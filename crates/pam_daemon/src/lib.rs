@@ -133,6 +133,8 @@ mod runtime_dir_test;
 mod secrets_test;
 
 #[cfg(test)]
+mod test_log;
+#[cfg(test)]
 mod transport_test;
 
 mod blocking_jobs;

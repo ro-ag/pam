@@ -19,6 +19,7 @@ const BUSY_CAUSES: readonly string[] = [
   "daemon_outdated",
   "deadline_exceeded",
   "reply_timeout",
+  "store_overloaded",
 ];
 
 /** True when `error` is the daemon saying it is momentarily busy or restarting. */

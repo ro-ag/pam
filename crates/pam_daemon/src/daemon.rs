@@ -51,9 +51,11 @@
 //! - **Shutdown** is a graceful drain: phase leaves [`LifecyclePhase::Serving`] (new requests
 //!   refused, [`CAUSE_DAEMON_SHUTTING_DOWN`]), executor/reaper stop taking leases (`queued` rows
 //!   are the restart-safe checkpoint), in-flight leases get [`DaemonConfig::drain_timeout`] then
-//!   cooperative cancellation, then the dispatcher stops. No explicit store flush is needed — every
-//!   write, audit included, is per-statement durable. A `waiting_approval` request is not drained;
-//!   crash recovery fails it on next boot.
+//!   cooperative cancellation, then the dispatcher stops. Every write, audit included, is durable
+//!   when its call returns, so nothing is flushed here; the store is closed last
+//!   ([`DaemonHandle::shutdown`]) so that its write-ahead log is folded into the main file and a
+//!   stopped daemon leaves `state.sqlite3` as the whole database. A `waiting_approval` request is
+//!   not drained; crash recovery fails it on next boot.
 //! - **Version handshake and restart policy**: a connection's hello carries the client build
 //!   version, and the listener applies the rule to it before the request is read
 //!   ([`crate::framed::version_rule`], the same on both planes); the pipeline never looks at an
@@ -174,8 +176,15 @@ pub const CAUSE_REQUEST_CAPACITY: &str = "request_capacity_exhausted";
 /// Refusal cause when a dispatcher pool's rate window is spent.
 pub const CAUSE_REQUEST_RATE: &str = "request_rate_exhausted";
 
-/// Refusal cause for a request arriving while the daemon drains.
+/// Refusal cause for a request arriving while the daemon drains, and for
+/// one whose store call found the store already closed
+/// ([`StoreError::Closed`]) at the end of the shutdown.
 pub const CAUSE_DAEMON_SHUTTING_DOWN: &str = "daemon_shutting_down";
+
+/// Refusal cause when the store refused a call at its queue bound
+/// ([`StoreError::Overloaded`]): the disk the state file is on is not
+/// keeping up. Nothing was written; the request can be sent again.
+pub const CAUSE_STORE_OVERLOADED: &str = "store_overloaded";
 
 /// `audit.action` for a refusal decided at the policy gate.
 pub const ACTION_GATE_REFUSAL: &str = "gate_refusal";
@@ -243,8 +252,12 @@ const RECOVERY_INTERNAL: &str = "Retry; if it persists, restart the daemon from 
 const RECOVERY_OUTDATED: &str = "The daemon is restarting with the new binary; retry your command.";
 
 /// Recovery line for [`CAUSE_DAEMON_SHUTTING_DOWN`] refusals.
-const RECOVERY_SHUTTING_DOWN: &str =
+pub(crate) const RECOVERY_SHUTTING_DOWN: &str =
     "Retry shortly; the next pam command starts a fresh daemon automatically.";
+
+/// Recovery line for [`CAUSE_STORE_OVERLOADED`] refusals. The detail, which
+/// is the store's own sentence, says what to check if it keeps happening.
+pub(crate) const RECOVERY_STORE_OVERLOADED: &str = "Retry shortly.";
 
 /// Recovery line for [`CAUSE_CLIENT_VERSION_MISMATCH`] refusals.
 const RECOVERY_VERSION_MISMATCH: &str = "Use the pam binary this daemon was started from, or stop the daemon from the PAM GUI and start it with the build you intend to use.";
@@ -453,12 +466,40 @@ impl DaemonHandle {
         self.router.clone()
     }
 
-    /// Waits for the graceful drain, then stops the transport and joins
-    /// every daemon task (see the module docs on the drain).
+    /// Waits for the graceful drain, then stops the transport, joins
+    /// every daemon task (see the module docs on the drain), and closes the
+    /// store.
     ///
     /// The drain starts when the shutdown watch handed to [`run_daemon`]
     /// flips (or its sender drops), or when the daemon requested its own
     /// restart — trigger one of those first, or this call never returns.
+    ///
+    /// The store is closed last, and the order is what makes that safe:
+    ///
+    /// 1. the daemon's own tasks are joined — the lease reaper, the
+    ///    retention scheduler, the status snapshot refresher, the
+    ///    maintenance loop (which offers parked terminal verdicts to the
+    ///    store one last time as it stops), the dispatcher (which joins or
+    ///    aborts every request handler) and the executor loop;
+    /// 2. both listeners are shut, so no request or administration call
+    ///    can arrive;
+    /// 3. [`ModelService::shutdown`] cancels the model downloads and
+    ///    verifications still running, waits (bounded) for their followers
+    ///    to record the job rows' verdicts, and stops the idle-unload
+    ///    ticker;
+    /// 4. [`Store::close`] waits for whatever store call is still running,
+    ///    folds the write-ahead log into the main file and closes the
+    ///    connections. After it, `state.sqlite3` alone is the whole
+    ///    database.
+    ///
+    /// Anything that still holds the store afterwards — an embedding host's
+    /// handle, an execution that outlived the drain bound and its cancel
+    /// grace, an approval nobody answered, a model follower that did not
+    /// stop within its bound — is answered
+    /// [`pam_store::StoreError::Closed`] by every call: a refusal that says
+    /// the daemon is shutting down and that nothing was written. A request
+    /// or job such a task could not finish is closed by crash recovery at
+    /// the next boot, exactly as after a kill.
     pub async fn shutdown(self) {
         // The lifecycle task is among these; joining it means the drain
         // ran to completion (waiting callers got their answers through
@@ -468,6 +509,15 @@ impl DaemonHandle {
         }
         self.admin_transport.shutdown().await;
         self.transport.shutdown().await;
+        // No admin call can start a transfer any more: stop the ones that
+        // run and let their followers write their verdicts while the store
+        // still takes them.
+        self.models.shutdown().await;
+        if let Err(error) = self.store.close().await {
+            // Nothing committed is lost: an unclosed store leaves its log
+            // for the next open to replay.
+            tracing::warn!(%error, "the store did not close cleanly at shutdown");
+        }
     }
 }
 
@@ -1637,9 +1687,10 @@ impl Pipeline {
         guard: Option<&mut ReplyGuard>,
     ) -> Response {
         let id = &envelope.id;
-        let Ok(decision) = self.gate.evaluate(id, &envelope.capability).await else {
+        let decision = match self.gate.evaluate(id, &envelope.capability).await {
+            Ok(decision) => decision,
             // Keep the not-yet-placed row out of the lanes forever.
-            return self.fail_internal(id, Audience::Laned).await;
+            Err(error) => return self.fail_store(id, Audience::Laned, &error).await,
         };
         match decision {
             GateDecision::Refuse {
@@ -1669,7 +1720,8 @@ impl Pipeline {
         let deadline = match self.store.get_request(id).await {
             Ok(Some(row)) => request_deadline(&row),
             // The row cannot be read: it still gets its terminal state.
-            _ => return self.fail_internal(id, Audience::Laned).await,
+            Ok(None) => return self.fail_internal(id, Audience::Laned).await,
+            Err(error) => return self.fail_store(id, Audience::Laned, &error).await,
         };
         let Some(deadline) = deadline else {
             return self.deadline_refusal(envelope, Audience::Laned).await;
@@ -1681,6 +1733,10 @@ impl Pipeline {
             Ok(position) => position,
             Err(QueueError::Expired) => {
                 return self.deadline_refusal(envelope, Audience::Laned).await;
+            }
+            // The store refusing on purpose is not a verdict on the request.
+            Err(QueueError::Store(error)) if store_refusal_cause(&error).is_some() => {
+                return self.fail_store(id, Audience::Laned, &error).await;
             }
             Err(error) => {
                 return self
@@ -1759,7 +1815,8 @@ impl Pipeline {
         let id = &envelope.id;
         let deadline = match self.store.get_request(id).await {
             Ok(Some(row)) => request_deadline(&row),
-            _ => return self.fail_internal(id, Audience::Laned).await,
+            Ok(None) => return self.fail_internal(id, Audience::Laned).await,
+            Err(error) => return self.fail_store(id, Audience::Laned, &error).await,
         };
         let Some(deadline) = deadline else {
             return self.deadline_refusal(envelope, Audience::Laned).await;
@@ -1816,7 +1873,7 @@ impl Pipeline {
                 ),
                 RECOVERY_APPROVAL_CANCELLED,
             ),
-            Err(_) => return self.fail_internal(id, Audience::Laned).await,
+            Err(error) => return self.fail_store(id, Audience::Laned, &error).await,
         };
         self.refuse(
             id,
@@ -1855,10 +1912,12 @@ impl Pipeline {
                 )
                 .await;
         };
-        let Ok(Some(row)) = self.store.get_request(id).await else {
+        let row = match self.store.get_request(id).await {
+            Ok(Some(row)) => row,
             // The row cannot be read back: it still gets a terminal state
             // (retried, then left to the reconciler), never a bare return.
-            return self.fail_internal(id, audience).await;
+            Ok(None) => return self.fail_internal(id, audience).await,
+            Err(error) => return self.fail_store(id, audience, &error).await,
         };
         let Some(deadline) = request_deadline(&row) else {
             return self.deadline_refusal(envelope, audience).await;
@@ -1940,11 +1999,14 @@ impl Pipeline {
                 execute_success_entry(&detail),
             )
             .await;
-        if written == Written::Parked {
+        match written {
+            Written::Durable => {}
             // The audit invariant: nothing is reported as done whose
             // terminal row is not durable. The verdict is parked and will
             // be recorded; the caller retries.
-            return unrecorded_refusal(id);
+            Written::Parked { overloaded } => return unrecorded_refusal(id, overloaded),
+            // Nor will it ever be recorded by this daemon: it is leaving.
+            Written::Closed => return store_refusal(id, &StoreError::Closed),
         }
         if audience.follows_events() {
             let _ = self.events.publish(id, Event::Done).await;
@@ -2009,26 +2071,35 @@ impl Pipeline {
             cancel,
             lease_deadline,
         } = work;
-        let Ok(Some(row)) = self.store.get_request(&id).await else {
-            self.fail_vanished_row(&id).await;
-            return;
+        let row = match self.store.get_request(&id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.fail_vanished_row(&id, None).await;
+                return;
+            }
+            Err(error) => {
+                self.fail_vanished_row(&id, Some(&error)).await;
+                return;
+            }
         };
         // Scoped: only a revocation of a grant this request depends on voids
-        // it. A store that cannot answer is not permission to run.
-        if !matches!(
-            self.store.request_authorization_current(&id).await,
-            Ok(true)
-        ) {
-            self.complete_leased(
-                &id,
-                &row.capability,
-                Err(CapabilityFailure::Refused {
-                    cause: "authorization_changed".to_owned(),
-                    detail: "A grant was revoked after this work was authorized".to_owned(),
-                    recovery: "Review current grants and submit a fresh request".to_owned(),
-                }),
-            )
-            .await;
+        // it. A store that cannot answer is not permission to run; one that
+        // refused on purpose (its queue bound, the shutdown) is named as
+        // that rather than as a revocation that did not happen.
+        let not_current = match self.store.request_authorization_current(&id).await {
+            Ok(true) => None,
+            Err(error) if store_refusal_cause(&error).is_some() => {
+                Some(store_capability_refusal(&error))
+            }
+            Ok(false) | Err(_) => Some(CapabilityFailure::Refused {
+                cause: "authorization_changed".to_owned(),
+                detail: "A grant was revoked after this work was authorized".to_owned(),
+                recovery: "Review current grants and submit a fresh request".to_owned(),
+            }),
+        };
+        if let Some(refused) = not_current {
+            self.complete_leased(&id, &row.capability, Err(refused))
+                .await;
             self.work.notify_one();
             return;
         }
@@ -2205,7 +2276,8 @@ impl Pipeline {
     ) {
         let mut terminal = self.queue.complete(id, state, Some(outcome), audit).await;
         for pause in crate::terminal::RETRY_BACKOFF {
-            if terminal.is_ok() {
+            // A closed store will not take a later attempt either.
+            if terminal.is_ok() || matches!(terminal, Err(QueueError::Store(StoreError::Closed))) {
                 break;
             }
             tokio::time::sleep(pause).await;
@@ -2219,6 +2291,16 @@ impl Pipeline {
             // The lease was reaped first: the reaper wrote the terminal
             // row and audit; release any waiters.
             Ok(false) => self.finish_reaped(id).await,
+            // The daemon closed its store under an execution that outlived
+            // the drain: nothing will record this verdict, so it is not
+            // parked, and whoever still waits is told the daemon is leaving
+            // rather than a result the next boot's recovery will not show.
+            Err(QueueError::Store(error @ StoreError::Closed)) => {
+                crate::terminal::log_closed(id, state);
+                self.queue.abandon_lease(id).await;
+                let _ = self.events.publish(id, Event::Refused).await;
+                self.router.finish(id, store_refusal(id, &error)).await;
+            }
             Err(error) => {
                 tracing::error!(
                     request = %id,
@@ -2298,15 +2380,28 @@ impl Pipeline {
 
     /// A leased request whose row cannot be read is unanswerable: record
     /// the internal failure (logged if even that fails) and free the lane.
-    async fn fail_vanished_row(&self, id: &str) {
-        let detail = serde_json::json!({ "cause": "request row missing" }).to_string();
+    /// `unread` is the store's error when the read itself failed, so the
+    /// store refusing on purpose is named as that ([`store_refusal`]).
+    async fn fail_vanished_row(&self, id: &str, unread: Option<&StoreError>) {
+        let (cause, detail, response) = match unread {
+            Some(error) => {
+                let cause = store_cause(error);
+                (cause, cause, store_refusal(id, error))
+            }
+            None => (
+                CAUSE_INTERNAL_ERROR,
+                "request row missing",
+                internal_refusal(id),
+            ),
+        };
+        let detail = serde_json::json!({ "cause": detail }).to_string();
         self.finish_leased(
             id,
             RequestState::Failed,
-            CAUSE_INTERNAL_ERROR,
+            cause,
             internal_failure_entry(&detail),
             Event::Refused,
-            internal_refusal(id),
+            response,
         )
         .await;
         self.work.notify_one();
@@ -2393,8 +2488,8 @@ impl Pipeline {
                 recorded,
             )
             .await;
-        if inserted.is_err() {
-            return internal_refusal(&envelope.id);
+        if let Err(error) = inserted {
+            return store_refusal(&envelope.id, &error);
         }
         self.register_ticket(envelope, origin);
         match self.gate.evaluate(&envelope.id, &envelope.capability).await {
@@ -2406,10 +2501,14 @@ impl Pipeline {
                 self.refuse(&envelope.id, Audience::Bypass, cause, detail, recovery)
                     .await
             }
+            Err(error) => {
+                self.fail_store(&envelope.id, Audience::Bypass, &error)
+                    .await
+            }
             // classify() said None, so the gate must refuse; anything
             // else is an internal inconsistency — and the row just
             // inserted still gets its terminal state.
-            _ => self.fail_internal(&envelope.id, Audience::Bypass).await,
+            Ok(_) => self.fail_internal(&envelope.id, Audience::Bypass).await,
         }
     }
 
@@ -2460,16 +2559,38 @@ impl Pipeline {
     /// request with its [`ACTION_INTERNAL_FAILURE`] audit row, tell
     /// whoever follows it, and answer with the internal refusal.
     async fn fail_internal(&self, id: &str, audience: Audience) -> Response {
-        let detail = serde_json::json!({ "cause": CAUSE_INTERNAL_ERROR }).to_string();
+        self.fail_with(id, audience, CAUSE_INTERNAL_ERROR, internal_refusal(id))
+            .await
+    }
+
+    /// [`Self::fail_internal`] for a failure the store reported. The store
+    /// refusing on purpose — its queue bound, or closed for the shutdown —
+    /// is answered with that cause and the store's own sentence
+    /// ([`store_refusal`]) and recorded under it; any other store error is
+    /// the internal failure it always was.
+    async fn fail_store(&self, id: &str, audience: Audience, error: &StoreError) -> Response {
+        self.fail_with(id, audience, store_cause(error), store_refusal(id, error))
+            .await
+    }
+
+    /// Fails the request under `cause` with its [`ACTION_INTERNAL_FAILURE`]
+    /// audit row, tells whoever follows it, and answers with `response`.
+    async fn fail_with(
+        &self,
+        id: &str,
+        audience: Audience,
+        cause: &str,
+        response: Response,
+    ) -> Response {
+        let detail = serde_json::json!({ "cause": cause }).to_string();
         self.terminals
             .finish(
                 id,
                 RequestState::Failed,
-                Some(CAUSE_INTERNAL_ERROR),
+                Some(cause),
                 internal_failure_entry(&detail),
             )
             .await;
-        let response = internal_refusal(id);
         self.announce(id, audience, Event::Refused, response.clone())
             .await;
         response
@@ -2540,10 +2661,13 @@ impl Pipeline {
         let id = &envelope.id;
         let terminal = self.queue.expire(id).await;
         log_terminal_failure(id, &terminal);
-        if terminal.is_err() {
+        if let Err(error) = &terminal {
             // Ownership stays with the queue: the reaper or the
             // reconciler finishes the row and releases its waiters.
-            return internal_refusal(id);
+            return match error {
+                QueueError::Store(error) => store_refusal(id, error),
+                _ => internal_refusal(id),
+            };
         }
         self.audit_deadline(id, envelope.deadline_ms).await;
         let response = self
@@ -2623,7 +2747,8 @@ impl Pipeline {
                     }
                 }
             }
-            Ok(_) | Err(_) => internal_refusal(id),
+            Ok(_) => internal_refusal(id),
+            Err(error) => store_refusal(id, &error),
         };
         let _ = self.events.publish(id, Event::Refused).await;
         self.router.finish(id, response).await;
@@ -2639,7 +2764,8 @@ impl Pipeline {
                 recovery: "Inspect retained evidence and reconcile the effect before submitting new work; PAM will not replay it.".to_owned(),
             },
             Ok(Some(_)) => fallback,
-            Ok(None) | Err(_) => internal_refusal(id),
+            Ok(None) => internal_refusal(id),
+            Err(error) => store_refusal(id, &error),
         }
     }
 
@@ -2856,10 +2982,67 @@ pub(crate) fn internal_refusal(id: &str) -> Response {
     )
 }
 
+/// The cause a store failure is recorded and answered under: the store's
+/// own when it refused on purpose ([`store_refusal_cause`]), otherwise
+/// [`CAUSE_INTERNAL_ERROR`].
+fn store_cause(error: &StoreError) -> &'static str {
+    store_refusal_cause(error).map_or(CAUSE_INTERNAL_ERROR, |(cause, _)| cause)
+}
+
+/// The cause and recovery line of a store error that is the store refusing
+/// on purpose, not the daemon's bookkeeping going wrong: its queue bound
+/// ([`CAUSE_STORE_OVERLOADED`]) and the store closed at the end of the
+/// shutdown ([`CAUSE_DAEMON_SHUTTING_DOWN`]). Both are transient and in both
+/// nothing was written. `None` for every other store error.
+pub(crate) fn store_refusal_cause(error: &StoreError) -> Option<(&'static str, &'static str)> {
+    match error {
+        StoreError::Overloaded { .. } => Some((CAUSE_STORE_OVERLOADED, RECOVERY_STORE_OVERLOADED)),
+        StoreError::Closed => Some((CAUSE_DAEMON_SHUTTING_DOWN, RECOVERY_SHUTTING_DOWN)),
+        _ => None,
+    }
+}
+
+/// The refusal a public caller gets for a store failure: retryable, with
+/// the store's own sentence as the detail, when the store refused on
+/// purpose ([`store_refusal_cause`]); the internal refusal otherwise, whose
+/// detail stays in the daemon log.
+pub(crate) fn store_refusal(id: &str, error: &StoreError) -> Response {
+    match store_refusal_cause(error) {
+        Some((cause, recovery)) => {
+            Response::transient_refusal(id, cause, error.to_string(), recovery)
+        }
+        None => internal_refusal(id),
+    }
+}
+
+/// [`store_refusal`] as the refusal of a leased execution. Only for an
+/// error [`store_refusal_cause`] names.
+fn store_capability_refusal(error: &StoreError) -> CapabilityFailure {
+    let (cause, recovery) =
+        store_refusal_cause(error).unwrap_or((CAUSE_INTERNAL_ERROR, RECOVERY_INTERNAL));
+    CapabilityFailure::Refused {
+        cause: cause.to_owned(),
+        detail: error.to_string(),
+        recovery: recovery.to_owned(),
+    }
+}
+
 /// Refusal for a bypass request that ran but whose terminal row the store
 /// would not take: the verdict is parked for retry, and reporting success
-/// without a durable audit row would break the audit invariant.
-fn unrecorded_refusal(id: &str) -> Response {
+/// without a durable audit row would break the audit invariant. `overloaded`
+/// says the store turned the write down at its queue bound, which the
+/// caller is told as that.
+fn unrecorded_refusal(id: &str, overloaded: bool) -> Response {
+    if overloaded {
+        return Response::transient_refusal(
+            id,
+            CAUSE_STORE_OVERLOADED,
+            "the request ran but its outcome could not be recorded yet: the store has too \
+             many calls waiting for the database, which is not keeping up (a stalled or \
+             very slow disk); the outcome is queued to be recorded",
+            RECOVERY_STORE_OVERLOADED,
+        );
+    }
     Response::transient_refusal(
         id,
         CAUSE_INTERNAL_ERROR,
@@ -2871,7 +3054,7 @@ fn unrecorded_refusal(id: &str) -> Response {
 
 /// The refusal for an admission the queue turned down. Capacity, an
 /// elapsed deadline and a store failure are all transient.
-fn queue_refusal(id: String, error: &QueueError) -> Response {
+pub(crate) fn queue_refusal(id: String, error: &QueueError) -> Response {
     let retryable = matches!(
         error,
         QueueError::Capacity { .. } | QueueError::Expired | QueueError::Store(_)
@@ -2886,12 +3069,16 @@ fn queue_refusal(id: String, error: &QueueError) -> Response {
 }
 
 /// Whether a cause a capability refused with is transient: the request's
-/// own deadline ran out, or the daemon's blocking pool was full. Everything
-/// else a capability refuses with would only repeat.
+/// own deadline ran out, the daemon's blocking pool was full, or the store
+/// refused on purpose ([`store_refusal_cause`]). Everything else a
+/// capability refuses with would only repeat.
 fn is_transient_cause(cause: &str) -> bool {
     matches!(
         cause,
-        CAUSE_DEADLINE_EXCEEDED | "blocking_capacity_exhausted"
+        CAUSE_DEADLINE_EXCEEDED
+            | "blocking_capacity_exhausted"
+            | CAUSE_STORE_OVERLOADED
+            | CAUSE_DAEMON_SHUTTING_DOWN
     )
 }
 

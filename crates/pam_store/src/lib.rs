@@ -8,17 +8,36 @@
 //! target runs the same engine). Write-ahead logging, a full sync per commit,
 //! foreign keys and the hardening settings are applied to the connection at
 //! open and read back (see `open`). The engine's client is synchronous; the
-//! public API is async. There is one connection: every call waits for it on an
+//! public API is async. One connection writes: every call waits for it on an
 //! async gate and then runs its statements as one closure on a blocking thread
 //! of the caller's runtime, to completion, so a call whose future is dropped
 //! never leaves a transaction open, and a write it had started either
-//! committed whole or not at all (see `conn_gate`). Integrity is enforced
-//! twice — CHECK and foreign-key constraints in the database, typed enums in
-//! Rust.
+//! committed whole or not at all (see `conn_gate`). A file-backed store has a
+//! second, read-only connection behind a gate of its own, which the list
+//! queries and the large reads use: they neither wait for a write nor hold
+//! one up. Integrity is enforced twice — CHECK and foreign-key constraints in
+//! the database, typed enums in Rust.
+//!
+//! Upgrades never start without the way back. Before a database is migrated
+//! its files are copied into `backup/` beside it, and a database last written
+//! by the previous engine is also checked in full, once; an open that cannot
+//! make the copy, or finds the database damaged, is refused and leaves every
+//! file as it found it (see `open` for the whole path, `backup` for the
+//! copies and how to restore one).
+//!
+//! [`Store::close`] ends a store in good order and leaves the main file as
+//! the whole database. A store that is dropped instead, or whose process is
+//! killed, leaves a write-ahead log the next open replays; nothing a call had
+//! returned from is lost either way. Dropping never checkpoints, and nothing
+//! may rely on it doing so: the rows of a dropped store are read by opening
+//! the file through the store again, not by reading or copying the main
+//! file, which is complete on its own only after `close`.
 
+mod backup;
 mod conn_gate;
 mod db;
 mod error;
+mod header;
 mod migrations;
 mod open;
 mod store;
@@ -39,6 +58,10 @@ pub use store::{
 };
 
 #[cfg(test)]
+mod backup_test;
+#[cfg(test)]
+mod close_test;
+#[cfg(test)]
 mod conn_gate_test;
 #[cfg(test)]
 mod error_test;
@@ -49,9 +72,15 @@ mod migrations_test;
 #[cfg(test)]
 mod open_test;
 #[cfg(test)]
+mod read_test;
+#[cfg(test)]
 mod store_integrity_test;
 #[cfg(test)]
 mod store_test;
+#[cfg(test)]
+mod sync_cost_test;
+#[cfg(test)]
+mod upgrade_test;
 
 #[cfg(test)]
 mod flow_results_test;

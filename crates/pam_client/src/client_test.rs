@@ -1014,6 +1014,10 @@ fn only_momentary_daemon_conditions_are_transient() {
     for cause in [
         "request_capacity_exhausted",
         "request_rate_exhausted",
+        // The store's queue bound: the daemon's disk is behind, nothing was
+        // decided about the caller. The literal the daemon refuses with.
+        pam_daemon::daemon::CAUSE_STORE_OVERLOADED,
+        "store_overloaded",
         "daemon_shutting_down",
         CAUSE_DAEMON_OUTDATED,
         "deadline_exceeded",

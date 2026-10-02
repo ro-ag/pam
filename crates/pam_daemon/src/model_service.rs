@@ -6,7 +6,9 @@
 //! keyed by job id (cancel, dedupe). A download runs an hour vs the admin op's ms response, so it
 //! returns a `job_id` and the history lives on `model_job` rows, polled every [`DOWNLOAD_POLL`]; a
 //! `running` row found at boot belonged to a dead daemon and [`ModelService::new`] fails it with
-//! [`CAUSE_DAEMON_RESTART`] (the part file still resumes). Administration is GUI-only
+//! [`CAUSE_DAEMON_RESTART`] (the part file still resumes). A daemon that stops in good order does
+//! not leave such rows: [`ModelService::shutdown`] cancels the running transfers and joins their
+//! followers, which record the same cause, before the store closes. Administration is GUI-only
 //! ([`crate::admin_models`]); the only daemon-internal entry point,
 //! [`ModelService::generate_bounded`], returns [`ModelUnavailable::NoDefault`] with nothing
 //! configured so the caller falls back deterministically. An [`IDLE_TICK`] ticker unloads the engine once idle past
@@ -180,6 +182,14 @@ pub fn summary_contract() -> Option<&'static PromptContract> {
 
 /// How often a download's follower reads its handle and writes progress.
 pub const DOWNLOAD_POLL: Duration = Duration::from_millis(500);
+
+/// How long [`ModelService::shutdown`] waits for the transfer followers and
+/// the idle-unload ticker to end. A cancelled download ends within a
+/// [`DOWNLOAD_POLL`]; a verification stops at its next chunk.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// What the job row of a transfer says when the daemon stopped under it.
+const STOPPED_DETAIL: &str = "the daemon stopped while this job was running";
 
 /// How often the idle-unload ticker looks at the runtime.
 pub const IDLE_TICK: Duration = Duration::from_secs(30);
@@ -400,6 +410,16 @@ pub struct ModelService {
     generate_total_ms: AtomicU64,
     /// Milliseconds the engine itself may take over one completion; tests shorten it.
     generate_step_ms: AtomicU64,
+    /// The service's own tasks: the idle-unload ticker and one follower per
+    /// running transfer. [`Self::shutdown`] joins them; a sync lock, taken
+    /// only to add a handle or to take them all, never across an await.
+    /// Plain handles, so a service dropped without a shutdown leaves its
+    /// tasks running instead of aborting them.
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// `true` from the moment [`Self::shutdown`] begins. The ticker returns
+    /// on it, and a follower whose transfer ends cancelled reads it to tell
+    /// the daemon's stop from a human's cancel.
+    stopping: watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for ModelService {
@@ -449,9 +469,85 @@ impl ModelService {
             orphans_checked: AtomicBool::new(false),
             generate_total_ms: AtomicU64::new(duration_ms(GENERATE_TOTAL_DEADLINE)),
             generate_step_ms: AtomicU64::new(duration_ms(ENGINE_GENERATE_DEADLINE)),
+            tasks: std::sync::Mutex::new(Vec::new()),
+            stopping: watch::channel(false).0,
         });
-        tokio::spawn(idle_unload_loop(Arc::downgrade(&service)));
+        service.spawn_task(idle_unload_loop(
+            Arc::downgrade(&service),
+            service.stopping.subscribe(),
+        ));
         Ok(service)
+    }
+
+    /// Spawns one of the service's own tasks where [`Self::shutdown`] can
+    /// join it, forgetting the ones that have already ended.
+    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|handle| !handle.is_finished());
+        tasks.push(tokio::spawn(task));
+    }
+
+    /// Stops what the service runs on its own, before the daemon closes the
+    /// store: cancels every running download and verification, waits for
+    /// their followers to write the job rows' verdicts, and stops the
+    /// idle-unload ticker.
+    ///
+    /// A transfer stopped here is recorded as `failed` with
+    /// [`CAUSE_DAEMON_RESTART`], which is what the next boot would have
+    /// written for a row left `running`; a download keeps its part file and
+    /// resumes. The wait is bounded by [`SHUTDOWN_WAIT`]: a follower that has
+    /// not ended by then (a finished download still hashing its private
+    /// copy, an engine unload in progress) is logged and left running, never
+    /// waited for. Such a task finds the store closed, and its row is failed
+    /// by the next boot.
+    ///
+    /// Call it once no admin operation can arrive: a transfer started
+    /// afterwards is not stopped by it. Calling it twice is harmless.
+    pub async fn shutdown(&self) {
+        self.shutdown_within(SHUTDOWN_WAIT).await;
+    }
+
+    /// [`Self::shutdown`] with the bound given, so a test need not wait
+    /// [`SHUTDOWN_WAIT`] to see a follower left behind.
+    pub(crate) async fn shutdown_within(&self, wait: Duration) {
+        self.stopping.send_replace(true);
+        for (_, handle) in self.downloads.lock().await.values() {
+            handle.cancel();
+        }
+        for cancel in self
+            .verifies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        let mut tasks = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let joined = tokio::time::timeout(wait, async {
+            for task in &mut tasks {
+                // A task that panicked has ended all the same.
+                let _ = task.await;
+            }
+        })
+        .await;
+        if joined.is_err() {
+            // Dropping a handle detaches its task: it is left to end on its
+            // own, not aborted in the middle of a write.
+            tracing::warn!(
+                left = tasks.iter().filter(|task| !task.is_finished()).count(),
+                waited_ms = duration_ms(wait),
+                "model tasks did not stop in time and were left running; a job row one of \
+                 them leaves unfinished is failed at the next start"
+            );
+        }
     }
 
     /// The llama.cpp supervisor when the pinned engine is installed under
@@ -1131,7 +1227,7 @@ impl ModelService {
             .lock()
             .await
             .insert(job_id.clone(), (dest, handle.clone()));
-        tokio::spawn(follow_download(
+        self.spawn_task(follow_download(
             Arc::clone(&self.store),
             Arc::clone(&self.downloads),
             job_id.clone(),
@@ -1139,6 +1235,7 @@ impl ModelService {
             // A download that carried an expected digest and finished has been checked
             // against it; only then is it recorded as verified, in the private store.
             expected_digest.then(|| (self.registry(), dest_for_record)),
+            self.stopping.subscribe(),
         ));
         tracing::info!(job = %job_id, model = model_id, "download started");
         Ok(job_id)
@@ -1221,13 +1318,14 @@ impl ModelService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(job_id.clone(), Arc::clone(&cancel));
-        tokio::spawn(follow_verify(
+        self.spawn_task(follow_verify(
             Arc::clone(&self.store),
             Arc::clone(&self.verifies),
             job_id.clone(),
             self.registry(),
             entry,
             cancel,
+            self.stopping.subscribe(),
         ));
         Ok(job_id)
     }
@@ -1429,6 +1527,7 @@ async fn follow_download(
     job_id: String,
     handle: DownloadHandle,
     record_as_verified: Option<(Registry, PathBuf)>,
+    stopping: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(DOWNLOAD_POLL);
     // A store that refuses every progress write would otherwise warn twice
@@ -1520,7 +1619,7 @@ async fn follow_download(
         }
         // `Running` cannot reach here; the loop only breaks on a terminal
         // state.
-        DownloadState::Cancelled | DownloadState::Running(_) => (JOB_CANCELLED, None),
+        DownloadState::Cancelled | DownloadState::Running(_) => stopped_or_cancelled(&stopping),
     };
     let encoded = detail.map(|value| value.to_string());
     if let Err(err) = store
@@ -1543,6 +1642,7 @@ async fn follow_verify(
     registry: Registry,
     entry: ModelEntry,
     cancel: Arc<AtomicBool>,
+    stopping: watch::Receiver<bool>,
 ) {
     let total = i64::try_from(entry.size_bytes).ok();
     let done = Arc::new(AtomicU64::new(0));
@@ -1574,7 +1674,7 @@ async fn follow_verify(
             }
             (JOB_DONE, Some(verify_detail(&outcome)))
         }
-        Ok(Err(RegistryError::Weights(WeightsError::Cancelled))) => (JOB_CANCELLED, None),
+        Ok(Err(RegistryError::Weights(WeightsError::Cancelled))) => stopped_or_cancelled(&stopping),
         Ok(Err(error)) => (
             JOB_FAILED,
             Some(job_failure_value(verify_cause(&error), &error.to_string())),
@@ -1592,6 +1692,22 @@ async fn follow_verify(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&job_id);
+}
+
+/// The verdict of a transfer that ended cancelled: the human's cancel, or,
+/// once [`ModelService::shutdown`] has begun, the daemon's stop, recorded as
+/// the failure the next boot would otherwise have written.
+fn stopped_or_cancelled(
+    stopping: &watch::Receiver<bool>,
+) -> (&'static str, Option<serde_json::Value>) {
+    if *stopping.borrow() {
+        (
+            JOB_FAILED,
+            Some(job_failure_value(CAUSE_DAEMON_RESTART, STOPPED_DETAIL)),
+        )
+    } else {
+        (JOB_CANCELLED, None)
+    }
 }
 
 /// What a finished verification's job row says.
@@ -1615,11 +1731,14 @@ pub(crate) fn verify_cause(error: &RegistryError) -> &'static str {
     }
 }
 
-/// Ticks until the service is dropped, unloading an idle model.
-async fn idle_unload_loop(service: Weak<ModelService>) {
+/// Ticks until the service is dropped or shut down, unloading an idle model.
+async fn idle_unload_loop(service: Weak<ModelService>, mut stopping: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(IDLE_TICK);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = cancelled(&mut stopping) => return,
+        }
         let Some(service) = service.upgrade() else {
             return;
         };

@@ -680,14 +680,34 @@ pub struct ConnectorPatch<'a> {
 /// connection and then runs its statements on a blocking thread, to
 /// completion (see `conn_gate`). Methods must be called from within a tokio
 /// runtime.
+///
+/// # Ending a store
+///
+/// [`Store::close`] is the only thing that folds the write-ahead log into
+/// the main file. Dropping a store never does: there is no destructor of
+/// the store's own, and the connections are told at open not to checkpoint
+/// when they close, so a drop writes nothing and leaves the main file and
+/// its `-wal` exactly as they were. Nothing in pam relies on a checkpoint
+/// at drop: the daemon closes its store at the end of shutdown, and whoever
+/// wants the rows of a store that was dropped, or of a daemon that was
+/// killed, reopens the file through [`Store::open`], which replays the log.
+/// Reading or copying the main file alone is only right after `close`
+/// returned `Ok`; before that it is an older, consistent database that
+/// lacks every commit still in the log.
 pub struct Store {
-    /// The one connection, behind the only gate that reaches it. The daemon
-    /// drives this store from many tasks at once — executor, dispatcher,
-    /// reaper, admin. Each method hands [`Self::run`] or [`Self::transact`]
-    /// one closure holding all of its statements; the gate serializes the
-    /// closures and runs each one whole, so a call that is dropped part-way
-    /// never leaves a transaction open behind it.
+    /// The one connection that writes, behind the only gate that reaches it.
+    /// The daemon drives this store from many tasks at once — executor,
+    /// dispatcher, reaper, admin. Each method hands [`Self::run`] or
+    /// [`Self::transact`] one closure holding all of its statements; the gate
+    /// serializes the closures and runs each one whole, so a call that is
+    /// dropped part-way never leaves a transaction open behind it.
     gate: ConnGate,
+    /// A second, read-only connection to the same file, behind a gate of its
+    /// own: write-ahead logging lets it read while the writer writes, so the
+    /// list queries and large reads handed to [`Self::read`] neither wait
+    /// behind a write nor make one wait. `None` for an in-memory store,
+    /// whose reads share the writer.
+    reader: Option<ConnGate>,
 }
 
 impl std::fmt::Debug for Store {
@@ -754,6 +774,14 @@ impl Store {
     /// settings (foreign keys, busy timeout, write-ahead logging with a full
     /// sync per commit; see `open`), checks a file of moderate size for
     /// structural damage, and applies any pending migrations.
+    ///
+    /// A database that needs an upgrade is copied first, into `backup/`
+    /// beside the state file, and an open that cannot make that copy is
+    /// refused with [`StoreError::UpgradeBackup`]. A database last written by
+    /// the previous engine also gets the engine's full integrity and
+    /// foreign-key checks, once; if it fails them the open is refused with
+    /// [`StoreError::Corrupt`], which names the copy and the ways out. A
+    /// refused open leaves every database file as it found it.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -787,9 +815,13 @@ impl Store {
     async fn init(target: Target) -> Result<Self, StoreError> {
         let opened = tokio::task::spawn_blocking(move || open::open(&target)).await;
         match opened {
-            Ok(conn) => Ok(Self {
-                gate: ConnGate::new(conn?),
-            }),
+            Ok(opened) => {
+                let opened = opened?;
+                Ok(Self {
+                    gate: ConnGate::new(opened.writer),
+                    reader: opened.reader.map(ConnGate::new),
+                })
+            }
             Err(error) => Err(StoreError::Unavailable {
                 detail: if error.is_panic() {
                     "opening the database panicked".to_owned()
@@ -800,9 +832,42 @@ impl Store {
         }
     }
 
+    /// Closes the store: waits for the call in progress, folds the
+    /// write-ahead log into the main file, and closes both connections.
+    ///
+    /// After it returns the main file alone is the whole database (a plain
+    /// copy of it is a complete backup), and every later call on this store
+    /// is answered [`StoreError::Closed`] without running. Calls that were
+    /// already waiting when the close took the connection get the same
+    /// answer; a call that was running finishes first. Closing twice is
+    /// harmless.
+    ///
+    /// The log cannot be folded while another connection (a second process
+    /// with the file open) is in the middle of a read or a write. The store
+    /// is closed all the same and a warning is logged: nothing is lost, the
+    /// next open replays the log, but until then a copy of the main file
+    /// alone is not a complete backup.
+    ///
+    /// A store that is dropped without this is safe: its connections are
+    /// closed without any write, which leaves the log for the next open to
+    /// replay, exactly as a killed process does. It is not checkpointed:
+    /// reopen it through [`Store::open`] to read it, never the main file on
+    /// its own.
+    pub async fn close(&self) -> Result<(), StoreError> {
+        // The reader first: the writer can only fold the whole log when
+        // nothing else is reading from it.
+        let reader = match &self.reader {
+            Some(reader) => reader.close(|conn| open::shut(conn, false)).await,
+            None => Ok(()),
+        };
+        let writer = self.gate.close(|conn| open::shut(conn, true)).await;
+        writer.and(reader)
+    }
+
     /// Runs `job` with exclusive use of the connection, outside any
     /// transaction: each statement in it commits on its own. Every statement
-    /// in this crate goes through here or through [`Self::transact`].
+    /// in this crate goes through here, through [`Self::transact`] or
+    /// through [`Self::read`].
     pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, StoreError>
     where
         F: FnOnce(Db<'_>) -> Result<T, StoreError> + Send + 'static,
@@ -820,6 +885,49 @@ impl Store {
         T: Send + 'static,
     {
         self.gate.run(move |conn| db::in_txn(conn, job)).await
+    }
+
+    /// Runs a job that only reads, on the read-only connection when the
+    /// store has one, as one read transaction: every statement in it sees
+    /// the database as of one moment, which includes every write whose call
+    /// had returned before this one started. It neither waits for the writer
+    /// nor holds it up.
+    ///
+    /// For the list queries and the large reads. A read that decides an
+    /// authorization, and any read whose job also writes, stays on
+    /// [`Self::run`]. An in-memory store has one connection and runs the job
+    /// there.
+    pub(crate) async fn read<T, F>(&self, job: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(Db<'_>) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        match &self.reader {
+            Some(reader) => reader.run(move |conn| db::in_read_txn(conn, job)).await,
+            None => self.run(job).await,
+        }
+    }
+
+    /// The read-only connection itself, for tests that hold it busy or
+    /// inspect its settings. `None` for an in-memory store.
+    #[cfg(test)]
+    pub(crate) async fn raw_read<T, F>(&self, job: F) -> Option<Result<T, StoreError>>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let reader = self.reader.as_ref()?;
+        Some(
+            reader
+                .run(move |conn| job(conn).map_err(crate::error::engine))
+                .await,
+        )
+    }
+
+    /// Calls waiting for, or running on, the writing connection.
+    #[cfg(test)]
+    pub(crate) fn queued_calls(&self) -> usize {
+        self.gate.queued()
     }
 
     /// The connection itself, for tests that seed or inspect rows the public
@@ -862,10 +970,13 @@ impl Store {
     /// Runs the engine's structural check over the whole file and answers
     /// [`StoreError::Corrupt`] with what it found. [`Self::open`] runs the
     /// same check at boot for files up to 256 MiB; this is the on-demand
-    /// form for larger ones (it reads every page under the connection lock,
-    /// so it belongs behind a deliberate operator action, not on a timer).
+    /// form for larger ones. It reads every page; on a file-backed store it
+    /// does so on the read-only connection, so writes carry on meanwhile,
+    /// but it still belongs behind a deliberate operator action, not on a
+    /// timer.
     pub async fn check_integrity(&self) -> Result<(), StoreError> {
-        self.gate.run(|conn| open::integrity_check(conn)).await
+        let gate = self.reader.as_ref().unwrap_or(&self.gate);
+        gate.run(|conn| open::integrity_check(conn)).await
     }
 
     /// The schema version currently recorded in the database.
@@ -1880,7 +1991,7 @@ impl Store {
     /// Reads every audit row for one request, oldest first.
     pub async fn audit_for_request(&self, request_id: &str) -> Result<Vec<AuditRow>, StoreError> {
         let request_id = request_id.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, request_id, action, decision, actor, detail, ts
                      FROM audit WHERE request_id = ?1 ORDER BY id",
@@ -2172,7 +2283,7 @@ impl Store {
         let repo = repo.map(str::to_owned);
         let agent = agent.map(str::to_owned);
         let capability = capability.map(str::to_owned);
-        self.run(move |conn| {
+        self.read(move |conn| {
             let limit = limit
                 .unwrap_or(DEFAULT_REQUEST_LIST_LIMIT)
                 .clamp(1, MAX_LIST_LIMIT);
@@ -2251,7 +2362,7 @@ impl Store {
     /// Every observed agent+repo pair, most recently seen first — feeds
     /// the GUI sidebar and activity filters.
     pub async fn list_callers(&self) -> Result<Vec<CallerRow>, StoreError> {
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT agent, repo, first_seen, last_seen
                      FROM caller ORDER BY last_seen DESC, agent, repo",
@@ -2675,7 +2786,7 @@ impl Store {
     /// The most recent model jobs, newest first, bounded by `limit`
     /// (clamped into `1..=`[`MAX_LIST_LIMIT`]).
     pub async fn list_model_jobs(&self, limit: u64) -> Result<Vec<ModelJobRow>, StoreError> {
-        self.run(move |conn| {
+        self.read(move |conn| {
             let limit = limit.clamp(1, MAX_LIST_LIMIT);
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, kind, model_id, source, state, bytes_done, bytes_total,
@@ -2769,7 +2880,7 @@ impl Store {
     /// not exist.
     pub async fn get_evidence(&self, id: &str) -> Result<Option<EvidenceRow>, StoreError> {
         let id = id.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, request_id, kind, content, content_hash, meta_json, ts
                      FROM evidence WHERE id = ?1",
@@ -2795,7 +2906,7 @@ impl Store {
     /// blobs — the GUI's evidence strip.
     pub async fn list_evidence(&self, request_id: &str) -> Result<Vec<EvidenceMeta>, StoreError> {
         let request_id = request_id.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, request_id, kind, LENGTH(content), content_hash, meta_json, ts
                      FROM evidence WHERE request_id = ?1 ORDER BY ts ASC, id ASC",
@@ -2827,7 +2938,7 @@ impl Store {
     /// counts as a compression — it happened — but contributes no
     /// figures, and says so in the log.
     pub async fn compression_stats(&self, since_ts: i64) -> Result<CompressionStats, StoreError> {
-        self.run(move |conn| {
+        self.read(move |conn| {
             let mut stmt =
                 conn.prepare("SELECT id, meta_json FROM evidence WHERE kind = ?1 AND ts >= ?2")?;
             let mut rows = stmt.query(params![EVIDENCE_KIND_LOG_COMPACT, since_ts])?;
@@ -3067,8 +3178,8 @@ impl Store {
     /// `keep_kind` and hangs off a finished request, every evidence row of
     /// a terminal request untouched since `request_cutoff` (counted once
     /// when both apply), and those request records themselves. All of it
-    /// is read under one hold of the connection, so the figures describe
-    /// one moment. Read-only.
+    /// is read in one read transaction (on the read-only connection when
+    /// the store has one), so the figures describe one moment. Read-only.
     pub async fn retention_census(
         &self,
         evidence_cutoff: Option<i64>,
@@ -3083,7 +3194,7 @@ impl Store {
              (SELECT 1 FROM request r WHERE r.id = e.request_id \
               AND r.state IN ('done','refused','failed'))";
         let keep_kind = keep_kind.to_owned();
-        self.run(move |conn| {
+        self.read(move |conn| {
             let (evidence, _) = Self::measure(conn, "SELECT COUNT(*), 0 FROM evidence", ())?;
             let (terminal, _) = Self::measure(
                 conn,

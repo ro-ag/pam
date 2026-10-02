@@ -236,7 +236,11 @@ impl InvokeError {
             Self::Secret(error) => error.cause(),
             Self::Connector(error) => error.cause(),
             Self::CurlMissing => CAUSE_CLI_MISSING,
-            Self::Store(_) => CAUSE_INTERNAL,
+            // The store refusing on purpose (its queue bound, the shutdown)
+            // is named as that, not as a bookkeeping failure.
+            Self::Store(error) => {
+                crate::daemon::store_refusal_cause(error).map_or(CAUSE_INTERNAL, |(cause, _)| cause)
+            }
         }
     }
 
@@ -281,7 +285,8 @@ impl InvokeError {
             Self::Secret(error) => error.recovery(),
             Self::Connector(_) => &lines.test,
             Self::CurlMissing => pam_model::download::curl_recovery_line(),
-            Self::Store(_) => RECOVERY_INTERNAL,
+            Self::Store(error) => crate::daemon::store_refusal_cause(error)
+                .map_or(RECOVERY_INTERNAL, |(_, recovery)| recovery),
         }
     }
 }

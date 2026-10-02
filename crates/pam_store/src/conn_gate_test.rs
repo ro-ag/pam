@@ -410,3 +410,98 @@ async fn concurrent_callers_are_served_one_at_a_time() {
         Some(CALLERS.to_string().as_str())
     );
 }
+
+/// Polls until `condition` holds; panics if it has not after ten seconds.
+async fn eventually(what: &str, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_queue_refuses_the_next_call_before_it_runs_and_recovers() {
+    use crate::conn_gate::MAX_QUEUED_CALLS;
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    // A disk that has stopped answering: one job holds the connection.
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let stalled = tokio::spawn({
+        let store = Arc::clone(&store);
+        async move {
+            store
+                .raw(move |_| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+        }
+    });
+    started_rx.await.unwrap();
+    assert_eq!(store.queued_calls(), 1);
+
+    // Callers keep arriving until the queue is full.
+    let mut waiting = Vec::new();
+    for index in 1..MAX_QUEUED_CALLS {
+        let store = Arc::clone(&store);
+        waiting.push(tokio::spawn(async move {
+            store.set_setting(&format!("k{index}"), "1").await
+        }));
+    }
+    eventually("the queue fills", || {
+        store.queued_calls() == MAX_QUEUED_CALLS
+    })
+    .await;
+
+    // The next one is answered at once, with the cause, and is not queued.
+    let refused = tokio::time::timeout(Duration::from_secs(5), store.set_setting("over", "1"))
+        .await
+        .expect("a call past the bound waited instead of being refused")
+        .unwrap_err();
+    assert!(
+        matches!(refused, StoreError::Overloaded { waiting } if waiting == MAX_QUEUED_CALLS),
+        "{refused:?}"
+    );
+    let text = refused.to_string();
+    assert!(text.contains("1024 calls waiting"), "{text}");
+    assert!(text.contains("refused before it ran"), "{text}");
+    assert!(text.contains("disk"), "{text}");
+    assert_eq!(store.queued_calls(), MAX_QUEUED_CALLS);
+
+    // A waiter that gives up leaves the queue, and its place can be taken.
+    let gave_up = waiting.pop().unwrap();
+    gave_up.abort();
+    let _ = gave_up.await;
+    eventually("the abandoned place is free", || {
+        store.queued_calls() == MAX_QUEUED_CALLS - 1
+    })
+    .await;
+    waiting.push(tokio::spawn({
+        let store = Arc::clone(&store);
+        async move { store.set_setting("took_the_place", "1").await }
+    }));
+    eventually("the place is taken", || {
+        store.queued_calls() == MAX_QUEUED_CALLS
+    })
+    .await;
+
+    // The disk answers again: everyone who waited is served, in full.
+    release_tx.send(()).unwrap();
+    stalled.await.unwrap().unwrap();
+    for task in waiting {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(store.queued_calls(), 0);
+    let written: i64 = store
+        .raw_scalar("SELECT COUNT(*) FROM setting", ())
+        .await
+        .unwrap();
+    // Every waiter but the one that gave up, plus the one that took its
+    // place; the refused call wrote nothing.
+    assert_eq!(written, i64::try_from(MAX_QUEUED_CALLS).unwrap() - 2 + 1);
+    assert_eq!(store.get_setting("over").await.unwrap(), None);
+    assert!(store.get_setting("took_the_place").await.unwrap().is_some());
+}

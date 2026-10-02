@@ -19,6 +19,13 @@
 //! The queue is bounded ([`MAX_PARKED`]). When it is full the oldest verdict is
 //! dropped with an error log; its row is then closed by the queue's reconciler
 //! once its deadline has passed, with the lease-expiry outcome. Nothing strands.
+//!
+//! One store answer is neither retried nor parked: [`StoreError::Closed`]. The
+//! daemon closes its store at the very end of shutdown, after the maintenance
+//! loop has stopped, so no later attempt in this process can succeed and
+//! nothing will ever drain the queue. The write is given up at once with one
+//! debug line ([`Written::Closed`]); the row is still in flight on disk and
+//! crash recovery closes it at the next boot, exactly as after a kill.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -40,7 +47,25 @@ pub enum Written {
     Durable,
     /// The store refused every attempt; the verdict is parked and will be
     /// retried. The row is still in flight right now.
-    Parked,
+    Parked {
+        /// The last refusal was the store's queue bound
+        /// ([`StoreError::Overloaded`]): the disk is not keeping up, which a
+        /// caller can be told in those words.
+        overloaded: bool,
+    },
+    /// The store is closed: the daemon is at the end of its shutdown.
+    /// Nothing was written and nothing is parked; the next boot's crash
+    /// recovery closes the row.
+    Closed,
+}
+
+impl Written {
+    /// Whether the terminal row and its audit row are on disk. Anything
+    /// else must not be reported to a caller as a recorded outcome.
+    #[must_use]
+    pub fn is_durable(self) -> bool {
+        self == Self::Durable
+    }
 }
 
 /// A terminal verdict the store has not accepted yet.
@@ -74,6 +99,10 @@ pub struct TerminalWriter {
     /// store, standing in for a store that will not take a write.
     #[cfg(test)]
     injected_failures: std::sync::atomic::AtomicUsize,
+    /// Test seam: the injected failures are the store's queue bound
+    /// ([`StoreError::Overloaded`]) instead of a generic store failure.
+    #[cfg(test)]
+    injected_overload: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for TerminalWriter {
@@ -94,12 +123,25 @@ impl TerminalWriter {
             parked: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             injected_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            injected_overload: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Makes the next `count` store calls fail without reaching the store.
     #[cfg(test)]
     pub(crate) fn fail_next(&self, count: usize) {
+        self.injected_overload
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.injected_failures
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// [`Self::fail_next`], failing as a store at its queue bound does.
+    #[cfg(test)]
+    pub(crate) fn fail_next_overloaded(&self, count: usize) {
+        self.injected_overload
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.injected_failures
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
@@ -122,14 +164,19 @@ impl TerminalWriter {
                 })
                 .is_ok()
             {
-                return Err(StoreError::AbandonedTransaction);
+                return Err(if self.injected_overload.load(Ordering::SeqCst) {
+                    StoreError::Overloaded { waiting: 1024 }
+                } else {
+                    StoreError::AbandonedTransaction
+                });
             }
         }
         self.store.finish_request(id, state, outcome, audit).await
     }
 
     /// Records `id`'s terminal `state`, `outcome` and `audit` row (see the
-    /// module docs): up to three attempts, then parked.
+    /// module docs): up to three attempts, then parked. A closed store ends
+    /// the call at once, with nothing parked.
     pub async fn finish(
         &self,
         id: &str,
@@ -151,6 +198,10 @@ impl TerminalWriter {
                     tracing::debug!(request = %id, "no request row to finish");
                     return Written::Durable;
                 }
+                Err(StoreError::Closed) => {
+                    log_closed(id, state);
+                    return Written::Closed;
+                }
                 Err(error) => {
                     let Some(next) = backoff.next() else {
                         tracing::error!(
@@ -160,7 +211,9 @@ impl TerminalWriter {
                             "could not record the terminal state; parked for retry"
                         );
                         self.park(id, state, outcome, audit);
-                        return Written::Parked;
+                        return Written::Parked {
+                            overloaded: matches!(error, StoreError::Overloaded { .. }),
+                        };
                     };
                     pause = Some(*next);
                 }
@@ -202,12 +255,19 @@ impl TerminalWriter {
     /// Offers every parked verdict to the store once. A verdict leaves the
     /// queue when the store takes it, the row is already terminal, or the
     /// row is gone; a store that still refuses keeps it for the next call.
+    /// A closed store ends the pass: what is parked stays where it is, with
+    /// one debug line for the lot, and is closed by the next boot's recovery.
     /// Returns how many left the queue.
     pub async fn retry_parked(&self) -> usize {
         let batch: Vec<ParkedTerminal> = self.lock().drain(..).collect();
         let mut settled = 0;
         let mut again = Vec::new();
+        let mut closed = false;
         for entry in batch {
+            if closed {
+                again.push(entry);
+                continue;
+            }
             match self
                 .attempt(
                     &entry.id,
@@ -221,11 +281,21 @@ impl TerminalWriter {
                     tracing::info!(request = %entry.id, "a parked terminal state is now recorded");
                     settled += 1;
                 }
+                Err(StoreError::Closed) => {
+                    closed = true;
+                    again.push(entry);
+                }
                 Err(error) => {
                     tracing::warn!(request = %entry.id, %error, "a parked terminal state is still refused");
                     again.push(entry);
                 }
             }
+        }
+        if closed {
+            tracing::debug!(
+                parked = again.len(),
+                "the store is closed; parked terminal states are left for the next boot's recovery"
+            );
         }
         if !again.is_empty() {
             let mut parked = self.lock();
@@ -251,4 +321,14 @@ impl TerminalWriter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// The one line a terminal write gets when the store is already closed.
+pub(crate) fn log_closed(id: &str, state: RequestState) {
+    tracing::debug!(
+        request = %id,
+        state = state.as_str(),
+        "the store is closed (the daemon is shutting down); the terminal state was not \
+         recorded and is left for the next boot's recovery"
+    );
 }

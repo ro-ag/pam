@@ -117,3 +117,18 @@ pub(crate) fn in_txn<T>(
     txn.commit().map_err(engine)?;
     Ok(value)
 }
+
+/// Runs `body` as one read transaction: every statement in it reads the same
+/// snapshot of the database, taken at its first read. Nothing is written, so
+/// ending it commits nothing; it only releases the snapshot.
+pub(crate) fn in_read_txn<T>(
+    conn: &mut Connection,
+    body: impl FnOnce(Db<'_>) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let txn = conn
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(engine)?;
+    let value = body(Db::new(&txn))?;
+    txn.commit().map_err(engine)?;
+    Ok(value)
+}

@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
 }
 
 #[tokio::test]
@@ -67,7 +67,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 13
+            supported: 14
         }
     ));
     let message = err.to_string();
@@ -91,7 +91,7 @@ async fn v1_database_upgrades_to_v2() {
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -119,7 +119,7 @@ async fn v3_database_gains_meta_json() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
     assert!(
         evidence_columns(&store)
             .await
@@ -155,7 +155,7 @@ async fn v4_database_upgrades_to_v5() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
 
     let count: i64 = store
         .raw_scalar(
@@ -292,7 +292,7 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     build_v11_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
 
     // Revocations are numbered in order; the two that share a second share
     // the higher number, so a request admitted between them is voided
@@ -422,7 +422,7 @@ async fn v12_database_gains_the_request_origin_columns() {
     build_v12_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
 
     for id in ["old_queued", "old_done", "old_admin"] {
         let row = store.get_request(id).await.unwrap().unwrap();
@@ -487,4 +487,47 @@ async fn v12_database_gains_the_request_origin_columns() {
             "ingress {ingress:?} relayed {relayed} was accepted"
         );
     }
+}
+
+/// The downgrade answer. A binary only ever knows the migrations compiled
+/// into it; handed a database stamped past them it refuses before it reads a
+/// row. The boundary migration's version (14) is above every version a
+/// binary on the previous engine knows (11 in release 0.4.3, 13 in the last
+/// development build), so such a binary is the "older binary" of this test.
+#[tokio::test]
+async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    store.set_setting("kept", "yes").await.unwrap();
+    store.close().await.unwrap();
+    assert_eq!(migrations::ENGINE_BOUNDARY, 14);
+
+    let mut conn = Connection::open(&path).unwrap();
+    for known in [11, 13] {
+        let older = &migrations::MIGRATIONS[..known];
+        let error = migrations::run_with(&mut conn, older).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                StoreError::VersionTooNew { found: 14, supported } if supported == i64::try_from(known).unwrap()
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "database schema version 14 is newer than this binary supports (max {known}); \
+                 upgrade pam instead of downgrading the database"
+            )
+        );
+    }
+    // Refusing changed nothing.
+    assert_eq!(migrations::current_version(&conn).unwrap(), 14);
+    let kept: String = conn
+        .query_row("SELECT value FROM setting WHERE key = 'kept'", (), |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(kept, "yes");
 }

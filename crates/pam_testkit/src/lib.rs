@@ -96,6 +96,11 @@ pub fn base_of(tmp: &tempfile::TempDir) -> PathBuf {
 /// Opens the store file a daemon on `tmp` uses — for pre-seeding
 /// profiles/grants before [`TestDaemon::spawn_at`], or for inspecting
 /// state between two daemon lifetimes on the same base dir.
+///
+/// This is how a stopped daemon's state is read back: the handle
+/// [`TestDaemon::store`] gave out is closed by [`TestDaemon::stop`], so pass
+/// the temp dir `stop` returns here and read through the store this opens.
+/// Drop it, or close it, before spawning the next daemon on the same base.
 pub async fn open_store(tmp: &tempfile::TempDir) -> Store {
     Store::open(&base_of(tmp).join("state.sqlite3"))
         .await
@@ -336,7 +341,17 @@ impl TestDaemon {
         &self.handle
     }
 
-    /// The daemon's own store handle.
+    /// The daemon's own store handle: the same store the daemon writes
+    /// through, not a second connection.
+    ///
+    /// It lives exactly as long as the daemon serves. A graceful shutdown
+    /// ([`Self::stop`], [`Self::join`]) closes the store as its last step,
+    /// and from then on every call on a handle taken here answers
+    /// [`pam_store::StoreError::Closed`] ("the store is closed: the pam
+    /// daemon is shutting down ...") without running. To inspect what a
+    /// stopped daemon left, reopen the file: `open_store(&tmp)` with the
+    /// temp dir `stop` returned. Closing this handle yourself closes the
+    /// daemon's store under it.
     #[must_use]
     pub fn store(&self) -> Arc<Store> {
         self.handle.store()
@@ -406,6 +421,11 @@ impl TestDaemon {
 
     /// Graceful shutdown; returns the temp dir so a follow-up daemon can
     /// relaunch on the same base (restart-persistence tests).
+    ///
+    /// The shutdown closes the daemon's store: a handle from [`Self::store`]
+    /// kept across this call answers [`pam_store::StoreError::Closed`]
+    /// afterwards. Read the stopped daemon's rows through
+    /// [`open_store`] on the returned temp dir instead.
     pub async fn stop(self) -> tempfile::TempDir {
         let _ = self.shutdown.send(true);
         with_deadline(self.handle.shutdown()).await;
@@ -414,6 +434,7 @@ impl TestDaemon {
 
     /// Joins the daemon **without** signalling shutdown — for tests
     /// where the daemon initiated its own drain (version handshake).
+    /// Closes the store exactly as [`Self::stop`] does.
     pub async fn join(self) -> tempfile::TempDir {
         with_deadline(self.handle.shutdown()).await;
         self.tmp

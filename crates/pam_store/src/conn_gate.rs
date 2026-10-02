@@ -25,6 +25,17 @@
 //!   transactions are scoped values that end with the job); it is the net
 //!   under them.
 //!
+//! - **Waiting is bounded.** At most [`MAX_QUEUED_CALLS`] calls wait for, or
+//!   run on, one connection. The next one is refused with
+//!   [`StoreError::Overloaded`] before it queues, so a disk that has stalled
+//!   under callers that keep arriving shows up as a refusal with a cause
+//!   instead of as memory that grows until the process is killed.
+//! - **Closing is explicit.** [`ConnGate::close`] waits for the running job,
+//!   closes the connection and leaves the gate empty; every later call is
+//!   answered [`StoreError::Closed`]. A gate that is dropped without being
+//!   closed just drops its connection: nothing waits and nothing is written
+//!   (see `open::shut` for what each way of ending leaves on disk).
+//!
 //! The blocking thread comes from the runtime's blocking pool
 //! (`spawn_blocking`) rather than a thread of the store's own because tokio's
 //! paused test clock treats an outstanding blocking task as work in progress
@@ -34,7 +45,7 @@
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rusqlite::Connection;
 use tokio::sync::Mutex;
@@ -42,11 +53,36 @@ use tokio::task::JoinHandle;
 
 use crate::error::StoreError;
 
+/// Most calls that may wait for, or run on, one connection at a time.
+///
+/// The daemon admits at most 200 requests at once across its pools (128
+/// work, 16 status, 16 query, 8 cancel, 32 admin-submitted) and runs about a
+/// dozen service loops; each of those waits on one store call at a time, and
+/// a caller that gives up (its deadline passed) leaves the queue. So about
+/// two hundred waiters is the most a healthy daemon can produce, and five
+/// times that is reached only when something spawns store calls without
+/// bound while the disk is not answering. A waiter costs its closure and the
+/// arguments it owns, usually a few hundred bytes.
+pub(crate) const MAX_QUEUED_CALLS: usize = 1024;
+
 /// Owner of the connection. Nothing else holds a handle to it.
 pub(crate) struct ConnGate {
-    conn: Arc<Mutex<Connection>>,
+    /// `None` once the gate has been closed.
+    conn: Arc<Mutex<Option<Connection>>>,
     /// Set when a transaction a job left open could not be rolled back.
     poisoned: Arc<AtomicBool>,
+    /// Calls waiting for the connection or running on it.
+    queued: Arc<AtomicUsize>,
+}
+
+/// One call's place in the queue, given back when the call ends or its
+/// future is dropped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Cancels a blocking task that has not started when the caller goes away.
@@ -63,9 +99,27 @@ impl<T> Drop for AbortUnstarted<T> {
 impl ConnGate {
     pub(crate) fn new(conn: Connection) -> Self {
         Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(Some(conn))),
             poisoned: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Takes a place in the queue, or refuses when it is full.
+    fn enter(&self) -> Result<Slot, StoreError> {
+        let ahead = self.queued.fetch_add(1, Ordering::AcqRel);
+        // Built first so the count is given back on the refusal path too.
+        let slot = Slot(Arc::clone(&self.queued));
+        if ahead >= MAX_QUEUED_CALLS {
+            return Err(StoreError::Overloaded { waiting: ahead });
+        }
+        Ok(slot)
+    }
+
+    /// Calls waiting for the connection or running on it, right now.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
     }
 
     /// Runs `job` on the connection, off the async threads, to completion.
@@ -78,7 +132,11 @@ impl ConnGate {
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
         T: Send + 'static,
     {
-        let mut conn = Arc::clone(&self.conn).lock_owned().await;
+        let _slot = self.enter()?;
+        let mut held = Arc::clone(&self.conn).lock_owned().await;
+        if held.is_none() {
+            return Err(StoreError::Closed);
+        }
         if self.poisoned.load(Ordering::Acquire) {
             return Err(StoreError::AbandonedTransaction);
         }
@@ -87,13 +145,18 @@ impl ConnGate {
         // the job has finished and the connection has been checked, whatever
         // happens to this future meanwhile.
         let mut task = AbortUnstarted(tokio::task::spawn_blocking(move || {
-            let outcome = catch_unwind(AssertUnwindSafe(|| job(&mut conn)));
+            let Some(conn) = held.as_mut() else {
+                // Checked above under this same guard; kept as an answer
+                // rather than an assumption.
+                return Ok(Err(StoreError::Closed));
+            };
+            let outcome = catch_unwind(AssertUnwindSafe(|| job(conn)));
             if outcome.is_err() {
                 // A statement the panic interrupted must not be handed out
                 // again half-stepped.
                 conn.flush_prepared_statement_cache();
             }
-            if !leave_no_transaction(&conn) {
+            if !leave_no_transaction(conn) {
                 poisoned.store(true, Ordering::Release);
             }
             outcome
@@ -115,6 +178,38 @@ impl ConnGate {
                 },
             }),
         }
+    }
+}
+
+impl ConnGate {
+    /// Waits for the running job, hands the connection to `shut`, and leaves
+    /// the gate closed. Idempotent: a second close finds nothing and does
+    /// nothing.
+    ///
+    /// It takes no place in the queue, so a full queue cannot refuse it; it
+    /// waits its turn behind the calls already queued, and the calls behind
+    /// it are answered [`StoreError::Closed`]. Once it has the connection the
+    /// shutting runs to its end on a blocking thread whether or not the
+    /// caller is still waiting.
+    pub(crate) async fn close<F>(&self, shut: F) -> Result<(), StoreError>
+    where
+        F: FnOnce(Connection) -> Result<(), StoreError> + Send + 'static,
+    {
+        let mut held = Arc::clone(&self.conn).lock_owned().await;
+        let closed = tokio::task::spawn_blocking(move || match held.take() {
+            Some(conn) => shut(conn),
+            None => Ok(()),
+        })
+        .await;
+        closed.unwrap_or_else(|error| {
+            Err(StoreError::Unavailable {
+                detail: if error.is_panic() {
+                    "closing the database panicked".to_owned()
+                } else {
+                    "the runtime is shutting down".to_owned()
+                },
+            })
+        })
     }
 }
 

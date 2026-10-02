@@ -127,6 +127,63 @@ pub enum StoreError {
         detail: String,
     },
 
+    /// The copy of the database files that precedes an upgrade could not be
+    /// written, so the database was not opened: an upgrade never starts
+    /// without the way back.
+    #[error(
+        "the state database was not opened: the backup that must precede its \
+         upgrade could not be written under {path:?} ({source}). The database \
+         files are unchanged. The backup needs about {needed_bytes} bytes there; \
+         free the space or fix that directory's permissions and start pam \
+         again. There is no override: to start without the existing history, \
+         stop the daemon and move the state file and its -wal and -shm files \
+         out of the pam directory"
+    )]
+    UpgradeBackup {
+        /// The backup directory that could not be written.
+        path: PathBuf,
+        /// Size of the files the backup has to hold.
+        needed_bytes: u64,
+        /// Underlying filesystem error.
+        source: std::io::Error,
+    },
+
+    /// The file is a database, but not one pam wrote: it carries a schema
+    /// version from pam's range without pam's application id.
+    #[error(
+        "the state file is a database that pam did not write (application id \
+         {found}, expected {expected}); it was not changed. Move it out of the \
+         pam directory, or point pam at its own base directory"
+    )]
+    NotPamDatabase {
+        /// The application id recorded in the file.
+        found: i64,
+        /// The id pam stamps.
+        expected: i64,
+    },
+
+    /// The store was closed (the daemon is shutting down). The call did not
+    /// run and wrote nothing.
+    #[error(
+        "the store is closed: the pam daemon is shutting down, so the call was \
+         not run and nothing was written; repeat it once the daemon is running \
+         again"
+    )]
+    Closed,
+
+    /// Too many calls are already waiting for the database: the disk it is
+    /// on is not keeping up. The call was refused before it ran.
+    #[error(
+        "the store has {waiting} calls waiting for the database, which is not \
+         keeping up (a stalled or very slow disk); this call was refused \
+         before it ran and wrote nothing. Retry it; if it keeps happening, \
+         check the disk the pam state file is on and restart the pam daemon"
+    )]
+    Overloaded {
+        /// Calls queued when this one was refused.
+        waiting: usize,
+    },
+
     /// Any underlying database engine failure.
     #[error("database error: {0}")]
     Database(#[source] EngineError),

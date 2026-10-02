@@ -186,7 +186,11 @@ impl QueueError {
             Self::Expired => "deadline_exceeded",
             Self::NotAdmitted => "admission_invalid",
             Self::Capacity { cause, .. } => cause,
-            Self::NotTerminal { .. } | Self::Store(_) => "internal_error",
+            // The store refusing on purpose (its queue bound, the shutdown)
+            // has a cause of its own; the detail is the store's sentence.
+            Self::Store(error) => crate::daemon::store_refusal_cause(error)
+                .map_or("internal_error", |(cause, _)| cause),
+            Self::NotTerminal { .. } => "internal_error",
         }
     }
 
@@ -202,9 +206,11 @@ impl QueueError {
                 "Wait for active work to finish or cancel an existing request, then retry."
             }
             Self::NotAdmitted => "Submit a fresh request through PAM admission.",
-            Self::NotTerminal { .. } | Self::Store(_) => {
-                "Inspect the PAM daemon status and audit before retrying."
-            }
+            Self::Store(error) => crate::daemon::store_refusal_cause(error).map_or(
+                "Inspect the PAM daemon status and audit before retrying.",
+                |(_, recovery)| recovery,
+            ),
+            Self::NotTerminal { .. } => "Inspect the PAM daemon status and audit before retrying.",
         }
     }
 }

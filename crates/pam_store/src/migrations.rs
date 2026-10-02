@@ -69,7 +69,37 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 13,
         sql: SCHEMA_V13,
     },
+    Migration {
+        version: ENGINE_BOUNDARY,
+        sql: SCHEMA_V14,
+    },
 ];
+
+/// The schema version at which the store's engine changed. Every database
+/// written by the previous engine, and by every pam release up to 0.4.3, is
+/// below it; a database at or above it has been opened, checked and stamped
+/// by this engine. See [`SCHEMA_V14`].
+pub(crate) const ENGINE_BOUNDARY: i64 = 14;
+
+/// `PAM1`, the application id migration 14 stamps into the database header.
+pub(crate) const APPLICATION_ID: i64 = 0x5041_4D31;
+
+/// Migration 14: the engine boundary. No table changes.
+///
+/// It exists for two reasons. First, the version stamp: a pam built on the
+/// previous engine knows schema versions up to 13 at most (11 in release
+/// 0.4.3) and refuses anything newer before it reads a row, so a database
+/// this engine has taken over is never opened by a binary that predates the
+/// take-over; the way back is the `pre-sqlite` backup (see `backup`).
+/// Second, the mark: the one-time work of the first open by this engine (a
+/// copy of the files as found, the full integrity and foreign-key checks) is
+/// done exactly when the version is below this one, so stamping it is what
+/// keeps that work from repeating.
+///
+/// The application id names the file as pam's in its header, where `file(1)`
+/// and the open path can read it without the engine. It is written in the
+/// same transaction as the version.
+const SCHEMA_V14: &str = "PRAGMA application_id = 1346456881;";
 
 /// Migration 13: where a request entered the daemon, on its row.
 ///
@@ -142,6 +172,7 @@ END;
 const SCHEMA_V11: &str = "CREATE TABLE landing_session(request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision>=0), document TEXT NOT NULL CHECK(length(CAST(document AS BLOB))<=131072));";
 
 /// Highest schema version this binary can produce.
+#[cfg(test)]
 pub(crate) fn latest_version() -> i64 {
     MIGRATIONS.last().map_or(0, |m| m.version)
 }
@@ -152,24 +183,37 @@ pub(crate) fn current_version(conn: &Connection) -> Result<i64, StoreError> {
         .map_err(engine)
 }
 
-/// Applies every migration newer than the database's recorded version.
+/// Applies every migration of `migrations` newer than the database's
+/// recorded version.
 ///
 /// Idempotent on reopen: an up-to-date database is left untouched. A
-/// database whose version is newer than this binary knows is refused
-/// with [`StoreError::VersionTooNew`].
-pub(crate) fn run(conn: &mut Connection) -> Result<(), StoreError> {
+/// database whose version is newer than the last of `migrations` is refused
+/// with [`StoreError::VersionTooNew`]: a binary never guesses at a schema it
+/// does not know. That refusal is the whole downgrade story, and it holds
+/// for binaries built on the previous engine too, which run this same check
+/// against the version this engine stamps (see [`SCHEMA_V14`]).
+///
+/// The list is [`MIGRATIONS`] everywhere but in tests that stand an older or
+/// a later binary next to a file.
+pub(crate) fn run_with(conn: &mut Connection, migrations: &[Migration]) -> Result<(), StoreError> {
     let current = current_version(conn)?;
-    let latest = latest_version();
+    let latest = migrations.last().map_or(0, |m| m.version);
     if current > latest {
         return Err(StoreError::VersionTooNew {
             found: current,
             supported: latest,
         });
     }
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
+    for migration in migrations.iter().filter(|m| m.version > current) {
         apply(conn, migration)?;
     }
     Ok(())
+}
+
+/// The application id currently recorded in the database.
+pub(crate) fn application_id(conn: &Connection) -> Result<i64, StoreError> {
+    conn.pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(engine)
 }
 
 /// Applies one migration inside its own transaction, so a botched migration

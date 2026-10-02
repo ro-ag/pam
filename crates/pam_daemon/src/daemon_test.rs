@@ -182,6 +182,76 @@ async fn deadline_expires_ticketed_approval_without_placing_or_executing_work() 
     .await;
 }
 
+/// The store refusing on purpose is a cause of its own on the public plane,
+/// retryable, with the store's sentence as the detail; any other store error
+/// stays the internal error whose detail is only in the daemon log.
+#[test]
+fn a_store_refusal_is_named_to_a_public_caller_and_other_store_errors_are_not() {
+    use crate::daemon::{
+        CAUSE_DAEMON_SHUTTING_DOWN, CAUSE_INTERNAL_ERROR, CAUSE_STORE_OVERLOADED, queue_refusal,
+        store_refusal,
+    };
+    use crate::queue::QueueError;
+    use pam_store::StoreError;
+
+    let parts = |response: Response| match response {
+        Response::Refusal {
+            id,
+            cause,
+            detail,
+            recovery,
+            retryable,
+        } => {
+            assert_eq!(id, "req_1");
+            (cause, detail, recovery, retryable)
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let overloaded = || StoreError::Overloaded { waiting: 1024 };
+
+    for response in [
+        store_refusal("req_1", &overloaded()),
+        // Admission, where a flooded store is met first.
+        queue_refusal("req_1".to_owned(), &QueueError::Store(overloaded())),
+    ] {
+        let (cause, detail, recovery, retryable) = parts(response);
+        assert_eq!(cause, CAUSE_STORE_OVERLOADED);
+        assert_eq!(detail, overloaded().to_string());
+        assert!(
+            detail.contains("1024 calls waiting for the database"),
+            "{detail}"
+        );
+        assert_eq!(recovery, "Retry shortly.");
+        assert!(retryable);
+    }
+
+    for response in [
+        store_refusal("req_1", &StoreError::Closed),
+        queue_refusal("req_1".to_owned(), &QueueError::Store(StoreError::Closed)),
+    ] {
+        let (cause, detail, recovery, retryable) = parts(response);
+        assert_eq!(cause, CAUSE_DAEMON_SHUTTING_DOWN);
+        assert_eq!(detail, StoreError::Closed.to_string());
+        assert!(recovery.starts_with("Retry shortly"), "{recovery}");
+        assert!(retryable);
+    }
+
+    let other = || StoreError::NotFound {
+        table: "request",
+        id: "secret_ticket".to_owned(),
+    };
+    let (cause, detail, _, retryable) = parts(store_refusal("req_1", &other()));
+    assert_eq!(cause, CAUSE_INTERNAL_ERROR);
+    assert!(!detail.contains("secret_ticket"), "{detail}");
+    assert!(retryable);
+    let (cause, _, _, retryable) = parts(queue_refusal(
+        "req_1".to_owned(),
+        &QueueError::Store(other()),
+    ));
+    assert_eq!(cause, CAUSE_INTERNAL_ERROR);
+    assert!(retryable);
+}
+
 // ---------------------------------------------------------------------------
 // A real daemon, driven through its ingress channel, with its internals in
 // reach. `pam_testkit` links the non-test build of this crate, so its
@@ -198,9 +268,10 @@ mod live {
     use tokio::sync::{oneshot, watch};
 
     use crate::daemon::{
-        ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, CANCEL_SLOTS, CAUSE_DEADLINE_EXCEEDED,
-        CAUSE_INTERNAL_ERROR, CAUSE_REQUEST_CAPACITY, CONTROL_SLOTS, DaemonConfig, DaemonHandle,
-        Registration, STATUS_SLOTS, WORK_SLOTS, run_daemon_with,
+        ACTION_DEADLINE_REFUSAL, ACTION_EXECUTE, CANCEL_SLOTS, CAUSE_DAEMON_SHUTTING_DOWN,
+        CAUSE_DEADLINE_EXCEEDED, CAUSE_INTERNAL_ERROR, CAUSE_REQUEST_CAPACITY,
+        CAUSE_STORE_OVERLOADED, CONTROL_SLOTS, DaemonConfig, DaemonHandle, Registration,
+        STATUS_SLOTS, WORK_SLOTS, run_daemon_with,
     };
     use crate::ingress::{Origin, PeerIdentity, PublicPeer};
     use crate::secrets::FakeSecretBackend;
@@ -212,7 +283,9 @@ mod live {
     struct Live {
         handle: DaemonHandle,
         shutdown: watch::Sender<bool>,
-        _tmp: tempfile::TempDir,
+        /// The base: kept alive for the daemon's lifetime, and handed back
+        /// by [`Self::stop_keeping_base`].
+        tmp: tempfile::TempDir,
     }
 
     impl Live {
@@ -244,7 +317,7 @@ mod live {
             Self {
                 handle,
                 shutdown,
-                _tmp: tmp,
+                tmp,
             }
         }
 
@@ -302,10 +375,16 @@ mod live {
         }
 
         async fn stop(self) {
+            self.stop_keeping_base().await;
+        }
+
+        /// Stops the daemon and hands back its base, to read what it left.
+        async fn stop_keeping_base(self) -> tempfile::TempDir {
             let _ = self.shutdown.send(true);
             tokio::time::timeout(Duration::from_secs(30), self.handle.shutdown())
                 .await
                 .expect("the daemon drains");
+            self.tmp
         }
     }
 
@@ -895,6 +974,194 @@ mod live {
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].action, ACTION_EXECUTE);
         live.stop().await;
+    }
+
+    /// The same bypass when the store turned the terminal write down at its
+    /// queue bound: the caller is told the store is overloaded, in words,
+    /// and to retry, instead of a bare "internal error".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bypass_whose_terminal_write_meets_the_store_queue_bound_says_store_overloaded() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+        let terminals = Arc::clone(&live.handle.admin().terminals);
+
+        terminals.fail_next_overloaded(3);
+        let response = live
+            .ask(request(
+                "overloaded",
+                "cancel",
+                serde_json::json!({ "ticket": "no_such_ticket" }),
+                true,
+            ))
+            .await;
+        assert_eq!(refusal(&response), (CAUSE_STORE_OVERLOADED, true));
+        let Response::Refusal {
+            detail, recovery, ..
+        } = &response
+        else {
+            unreachable!()
+        };
+        assert!(
+            detail.contains("calls waiting for the database"),
+            "{detail}"
+        );
+        assert!(detail.contains("queued to be recorded"), "{detail}");
+        assert_eq!(recovery, "Retry shortly.");
+        assert_eq!(terminals.parked_count(), 1);
+
+        // Nothing was lost: the verdict is recorded once the store keeps up.
+        eventually("the parked verdict is recorded", || async {
+            state_of(&store, "overloaded").await == Some(RequestState::Done)
+        })
+        .await;
+        live.stop().await;
+    }
+
+    /// A store that is already closed answers every call with "the daemon
+    /// is shutting down". A public request that reaches it used to be told
+    /// "internal error"; it is told the truth, as a refusal to retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_public_request_that_meets_the_closed_store_is_told_the_daemon_is_shutting_down() {
+        let live = Live::start("relaxed", |_| {}).await;
+        // What the end of a shutdown does, while the dispatcher still runs.
+        live.store().close().await.unwrap();
+
+        for (id, capability, args) in [
+            // Laned work, refused at admission.
+            ("closed_echo", "echo", serde_json::json!({ "msg": "hi" })),
+            // A control request, refused at admission too.
+            (
+                "closed_cancel",
+                "cancel",
+                serde_json::json!({ "ticket": "no_such_ticket" }),
+            ),
+            // No class: the row insert itself meets the closed store.
+            (
+                "closed_unknown",
+                "no.such.capability",
+                serde_json::json!({}),
+            ),
+        ] {
+            let response = live.ask(request(id, capability, args, true)).await;
+            assert_eq!(
+                refusal(&response),
+                (CAUSE_DAEMON_SHUTTING_DOWN, true),
+                "{id}: {response:?}"
+            );
+            let Response::Refusal {
+                detail, recovery, ..
+            } = &response
+            else {
+                unreachable!()
+            };
+            assert!(detail.contains("the store is closed"), "{id}: {detail}");
+            assert!(detail.contains("nothing was written"), "{id}: {detail}");
+            assert!(recovery.starts_with("Retry shortly"), "{id}: {recovery}");
+        }
+
+        // The private plane keeps the store's own sentence too, under its
+        // own cause.
+        let mut admin = pam_testkit::envelope_for_repo(
+            crate::admin::ADMIN_REPO,
+            "closed_admin",
+            crate::admin::OP_GRANTS_LIST,
+            serde_json::json!({}),
+            true,
+        );
+        crate::admin::ADMIN_CALLER_AGENT.clone_into(&mut admin.caller.agent);
+        let response = live.handle.admin().handle(&admin).await;
+        let Response::Refusal { cause, detail, .. } = &response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(cause, CAUSE_INTERNAL_ERROR);
+        assert!(
+            detail.contains("the store is closed: the pam daemon is shutting down"),
+            "{detail}"
+        );
+        // Closing twice is harmless: the shutdown closes it again.
+        live.stop().await;
+    }
+
+    /// An execution that outlives the drain finds the store closed when it
+    /// ends. Its verdict cannot be recorded by this daemon, so it is not
+    /// parked and its waiter is not told a result the next boot will not
+    /// show: it is told the daemon is shutting down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leased_request_that_ends_on_a_closed_store_is_not_parked_and_not_reported_done() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+        let terminals = Arc::clone(&live.handle.admin().terminals);
+
+        let mut slow = request(
+            "outlived",
+            "echo",
+            serde_json::json!({ "delay_ms": 600 }),
+            true,
+        );
+        slow.deadline_ms = 30_000;
+        let answer = live.submit(slow).await;
+        eventually("the echo is running", || async {
+            state_of(&store, "outlived").await == Some(RequestState::Running)
+        })
+        .await;
+        store.close().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(PATIENCE, answer)
+            .await
+            .expect("an answer within the test's patience")
+            .expect("the daemon answers every admitted request");
+        assert_eq!(
+            refusal(&response),
+            (CAUSE_DAEMON_SHUTTING_DOWN, true),
+            "{response:?}"
+        );
+        assert_eq!(terminals.parked_count(), 0);
+        // The echo's own 600 ms, without two backoff pauses on top that a
+        // closed store would have made pointless; generous for a loaded host.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        live.stop().await;
+    }
+
+    /// A model verification still hashing when the daemon stops: the
+    /// shutdown stops it and its follower records why before the store
+    /// closes, so the row a reopened store shows is finished, not `running`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_model_job_running_at_shutdown_is_recorded_before_the_store_closes() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let models = live.handle.models();
+        let dir = tempfile::tempdir().unwrap();
+        models.set_models_dir(dir.path()).await.unwrap();
+        // Sparse: no disk, and still hashing long after the stop begins.
+        let big = dir.path().join("qwen").join("big.gguf");
+        std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(768 * 1024 * 1024)
+            .unwrap();
+        let entry = models.find("qwen/big").await.unwrap().unwrap();
+        let job = models.start_verify(entry).await.unwrap();
+        drop(models);
+
+        let tmp = live.stop_keeping_base().await;
+
+        // Reopening the file runs no recovery of model jobs (that is the
+        // model service's, at the next daemon start): this is what the
+        // stopped daemon itself wrote.
+        let store = pam_testkit::open_store(&tmp).await;
+        let rows = store.list_model_jobs(10).await.unwrap();
+        let row = rows.iter().find(|row| row.id == job).expect("the job row");
+        assert_eq!(row.state, crate::model_service::JOB_FAILED, "{row:?}");
+        let detail = row.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains(crate::model_service::CAUSE_DAEMON_RESTART),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("the daemon stopped while this job was running"),
+            "{detail}"
+        );
+        store.close().await.unwrap();
     }
 
     /// The hub removes a ticket when its terminal event is published. A

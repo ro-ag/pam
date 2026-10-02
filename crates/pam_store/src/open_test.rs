@@ -229,3 +229,36 @@ fn a_path_that_looks_like_a_uri_stays_a_path() {
     );
     assert_eq!(crate::open::literal_path("state.sqlite3"), "state.sqlite3");
 }
+
+/// On macOS a plain `fsync` stops at the drive's cache. Checkpoints, where
+/// the main file is rewritten and the log recycled, go through to the drive.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn checkpoints_are_synced_through_to_the_drive_on_macos() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = file_store(dir.path()).await;
+    assert_eq!(pragma_i64(&store, "checkpoint_fullfsync").await, 1);
+}
+
+#[tokio::test]
+async fn every_open_of_a_file_keeps_the_same_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    // New, reopened after a close, and reopened after a drop.
+    for round in 0..3 {
+        let store = file_store(dir.path()).await;
+        let mode: String = store.raw_scalar("PRAGMA journal_mode", ()).await.unwrap();
+        assert_eq!(mode, "wal", "round {round}");
+        assert_eq!(pragma_i64(&store, "synchronous").await, 2, "round {round}");
+        assert_eq!(pragma_i64(&store, "foreign_keys").await, 1, "round {round}");
+        assert_eq!(
+            pragma_i64(&store, "secure_delete").await,
+            1,
+            "round {round}"
+        );
+        store.check_integrity().await.unwrap();
+        if round == 0 {
+            store.close().await.unwrap();
+        }
+    }
+    assert!(!dir.path().join("backup").exists());
+}

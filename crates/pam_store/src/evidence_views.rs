@@ -125,6 +125,22 @@ pub enum EvidenceRangeOutcome {
     Range(EvidenceRange),
 }
 
+/// What charging a range read came to.
+enum Charged {
+    /// There is no page to read; this is the answer.
+    Answer(EvidenceRangeOutcome),
+    /// The page was paid for.
+    Page(RangeCharge),
+}
+
+/// The allowance as one charge left it, and the view's full length.
+struct RangeCharge {
+    total: u64,
+    allowance_expires_at: i64,
+    remaining_bytes: u64,
+    remaining_pages: u32,
+}
+
 fn invalid() -> StoreError {
     StoreError::UnexpectedValue {
         column: "evidence_view",
@@ -241,11 +257,19 @@ impl Store {
     /// Charges every valid range attempt against a persisted first-read one-hour,
     /// 64-MiB, 4096-page allowance. Continuations and retries never renew it.
     /// Cancellation after charging does not refund uncertain delivery.
+    ///
+    /// Two steps. The charge is a write and runs on the writing connection,
+    /// each statement committing on its own: it must survive whatever happens
+    /// to the read. The page itself is then read on the read-only connection
+    /// (see `Store::read`): the engine loads a whole view, up to 64 MiB, to
+    /// cut one page out of it, and no write should wait behind that. A view
+    /// that retention removes between the two steps answers `Expired` or
+    /// `Unavailable`, charged, like any other delivery that did not happen.
     pub async fn read_evidence_view_range(
         &self,
         request: &EvidenceRangeRequest,
     ) -> Result<EvidenceRangeOutcome, StoreError> {
-        let request = EvidenceRangeRequest {
+        let request = std::sync::Arc::new(EvidenceRangeRequest {
             request_id: request.request_id.clone(),
             evidence_id: request.evidence_id.clone(),
             repository: request.repository.clone(),
@@ -254,20 +278,26 @@ impl Store {
             offset: request.offset,
             length: request.length,
             now: request.now,
+        });
+        let charging = std::sync::Arc::clone(&request);
+        let charged = self
+            .run(move |conn| Self::charge_evidence_range(conn, &charging))
+            .await?;
+        let charge = match charged {
+            Charged::Answer(outcome) => return Ok(outcome),
+            Charged::Page(charge) => charge,
         };
-        self.run(move |conn| {
-            // Each write autocommits, on purpose: the allowance charge must
-            // survive a failure of the read that follows it. The job runs
-            // whole, so nothing interleaves between the charge and the read.
-            Self::evidence_range_locked(conn, &request)
-        })
-        .await
+        self.read(move |conn| Self::read_charged_range(conn, &request, &charge))
+            .await
     }
 
-    fn evidence_range_locked(
+    /// Validates the range and charges it. Answers the outcome when there is
+    /// no page to read (no such view, expired, invalid, end of view, budget
+    /// exhausted), and otherwise the allowance as the charge left it.
+    fn charge_evidence_range(
         conn: Db<'_>,
         r: &EvidenceRangeRequest,
-    ) -> Result<EvidenceRangeOutcome, StoreError> {
+    ) -> Result<Charged, StoreError> {
         let mut stmt = conn.prepare("SELECT view_bytes,expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5")?;
         let mut rows = stmt.query(params![
             r.evidence_id.clone(),
@@ -277,22 +307,23 @@ impl Store {
             r.expected_sha256.clone()
         ])?;
         let Some(row) = rows.next()? else {
-            return Ok(EvidenceRangeOutcome::Unavailable);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::Unavailable));
         };
         let total = u64::try_from(row.get::<i64>(0)?).map_err(|_| invalid())?;
         if row.get::<Option<i64>>(1)?.is_some() {
-            return Ok(EvidenceRangeOutcome::Expired);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::Expired));
         }
         drop(rows);
         if r.length == 0 || r.length > RANGE_LIMIT || r.offset > total {
-            return Ok(EvidenceRangeOutcome::InvalidRange);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::InvalidRange));
         }
         if r.offset == total {
             // Exactly at the end, which for an empty view is also the start:
             // a legitimate read with nothing left to return. It answers an
             // empty end-of-view page instead of an error, and charges
             // nothing, since no bytes and no page were delivered.
-            return Self::end_of_view(conn, r, total).map(EvidenceRangeOutcome::Range);
+            return Self::end_of_view(conn, r, total)
+                .map(|range| Charged::Answer(EvidenceRangeOutcome::Range(range)));
         }
         let Some(expires) = r.now.checked_add(3600) else {
             return Err(invalid());
@@ -300,16 +331,43 @@ impl Store {
         conn.execute("INSERT OR IGNORE INTO evidence_read_allowance (request_id,repository,started_at,expires_at,remaining_bytes,remaining_pages) VALUES (?1,?2,?3,?4,67108864,4096)",params![r.request_id.clone(),r.repository.clone(),r.now,expires])?;
         let changed = conn.execute("UPDATE evidence_read_allowance SET remaining_bytes=remaining_bytes-?3,remaining_pages=remaining_pages-1 WHERE request_id=?1 AND repository=?2 AND expires_at>?4 AND remaining_bytes>=?3 AND remaining_pages>0",params![r.request_id.clone(),r.repository.clone(),i64::from(r.length),r.now])?;
         if changed == 0 {
-            return Ok(EvidenceRangeOutcome::BudgetExhausted);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::BudgetExhausted));
         }
-        let mut stmt = conn.prepare("SELECT substr(v.view_blob,?3,?4),a.expires_at,a.remaining_bytes,a.remaining_pages FROM evidence_view v JOIN evidence_read_allowance a ON a.request_id=v.request_id AND a.repository=v.repository WHERE v.evidence_id=?1 AND v.request_id=?2")?;
+        let mut stmt = conn.prepare("SELECT expires_at,remaining_bytes,remaining_pages FROM evidence_read_allowance WHERE request_id=?1 AND repository=?2")?;
+        let mut rows = stmt.query(params![r.request_id.clone(), r.repository.clone()])?;
+        let row = rows.next()?.ok_or_else(invalid)?;
+        Ok(Charged::Page(RangeCharge {
+            total,
+            allowance_expires_at: row.get(0)?,
+            remaining_bytes: u64::try_from(row.get::<i64>(1)?).map_err(|_| invalid())?,
+            remaining_pages: u32::try_from(row.get::<i64>(2)?).map_err(|_| invalid())?,
+        }))
+    }
+
+    /// Reads the page a charge paid for. The view is named by its whole
+    /// identity again: this runs after the charge, not with it.
+    fn read_charged_range(
+        conn: Db<'_>,
+        r: &EvidenceRangeRequest,
+        charge: &RangeCharge,
+    ) -> Result<EvidenceRangeOutcome, StoreError> {
+        let mut stmt = conn.prepare("SELECT substr(view_blob,?6,?7),expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5")?;
         let mut rows = stmt.query(params![
             r.evidence_id.clone(),
             r.request_id.clone(),
+            r.repository.clone(),
+            r.expected_view_id.clone(),
+            r.expected_sha256.clone(),
             i64::try_from(r.offset).map_err(|_| invalid())? + 1,
             i64::from(r.length)
         ])?;
-        let row = rows.next()?.ok_or_else(invalid)?;
+        let Some(row) = rows.next()? else {
+            // The record went away after the charge.
+            return Ok(EvidenceRangeOutcome::Unavailable);
+        };
+        if row.get::<Option<i64>>(1)?.is_some() {
+            return Ok(EvidenceRangeOutcome::Expired);
+        }
         let bytes = blob_column(&row, 0)?;
         if bytes.is_empty() {
             // `offset < total` yet no bytes: the blob is gone without a
@@ -324,11 +382,11 @@ impl Store {
             view_sha256: r.expected_sha256.clone(),
             offset: r.offset,
             bytes,
-            total_bytes: total,
-            next_offset: (next < total).then_some(next),
-            allowance_expires_at: row.get(1)?,
-            remaining_bytes: u64::try_from(row.get::<i64>(2)?).map_err(|_| invalid())?,
-            remaining_pages: u32::try_from(row.get::<i64>(3)?).map_err(|_| invalid())?,
+            total_bytes: charge.total,
+            next_offset: (next < charge.total).then_some(next),
+            allowance_expires_at: charge.allowance_expires_at,
+            remaining_bytes: charge.remaining_bytes,
+            remaining_pages: charge.remaining_pages,
         }))
     }
 

@@ -6,9 +6,17 @@ opening it; nothing opens these files in place.
 
 ## `turso-0.7/`
 
-Written by turso 0.7.2 (the workspace's vendored `turso_core`), with
-`crates/pam_store/src` as of commit `ac1859fed63bdde3d411566b0ab56fa13fcd75ad`
-(schema 13), by `crates/pam_store/tests/store_fixtures_generate.rs`.
+Written once by turso 0.7.2 (the `turso_core` the workspace vendored at the
+time), with `crates/pam_store/src` as of commit
+`ac1859fed63bdde3d411566b0ab56fa13fcd75ad` (schema 13). The generator that
+wrote them, a test file named `store_fixtures_generate.rs`, named turso's
+types; it was deleted when the store moved to SQLite and the engine left the
+workspace, so it is not in the tree and cannot be run. These files are
+therefore history: the record of what turso wrote and of what turso read back
+from it. They are never regenerated and never edited. The `.gitattributes`
+in this directory marks them binary so no checkout rewrites a byte, and each
+`expected.json` carries the size and SHA-256 of its database files, which the
+oracle test checks before it opens anything.
 
 | Directory | Schema | Written through | Files |
 | --- | --- | --- | --- |
@@ -41,21 +49,30 @@ throughout.
 
 ## Tests
 
-`crates/pam_store/tests/store_fixtures.rs`, public `Store` API only:
+Every test copies a fixture to a temporary directory and opens the copy.
 
-- by default, every fixture and variant is opened with the store and its
-  public reads must equal `public`;
+`crates/pam_store/tests/store_fixtures.rs` is the oracle test, public `Store`
+API only. The store that opens the copy now runs on SQLite, and the record it
+is held to was written by turso, so agreement is the proof that the two
+engines read the same rows from the same files:
+
+- every fixture is opened as written (`as_written`) and, where it has a log,
+  without it (`main_only`); the open upgrades the copy to the current schema,
+  and every public read must then equal that variant's `public`, row for row,
+  including the rows that exist only in the log;
+- every table of every fixture must have a recorded digest in `raw`, so a
+  table cannot be left out of the comparison unnoticed;
 - with `PAM_STORE_FIXTURES_SQLITE3=1` (or the path of a `sqlite3` binary), the
   SQLite shell reads a copy of every fixture and must agree with `raw`, then
   checks a copy the store has opened and migrated.
 
-## Regenerating
+`crates/pam_store/tests/store_upgrade.rs` uses the same files for the first
+open after the engine change: the backup, the full check, the schema stamp,
+and each way that open is refused. `crates/pam_daemon/tests/store_lifecycle.rs`
+boots a daemon on `v11`.
 
-```
-PAM_REGENERATE_STORE_FIXTURES=1 cargo test -p pam_store --test store_fixtures_generate
-```
+## Not regenerated
 
-This rewrites the files above. It is possible only while the store runs on
-turso: the generator names turso types and is deleted with the engine. From
-then on these files are the record of what turso wrote and are not
-regenerated.
+There is no command that rewrites these files. A new fixture for a later
+schema is written by the store as it is then, into a directory of its own
+beside `turso-0.7/`, with its own record; these stay as they are.

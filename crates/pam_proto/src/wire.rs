@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Envelope, Event, Response};
 
-/// Wire protocol number carried in `hello` and `hello_ack`. The `ZeroMQ`
-/// envelope protocol was 1.
+/// Wire protocol number carried in `hello` and `hello_ack`. The envelope
+/// protocol of pre-migration builds (ZMTP) was 1.
 pub const WIRE_PROTOCOL: u32 = 2;
 
 /// Largest public request, reply or event frame, and the largest
@@ -244,16 +244,10 @@ pub enum Frame {
     Event(EventFrame),
     /// Daemon: the follow stream's final frame.
     End(End),
-    /// Client (administration plane): stream every event.
-    Events {
-        /// Include `status` and `query` traffic, which is left out by default.
-        /// The daemon publishes no lifecycle events for control requests
-        /// (`status`, `query`, `cancel`) at all, so today the two settings
-        /// deliver the same stream; the member is kept so that a daemon
-        /// which does publish them leaves them out unless asked.
-        #[serde(default)]
-        include_probes: bool,
-    },
+    /// Client (administration plane): stream every event. A bare marker:
+    /// the daemon publishes no lifecycle events for control requests
+    /// (`status`, `query`, `cancel`), so there is nothing to select.
+    Events,
     /// Daemon (administration plane): the `events` subscription is in place.
     /// Every event published from here on is delivered or shows as a gap in
     /// `n`; nothing published before it is replayed.
@@ -323,7 +317,7 @@ impl Frame {
             Self::Following(_) => "following",
             Self::Event(_) => "event",
             Self::End(_) => "end",
-            Self::Events { .. } => "events",
+            Self::Events => "events",
             Self::Subscribed => "subscribed",
             Self::Error(_) => "error",
         }

@@ -72,7 +72,7 @@ async fn the_nonce_holder_is_served_requests_and_events_until_shutdown() {
         );
 
         let stream = connect(&base).await.unwrap();
-        let mut events = subscribe_on(stream, &hello(env!("CARGO_PKG_VERSION")), false)
+        let mut events = subscribe_on(stream, &hello(env!("CARGO_PKG_VERSION")))
             .await
             .unwrap();
         hub.publish("req_ticket", Event::Queued).unwrap();
@@ -236,7 +236,7 @@ async fn the_windows_adapter_is_supported_and_mints_a_fresh_nonce_per_bind() {
         Listener::bind(&base, admin_service().await, lifecycle(), EventHub::new()).unwrap();
     let (_, second_nonce) = read_control(&control).unwrap();
     assert!(!same(&first_nonce, &second_nonce));
-    let mut events = crate::admin_transport::events(&base, true).await.unwrap();
+    let mut events = crate::admin_transport::events(&base).await.unwrap();
     second.shutdown().await;
     assert!(matches!(
         events.next().await,

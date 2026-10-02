@@ -179,10 +179,10 @@ mod in_process {
 
         // The all-events slot beside the held ones: one subscriber
         // is admitted, the next is refused for capacity, both go.
-        let subscriber = admin_transport::events(base, true).await;
+        let subscriber = admin_transport::events(base).await;
         assert!(subscriber.is_ok(), "{:?}", subscriber.err());
         assert!(
-            capacity_refusal(&admin_transport::events(base, true).await),
+            capacity_refusal(&admin_transport::events(base).await),
             "a fifth all-events subscriber is refused for capacity"
         );
         drop(subscriber);
@@ -255,7 +255,7 @@ mod in_process {
             let mut held = Vec::new();
             for _ in 0..MAX_SUBSCRIBERS - 1 {
                 held.push(
-                    admin_transport::events(&base, true)
+                    admin_transport::events(&base)
                         .await
                         .expect("an all-events subscriber attaches"),
                 );
@@ -303,7 +303,7 @@ mod in_process {
                 client.request(&final_poll).await,
                 Response::Result { .. }
             ));
-            assert!(admin_transport::events(&base, true).await.is_ok());
+            assert!(admin_transport::events(&base).await.is_ok());
 
             daemon.assert_invariant_clean().await;
             daemon.stop().await;
@@ -771,7 +771,7 @@ mod cross_process {
     /// beside.
     async fn attach_standing_peers(harness: &mut Harness) {
         for _ in 0..HELD_SUBSCRIBERS {
-            let events = admin_transport::events(&harness.base, true)
+            let events = admin_transport::events(&harness.base)
                 .await
                 .expect("an all-events subscriber attaches");
             harness.held_subscribers.push(events);
@@ -888,7 +888,7 @@ mod cross_process {
             // ones never read, so the daemon cuts each with `subscriber_lagged`
             // once its queue overflows and the slot is free again: the churn
             // is admitted either way.
-            let subscriber = admin_transport::events(&harness.base, true).await;
+            let subscriber = admin_transport::events(&harness.base).await;
             assert!(subscriber.is_ok(), "{:?}", subscriber.err());
             drop(subscriber);
             harness.subscriber_churn += 1;

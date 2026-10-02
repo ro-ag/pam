@@ -3,11 +3,10 @@
 //!
 //! The public listener serves [`crate::framed`] frames on
 //! [`crate::runtime_dir::RuntimeDir::public_socket`] (unix) or behind
-//! [`crate::runtime_dir::RuntimeDir::public_control`] (Windows), next to the
-//! `ZeroMQ` sockets until those are removed. A connection carries a hello, then
-//! exactly one request: a unary call answered with one reply, or a follow of
-//! one ticket that ends with the durable result. The daemon closes it after
-//! the answer.
+//! [`crate::runtime_dir::RuntimeDir::public_control`] (Windows). A connection
+//! carries a hello, then exactly one request: a unary call answered with one
+//! reply, or a follow of one ticket that ends with the durable result. The
+//! daemon closes it after the answer.
 //!
 //! What this plane does with a connection, and nothing else in the daemon:
 //!
@@ -55,7 +54,7 @@
 //! A client must keep its side of the connection open until it has read the
 //! answer: end of file from the client is a disconnect, also on a unary call.
 //!
-//! The listener is started by [`crate::transport::Transport::bind_with`] and
+//! The listener is started by [`crate::transport::Transport::bind`] and
 //! stopped by [`crate::transport::Transport::shutdown`].
 
 use std::sync::atomic::{AtomicU64, Ordering};

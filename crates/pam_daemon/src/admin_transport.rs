@@ -178,11 +178,9 @@ pub async fn exchange(base: &Path, envelope: &Envelope) -> io::Result<Response> 
 /// delivered by [`AdminEvents::next`] or shows as a gap in `n`; nothing
 /// published before is replayed.
 ///
-/// `include_probes` asks for `status` and `query` traffic too, which the
-/// hub otherwise leaves out at the source. The daemon core publishes no
-/// lifecycle events for control requests (`status`, `query`, `cancel`) at
-/// all, so today both settings deliver the same stream: a caller that wants
-/// to observe a poll reads its reply, not this stream.
+/// The daemon core publishes no lifecycle events for control requests
+/// (`status`, `query`, `cancel`): a caller that wants to observe a poll reads
+/// its reply, not this stream.
 ///
 /// It connects once. Reconnecting, and refreshing whatever was derived from
 /// events that were missed in between, is the caller's.
@@ -196,13 +194,13 @@ pub async fn exchange(base: &Path, envelope: &Envelope) -> io::Result<Response> 
 ///   `client_version_mismatch`, `daemon_outdated`, `protocol_mismatch`,
 ///   `connection_capacity_exhausted`, [`CAUSE_SUBSCRIBER_CAPACITY`], or
 ///   `daemon_shutting_down`.
-pub async fn events(base: &Path, include_probes: bool) -> Result<AdminEvents, DialError> {
+pub async fn events(base: &Path) -> Result<AdminEvents, DialError> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
         let opened = tokio::time::timeout(framed::HANDSHAKE_TIMEOUT, async {
             let stream = platform::connect(base).await?;
             let hello = framed::client_hello(Via::Direct);
-            events_stream::subscribe_on(stream, &hello, include_probes).await
+            events_stream::subscribe_on(stream, &hello).await
         })
         .await;
         opened.unwrap_or_else(|_| {
@@ -214,7 +212,7 @@ pub async fn events(base: &Path, include_probes: bool) -> Result<AdminEvents, Di
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
-        let _ = (base, include_probes, Via::Direct, framed::HANDSHAKE_TIMEOUT);
+        let _ = (base, Via::Direct, framed::HANDSHAKE_TIMEOUT);
         Err(DialError::Io(unsupported()))
     }
 }

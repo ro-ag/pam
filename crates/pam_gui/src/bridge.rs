@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pam_client::client::{self, RequestError};
+use pam_client::client::{self, ClientError, RequestError};
 use pam_daemon::admin::{
     OP_ACTIVITY_LIST, OP_APPROVALS_PENDING, OP_APPROVALS_RESOLVE, OP_AUDIT_REQUEST,
     OP_CALLERS_LIST, OP_GRANTS_ADD, OP_GRANTS_LIST, OP_GRANTS_REVOKE, OP_PROFILE_GET,
@@ -200,6 +200,15 @@ impl BridgeError {
     }
 }
 
+/// What the human does about a daemon of an earlier build that this process
+/// could not stop. Windows has no `pam daemon stop`.
+const LEGACY_DAEMON_RECOVERY: &str = if cfg!(windows) {
+    "End the old pam daemon process (Task Manager), then try again; PAM starts the current \
+     daemon by itself."
+} else {
+    "Run `pam daemon stop` in a terminal, then try again; PAM starts the current daemon by itself."
+};
+
 /// Maps a client-side request failure onto the refusal shape.
 impl From<RequestError> for BridgeError {
     fn from(err: RequestError) -> Self {
@@ -222,6 +231,18 @@ impl From<RequestError> for BridgeError {
             RequestError::FollowTimeout { .. } | RequestError::ReplyTimeout { .. } => {
                 Self::new("reply_timeout", detail, "Retry with a larger deadline.")
             }
+            // A daemon of an earlier build is there and this process could
+            // not stop it. Not "unreachable": starting a daemon would not
+            // help, and the human has to act.
+            RequestError::Ensure(
+                ClientError::LegacyDaemon { .. } | ClientError::LegacyBehindRelay { .. },
+            ) => Self::new("legacy_daemon", detail, LEGACY_DAEMON_RECOVERY),
+            // The old daemon was told to stop and is still draining.
+            RequestError::Ensure(ClientError::LegacyDraining { .. }) => Self::new(
+                "daemon_restarting",
+                detail,
+                "Retry in a few seconds; the old daemon exits when its drain completes.",
+            ),
             RequestError::Ensure(_)
             | RequestError::RuntimeDir(_)
             | RequestError::Connect { .. } => Self::new(
@@ -258,15 +279,24 @@ impl From<RequestError> for BridgeError {
 
 /// True when the failure means "no daemon is answering" — the status
 /// command reports these as `connected: false` instead of erroring.
+///
+/// A pre-migration daemon this process could not stop is not that: a daemon
+/// is answering, in a protocol this build does not speak, and it stays until
+/// the human stops it. That surfaces as the `legacy_daemon` error with its
+/// instruction instead of a silent "offline". One that was told to stop and
+/// is still draining is momentary and does read as disconnected.
 #[must_use]
 pub fn is_disconnect(err: &RequestError) -> bool {
-    matches!(
-        err,
+    match err {
+        RequestError::Ensure(
+            ClientError::LegacyDaemon { .. } | ClientError::LegacyBehindRelay { .. },
+        ) => false,
         RequestError::Ensure(_)
-            | RequestError::Connect { .. }
-            | RequestError::Transport { .. }
-            | RequestError::ReplyTimeout { .. }
-    )
+        | RequestError::Connect { .. }
+        | RequestError::Transport { .. }
+        | RequestError::ReplyTimeout { .. } => true,
+        _ => false,
+    }
 }
 
 /// Unwraps a [`Response`], passing a daemon refusal through verbatim and

@@ -37,8 +37,40 @@ All notable changes to pam are documented in this file. The format follows
   stale; Settings offers "Repoint to this binary".
 - `pam flow result` labels local-model summaries `[untrusted local-model
   summary]` and escapes control characters in them.
+- Request rows record where a request entered the daemon and who connected:
+  `ingress` (`public` or `admin`), the kernel's uid and pid of the peer
+  (`peer_uid`, `peer_pid`; empty on Windows, which reports none) and whether
+  the client said it came through `pam listen` (`relayed`).
+  `admin.activity.list` returns them. They are attribution, never
+  authorization.
+- The GUI receives every lifecycle event over the private administration
+  channel, with the ticket's capability, repository, agent label and the real
+  progress note. Settings › Daemon explains a window and a daemon of different
+  builds, and Models readiness says what a qualification covers.
 
 ### Changed
+
+- The public transport is PAM's own framed protocol on the same socket,
+  `<base>/run/pam.sock`: length-prefixed JSON, a `hello`, then one request per
+  connection. On Windows it is a loopback port behind an owner nonce published
+  in `<base>\run\public.json`. The daemon closes a connection after its
+  answer, tells a connection over its 256-connection cap why
+  (`connection_capacity_exhausted`), and keeps answering with a refusal frame
+  while it drains instead of refusing the connect.
+- Events are no longer broadcast. `pam wait` and `pam subscribe` follow one
+  ticket on one connection, authorized like a result read, and the stream ends
+  with the durable result: a follow costs one `query` request, a finished
+  ticket is answered at once, and a late `pam subscribe` is shown the earlier
+  events of a running ticket. At most 16 followers per ticket and 96 in total.
+- `pam listen` binds one socket. It refuses a session directory that is a
+  link, is owned by someone else or is writable by group or others, and a
+  socket entry that is a link or not a socket. The daemon records the relay
+  process as the peer of a relayed request.
+- A `pam gui` built without the embedded frontend refuses to start unless
+  `PAM_GUI_DEV=1` is set, because its window would load the development server
+  with full control of the daemon. `npm run gui:dev` and `npm run dev:desktop`
+  set it, on Windows too.
+- `pam daemon stop` reports what `kill` said inside its own error line.
 
 - `pam cancel` only acts on a ticket submitted from the caller's own
   repository; another repository's ticket answers `not_found`, like a missing
@@ -51,8 +83,10 @@ All notable changes to pam are documented in this file. The format follows
   It used to apply at the next daemon start.
 - A client of a different version no longer restarts the daemon. The daemon
   restarts only when its own binary was replaced on disk; otherwise it
-  refuses with `client_version_mismatch`, naming its version and path. While it
-  restarts, every request is answered `daemon_outdated`.
+  refuses with `client_version_mismatch`, naming its version and path; the
+  CLI prints one sentence with both versions and exits `3`. The version is
+  judged on each connection's hello, on both planes. While it restarts, every
+  request is answered `daemon_outdated`.
 - `status` is served from a snapshot refreshed in the background, and a poll
   is no longer a request: it leaves no request or audit row, no caller entry
   and no lifecycle events. `active_requests` excludes the poll. `query` and
@@ -60,9 +94,10 @@ All notable changes to pam are documented in this file. The format follows
 - Admission pools are separate per class: 128 work, 16 `status`, 16 `query`,
   8 `cancel` and 32 for requests the GUI submits, at 256, 64, 64 and 16 per
   second for the first four. Every request handler has a hard deadline.
-- `pam wait` and `pam subscribe` retry transient refusals and reconnect a lost
-  event stream until `--timeout-ms`, then exit `1` with `follow_timeout`.
-  Exit `3` now means a policy refusal only.
+- `pam wait` and `pam subscribe` retry transient refusals and resume a dropped
+  follow after the last event seen until `--timeout-ms`, then exit `1` with
+  `follow_timeout`. Exit `3` now means the daemon refused and a retry will not
+  help: a policy refusal, or a daemon of another build.
 - A daemon started lazily by a client runs with a reduced environment (home,
   user, locale, temp and absolute `PATH` entries, plus `PAM_BASE_DIR`), in its
   own process group, with `/` as its directory. Flow steps no longer inherit
@@ -75,7 +110,10 @@ All notable changes to pam are documented in this file. The format follows
 - Model verification is recorded privately under `<base>/model-trust` and
   checked again whenever a model loads. A sidecar next to the weights no longer
   makes a model verified, so each existing model needs "Verify" once after
-  upgrading. A model with a leftover sidecar says so.
+  upgrading. A model with a leftover sidecar says so. On Windows a model
+  file's "verified" fingerprint is its size and modification time only, so a
+  same-size replacement with the timestamp restored is not noticed there; the
+  engine loads only PAM's private verified copy, so what runs is unaffected.
 - Local summaries are bounded to two minutes in the engine and five minutes
   in all, and a cancelled flow step cancels its summary.
 - The local engine's API key is passed as a private file, not on the command
@@ -109,6 +147,11 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Removed
 
+- ZeroMQ: the `zeromq` dependency, its vendored patch and its separate gate
+  step are gone, and nothing on either plane speaks ZMTP.
+- `events.sock`, the event broadcast socket, and the second socket
+  `pam listen` bound for it. A stale one in the run directory or in a session
+  directory is removed at the next start.
 - The AWS CLI adapter, which was always refused, is removed. A flow that still
   names `connector: aws` fails validation as a removed connector; a stored `aws`
   connector row is ignored, and a keychain item left behind for it is harmless.
@@ -137,8 +180,9 @@ All notable changes to pam are documented in this file. The format follows
 - Reading at the end of an evidence view returns an empty page marked `eof`
   instead of an error.
 - Activity shows refused `admin.*` attempts even with probes hidden.
-- The admin channel and `pam listen` survive transient accept errors; the
-  relay caps concurrent connections at 64 per socket.
+- The admin channel and `pam listen` survive transient accept errors on every
+  platform; the relay caps concurrent connections at 64. A full admin listener
+  answers `connection_capacity_exhausted` instead of dropping the connection.
 - A killed flow step (timeout, cancel, output limit) takes its whole process
   group with it.
 - Cancelling, or restarting the daemon, while a step waits for approval no
@@ -163,8 +207,24 @@ All notable changes to pam are documented in this file. The format follows
 ### Compatibility
 
 - Schema version 12 adds indexes for Activity and retention and makes audit
-  rows append-only and evidence views immutable. A store upgraded by this
-  version is refused by older binaries.
+  rows append-only and evidence views immutable. Version 13 adds the origin
+  columns to request rows. A store upgraded by this version is refused by
+  older binaries.
+- Upgrading from 0.4.x with a daemon still running: the old daemon speaks the
+  previous protocol on the same socket, and a new client recognises it by its
+  greeting. The first `pam` command run outside a sandbox, the GUI, or
+  `pam listen` stops it the way `pam daemon stop` does and starts the new one.
+  A first command that may not signal it (under an agent sandbox, or through
+  `PAM_SOCKET_DIR`) exits `1` with the instruction to run `pam daemon stop`
+  outside the sandbox. On Windows the old daemon is not stopped automatically;
+  the message names its process to end.
+- An old `pam` binary cannot talk to the new daemon: it fails to connect and
+  the daemon logs the stale client (at most once a minute) without answering.
+  A GUI left open across the upgrade is refused `client_outdated` and must be
+  quit and reopened.
+- Sandbox profiles need only `<base>/run/pam.sock` (or `<dir>/pam.sock` for a
+  session relay). A rule that still allows `events.sock` is harmless and can
+  be dropped.
 
 ## [0.4.3] - 2026-10-01
 

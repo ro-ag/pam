@@ -222,13 +222,12 @@ where
             };
         let served = match Frame::decode(&body) {
             Ok(Frame::Request { envelope }) => self.request(&mut stream, &envelope).await,
-            Ok(Frame::Events { include_probes }) => {
+            Ok(Frame::Events) => {
                 events_stream::serve(
                     &mut stream,
                     &self.hub,
                     self.lifecycle.phase.subscribe(),
                     stop,
-                    include_probes,
                 )
                 .await;
                 Ok(())

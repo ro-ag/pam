@@ -10,11 +10,10 @@
 //!
 //! **Server** (`serve`). The subscription is taken from the hub, then one
 //! `subscribed` frame is written, then `event` frames in the hub's publish
-//! order. `status` and `query` traffic is left out unless the request asked
-//! for it, at the source — and the daemon core publishes no lifecycle events
-//! for control requests (`status`, `query`, `cancel`) in the first place, so
-//! on a real daemon neither setting ever carries one. The stream ends with an
-//! `error` frame and a close:
+//! order. The daemon core publishes no lifecycle events for control requests
+//! (`status`, `query`, `cancel`), so the stream never carries a poll — the
+//! subscriber's own included. The stream ends with an `error` frame and a
+//! close:
 //!
 //! | Cause | When |
 //! | --- | --- |
@@ -72,13 +71,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     hub: &Arc<EventHub>,
     mut phase: watch::Receiver<LifecyclePhase>,
     mut stop: watch::Receiver<bool>,
-    include_probes: bool,
 ) {
     if *phase.borrow() != LifecyclePhase::Serving || *stop.borrow() {
         shutting_down(stream).await;
         return;
     }
-    let mut subscriber = match hub.subscribe_all(include_probes) {
+    let mut subscriber = match hub.subscribe_all() {
         Ok(subscriber) => subscriber,
         Err(SubscribeError::Capacity) => {
             framed::refuse(
@@ -236,15 +234,11 @@ impl AdminEvents {
 /// [`DialError::Refused`] when the daemon refuses the hello
 /// (`client_version_mismatch`, `daemon_outdated`, `protocol_mismatch`) or the
 /// subscription (`subscriber_capacity_exhausted`, `daemon_shutting_down`).
-pub(super) async fn subscribe_on<S>(
-    mut stream: S,
-    hello: &Hello,
-    include_probes: bool,
-) -> Result<AdminEvents, DialError>
+pub(super) async fn subscribe_on<S>(mut stream: S, hello: &Hello) -> Result<AdminEvents, DialError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let ack = framed::open(&mut stream, hello, &Frame::Events { include_probes }).await?;
+    let ack = framed::open(&mut stream, hello, &Frame::Events).await?;
     match framed::read_daemon_frame(&mut stream, MAX_FRAME_BYTES).await? {
         Frame::Subscribed => {}
         other => {

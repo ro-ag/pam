@@ -1,6 +1,6 @@
 //! The hub's contract: publish never waits, followers see only their ticket
-//! and only sanitised events, the administration view is rich and filterable,
-//! and every table and queue is bounded.
+//! and only sanitised events, the administration view is rich, and every table
+//! and queue is bounded.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,6 +110,59 @@ async fn sequence_numbers_start_at_one_per_ticket_and_a_follower_sees_only_its_t
         }
     );
     assert_idle(&mut b).await;
+}
+
+/// Whatever a service puts in a progress note, and whatever the percentage,
+/// a public follower receives the constant; lifecycle events pass as they
+/// are. Nothing of the prose is on the frame a follower would be written.
+#[tokio::test]
+async fn a_follower_never_sees_progress_prose_and_lifecycle_passes_unchanged() {
+    let hub = EventHub::new();
+    let mut follower = hub.attach("req_opaque", 0).unwrap().follower;
+    let mut seq = 0;
+    for pct in [None, Some(0), Some(52), Some(100)] {
+        hub.publish(
+            "req_opaque",
+            Event::Progress {
+                pct,
+                note: format!(
+                    "private-repository publish-secret-artifact FAILED {}",
+                    "secret".repeat(100_000)
+                ),
+            },
+        )
+        .unwrap();
+        seq += 1;
+        let Followed::Event { seq: got, event } = next(&mut follower).await else {
+            panic!("expected an event");
+        };
+        assert_eq!(got, seq);
+        assert_eq!(
+            event,
+            Event::Progress {
+                pct,
+                note: PUBLIC_PROGRESS_NOTE.to_owned(),
+            }
+        );
+        let frame = Frame::follow_event(got, event).encode().unwrap();
+        let frame = String::from_utf8(frame).unwrap();
+        for private in ["private-repository", "publish-secret", "FAILED", "secret"] {
+            assert!(!frame.contains(private), "{frame}");
+        }
+    }
+    for event in [Event::Queued, Event::Started, Event::ApprovalPending] {
+        hub.publish("req_opaque", event.clone()).unwrap();
+        seq += 1;
+        assert_eq!(next(&mut follower).await, Followed::Event { seq, event });
+    }
+    for terminal in [Event::Done, Event::Refused] {
+        let mut follower = hub.attach("req_ending", 0).unwrap().follower;
+        hub.publish("req_ending", terminal.clone()).unwrap();
+        assert!(matches!(
+            next(&mut follower).await,
+            Followed::Terminal { event, .. } if event == terminal
+        ));
+    }
 }
 
 #[tokio::test]
@@ -395,7 +448,7 @@ async fn follower_caps_hold_per_ticket_and_in_total_and_a_freed_slot_is_reusable
 #[tokio::test]
 async fn the_admin_subscription_sees_every_ticket_unsanitised_with_metadata() {
     let hub = EventHub::new();
-    let mut subscriber = hub.subscribe_all(false).unwrap();
+    let mut subscriber = hub.subscribe_all().unwrap();
     let mut follower = hub.attach("req_a", 0).unwrap().follower;
     hub.register("req_a", meta("flow.run"));
     hub.publish("req_a", Event::Queued).unwrap();
@@ -449,64 +502,54 @@ async fn the_admin_subscription_sees_every_ticket_unsanitised_with_metadata() {
     );
 }
 
+/// The hub does not filter by capability: every subscriber sees every
+/// published event under the one daemon-wide counter. A poll is absent from a
+/// real daemon's stream because the daemon core publishes nothing for control
+/// requests, not because the hub hides it.
 #[tokio::test]
-async fn probes_are_left_out_unless_asked_and_each_view_counts_without_gaps() {
+async fn every_subscriber_counts_every_published_event_without_gaps() {
     let hub = EventHub::new();
-    let mut plain = hub.subscribe_all(false).unwrap();
-    let mut probing = hub.subscribe_all(true).unwrap();
-    hub.register("req_status", meta("status"));
+    let mut first = hub.subscribe_all().unwrap();
+    let mut second = hub.subscribe_all().unwrap();
     hub.register("req_query", meta("query"));
     hub.register("req_flow", meta("flow.run"));
 
     hub.publish("req_flow", Event::Queued).unwrap();
-    hub.publish("req_status", Event::Started).unwrap();
-    hub.publish("req_status", Event::Done).unwrap();
+    hub.publish("req_query", Event::Started).unwrap();
     hub.publish("req_query", Event::Done).unwrap();
+    hub.publish("req_bare", Event::Queued).unwrap();
     hub.publish("req_flow", Event::Done).unwrap();
 
-    // Without probes: only the flow, numbered 1, 2 — a status poll does not
-    // come back as an event, and it leaves no gap behind.
-    let seen: Vec<_> = [admin_event(&mut plain).await, admin_event(&mut plain).await]
-        .into_iter()
-        .map(|event| (event.n, event.ticket))
-        .collect();
-    assert_eq!(
-        seen,
-        vec![(1, "req_flow".to_owned()), (2, "req_flow".to_owned())]
-    );
-    assert_eq!(plain.queued(), 0);
-
-    // With probes: everything, in publish order, numbered 1..=5.
-    let mut all = Vec::new();
-    for _ in 0..5 {
-        let event = admin_event(&mut probing).await;
-        all.push((event.n, event.ticket));
+    for subscriber in [&mut first, &mut second] {
+        let mut all = Vec::new();
+        for _ in 0..5 {
+            let event = admin_event(subscriber).await;
+            all.push((event.n, event.ticket));
+        }
+        assert_eq!(
+            all,
+            vec![
+                (1, "req_flow".to_owned()),
+                (2, "req_query".to_owned()),
+                (3, "req_query".to_owned()),
+                (4, "req_bare".to_owned()),
+                (5, "req_flow".to_owned()),
+            ]
+        );
+        assert_eq!(subscriber.queued(), 0);
     }
-    assert_eq!(
-        all,
-        vec![
-            (1, "req_flow".to_owned()),
-            (2, "req_status".to_owned()),
-            (3, "req_status".to_owned()),
-            (4, "req_query".to_owned()),
-            (5, "req_flow".to_owned()),
-        ]
-    );
 }
 
 #[tokio::test]
 async fn subscribers_are_capped_and_a_dropped_one_frees_its_slot() {
     let hub = EventHub::new();
     let mut held: Vec<Subscriber> = (0..MAX_SUBSCRIBERS)
-        .map(|_| hub.subscribe_all(false).unwrap())
+        .map(|_| hub.subscribe_all().unwrap())
         .collect();
-    assert_eq!(
-        hub.subscribe_all(false).unwrap_err(),
-        SubscribeError::Capacity
-    );
+    assert_eq!(hub.subscribe_all().unwrap_err(), SubscribeError::Capacity);
     assert_eq!(hub.usage().subscribers, MAX_SUBSCRIBERS);
     held.pop();
-    held.push(hub.subscribe_all(true).unwrap());
+    held.push(hub.subscribe_all().unwrap());
     drop(held);
     assert_eq!(hub.usage().subscribers, 0);
 }
@@ -514,8 +557,8 @@ async fn subscribers_are_capped_and_a_dropped_one_frees_its_slot() {
 #[tokio::test]
 async fn a_subscriber_loses_progress_first_and_lags_only_on_lifecycle_overflow() {
     let hub = EventHub::new();
-    let mut slow = hub.subscribe_all(false).unwrap();
-    let mut reading = hub.subscribe_all(false).unwrap();
+    let mut slow = hub.subscribe_all().unwrap();
+    let mut reading = hub.subscribe_all().unwrap();
     hub.publish("req_a", Event::Started).unwrap();
     // Twice the queue in progress: the oldest go, the subscriber stays.
     for index in 0..(2 * SUBSCRIBER_QUEUE) {
@@ -578,16 +621,18 @@ async fn the_table_is_bounded_and_evicts_the_oldest_ticket_nobody_follows() {
     assert_eq!(hub.usage().entries, MAX_ENTRIES - 1);
 }
 
+/// The tap behind `EventPublisher::for_tests`, which the daemon's unit tests
+/// observe published events through.
 #[tokio::test]
-async fn the_legacy_sink_gets_what_a_public_client_sees_and_never_blocks() {
+async fn the_test_tap_gets_what_a_public_client_sees_and_never_blocks() {
     let hub = EventHub::new();
-    // No sink: publishing is fine.
+    // No tap: publishing is fine.
     hub.publish("req_a", Event::Queued).unwrap();
     let (tx, mut rx) = mpsc::channel(2);
-    hub.set_legacy_sink(tx);
+    hub.set_test_tap(tx);
     hub.publish("req_a", progress(7, "private prose")).unwrap();
     hub.publish("req_b", Event::Started).unwrap();
-    // A full sink drops the notification without an error or a wait.
+    // A full tap drops the notification without an error or a wait.
     hub.publish("req_b", Event::Done).unwrap();
     assert_eq!(
         rx.recv().await.unwrap(),
@@ -598,7 +643,7 @@ async fn the_legacy_sink_gets_what_a_public_client_sees_and_never_blocks() {
         ("req_b".to_owned(), Event::Started)
     );
     assert!(rx.try_recv().is_err());
-    // A closed sink is the transport having shut down.
+    // A closed tap is a test's stand-in for the transport having shut down.
     drop(rx);
     assert!(hub.publish("req_c", Event::Queued).is_err());
 }
@@ -607,7 +652,7 @@ async fn the_legacy_sink_gets_what_a_public_client_sees_and_never_blocks() {
 async fn close_tells_everyone_and_refuses_everything_after() {
     let hub = EventHub::new();
     let mut follower = hub.attach("req_a", 0).unwrap().follower;
-    let mut subscriber = hub.subscribe_all(false).unwrap();
+    let mut subscriber = hub.subscribe_all().unwrap();
     let publisher = hub.publisher();
     assert!(Arc::ptr_eq(publisher.hub(), &hub));
     publisher.publish("req_a", Event::Started).await.unwrap();
@@ -627,10 +672,7 @@ async fn close_tells_everyone_and_refuses_everything_after() {
 
     assert!(publisher.publish("req_a", Event::Done).await.is_err());
     assert_eq!(hub.attach("req_a", 0).unwrap_err(), AttachError::Closed);
-    assert_eq!(
-        hub.subscribe_all(false).unwrap_err(),
-        SubscribeError::Closed
-    );
+    assert_eq!(hub.subscribe_all().unwrap_err(), SubscribeError::Closed);
     hub.register("req_late", meta("flow.run"));
     assert_eq!(hub.usage().entries, 0);
     drop(follower);

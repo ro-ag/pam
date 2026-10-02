@@ -71,8 +71,6 @@ async fn the_seam_hands_the_core_one_request_with_its_origin_and_peer_and_return
     let serving = tokio::spawn(async move {
         let request = core.recv().await.expect("one request");
         let seen = (request.origin, request.peer, request.envelope.clone());
-        // The framed listener has no routing identity to carry.
-        assert!(request.identity.is_empty());
         request.reply.send(answer(&request.envelope.id)).unwrap();
         // The second request is accepted and never answered.
         let dropped = core.recv().await.expect("a second request");

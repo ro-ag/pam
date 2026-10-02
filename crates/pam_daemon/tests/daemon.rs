@@ -439,7 +439,7 @@ async fn approval_approve_resumes_execution_and_audits_the_resolution() {
             .send(&envelope("req_appr", "echo", args.clone(), true))
             .await;
 
-        // The request parks: approval_pending on PUB, waiting_approval
+        // The request parks: approval_pending published, waiting_approval
         // in the store, and one entry on the GUI's pending list.
         assert_eq!(
             events.recv().await,

@@ -1,4 +1,4 @@
-//! The flow engine end to end: a real daemon on a temp base dir, real zmq, a real `SQLite` store,
+//! The flow engine end to end: a real daemon on a temp base dir, real sockets, a real `SQLite` store,
 //! real child processes. Nothing about a run is faked here except the two things a test must never
 //! reach — the OS keychain and the network — which the harness replaces with [`FakeSecretBackend`]
 //! and [`FakeTransport`]. The flows themselves are written into the library the daemon reads, the
@@ -896,31 +896,163 @@ async fn an_existing_but_unapproved_repo_runs_no_steps() {
     .await;
 }
 
+/// A flow whose first step is still running when a client attaches to follow
+/// it: long enough to dial, short enough not to matter.
+const HELD_TWO_STEP: &str = "schema: 1\n\
+id: held-two-step\n\
+name: Held two steps\n\
+steps:\n\
+\x20 - id: hold\n\
+\x20   run: [pam-flow-helper, sleep, '1500']\n\
+\x20 - id: prove\n\
+\x20   run: [git, --version]\n\
+\x20   role: verify\n";
+
+/// One real public follow of `ticket`, as `pam wait` opens one, read to its
+/// end: whether the daemon attached it to a pending ticket (`following`), the
+/// events it was written, and the final frame.
+async fn follow_to_end(
+    flows: &FlowDaemon,
+    ticket: &str,
+) -> (bool, Vec<Event>, pam_proto::wire::End) {
+    use pam_daemon::framed::{self, FrameReader};
+    use pam_proto::wire::{Frame, MAX_FRAME_BYTES, Via};
+
+    let query = envelope_for_repo(
+        &flows.repo(),
+        "req_follow",
+        "query",
+        serde_json::json!({ "ticket": ticket }),
+        true,
+    );
+    let mut stream = framed::connect_public(flows.daemon.handle().runtime_dir())
+        .await
+        .expect("the public listener accepts");
+    let hello = framed::client_hello(Via::Direct);
+    framed::follow(&mut stream, &hello, &query, 0, None)
+        .await
+        .expect("the hello is acknowledged");
+    let mut reader = FrameReader::new(MAX_FRAME_BYTES);
+    let mut attached = false;
+    let mut followed = Vec::new();
+    loop {
+        match reader.daemon_frame(&mut stream).await {
+            Ok(Frame::Following(following)) => {
+                assert_eq!(following.ticket, ticket);
+                attached = true;
+            }
+            Ok(Frame::Event(frame)) => {
+                // A follower's frame names nothing but its position.
+                assert!(frame.seq.is_some());
+                assert_eq!(
+                    (&frame.ticket, &frame.capability, &frame.repo, &frame.agent),
+                    (&None, &None, &None, &None),
+                    "{frame:?}"
+                );
+                followed.push(frame.event);
+            }
+            Ok(Frame::End(end)) => return (attached, followed, end),
+            other => panic!("expected following, event or end, got {other:?}"),
+        }
+    }
+}
+
+/// The progress events among `events`, as `(pct, note)`.
+fn progress_of(events: &[Event]) -> Vec<(Option<u8>, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Progress { pct, note } => Some((*pct, note.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the daemon itself hands each plane, read off the wire: a public
+/// follower of the run (a real follow connection on the public socket, not the
+/// harness's view of the admin stream) is shown only the constant progress
+/// note, while the administration stream carries the same events with the
+/// step each note is about, and the scoped report keeps the step details.
 #[tokio::test]
 async fn public_progress_is_generic_and_scoped_evidence_retains_step_details() {
     Box::pin(with_deadline(async {
-        let flows = FlowDaemon::spawn(&[("two-step", TWO_STEP)]).await;
+        let flows = FlowDaemon::spawn(&[("held-two-step", HELD_TWO_STEP)]).await;
         let mut client = flows.daemon.client().await;
-        let mut events = flows.daemon.subscribe(&["req_run"]).await;
+        // The administration plane's stream, whole.
+        let mut admin = flows.daemon.subscribe(&["req_run"]).await;
 
-        let body = flows.run(&mut client, "req_run", "two-step").await;
+        // The run, waiting; its reply is collected after the follow ends.
+        client
+            .send(&flows.run_envelope("req_run", "held-two-step", &serde_json::json!({})))
+            .await;
+        flows.daemon.wait_for_row("req_run", |_| true).await;
+        let (attached, followed, end) = follow_to_end(&flows, "req_run").await;
+
+        let response = client.recv().await;
+        let body = flows.full_report(&mut client, "req_run", response).await;
         if assert_unsupported_flow(&body) {
             flows.daemon.assert_invariant_clean().await;
             flows.daemon.stop().await;
             return;
         }
-        assert_eq!(step(&body, "version")["status"], "succeeded");
+        // The scoped report keeps what each step did.
+        assert_eq!(step(&body, "hold")["status"], "succeeded");
         assert_eq!(step(&body, "prove")["status"], "succeeded");
 
-        let seen: Vec<Event> = events.until_terminal("req_run").await;
-        let notes: Vec<String> = seen
-            .into_iter()
-            .filter_map(|event| match event {
-                Event::Progress { note, .. } => Some(note),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notes, vec!["Task progress updated".to_owned(); 4]);
+        // The public follower attached while the first step was running and
+        // was told the ending with the durable answer.
+        assert!(attached, "the follow attached to a running ticket");
+        assert_eq!(end.event, Some(Event::Done));
+        assert!(
+            matches!(&end.response, Response::Result { body, .. } if body["state"] == "done"),
+            "{:?}",
+            end.response
+        );
+        let public = progress_of(&followed);
+        assert_eq!(
+            public
+                .iter()
+                .map(|(_, note)| note.as_str())
+                .collect::<Vec<_>>(),
+            ["Task progress updated"; 4],
+            "a public follower never sees a progress note's prose"
+        );
+
+        // The administration stream: the same events, with the real notes.
+        let mut watched = Vec::new();
+        loop {
+            let frame = admin.recv_admin().await;
+            assert_eq!(frame.ticket.as_deref(), Some("req_run"));
+            assert_eq!(frame.capability.as_deref(), Some(CAP_FLOW_RUN), "{frame:?}");
+            let terminal = matches!(frame.event, Event::Done | Event::Refused);
+            watched.push(frame.event);
+            if terminal {
+                break;
+            }
+        }
+        let private = progress_of(&watched);
+        assert_eq!(
+            private
+                .iter()
+                .map(|(_, note)| note.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "hold: running (1/2)",
+                "hold: succeeded",
+                "prove: running (2/2)",
+                "prove: succeeded",
+            ],
+        );
+        // Event for event the same progress, minus the prose.
+        assert_eq!(
+            public.iter().map(|(pct, _)| *pct).collect::<Vec<_>>(),
+            private.iter().map(|(pct, _)| *pct).collect::<Vec<_>>(),
+        );
+        // Nothing the follower was written carries a step's name.
+        for event in &followed {
+            let wire = serde_json::to_string(event).expect("an event serialises");
+            assert!(!wire.contains("hold") && !wire.contains("prove"), "{wire}");
+        }
 
         flows.daemon.assert_invariant_clean().await;
         flows.daemon.stop().await;

@@ -1,6 +1,6 @@
 //! Privileged administration through a separate native daemon ingress.
 //!
-//! Public `ZeroMQ` refuses every `admin.*` envelope, including forged GUI labels; private ingress
+//! The public socket refuses every `admin.*` envelope, including forged GUI labels; private ingress
 //! checks kernel peer ownership, and the enterprise sandbox must exclude that endpoint, PAM state,
 //! and trusted process/assets from agents. OS ownership does not prove GUI mode — unrestricted
 //! same-user processes remain privileged and sit outside this boundary (see
@@ -625,8 +625,7 @@ impl AdminService {
         let (reply, answer) = oneshot::channel();
         self.submit
             .send(IncomingRequest {
-                // No zmq peer: the reply comes back through the channel.
-                identity: Vec::new(),
+                // No peer: the reply comes back through the channel.
                 origin: Origin::Admin,
                 peer: None,
                 envelope,

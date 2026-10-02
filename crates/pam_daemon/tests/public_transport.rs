@@ -455,6 +455,12 @@ async fn a_version_claim_is_refused_at_the_hello_and_only_a_replaced_binary_rest
 async fn a_legacy_zmtp_greeting_is_closed_and_the_daemon_keeps_serving() {
     with_deadline(async {
         let fixture = Fixture::start().await;
+        // The path a pre-migration client dials is the one this daemon serves.
+        #[cfg(unix)]
+        assert_eq!(
+            fixture.handle().runtime_dir().public_socket().file_name(),
+            Some(std::ffi::OsStr::new("pam.sock"))
+        );
 
         // What a pre-migration DEALER sends the moment it connects.
         let mut greeting = [0u8; 64];
@@ -666,14 +672,38 @@ async fn malformed_requests_keep_their_shapes_and_leave_no_row() {
         assert_eq!(refusal(&fixture.call(&huge).await), ("bad_request", false));
         assert!(store.get_request("req_long_label").await.unwrap().is_none());
 
+        // The envelope's `client_version` decides nothing any more, but it is
+        // caller-chosen text that is stored: bounded like every other field.
+        let mut versioned =
+            fixture.envelope("req_long_version", "echo", serde_json::json!({}), true);
+        versioned.client_version = "9".repeat(129);
+        assert_eq!(
+            refusal(&fixture.call(&versioned).await),
+            ("bad_request", false)
+        );
+        assert!(
+            store
+                .get_request("req_long_version")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // At the limit it is carried to the daemon core and served.
+        let mut carried = fixture.envelope("req_ok_version", "echo", serde_json::json!({}), true);
+        carried.client_version = "9".repeat(128);
+        assert!(matches!(
+            fixture.call(&carried).await,
+            Response::Result { .. }
+        ));
+        let row = store.get_request("req_ok_version").await.unwrap().unwrap();
+        assert_eq!(row.origin.ingress, RequestIngress::Public);
+
         // The all-events stream belongs to the private plane.
         let mut stream = fixture.dial().await;
         let answer = framed::open(
             &mut stream,
             &framed::client_hello(Via::Direct),
-            &Frame::Events {
-                include_probes: true,
-            },
+            &Frame::Events,
         )
         .await;
         assert!(answer.is_ok(), "the hello itself is fine: {answer:?}");
@@ -730,6 +760,9 @@ async fn shutdown_flushes_the_in_flight_reply_and_removes_the_socket() {
         .await;
         let store = fixture.daemon.store();
         let dirs = fixture.handle().runtime_dir().clone();
+        let hub = fixture.handle().event_hub();
+        hub.publish("req_early", pam_proto::Event::Queued)
+            .expect("a serving daemon's hub takes events");
 
         let request = fixture.envelope(
             "req_draining",
@@ -783,6 +816,60 @@ async fn shutdown_flushes_the_in_flight_reply_and_removes_the_socket() {
             "the control file is removed at shutdown"
         );
         assert!(framed::connect_public(&dirs).await.is_err());
+        // The hub went with the transport: a late publish is an error the
+        // publisher can see, not an event queued for nobody.
+        assert!(hub.publish("req_late", pam_proto::Event::Done).is_err());
+    })
+    .await;
+}
+
+/// The run directory of a base an older daemon used: its event broadcast
+/// socket, and the socket name the framed listener had during development,
+/// are removed at bind (under the instance lock), and the public socket is
+/// served at `pam.sock`, replacing the dead one of that name.
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_files_an_older_daemon_left_are_removed_at_bind() {
+    use std::os::unix::fs::FileTypeExt;
+
+    with_deadline(async {
+        let tmp = short_tempdir();
+        seed_relaxed(&tmp).await;
+        let run = pam_testkit::base_of(&tmp).join("run");
+        std::fs::create_dir_all(&run).expect("the run directory");
+        // The daemon serves the canonical base (`/tmp` is a link on macOS).
+        let run = run.canonicalize().expect("the run directory exists");
+        // Dead sockets, as a daemon that did not exit cleanly leaves them.
+        for name in ["pam.sock", "events.sock", "pam.next.sock"] {
+            drop(std::os::unix::net::UnixListener::bind(run.join(name)).expect("a stale socket"));
+            assert!(run.join(name).exists());
+        }
+
+        let daemon = TestDaemon::spawn_at(tmp).await;
+        let dirs = daemon.handle().runtime_dir().clone();
+        assert_eq!(dirs.public_socket(), run.join("pam.sock"));
+        assert!(
+            std::fs::metadata(dirs.public_socket())
+                .expect("the public socket")
+                .file_type()
+                .is_socket()
+        );
+        assert!(!run.join("events.sock").exists(), "events.sock is gone");
+        assert!(!run.join("pam.next.sock").exists(), "pam.next.sock is gone");
+        // Only what this daemon serves is left: its socket and its lock.
+        let mut entries: Vec<String> = std::fs::read_dir(&run)
+            .expect("the run directory lists")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["daemon.lock", "pam.sock"]);
+
+        // And it is this daemon that answers there.
+        let mut stream = framed::connect_public(&dirs).await.expect("connect");
+        greet(&mut stream).await;
+
+        daemon.stop().await;
+        assert!(!run.join("pam.sock").exists());
     })
     .await;
 }

@@ -33,7 +33,7 @@ fn own_uid(dir: &std::path::Path) -> u32 {
 #[tokio::test]
 async fn bind_replaces_a_stale_file_and_leaves_an_owner_only_socket() {
     let tmp = short_dir();
-    let path = tmp.path().join("pam.next.sock");
+    let path = tmp.path().join("pam.sock");
     // What a dead daemon left behind.
     std::fs::write(&path, b"stale").unwrap();
     let acceptor = UnixAcceptor::bind(&path).unwrap();
@@ -61,7 +61,7 @@ async fn an_over_long_path_is_refused_with_the_limit_before_anything_is_touched(
 async fn an_accepted_connection_carries_the_kernels_view_of_this_process() {
     tokio::time::timeout(PATIENCE, async {
         let tmp = short_dir();
-        let path = tmp.path().join("pam.next.sock");
+        let path = tmp.path().join("pam.sock");
         let mut acceptor = UnixAcceptor::bind(&path).unwrap();
         let client = connect(&path).await.unwrap();
         let (server, peer) = acceptor.accept().await.unwrap();
@@ -99,7 +99,7 @@ async fn an_accepted_connection_carries_the_kernels_view_of_this_process() {
 async fn a_listener_on_a_real_socket_serves_records_the_peer_and_unlinks_at_shutdown() {
     tokio::time::timeout(PATIENCE, async {
         let tmp = short_dir();
-        let path = tmp.path().join("pam.next.sock");
+        let path = tmp.path().join("pam.sock");
         let policy = Answering::new(Limits::PUBLIC);
         let listener = Listener::spawn(UnixAcceptor::bind(&path).unwrap(), Arc::clone(&policy));
 
@@ -141,7 +141,7 @@ async fn a_listener_on_a_real_socket_serves_records_the_peer_and_unlinks_at_shut
 async fn a_real_connection_over_the_cap_reads_the_capacity_frame() {
     tokio::time::timeout(PATIENCE, async {
         let tmp = short_dir();
-        let path = tmp.path().join("pam.next.sock");
+        let path = tmp.path().join("pam.sock");
         let policy = Holding::new(1);
         let listener = Listener::spawn(UnixAcceptor::bind(&path).unwrap(), Arc::clone(&policy));
 

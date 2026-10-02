@@ -2,7 +2,7 @@
 //!
 //! macOS/Linux exercise the private Unix socket. Unsupported platforms use
 //! an explicit in-process fixture; GUI tests separately assert unsupported
-//! production administration. Forgery tests always use raw public `ZeroMQ`.
+//! production administration. Forgery tests always use the raw public socket.
 
 use pam_daemon::admin::{
     ADMIN_CALLER_AGENT, ADMIN_REPO, CAUSE_ADMIN_DENIED, OP_ACTIVITY_LIST, OP_APPROVALS_PENDING,

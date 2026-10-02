@@ -14,8 +14,7 @@
 //! reads an origin depends on how the bytes arrived. The kernel's view of the
 //! connection ([`PeerIdentity`]) and the relay marker travel beside the origin,
 //! as [`PublicPeer`] on the [`crate::transport::IncomingRequest`]: `None` for a
-//! request the administration plane submitted and for the legacy `ZeroMQ`
-//! listener, which has no way to ask. They are recorded, never used to
+//! request the administration plane submitted. They are recorded, never used to
 //! authorize. [`Ingress`] is the seam itself: the one call a transport adapter
 //! makes to run a request, whatever carried the bytes.
 //!
@@ -71,8 +70,8 @@ impl Origin {
 /// The peer is recorded for a public request only: a request of
 /// [`Origin::Admin`] was submitted in process, and whatever connection the
 /// human's surface arrived on was already admitted by the administration
-/// plane's own check. A public request with no peer came through a listener
-/// that cannot ask the kernel (the legacy `ZeroMQ` socket).
+/// plane's own check. A public request always has a peer; one built without
+/// (a test harness submitting in process) records no uid and no pid.
 #[must_use]
 pub fn recorded(origin: Origin, peer: Option<PublicPeer>) -> RequestOrigin {
     match origin {
@@ -181,7 +180,6 @@ impl Ingress {
         let (reply, answer) = oneshot::channel();
         self.incoming
             .send(IncomingRequest {
-                identity: Vec::new(),
                 origin,
                 peer,
                 envelope,

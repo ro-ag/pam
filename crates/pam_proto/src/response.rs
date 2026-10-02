@@ -1,4 +1,5 @@
-//! Responses returned by the daemon over the `pam.sock` `ROUTER` socket.
+//! Responses the daemon returns, inside a `reply` or `end` frame
+//! ([`crate::wire`]).
 
 use serde::{Deserialize, Serialize};
 

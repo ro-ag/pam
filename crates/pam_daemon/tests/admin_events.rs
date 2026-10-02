@@ -49,13 +49,11 @@ fn assert_gap_free(frames: &[EventFrame]) {
 /// it.
 ///
 /// Control requests (`status`, `query`, `cancel`) never appear: the daemon
-/// core publishes no lifecycle events for them, so there is no probe traffic
-/// to leave out — and none to include. A subscriber that asks for probes
-/// (`include_probes: true`) therefore receives exactly the stream one that
-/// does not ask receives. That the hub's filter itself honours the flag is
-/// proved against the hub in `admin_transport_events_test`.
+/// core publishes no lifecycle events for them, so a subscriber's own polls
+/// cannot come back to it. Two subscribers receive the same stream, frame for
+/// frame.
 #[tokio::test]
-async fn work_arrives_in_order_and_control_requests_never_appear_even_when_probes_are_asked_for() {
+async fn work_arrives_in_order_and_control_requests_never_appear() {
     with_deadline(async {
         // A query is only admitted for a ticket under an approved repository.
         let tmp = short_tempdir();
@@ -66,9 +64,9 @@ async fn work_arrives_in_order_and_control_requests_never_appear_even_when_probe
         let repo = repo.to_string_lossy();
         let daemon = TestDaemon::spawn_at(tmp).await;
         let base = daemon.base_dir();
-        let mut quiet = admin_transport::events(&base, false).await.unwrap();
-        let mut everything = admin_transport::events(&base, true).await.unwrap();
-        assert_eq!(quiet.epoch(), everything.epoch());
+        let mut first = admin_transport::events(&base).await.unwrap();
+        let mut second = admin_transport::events(&base).await.unwrap();
+        assert_eq!(first.epoch(), second.epoch());
 
         // Two work requests with one control request of every kind between
         // them. Each control request is served (the query and the cancel are
@@ -102,8 +100,8 @@ async fn work_arrives_in_order_and_control_requests_never_appear_even_when_probe
             );
         }
 
-        // The default stream: both echoes' lifecycles, in publish order.
-        let seen = through_terminal(&mut quiet, "ev_work").await;
+        // Both echoes' lifecycles, in publish order.
+        let seen = through_terminal(&mut first, "ev_work").await;
         assert_gap_free(&seen);
         let work = of(&seen, "ev_work");
         let kinds: Vec<&Event> = work.iter().map(|frame| &frame.event).collect();
@@ -126,19 +124,18 @@ async fn work_arrives_in_order_and_control_requests_never_appear_even_when_probe
         };
         assert!(position(&seen, "ev_first") < position(&seen, "ev_work"));
 
-        // The stream that asked for probes: frame for frame the same. No
-        // control request has a frame on either, under its own id or as a
-        // capability.
-        let with_probes = through_terminal(&mut everything, "ev_work").await;
-        assert_gap_free(&with_probes);
+        // The second subscriber: frame for frame the same. No control request
+        // has a frame on either, under its own id or as a capability.
+        let again = through_terminal(&mut second, "ev_work").await;
+        assert_gap_free(&again);
         let pairs = |frames: &[EventFrame]| -> Vec<(Option<String>, Event)> {
             frames
                 .iter()
                 .map(|frame| (frame.ticket.clone(), frame.event.clone()))
                 .collect()
         };
-        assert_eq!(pairs(&with_probes), pairs(&seen));
-        for (stream, frames) in [("default", &seen), ("with probes", &with_probes)] {
+        assert_eq!(pairs(&again), pairs(&seen));
+        for (stream, frames) in [("first", &seen), ("second", &again)] {
             for frame in frames {
                 let ticket = frame.ticket.as_deref().expect("a ticket");
                 assert!(
@@ -166,7 +163,7 @@ async fn the_stream_ends_with_daemon_shutting_down_and_reconnects_to_the_next_da
     with_deadline(async {
         let daemon = TestDaemon::spawn().await;
         let base = daemon.base_dir();
-        let mut events = admin_transport::events(&base, false).await.unwrap();
+        let mut events = admin_transport::events(&base).await.unwrap();
         let first_epoch = events.epoch().to_owned();
 
         let tmp = daemon.stop().await;
@@ -181,11 +178,11 @@ async fn the_stream_ends_with_daemon_shutting_down_and_reconnects_to_the_next_da
             "{ended:?}"
         );
         // No daemon: the caller sees a plain connection failure and backs off.
-        let down = admin_transport::events(&base, false).await;
+        let down = admin_transport::events(&base).await;
         assert!(matches!(&down, Err(DialError::Io(_))), "{down:?}");
 
         let restarted = TestDaemon::spawn_at(tmp).await;
-        let mut events = admin_transport::events(&base, false).await.unwrap();
+        let mut events = admin_transport::events(&base).await.unwrap();
         assert_ne!(events.epoch(), first_epoch, "a restarted daemon is a new epoch");
         let mut client = restarted.client().await;
         client
@@ -207,9 +204,9 @@ async fn the_subscriber_cap_holds_on_a_real_daemon_and_requests_are_still_served
         let base = daemon.base_dir();
         let mut held = Vec::new();
         for _ in 0..4 {
-            held.push(admin_transport::events(&base, false).await.unwrap());
+            held.push(admin_transport::events(&base).await.unwrap());
         }
-        let fifth = admin_transport::events(&base, false).await;
+        let fifth = admin_transport::events(&base).await;
         assert!(
             matches!(&fifth, Err(DialError::Refused(error)) if error.cause == CAUSE_SUBSCRIBER_CAPACITY),
             "{fifth:?}"

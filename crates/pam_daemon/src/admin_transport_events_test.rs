@@ -18,8 +18,8 @@ use crate::lifecycle::LifecyclePhase;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-async fn subscribe(plane: &Plane, include_probes: bool) -> AdminEvents {
-    subscribe_on(plane.connect(), &hello(VERSION), include_probes)
+async fn subscribe(plane: &Plane) -> AdminEvents {
+    subscribe_on(plane.connect(), &hello(VERSION))
         .await
         .expect("subscribed")
 }
@@ -87,7 +87,7 @@ fn assert_gap_free(frames: &[EventFrame]) {
 async fn the_stream_carries_rich_events_in_publish_order() {
     bounded(async {
         let plane = Plane::new().await;
-        let mut events = subscribe(&plane, false).await;
+        let mut events = subscribe(&plane).await;
         assert_eq!(events.epoch(), plane.hub.epoch());
         assert_eq!(events.daemon_version(), crate::daemon::DAEMON_VERSION);
 
@@ -146,18 +146,18 @@ async fn the_stream_carries_rich_events_in_publish_order() {
     .await;
 }
 
-/// `status` and `query` traffic is left out at the source unless the
-/// subscriber asked for it, and either view is numbered without gaps.
+/// The hub has no filter: whatever is published reaches every subscriber in
+/// publish order under one gap-free counter, whatever capability the ticket
+/// was registered with. Polls are absent from a real daemon's stream because
+/// the daemon core publishes nothing for them, not because they are hidden
+/// here.
 #[tokio::test]
-async fn probes_are_omitted_by_default_and_included_on_request() {
+async fn every_published_event_reaches_every_subscriber_under_one_counter() {
     bounded(async {
         let plane = Plane::new().await;
-        let mut quiet = subscribe(&plane, false).await;
-        let mut everything = subscribe(&plane, true).await;
+        let mut first = subscribe(&plane).await;
+        let mut second = subscribe(&plane).await;
 
-        plane
-            .hub
-            .register("req_status", meta("status", Ingress::Public));
         plane
             .hub
             .register("req_query", meta("query", Ingress::Public));
@@ -165,9 +165,7 @@ async fn probes_are_omitted_by_default_and_included_on_request() {
             .hub
             .register("req_work", meta("echo", Ingress::Public));
         let published = [
-            ("req_status", Event::Queued),
             ("req_work", Event::Queued),
-            ("req_status", Event::Done),
             ("req_query", Event::Started),
             ("req_query", Event::Done),
             ("req_work", Event::Done),
@@ -175,21 +173,16 @@ async fn probes_are_omitted_by_default_and_included_on_request() {
         for (ticket, event) in &published {
             plane.hub.publish(ticket, event.clone()).unwrap();
         }
-
-        let seen = read_through(&mut quiet, "req_work", &Event::Done).await;
-        assert_eq!(
-            pairs(&seen),
-            [("req_work", &Event::Queued), ("req_work", &Event::Done)]
-        );
-        assert_gap_free(&seen);
-
-        let seen = read_through(&mut everything, "req_work", &Event::Done).await;
         let expected: Vec<(&str, &Event)> = published
             .iter()
             .map(|(ticket, event)| (*ticket, event))
             .collect();
-        assert_eq!(pairs(&seen), expected);
-        assert_gap_free(&seen);
+        for events in [&mut first, &mut second] {
+            let seen = read_through(events, "req_work", &Event::Done).await;
+            assert_eq!(pairs(&seen), expected);
+            assert_gap_free(&seen);
+            assert_eq!(seen.first().and_then(|frame| frame.n), Some(1));
+        }
     })
     .await;
 }
@@ -202,11 +195,11 @@ async fn the_subscriber_cap_is_enforced_and_a_freed_slot_is_reusable() {
         let plane = Plane::new().await;
         let mut held = Vec::new();
         for _ in 0..MAX_SUBSCRIBERS {
-            held.push(subscribe(&plane, false).await);
+            held.push(subscribe(&plane).await);
         }
         assert_eq!(plane.hub.usage().subscribers, MAX_SUBSCRIBERS);
 
-        let outcome = subscribe_on(plane.connect(), &hello(VERSION), false).await;
+        let outcome = subscribe_on(plane.connect(), &hello(VERSION)).await;
         match outcome {
             Err(DialError::Refused(error)) => {
                 assert_eq!(error.cause, CAUSE_SUBSCRIBER_CAPACITY);
@@ -224,7 +217,7 @@ async fn the_subscriber_cap_is_enforced_and_a_freed_slot_is_reusable() {
         // A client that closes ends its stream and frees its slot.
         drop(held.pop());
         eventually(|| plane.hub.usage().subscribers == MAX_SUBSCRIBERS - 1).await;
-        let mut again = subscribe(&plane, false).await;
+        let mut again = subscribe(&plane).await;
         plane.hub.publish("req_y", Event::Started).unwrap();
         assert_eq!(again.next().await.unwrap().ticket.as_deref(), Some("req_y"));
     })
@@ -237,7 +230,7 @@ async fn the_subscriber_cap_is_enforced_and_a_freed_slot_is_reusable() {
 async fn a_slow_subscriber_loses_progress_before_anything_else() {
     bounded(async {
         let plane = Plane::new().await;
-        let mut slow = subscribe(&plane, false).await;
+        let mut slow = subscribe(&plane).await;
         // No await in this loop: the serving task cannot take anything, so
         // the queue overflows three times over.
         for index in 0..3 * SUBSCRIBER_QUEUE {
@@ -273,7 +266,7 @@ async fn a_slow_subscriber_loses_progress_before_anything_else() {
 async fn a_subscriber_whose_queue_overflows_is_closed_with_subscriber_lagged() {
     bounded(async {
         let plane = Plane::new().await;
-        let mut lagging = subscribe(&plane, false).await;
+        let mut lagging = subscribe(&plane).await;
         for index in 0..SUBSCRIBER_QUEUE + 8 {
             plane
                 .hub
@@ -291,7 +284,7 @@ async fn a_subscriber_whose_queue_overflows_is_closed_with_subscriber_lagged() {
         eventually(|| plane.hub.usage().subscribers == 0).await;
 
         // Publishing was never held up, and a new subscription starts clean.
-        let mut fresh = subscribe(&plane, false).await;
+        let mut fresh = subscribe(&plane).await;
         plane.hub.publish("req_after", Event::Started).unwrap();
         let frame = fresh.next().await.unwrap();
         assert_eq!(frame.ticket.as_deref(), Some("req_after"));
@@ -305,7 +298,7 @@ async fn a_subscriber_whose_queue_overflows_is_closed_with_subscriber_lagged() {
 async fn a_subscriber_that_does_not_read_is_dropped_at_the_write_timeout() {
     bounded(async {
         let plane = Plane::new().await;
-        let mut stuck = subscribe(&plane, false).await;
+        let mut stuck = subscribe(&plane).await;
         tokio::time::pause();
         // More bytes than the connection buffers: the serving task ends up
         // waiting on a write the client never reads.
@@ -343,7 +336,7 @@ async fn the_drain_ends_every_stream_with_daemon_shutting_down() {
     bounded(async {
         for ending in ["phase", "restart", "listener", "hub"] {
             let plane = Plane::new().await;
-            let mut events = subscribe(&plane, false).await;
+            let mut events = subscribe(&plane).await;
             plane.hub.publish("req_before", Event::Queued).unwrap();
             assert_eq!(events.next().await.unwrap().event, Event::Queued);
             match ending {
@@ -368,7 +361,7 @@ async fn the_drain_ends_every_stream_with_daemon_shutting_down() {
 
         let plane = Plane::new().await;
         plane.phase.send_replace(LifecyclePhase::Draining);
-        let outcome = subscribe_on(plane.connect(), &hello(VERSION), false).await;
+        let outcome = subscribe_on(plane.connect(), &hello(VERSION)).await;
         assert!(
             matches!(&outcome, Err(DialError::Refused(error)) if error.cause == cause::DAEMON_SHUTTING_DOWN),
             "{outcome:?}"
@@ -386,13 +379,7 @@ async fn the_wire_sequence_is_ack_subscribed_events_and_the_client_stays_silent(
         let plane = Plane::new().await;
         let mut client = plane.connect();
         write(&mut client, &Frame::Hello(hello(VERSION))).await;
-        write(
-            &mut client,
-            &Frame::Events {
-                include_probes: false,
-            },
-        )
-        .await;
+        write(&mut client, &Frame::Events).await;
         assert!(matches!(read(&mut client).await, Frame::HelloAck(_)));
         // The marker is exactly this on the wire, and the shared enum names it.
         let body = framed::read_frame(&mut client, MAX_REQUEST_BYTES)
@@ -425,7 +412,7 @@ async fn the_wire_sequence_is_ack_subscribed_events_and_the_client_stays_silent(
 async fn a_stream_is_refused_to_another_build_and_to_another_peer() {
     bounded(async {
         let plane = Plane::new().await;
-        let outcome = subscribe_on(plane.connect(), &hello("9.9.9"), true).await;
+        let outcome = subscribe_on(plane.connect(), &hello("9.9.9")).await;
         assert!(
             matches!(&outcome, Err(DialError::Refused(error)) if error.cause == cause::CLIENT_VERSION_MISMATCH),
             "{outcome:?}"
@@ -435,7 +422,7 @@ async fn a_stream_is_refused_to_another_build_and_to_another_peer() {
             gid: 20,
             pid: Some(9),
         };
-        let outcome = subscribe_on(plane.connect_as(stranger), &hello(VERSION), true).await;
+        let outcome = subscribe_on(plane.connect_as(stranger), &hello(VERSION)).await;
         assert!(matches!(&outcome, Err(DialError::Io(_))), "{outcome:?}");
         assert_eq!(plane.hub.usage().subscribers, 0);
         assert_eq!(*plane.phase.borrow(), LifecyclePhase::Serving);
@@ -449,7 +436,7 @@ async fn a_stream_is_refused_to_another_build_and_to_another_peer() {
 async fn a_cancelled_next_keeps_the_stream_usable() {
     bounded(async {
         let plane = Plane::new().await;
-        let mut events = subscribe(&plane, false).await;
+        let mut events = subscribe(&plane).await;
         for round in 0..3 {
             let quiet =
                 tokio::time::timeout(std::time::Duration::from_millis(20), events.next()).await;

@@ -183,7 +183,7 @@ impl Connect for AdminConnect {
     async fn connect(&self) -> Result<AdminEvents, DialError> {
         // Never starts the daemon: `daemon_status` does that, and a stream that spawned one would
         // fight a deliberate `Stop daemon`.
-        admin_transport::events(&self.base, false).await
+        admin_transport::events(&self.base).await
     }
 }
 

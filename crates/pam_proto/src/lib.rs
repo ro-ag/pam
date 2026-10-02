@@ -2,8 +2,9 @@
 //!
 //! The protocol is internal: agents only ever see `pam` subcommands, so
 //! these types may evolve freely as long as client and daemon ship in the
-//! same binary. The envelope still carries a version field to detect a
-//! daemon that predates the installed binary.
+//! same binary. Envelopes, responses and events travel inside the frames of
+//! [`wire`]; a connection's `hello` is what tells a daemon and a client of
+//! different builds apart, not anything in the envelope.
 
 mod envelope;
 mod event;
@@ -14,8 +15,9 @@ pub use envelope::{Caller, Envelope};
 pub use event::Event;
 pub use response::{Outcome, Response};
 
-/// Protocol version stamped on every request envelope.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Protocol version stamped on every request envelope: the wire protocol
+/// number ([`wire::WIRE_PROTOCOL`]). It is recorded, not judged; the hello is.
+pub const PROTOCOL_VERSION: u32 = wire::WIRE_PROTOCOL;
 
 #[cfg(test)]
 mod envelope_test;

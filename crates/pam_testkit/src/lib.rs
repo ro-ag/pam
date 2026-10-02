@@ -197,22 +197,19 @@ pub fn seed_flow(tmp: &tempfile::TempDir, id: &str, yaml: &str) -> PathBuf {
     path
 }
 
-/// Guards the 104-byte unix socket path limit before the daemon tries
-/// to bind — a failure here means the temp root is too deep, not a
-/// daemon bug.
+/// Guards the unix socket path limit before the daemon tries to bind — a
+/// failure here means the temp root is too deep, not a daemon bug.
 fn assert_socket_paths_fit(base: &std::path::Path) {
-    // `pam.next.sock` is the framed public listener's transitional path, the
-    // longest of the three: the daemon refuses to start when it does not fit.
-    for socket in ["pam.sock", "events.sock", "pam.next.sock"] {
-        let path = base.join("run").join(socket);
-        let len = path.as_os_str().len();
-        assert!(
-            len <= MAX_SOCKET_PATH_BYTES,
-            "socket path {} is {len} bytes, over the {MAX_SOCKET_PATH_BYTES}-byte \
-             unix limit; use short_tempdir()",
-            path.display()
-        );
-    }
+    // The public socket is the one path the daemon binds under the run
+    // directory; it must be shorter than the limit (the terminator counts).
+    let path = base.join("run").join("pam.sock");
+    let len = path.as_os_str().len();
+    assert!(
+        len < MAX_SOCKET_PATH_BYTES,
+        "socket path {} is {len} bytes; a unix socket path must be shorter than \
+         {MAX_SOCKET_PATH_BYTES} bytes; use short_tempdir()",
+        path.display()
+    );
 }
 
 /// A deterministic request envelope: fixed caller identity (no
@@ -383,7 +380,7 @@ impl TestDaemon {
     /// When the daemon refuses the subscription.
     pub async fn subscribe(&self, topics: &[&str]) -> EventStream {
         let source = if pam_daemon::admin_transport::supported() {
-            let events = with_deadline(pam_daemon::admin_transport::events(&self.base_dir(), true))
+            let events = with_deadline(pam_daemon::admin_transport::events(&self.base_dir()))
                 .await
                 .unwrap_or_else(|error| panic!("the all-events stream opens: {error}"));
             Source::Admin(Box::new(events))
@@ -391,7 +388,7 @@ impl TestDaemon {
             Source::Hub(
                 self.handle
                     .event_hub()
-                    .subscribe_all(true)
+                    .subscribe_all()
                     .expect("an in-process subscriber attaches"),
             )
         };

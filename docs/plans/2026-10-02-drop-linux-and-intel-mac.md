@@ -56,7 +56,7 @@ Read-only inventory; line numbers are from the working tree on `feat/framed-publ
 | 1.3 | `Cargo.toml:76` `tauri = { version = "2", default-features = false, features = ["wry", "x11"] }` and its comment ("`x11` keeps Linux building") | Change to `features = ["wry"]`; delete the `x11` clause from the comment. `x11` is inert on macOS/Windows. Verify with `cargo tree -p pam_gui -e features` after the edit. |
 | 1.4 | `crates/pam/Cargo.toml`, `crates/pam_gui/Cargo.toml` | No Linux items (`tauri.workspace = true`). No change. |
 | 1.5 | `crates/pam_daemon/Cargo.toml` `[target.'cfg(target_os = "macos")']` (apple keyring), `[target.'cfg(target_os = "windows")']` (windows keyring), `[target.'cfg(windows)'] getrandom` | Untouched. |
-| 1.6 | `vendor/{zeromq,turso_core,aegis}` | Upstream code with their own Linux cfgs; leave. |
+| 1.6 | `vendor/{turso_core,aegis}` (`vendor/zeromq` was removed with the framed public transport) | Upstream code with their own Linux cfgs; leave. |
 | 1.7 | `.cargo/config.toml:3-12` `[target.aarch64-unknown-linux-gnu] rustflags = ["-C","target-feature=+fp16"]` plus the comment paragraph | Delete the Linux table; reword the comment to name only `aarch64-pc-windows-msvc`. (The whole fp16 rationale cites candle, removed 2026-09-13; separate cleanup, not Linux-driven.) Line 17-18 comment "macOS and Linux give it 8 MiB" -> "macOS gives". |
 | 1.8 | `frontend/package-lock.json` (144 lines mention linux; 36 `"os": ["linux"]` optional entries for esbuild/rollup/lightningcss/@tauri-apps/cli etc.) | Leave untouched. npm lists every platform's optional binary by design; regenerating would not drop them. |
 | 1.9 | `.github/dependabot.yml` | github-actions only; no change. |
@@ -188,7 +188,7 @@ ETXTBSY risk note (flag, not blocking): the race (a forked-but-not-yet-exec'd ch
 
 | Job | Runner | What it does | Class |
 | --- | --- | --- | --- |
-| `gate` (22-60) | `ubuntu-24.04` | apt Tauri deps, rust+cache, node, `tools/check.sh` (fmt, clippy, doc, vendor zeromq tests, `cargo test --workspace`, eslint, tsc+vite, vitest); emits the desktop-package matrix | the cheap gate |
+| `gate` (22-60) | `ubuntu-24.04` | apt Tauri deps, rust+cache, node, `tools/check.sh` (fmt, clippy, doc, `cargo test --workspace`, eslint, tsc+vite, vitest); emits the desktop-package matrix | the cheap gate |
 | `targets` (62-91) | matrix `ubuntu-24.04-arm, macos-15, windows-2025, windows-11-arm` | apt deps (Linux rows), `cargo test --workspace` with `PAM_ENGINE_LIVE=1`; macOS row also builds `--features gui-embed` | per-target tests |
 | `desktop-packages` (92-242) | matrix from `gate` output: PR = `linux_amd64` only; non-PR = linux amd64, linux arm64, windows amd64, windows arm64 | `tauri build`, then "Verify Linux package contract" (121-172) or "Verify Windows package contract" (173-221), tars Linux bundles (230-235), uploads `pam-linux-*`/`pam-windows-*` | Linux product jobs (2 of 4 rows) + Windows |
 | `macos-package` (243-298) | `macos-15` | unsigned dmg preview, non-PR only | macOS product |

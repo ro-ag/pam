@@ -215,7 +215,7 @@ struct Watched {
 }
 
 /// Runs a slow echo over the framed public socket with an administration
-/// subscriber (asking for probes too) opened before it and a public follower
+/// subscriber opened before it and a public follower
 /// attached to it, publishes progress the way a flow step does with a
 /// `status` poll in between, and reads both streams to the end.
 async fn watch_one_request(fixture: &Fixture, watcher: &mut AdminEvents) -> Watched {
@@ -348,7 +348,7 @@ fn assert_watched_whole(watched: &Watched, repo: &str) {
         "n has a gap: {numbers:?}"
     );
     // Only the work ticket ever published: neither the status poll nor the
-    // follower's query has a lifecycle, with probes asked for or not.
+    // follower's query has a lifecycle.
     for frame in seen {
         assert_eq!(frame.ticket.as_deref(), Some(ticket.as_str()), "{seen:?}");
         assert_eq!(frame.capability.as_deref(), Some("echo"), "{frame:?}");
@@ -379,8 +379,7 @@ fn assert_watched_whole(watched: &Watched, repo: &str) {
 /// administration subscriber sees the same lifecycle whole: the real progress
 /// note and what admission knew, `ingress: "public"`. The rows record the
 /// plane and the kernel's peer. A `status` poll made in between, and the
-/// follower's own authorising `query`, appear in neither stream — also for a
-/// subscriber that asked for probes.
+/// follower's own authorising `query`, appear in neither stream.
 #[tokio::test]
 async fn a_public_request_is_followed_content_free_and_watched_whole_on_the_admin_plane() {
     with_deadline(async {
@@ -388,9 +387,9 @@ async fn a_public_request_is_followed_content_free_and_watched_whole_on_the_admi
         let base = fixture.daemon.base_dir();
         let store = fixture.daemon.store();
 
-        // The administration subscriber first, asking for probes too: from
-        // `subscribed` on, nothing published is missed.
-        let mut subscriber = admin_transport::events(&base, true)
+        // The administration subscriber first: from `subscribed` on, nothing
+        // published is missed.
+        let mut subscriber = admin_transport::events(&base)
             .await
             .expect("the all-events stream opens");
         let watched = watch_one_request(&fixture, &mut subscriber).await;
@@ -478,7 +477,7 @@ async fn one_drain_answers_both_planes_before_either_endpoint_goes_away() {
         let store = fixture.daemon.store();
         let mut phase = fixture.daemon.handle().lifecycle();
 
-        let mut watcher = admin_transport::events(&base, false)
+        let mut watcher = admin_transport::events(&base)
             .await
             .expect("the all-events stream opens");
 
@@ -550,7 +549,7 @@ async fn one_drain_answers_both_planes_before_either_endpoint_goes_away() {
             .await
             .expect("a reply frame");
         assert_eq!(refusal_cause(&refused), cause::DAEMON_SHUTTING_DOWN);
-        let again = admin_transport::events(&base, false).await;
+        let again = admin_transport::events(&base).await;
         assert!(
             matches!(&again, Err(DialError::Refused(error)) if error.cause == cause::DAEMON_SHUTTING_DOWN),
             "{again:?}"
@@ -581,7 +580,7 @@ async fn one_drain_answers_both_planes_before_either_endpoint_goes_away() {
             assert!(!admin_endpoint.exists(), "the admin socket was unlinked");
         }
         assert!(framed::connect_public(&dirs).await.is_err());
-        let down = admin_transport::events(&base, false).await;
+        let down = admin_transport::events(&base).await;
         assert!(matches!(&down, Err(DialError::Io(_))), "{down:?}");
     })
     .await;

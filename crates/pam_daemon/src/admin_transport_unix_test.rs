@@ -142,7 +142,7 @@ async fn the_private_socket_serves_requests_and_events_and_is_unlinked_at_shutdo
             "{response:?}"
         );
 
-        let mut events = super::events(&base, false).await.unwrap();
+        let mut events = super::events(&base).await.unwrap();
         assert_eq!(events.epoch(), hub.epoch());
         hub.publish("req_ticket", Event::Started).unwrap();
         let frame = events.next().await.unwrap();
@@ -160,7 +160,7 @@ async fn the_private_socket_serves_requests_and_events_and_is_unlinked_at_shutdo
         assert!(!socket.exists(), "the socket file is unlinked at shutdown");
         let gone = super::exchange(&base, &profile_get("req_gone")).await;
         assert_eq!(gone.unwrap_err().kind(), io::ErrorKind::NotFound);
-        let gone = super::events(&base, false).await;
+        let gone = super::events(&base).await;
         assert!(
             matches!(&gone, Err(DialError::Io(error)) if error.kind() == io::ErrorKind::NotFound),
             "{gone:?}"
@@ -185,7 +185,7 @@ async fn an_endpoint_that_is_not_owner_only_is_refused_by_client_and_daemon() {
 
         let refused = super::exchange(&base, &profile_get("req_loose_socket")).await;
         assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        let refused = super::events(&base, false).await;
+        let refused = super::events(&base).await;
         assert!(
             matches!(&refused, Err(DialError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied),
             "{refused:?}"

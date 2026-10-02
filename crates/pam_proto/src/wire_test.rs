@@ -122,9 +122,7 @@ fn every_frame_type_round_trips_under_its_documented_name() {
             event: Some(Event::Done),
             response: result("req_2"),
         }),
-        Frame::Events {
-            include_probes: true,
-        },
+        Frame::Events,
         Frame::Subscribed,
         Frame::error(cause::BAD_FRAME, "not JSON", "Upgrade pam."),
     ];
@@ -226,12 +224,14 @@ fn a_refused_follow_ends_without_a_sequence_number_or_event() {
 }
 
 #[test]
-fn events_leaves_probes_out_unless_asked() {
+fn events_is_a_bare_marker_and_ignores_unknown_members() {
+    assert_eq!(Frame::Events.encode().unwrap(), br#"{"t":"events"}"#);
+    assert_eq!(Frame::decode(br#"{"t":"events"}"#).unwrap(), Frame::Events);
+    // An earlier build of this protocol sent a selector with it; the frame
+    // still reads, and selects nothing.
     assert_eq!(
-        Frame::decode(br#"{"t":"events"}"#).unwrap(),
-        Frame::Events {
-            include_probes: false
-        }
+        Frame::decode(br#"{"t":"events","include_probes":true}"#).unwrap(),
+        Frame::Events
     );
 }
 

@@ -10,14 +10,14 @@ use crate::runtime_dir::{
 
 #[test]
 fn too_long_socket_path_is_a_legible_error() {
-    // Long enough that `<base>/run/events.sock` blows past 104 bytes.
+    // Long enough that `<base>/run/pam.sock` blows past 104 bytes.
     let base = PathBuf::from(format!("/tmp/{}", "x".repeat(MAX_SOCKET_PATH_BYTES)));
     let err = RuntimeDir::at_base(&base).expect_err("path must be rejected");
     let RuntimeDirError::SocketPathTooLong { ref path, len } = err else {
         panic!("expected SocketPathTooLong, got {err:?}");
     };
     assert!(len > MAX_SOCKET_PATH_BYTES);
-    assert!(path.ends_with("pam.sock") || path.ends_with("events.sock"));
+    assert!(path.ends_with("pam.sock"));
     let message = err.to_string();
     assert!(
         message.contains("104"),
@@ -36,10 +36,8 @@ fn ok_path_passes_and_creates_run_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dirs = RuntimeDir::at_base(tmp.path()).expect("short path must pass");
     assert!(dirs.run_dir().is_dir());
-    assert_eq!(dirs.router_socket(), dirs.run_dir().join("pam.sock"));
-    assert_eq!(dirs.events_socket(), dirs.run_dir().join("events.sock"));
-    assert!(dirs.router_endpoint().starts_with("ipc://"));
-    assert!(dirs.events_endpoint().ends_with("events.sock"));
+    assert_eq!(dirs.public_socket(), dirs.run_dir().join("pam.sock"));
+    assert_eq!(dirs.public_control(), dirs.run_dir().join("public.json"));
 }
 
 #[cfg(unix)]
@@ -212,8 +210,8 @@ fn client_path_resolution_does_not_create_runtime_state() {
     let dirs = RuntimeDir::paths_at_base(tmp.path()).expect("paths resolve");
     assert!(!dirs.run_dir().exists());
     let prepared = RuntimeDir::at_base(tmp.path()).expect("daemon prepares paths");
-    assert_eq!(dirs.router_socket(), prepared.router_socket());
-    assert_eq!(dirs.events_socket(), prepared.events_socket());
+    assert_eq!(dirs.public_socket(), prepared.public_socket());
+    assert_eq!(dirs.public_control(), prepared.public_control());
     let excessive = PathBuf::from(format!("/tmp/{}", "x".repeat(MAX_SOCKET_PATH_BYTES)));
     assert!(matches!(
         RuntimeDir::paths_at_base(&excessive),
@@ -242,8 +240,8 @@ fn a_flat_socket_directory_resolves_the_relay_layout() {
     // No filesystem access: `paths_at_dir` only resolves and validates.
     let dir = PathBuf::from("/tmp/pam-relay-fixture");
     let dirs = RuntimeDir::paths_at_dir(&dir).expect("flat layout resolves");
-    assert_eq!(dirs.router_socket(), dir.join("pam.sock"));
-    assert_eq!(dirs.events_socket(), dir.join("events.sock"));
+    assert_eq!(dirs.public_socket(), dir.join("pam.sock"));
+    assert_eq!(dirs.public_control(), dir.join("public.json"));
     assert_eq!(dirs.run_dir(), dir, "the run dir is the socket dir itself");
 
     let base = PathBuf::from(format!("/tmp/{}", "y".repeat(MAX_SOCKET_PATH_BYTES)));
@@ -254,38 +252,32 @@ fn a_flat_socket_directory_resolves_the_relay_layout() {
     );
 }
 
+/// The length rule is the listener's own: `sun_path` holds the path and its
+/// terminator, so a path of exactly the limit is refused at boot instead of
+/// passing here and failing at bind. `pam.sock` is the only socket name, so
+/// a base that fitted the longer names an older daemon also bound still fits.
 #[test]
-fn the_framed_public_endpoints_sit_beside_the_legacy_sockets() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let dirs = RuntimeDir::at_base(tmp.path()).expect("runtime dir");
-    // Transitional: the framed socket is served next to the ZeroMQ one, so
-    // it cannot share its name until the cut-over.
-    assert_eq!(dirs.public_socket(), dirs.run_dir().join("pam.next.sock"));
-    assert_ne!(dirs.public_socket(), dirs.router_socket());
-    assert_eq!(dirs.public_control(), dirs.run_dir().join("public.json"));
-    let resolved = RuntimeDir::paths_at_base(tmp.path()).expect("paths resolve");
-    assert_eq!(resolved.public_socket(), dirs.public_socket());
-    assert_eq!(resolved.public_control(), dirs.public_control());
-
-    let dir = PathBuf::from("/tmp/pam-relay-fixture");
-    let flat = RuntimeDir::paths_at_dir(&dir).expect("flat layout resolves");
-    assert_eq!(flat.public_socket(), dir.join("pam.next.sock"));
-    assert_eq!(flat.public_control(), dir.join("public.json"));
-}
-
-#[test]
-fn the_transitional_public_socket_does_not_tighten_the_boot_length_check() {
-    // A base whose `events.sock` path is exactly at the limit worked before
-    // the framed socket existed and still resolves.
-    let fixed = "/tmp//run/events.sock".len();
-    let base = PathBuf::from(format!(
+fn the_public_socket_path_must_leave_room_for_its_terminator() {
+    let fixed = "/tmp//run/pam.sock".len();
+    let at_limit = PathBuf::from(format!(
         "/tmp/{}",
         "z".repeat(MAX_SOCKET_PATH_BYTES - fixed)
     ));
-    let dirs = RuntimeDir::paths_at_base(&base).expect("a base at the limit resolves");
+    let err = RuntimeDir::paths_at_base(&at_limit).expect_err("the limit itself is too long");
+    let RuntimeDirError::SocketPathTooLong { len, .. } = err else {
+        panic!("expected SocketPathTooLong, got {err:?}");
+    };
+    assert_eq!(len, MAX_SOCKET_PATH_BYTES);
+
+    let below = PathBuf::from(format!(
+        "/tmp/{}",
+        "z".repeat(MAX_SOCKET_PATH_BYTES - fixed - 1)
+    ));
+    let dirs = RuntimeDir::paths_at_base(&below).expect("one byte shorter resolves");
     assert_eq!(
-        dirs.events_socket().as_os_str().len(),
-        MAX_SOCKET_PATH_BYTES
+        dirs.public_socket().as_os_str().len(),
+        MAX_SOCKET_PATH_BYTES - 1
     );
-    assert!(dirs.public_socket().as_os_str().len() > MAX_SOCKET_PATH_BYTES);
+    // What an older daemon needed in the same directory would not have fitted.
+    assert!(below.join("run").join("events.sock").as_os_str().len() > MAX_SOCKET_PATH_BYTES);
 }

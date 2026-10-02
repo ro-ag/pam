@@ -1,11 +1,17 @@
 # Public transport without ZeroMQ — design and implementation plan
 
-Status: approved for implementation 2026-10-02 (ptrack plan 49). Implements
+Status: implemented 2026-10-02 on branch `feat/framed-public-transport` (ptrack
+plan 49), tasks T1 to T8; what was and was not verified is recorded under
+[Verification record](#verification-record). T9, the upgrade rehearsal with real
+0.4.3 binaries, is still open. Approved for implementation 2026-10-02; implements
 the owner decision recorded on plan 49 (closes issue 39). Sequenced after plan
-48, the design-review fix round. Implementation branch:
-`feat/framed-public-transport`, stacked on the design-review fix branch
-(`fix/design-review-2026-10`) until that lands, then rebased onto `main`.
+48, the design-review fix round.
 Review record: [design review, 2026-10-02](../reviews/design-review-2026-10-02.md).
+
+The sections "Current state" and "Consumer inventory" describe the tree
+**before** this plan and are kept as the record of what was replaced; every
+other section describes what is now in the tree, except where the verification
+record says otherwise.
 
 Line references are to `HEAD` (c8b939d, v0.4.3). `crates/pam_client`,
 `crates/pam_gui`, `crates/pam_store`, `crates/pam/src/main.rs` and
@@ -484,10 +490,10 @@ protocol error; end of file from the client ends the follow.
 Admin connections only (see "Events"):
 
 ```json
-{"t":"events","include_probes":false}
+{"t":"events"}
 ```
 
-answered first by `{"t":"subscribed"}`, written once the subscription is
+a bare marker, answered first by `{"t":"subscribed"}`, written once the subscription is
 registered in the hub: every event published from then on is delivered or
 shows as a gap in `n`, and nothing published before it is replayed. Then a
 stream of
@@ -585,9 +591,12 @@ New, introduced by the follow stream:
   chmods the run directory.
 - `PAM_SOCKET_DIR` keeps meaning "dial `<dir>/pam.sock`" (`paths_at_dir`).
 
-`RuntimeDir` loses `events`, `events_socket()`, `router_endpoint()` and
-`events_endpoint()`. `router_socket()` is superseded by `public_socket()`
-(see the implementation plan for the transitional value).
+`RuntimeDir` lost `events`, `events_socket()`, `router_endpoint()`,
+`events_endpoint()` and `router_socket()`; `public_socket()` is `<run>/pam.sock`
+and is the one path validated against the socket length limit (it must be
+shorter than 104 bytes, the bound the listener applies at bind). The daemon
+also removes a stale `pam.next.sock`, the name the framed socket had while it
+was served beside the old one during the implementation.
 
 ## Windows adapter
 
@@ -723,9 +732,10 @@ events and should refresh its lists from `admin.activity.list`.
 
 Control requests (`status`, `query`, `cancel`) publish no lifecycle events at
 all, so the stream never carries them and the GUI's own polls cannot come back
-as events. `include_probes` is accepted and the hub's filter honours it, but
-there is no probe traffic for it to select: both settings deliver the same
-stream.
+as events. The request therefore has no selector: an `include_probes` member
+existed while the plan was implemented, selected nothing, and was removed at
+the cut-over (unknown members are ignored on the wire, so a frame that still
+carries it reads as the bare marker).
 
 At most four subscribers. A subscriber whose 1,024-event queue overflows
 loses the oldest progress events first and, if that is not enough, is closed
@@ -896,10 +906,12 @@ sandbox and its clients cannot.
 
 Both sides speak this protocol. A hello with a different version leads to
 `daemon_outdated` (image replaced; wait and retry once) or
-`client_version_mismatch` (image unchanged; the message names the running
-daemon's version and path and says to run `pam daemon stop` outside the
-sandbox, or to use the matching binary). The client does not stop the daemon
-in this case; see Decisions, 1.
+`client_version_mismatch` (image unchanged; the detail names the running
+daemon's version and path, and the recovery says to use the pam binary the
+daemon was started from, or to stop the daemon from the PAM GUI and start it
+with the intended build). It reaches a caller as a refusal, so the CLI exits 3
+and prints one sentence built from that detail. The client does not stop the
+daemon in this case; see Decisions, 1.
 
 ## Relay
 
@@ -929,7 +941,18 @@ to a `pam listen` process for anyone investigating. A direct client that
 claims it gains nothing.
 
 At start the relay probes the daemon (see "Old daemon, new client") and
-prints one forwarding line instead of two.
+prints one forwarding line instead of two. A daemon it meets in the old
+protocol and cannot replace ends the start: the relay removes the socket it
+bound and exits with the instruction rather than forward to a daemon its
+clients cannot talk to.
+
+Preparing the session directory refuses, rather than repairs, what a
+neighbour could use to point the relay elsewhere: a `<dir>` or socket entry
+that is a symbolic link, a `<dir>` not owned by the user or writable by group
+or others, and a socket entry that is not a socket. A missing `<dir>` is
+created `0700`, an owned one tightened to it. The check-then-bind window
+against another process of the same user is narrowed (the directory's identity
+is compared before and after the bind) and not closed.
 
 docs/session-socket-relay.md is updated: one socket; sandbox policies need
 only `<dir>/pam.sock`.
@@ -1130,7 +1153,7 @@ files; every await in a test is bounded.
 | tests/transport_stress.rs: GUI polling and abandoned subscribers | same scenario with abandoned followers (connected, never reading) and status polling; control requests keep being answered; follower count and file descriptors stay bounded |
 | tests/session_relay.rs | request and follow through the relay; the session directory holds only `pam.sock` |
 | pam_testkit `TestClient` (one DEALER, pipelined) | per-request connections; `send` starts a reader task, `recv` returns the next completed reply; API unchanged, so spine, admin, flows and the other suites do not change |
-| pam_testkit `EventStream` (SUB, `SUB_SETTLE` sleep) | the admin all-events stream filtered to the requested ids (control requests have no events on it, with or without `include_probes`), in the hub's publish order; subscribing before the ids exist keeps working; no settle sleep. Where no admin adapter exists the harness reads the hub in process |
+| pam_testkit `EventStream` (SUB, `SUB_SETTLE` sleep) | the admin all-events stream filtered to the requested ids (control requests have no events on it), in the hub's publish order; subscribing before the ids exist keeps working; no settle sleep. Where no admin adapter exists the harness reads the hub in process |
 | client_test.rs fake ROUTER daemon (268-326) | a fake framed daemon (unix listener, lock, scripted frames) and a fake ZMTP daemon (writes the 64-byte greeting) |
 | client_test.rs: refused follow queries once, never subscribes | one connection, one `end` refusal, no retry |
 | client_test.rs: no reply within deadline plus margin; two outdated refusals stop after one retry | same over frames |
@@ -1226,7 +1249,30 @@ Done last, when nothing in the workspace imports the crate:
 
 Acceptance for the removal: `grep -ri "zeromq\|zmq\|zmtp"` over the tree
 finds only CHANGELOG history, this specification, the legacy-greeting
-detection (constants and tests) and the upgrade notes.
+detection (constants and tests) and the upgrade notes. As carried out, with
+the differences from the nine steps above:
+
+- Step 1: `Transport::bind` is the one entry point (the former `bind_with`);
+  the ZeroMQ-only `bind`, `TransportError::Bind` and `RemoveStale`,
+  `bounded_response` and `salvage_request_id` are gone (the framed listener
+  has its own in `public_transport.rs` and `pam_proto::wire`).
+  `IncomingRequest::identity` is gone. The event hub's legacy sink is gone;
+  `EventPublisher::for_tests()` keeps its API over a `cfg(test)` tap.
+- The pipeline's envelope-version check, which the fix round had kept for the
+  listener without a hello, is deleted with that listener: the version is
+  judged on the hello only, on both planes.
+- Step 2 as written. A leftover `events.sock` or `pam.next.sock` is removed at
+  bind and logged, not fatal, when it cannot be; on Windows a leftover
+  `pam.sock` is removed too (a client reads one beside a held lock as a
+  pre-migration daemon).
+- Step 5: `zeromq`, `win_uds`, `asynchronous-codec`, `crossbeam-queue`,
+  `futures`, `scc`, `sdd` and `saa` left `Cargo.lock`.
+- Step 6: the flow's `transport-tests` step is deleted and `tests` now needs
+  `clippy`.
+- Step 8: `PROTOCOL_VERSION` is `wire::WIRE_PROTOCOL` (2).
+- Step 9: `docs/vision.md`, the dated specifications and reviews, and the
+  memento rule text in AGENTS.md / CLAUDE.md / MEMENTO.md (it describes a past
+  symptom) are left as history; the ptrack goal text is the coordinator's.
 
 ## Implementation plan
 
@@ -1236,17 +1282,17 @@ PR, squash-merged, CI green first; commits name their ptrack task (`#<id>`). No
 release is cut from an intermediate state.
 
 To let tasks land independently and keep every commit green, the new public
-listener is introduced next to the ZeroMQ one and the path is swapped at the
+listener was introduced next to the ZeroMQ one and the path was swapped at the
 end:
 
-- During the work, `RuntimeDir::public_socket()` returns
-  `<run>/pam.next.sock` and the daemon serves both transports into the same
-  `IncomingRequest` channel and the same hub (the hub feeds the legacy `PUB`
-  loop as one more sink). Windows uses `public.json` from the start; there is
+- During the work, `RuntimeDir::public_socket()` returned
+  `<run>/pam.next.sock` and the daemon served both transports into the same
+  `IncomingRequest` channel and the same hub (the hub fed the legacy `PUB`
+  loop as one more sink). Windows used `public.json` from the start; there was
   no path conflict there.
-- The last task makes `public_socket()` return `<run>/pam.sock` and deletes
-  the old transport. In-band legacy detection goes live against real old
-  daemons at that moment.
+- The last task (T8) made `public_socket()` return `<run>/pam.sock` and
+  deleted the old transport. In-band legacy detection has been live against
+  real old daemons since then; no release was cut from the transitional state.
 
 Tasks within a phase own disjoint files and can run in parallel. A file not
 listed for a task is not touched by it. For each task: `cargo clippy -p
@@ -1439,9 +1485,8 @@ Risks:
   be reused; it must not grow into an authorisation input.
 - On Windows the public plane has no kernel peer identity and no automatic
   takeover. Windows is CI-only today.
-- The transitional socket path must not ship. The implementation plan forbids
-  a release before T8; if one is forced, sandbox profiles would need the
-  transitional path.
+- The transitional socket path did not ship: T8 removed it before any release,
+  and the daemon clears a leftover `pam.next.sock` at bind.
 - Plan #48's task #200 touches the same handler, restart and cancel code. T2
   starts from its result and drops whatever it already covers.
 - Sandbox profiles in the field that still allow `events.sock` are harmless;
@@ -1469,3 +1514,57 @@ recorded in the next section.
    separately, so it is not part of this plan's work (see Already landed).
 4. **On Windows a pre-migration daemon is stopped manually.** Windows is CI-only
    today, so no forced `taskkill` takeover is added.
+
+## Verification record
+
+What was run on the final tree of T8 (2026-10-02, macOS arm64), and what was
+not.
+
+Verified:
+
+- `tools/check.sh`, the whole local gate: fmt, clippy `-D warnings` on every
+  target, rustdoc `-D warnings`, `cargo test --workspace`, frontend lint, build
+  and 723 vitest tests.
+- The removal: `grep -ri zeromq` over Rust, manifest, lock, YAML, shell and
+  frontend sources finds nothing; `cargo tree -i zeromq` and `-i win_uds` match
+  no package; `vendor/zeromq` is gone.
+- The framed listener on the real path, against a real daemon:
+  `tests/public_transport.rs` (round trip and recorded peer, malformed requests,
+  a ZMTP greeting closed unanswered with the daemon still serving, the drain
+  flush, and stale `pam.sock` / `events.sock` / `pam.next.sock` replaced or
+  removed at bind), `tests/public_follow.rs`, `tests/transport_planes.rs`,
+  `tests/admin_events.rs`, `tests/session_relay.rs`.
+- The upgrade path with the compiled CLI (`crates/pam/tests/legacy_takeover.rs`):
+  a separate process that holds the instance lock with its pid, listens on
+  `<base>/run/pam.sock` and greets in ZMTP is recognised, stopped by `SIGTERM`
+  through the pid in the lock, and replaced by a lazily started daemon of this
+  build that answers the command; behind `PAM_SOCKET_DIR` nothing is signalled
+  and the relay wording is printed; with no pid in the lock, and (macOS) with
+  signals denied by a sandbox, the instruction is printed, the exit is 1 and
+  the old process keeps running.
+- `cargo test -p pam --test sandbox_macos`: the profile allows only
+  `pam.sock`; a sandboxed client facing a ZMTP daemon fails with the
+  instruction and the daemon's process is still alive.
+- The cross-process churn (`tests/transport_stress.rs`, opt-in, 120 seconds
+  against the compiled daemon): about 4,300 exchanges with abandoned requests,
+  followers and subscribers; descriptors back to baseline; a graceful drain.
+
+Not verified:
+
+- Nothing was compiled or run on Windows. The public adapter there (control
+  file, nonce proof), the removal of a leftover `pam.sock` at bind, the
+  pre-migration heuristic in the client, and every test that is not
+  `cfg(unix)` wait for the Windows VM and the CI Windows job.
+- No real 0.4.3 daemon was met. The pre-migration daemon in the tests greets
+  with the 64 bytes a ZMTP peer sends and speaks nothing else, and it dies on
+  `SIGTERM` instead of draining for up to ten seconds; the "still draining"
+  outcome is covered against fakes in `pam_client` only. T9 rehearses the
+  upgrade with real binaries, loose and under the LaunchAgent, and records what
+  the service manager does.
+- An old `pam` binary against the new daemon was not run; the daemon's side of
+  it (a ZMTP greeting is closed and logged at most once a minute) is tested
+  with the greeting bytes.
+- A follow from the compiled CLI through a real `pam listen` (the relay test
+  dials through `pam_client` in process).
+- The same-user directory-swap race of the relay has no test; it cannot be
+  provoked deterministically.

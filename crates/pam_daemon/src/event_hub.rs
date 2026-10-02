@@ -3,19 +3,19 @@
 //! Every lifecycle event a daemon service publishes lands here, under one
 //! `std::sync::Mutex` that is never held across an await: [`EventPublisher::publish`]
 //! appends and returns, and nothing in it waits on a peer. The hub then fans the
-//! event out three ways:
+//! event out two ways:
 //!
 //! - **Followers** of that one ticket ([`EventHub::attach`]): each has its own
 //!   bounded queue ([`FOLLOWER_QUEUE`]) and a wake-up, and receives the
-//!   *sanitised* event — progress prose replaced by [`PUBLIC_PROGRESS_NOTE`],
-//!   exactly what the public broadcast carried. Task, product, repository and
-//!   evidence details stay behind scoped result reads.
+//!   *sanitised* event — progress prose replaced by [`PUBLIC_PROGRESS_NOTE`].
+//!   Task, product, repository and evidence details stay behind scoped result
+//!   reads.
 //! - **All-events subscribers** ([`EventHub::subscribe_all`]), for the private
 //!   administration plane only: the unsanitised event plus the ticket's
 //!   admission metadata ([`TicketMeta`]) and a daemon-wide counter.
-//! - **The legacy sink**: the `ZeroMQ` `PUB` loop in [`crate::transport`], fed
-//!   the sanitised `(ticket, event)` pairs it always carried, until that
-//!   transport is removed.
+//!
+//! There is no broadcast: a public client sees the events of a ticket it was
+//! authorised to follow and nothing else.
 //!
 //! Per live ticket the hub keeps a sequence counter (starting at 1), a replay
 //! ring of the last [`REPLAY_RING`] sanitised events, the optional metadata and
@@ -41,9 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use pam_proto::Event;
 use pam_proto::wire::{EventFrame, Frame, Ingress};
 use thiserror::Error;
-use tokio::sync::{Notify, mpsc};
-
-use crate::policy::{CAP_QUERY, CAP_STATUS};
+use tokio::sync::Notify;
 
 /// Public progress carries no task-specific prose; details require scoped reads.
 pub const PUBLIC_PROGRESS_NOTE: &str = "Task progress updated";
@@ -69,10 +67,11 @@ pub const MAX_SUBSCRIBERS: usize = 4;
 /// Events one all-events subscriber may have queued before it lags.
 pub const SUBSCRIBER_QUEUE: usize = 1024;
 
-/// Capacity of the channel feeding the legacy `PUB` loop.
-pub(crate) const LEGACY_SINK_CAPACITY: usize = 256;
+/// Capacity of the channel [`EventPublisher::for_tests`] taps the hub with.
+#[cfg(test)]
+pub(crate) const TEST_TAP_CAPACITY: usize = 256;
 
-/// The transport was shut down; the event was dropped.
+/// The event hub was closed by shutdown; the event was dropped.
 #[derive(Debug, Error)]
 #[error("transport is shut down; event dropped")]
 pub struct PublishError;
@@ -116,21 +115,12 @@ pub struct TicketMeta {
     pub ingress: Ingress,
 }
 
-impl TicketMeta {
-    /// Whether the ticket is `status` or `query` traffic, which the all-events
-    /// stream leaves out unless asked.
-    #[must_use]
-    pub fn is_probe(&self) -> bool {
-        self.capability == CAP_STATUS || self.capability == CAP_QUERY
-    }
-}
-
 /// One event as an all-events subscriber receives it: unsanitised, with the
 /// ticket and its metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdminEvent {
-    /// Daemon-wide counter for this subscriber's view (with or without
-    /// probes); a gap means the subscriber missed events.
+    /// Daemon-wide counter of published events; a gap means the subscriber
+    /// missed events.
     pub n: u64,
     /// The ticket the event belongs to.
     pub ticket: String,
@@ -200,7 +190,6 @@ struct SubscriberShared {
 #[derive(Debug)]
 struct SubscriberSlot {
     id: u64,
-    include_probes: bool,
     shared: Arc<SubscriberShared>,
 }
 
@@ -227,11 +216,12 @@ struct State {
     /// Live follower handles, including those whose entry has ended.
     followers: usize,
     subscribers: Vec<SubscriberSlot>,
-    /// Events published, probes included.
-    n_all: u64,
-    /// Events published, probes left out.
-    n_plain: u64,
-    legacy: Option<mpsc::Sender<(String, Event)>>,
+    /// Events published since boot: the all-events stream's counter.
+    published: u64,
+    /// What [`EventPublisher::for_tests`] observes: the sanitised
+    /// `(ticket, event)` pairs, as a public follower would see them.
+    #[cfg(test)]
+    tap: Option<tokio::sync::mpsc::Sender<(String, Event)>>,
 }
 
 /// The daemon's one event fan-out. See the module docs.
@@ -410,14 +400,16 @@ impl EventHub {
         }
     }
 
-    /// Feeds every sanitised event to the legacy `PUB` loop as well.
-    pub(crate) fn set_legacy_sink(&self, sink: mpsc::Sender<(String, Event)>) {
-        lock(&self.state).legacy = Some(sink);
+    /// Feeds every sanitised event to `tap` as well, so a unit test can
+    /// observe what was published without attaching to each ticket.
+    #[cfg(test)]
+    pub(crate) fn set_test_tap(&self, tap: tokio::sync::mpsc::Sender<(String, Event)>) {
+        lock(&self.state).tap = Some(tap);
     }
 
     /// Records what admission knows about `ticket`, so the all-events stream
-    /// can name its capability, repository, agent label and ingress, and
-    /// leave probes out. Call it before the ticket's first event.
+    /// can name its capability, repository, agent label and ingress. Call it
+    /// before the ticket's first event.
     pub fn register(&self, ticket: &str, meta: TicketMeta) {
         let mut state = lock(&self.state);
         if state.closed {
@@ -453,19 +445,18 @@ impl EventHub {
     ///
     /// # Errors
     ///
-    /// [`PublishError`] once the hub is closed or the legacy sink is gone.
+    /// [`PublishError`] once the hub is closed.
     pub fn publish(&self, ticket: &str, event: Event) -> Result<(), PublishError> {
         let mut state = lock(&self.state);
         if state.closed {
             return Err(PublishError);
         }
+        state.published += 1;
+        let n = state.published;
         let State {
             entries,
             next_born,
             subscribers,
-            n_all,
-            n_plain,
-            legacy,
             ..
         } = &mut *state;
         let terminal = is_terminal(&event);
@@ -475,20 +466,11 @@ impl EventHub {
         let meta = entry.meta.clone();
 
         // The administration view first: it takes the event as published.
-        let probe = meta.as_deref().is_some_and(TicketMeta::is_probe);
-        *n_all += 1;
-        if !probe {
-            *n_plain += 1;
-        }
-        let (n_all, n_plain) = (*n_all, *n_plain);
         subscribers.retain(|slot| {
-            if probe && !slot.include_probes {
-                return true;
-            }
             deliver_to_subscriber(
                 &slot.shared,
                 AdminEvent {
-                    n: if slot.include_probes { n_all } else { n_plain },
+                    n,
                     ticket: ticket.to_owned(),
                     meta: meta.clone(),
                     event: event.clone(),
@@ -510,14 +492,17 @@ impl EventHub {
             entries.remove(ticket);
         }
 
-        match legacy
-            .as_ref()
-            .map(|sink| sink.try_send((ticket.to_owned(), public)))
-        {
-            Some(Err(mpsc::error::TrySendError::Closed(_))) => Err(PublishError),
-            // A full legacy queue drops the notification, as it always did.
-            None | Some(Ok(()) | Err(mpsc::error::TrySendError::Full(_))) => Ok(()),
+        #[cfg(test)]
+        if let Some(tap) = &state.tap {
+            use tokio::sync::mpsc::error::TrySendError;
+            return match tap.try_send((ticket.to_owned(), public)) {
+                // A full tap drops the notification, as any slow reader does.
+                Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+                // The test dropped its receiver: its stand-in for shutdown.
+                Err(TrySendError::Closed(_)) => Err(PublishError),
+            };
         }
+        Ok(())
     }
 
     /// Attaches a follower to `ticket`: registers its queue and returns the
@@ -574,18 +559,13 @@ impl EventHub {
     }
 
     /// Subscribes to every event, unsanitised (administration plane only).
-    /// `status` and `query` traffic is left out unless `include_probes`. The
-    /// filter reads the metadata given to [`Self::register`]; the daemon core
-    /// registers no control request and publishes nothing for one, so on a
-    /// running daemon there is no probe traffic for either setting to see.
+    /// The daemon core publishes nothing for a control request (`status`,
+    /// `query`, `cancel`), so a subscriber's own polls never come back to it.
     ///
     /// # Errors
     ///
     /// [`SubscribeError`] at the subscriber cap, or once the hub is closed.
-    pub fn subscribe_all(
-        self: &Arc<Self>,
-        include_probes: bool,
-    ) -> Result<Subscriber, SubscribeError> {
+    pub fn subscribe_all(self: &Arc<Self>) -> Result<Subscriber, SubscribeError> {
         let mut state = lock(&self.state);
         if state.closed {
             return Err(SubscribeError::Closed);
@@ -598,7 +578,6 @@ impl EventHub {
         let shared = Arc::new(SubscriberShared::default());
         state.subscribers.push(SubscriberSlot {
             id,
-            include_probes,
             shared: Arc::clone(&shared),
         });
         Ok(Subscriber {
@@ -613,7 +592,10 @@ impl EventHub {
     pub fn close(&self) {
         let mut state = lock(&self.state);
         state.closed = true;
-        state.legacy = None;
+        #[cfg(test)]
+        {
+            state.tap = None;
+        }
         for entry in state.entries.values() {
             for (_, follower) in &entry.followers {
                 lock(&follower.queue).closed = true;
@@ -802,14 +784,14 @@ pub struct EventPublisher {
 }
 
 impl EventPublisher {
-    /// A publisher over a hub whose legacy sink is a bare channel, for
-    /// in-crate unit tests that need to observe published events without
-    /// binding real sockets. The channel carries what a public client sees.
+    /// A publisher over a hub tapped by a bare channel, for in-crate unit
+    /// tests that need to observe published events without binding real
+    /// sockets. The channel carries what a public client sees.
     #[cfg(test)]
-    pub(crate) fn for_tests() -> (Self, mpsc::Receiver<(String, Event)>) {
+    pub(crate) fn for_tests() -> (Self, tokio::sync::mpsc::Receiver<(String, Event)>) {
         let hub = EventHub::new();
-        let (tx, rx) = mpsc::channel(LEGACY_SINK_CAPACITY);
-        hub.set_legacy_sink(tx);
+        let (tx, rx) = tokio::sync::mpsc::channel(TEST_TAP_CAPACITY);
+        hub.set_test_tap(tx);
         (hub.publisher(), rx)
     }
 

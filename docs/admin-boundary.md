@@ -1,9 +1,9 @@
 # Administration boundary
 
-PAM separates ordinary agent requests from administration. The public ZeroMQ
-endpoint rejects every `admin.*` operation, including envelopes claiming
-`caller.agent = "pam-gui"`. Caller labels, repository names, and caller-supplied
-PIDs do not authorize administration.
+PAM separates ordinary agent requests from administration. The public endpoint
+rejects every `admin.*` operation before any row is written, including
+envelopes claiming `caller.agent = "pam-gui"`. Caller labels, repository names,
+and caller-supplied PIDs do not authorize administration.
 
 The GUI cancels a ticket through `admin.requests.cancel` on the private
 channel, which the audit records as the human's act. The bridge has no
@@ -11,6 +11,40 @@ channel, which the audit records as the human's act. The bridge has no
 is recorded as `system` whatever `caller.agent` says, and it acts only on a
 ticket admitted under the caller's own canonical repository; a foreign ticket
 answers `not_found`, like a missing one.
+
+## The two endpoints
+
+Both planes speak one protocol: length-prefixed JSON frames, a `hello` first,
+then exactly one request per connection (wire protocol 2; see the
+[transport specification](specs/2026-10-02-framed-public-transport.md)).
+
+The **public endpoint** is what agents reach. On macOS it is one stream socket,
+`<base>/run/pam.sock`, mode `0600` in the `0700` run directory; who may connect
+is decided by those filesystem modes and by the agent's sandbox, not by the
+daemon. On Windows the daemon listens on an ephemeral `127.0.0.1` port and
+writes `<base>\run\public.json` (the port and a fresh 32-byte nonce); the
+handshake is the administration one described below with its own label
+(`pam-public-server`) and its own nonce, which confers nothing on the
+administration plane. A sandboxed Windows client needs read access to
+`<base>\run` and an outbound loopback connection, and must not be given
+`<base>\admin` or the state database.
+
+The daemon **records** the kernel's view of every public connection and never
+authorizes by it: each request row carries the plane it arrived on (`ingress`:
+`public` or `admin`), the peer's uid and pid as the kernel reports them
+(`peer_uid`, `peer_pid`), and whether the client said it came through a session
+relay (`relayed`). `admin.activity.list` returns them. On Windows there is no
+kernel peer identity on a loopback connection, so both are empty there: the
+recorded standing is "could read the owner's control file". A peer whose uid is
+not the daemon's is served and logged. The pid names a short-lived `pam` process
+and can be reused; it is attribution, like `caller.agent`, and the audit actor
+is decided by the plane alone.
+
+There is no event broadcast and no second public socket. A public client
+receives events only as the follow of one ticket (see
+[Global target authority](#global-target-authority)).
+
+## The private endpoint
 
 On macOS and Linux, the native GUI client uses a separate Unix socket at
 `<base>/admin/control.sock`. The transport obtains the connected peer's UID and
@@ -29,12 +63,22 @@ the owner's private base, whose NTFS ACL is inherited from the profile directory
 `sha256("pam-admin-server" ‖ nonce)` before reading a byte, so a client never
 hands the nonce to a process that merely reused the port after a stale control
 file; the client then presents the raw nonce, compared in constant time, and only
-then is a request frame read. Reading that file is the same standing a Unix peer
+then is the hello read. Reading that file is the same standing a Unix peer
 proves through its uid: another local user cannot; an administrator or an
 unrestricted same-user process can, exactly as root or a same-uid process can on
 Unix. The connection is loopback-only and the same frame budgets, header timeout
 and connection cap apply. This proves no more than the Unix path does: not GUI
 mode, not code integrity, not that a human asked.
+
+The GUI also receives every lifecycle event over this endpoint: an admitted
+connection that sends `events` becomes a stream of each published event with
+its ticket, capability, repository, agent label, plane and the real progress
+note. At most four such subscribers are attached at once, each holding one of
+the 32 connections; a subscriber that falls more than 1,024 events behind is
+closed with `subscriber_lagged` and reconnects. Requests the daemon publishes
+nothing for (`status`, `query`, `cancel`) never appear on it. This richer view
+is acceptable here because the peer has already proved it is the daemon's
+owner; it is the reason the stream is not offered on the public endpoint.
 
 ## Deployment assumption
 
@@ -57,9 +101,10 @@ debugging, inherited private descriptors and replacement of trusted frontend
 assets. A writable development server serving the GUI is part of the trusted
 execution surface. Production verification must use the embedded frontend or
 separately protect that server. A plain build of `pam gui` (without the
-`gui-embed` feature) loads the Vite development URL, `http://127.0.0.1:1420`,
-with the full admin bridge: that is a development configuration only, and the
-caveat stands. Blocking a direct child process is not proof that
+`gui-embed` feature) would load the Vite development URL,
+`http://127.0.0.1:1420`, with the full admin bridge, so such a build refuses to
+start unless `PAM_GUI_DEV=1` is set; with it, that is a development
+configuration only, and the caveat stands. Blocking a direct child process is not proof that
 a system broker cannot launch an unsandboxed process on its behalf.
 
 OS keychain isolation requires restricting the credential service as well as
@@ -103,18 +148,32 @@ relabeling that ticket under another root. It does not isolate agents or keep
 evidence confidential from another public client authorized through the same
 global policy. Per-agent repository authentication is not implemented.
 
-Public events expose lifecycle timing, opaque request IDs and progress percentages.
-They do not carry step names, repository/product details or diagnostic text;
-progress notes are fixed generic text. Raw subscribers can observe all these
-public events. Topic filtering and CLI authorization are not event access control.
-Use scoped result/evidence reads for details.
+Events are per follow, not broadcast. A public client that wants a ticket's
+events opens a follow for that one ticket; the daemon authorizes it by the same
+rule as a scoped result read (the caller's repository must be an approved root
+and the ticket's own canonical repository, and the ticket's grant revision must
+still hold), re-checks that rule while the follow lasts, and ends the stream
+with the durable result. A ticket the caller may not read and one that does not
+exist answer alike (`result_unavailable`). At most 16 followers attach to one
+ticket and 96 in total; a follow lasts at most one hour and is then reconnected
+by the client.
+
+What a follower is sent is deliberately small: lifecycle states, a per-ticket
+sequence number and progress percentages. Events do not carry step names,
+repository/product details or diagnostic text; progress notes are fixed generic
+text even though the follower passed the check that lets it read the result.
+Use scoped result/evidence reads for details. Because target authority is
+global, any public client working under the same approved repository can follow
+that repository's tickets; the follow is scoped, not private to one agent. The
+stream that carries every ticket with its real notes exists only on the private
+endpoint, for the GUI.
 
 ## Failure behavior
 
 Administration uses no bearer secret carried through the public protocol and
 never falls back to the public socket. The Windows nonce travels only over the
 private loopback connection, after the server has proved it holds the same nonce,
-and never through the public ZeroMQ endpoint. On a platform with no adapter at all
+and never through the public endpoint. On a platform with no adapter at all
 PAM reports that limitation rather than use a weaker identity check or silently
 restore public administration.
 
@@ -135,7 +194,14 @@ what it says. The daemon re-reads its own executable's file facts (cached for
 one second): only a replaced image answers `daemon_outdated` and restarts, and
 it respawns from the path it recorded at boot. A different version with an
 unchanged image is refused `client_version_mismatch`, naming the daemon's
-version and path, on both planes, and the phase does not move.
+version and path, on both planes, and the phase does not move. The version is
+judged on each connection's hello, before the request frame is read; nothing in
+a request envelope decides it.
+
+A GUI left open across an upgrade from 0.4.x still sends that version's bare
+request frame. The private endpoint recognises it and answers in the old shape
+with a `client_outdated` refusal telling the human to quit and reopen PAM; the
+operation is not run.
 
 ## What verification establishes
 
@@ -157,8 +223,11 @@ modify the private resources listed above.
 ## Resource and recovery limits
 
 Native frames are capped before allocation: 1 MiB requests and 16 MiB replies.
-At most 32 native connection handlers are active, with a five-second frame-read
-limit and request deadlines between one millisecond and five minutes. The request
+At most 32 native connections are served at once (an event subscriber holds one
+for its lifetime), the hello and the request frame together must arrive within
+five seconds, and request deadlines are between one millisecond and five
+minutes. A connection over the cap is told `connection_capacity_exhausted`
+rather than dropped. The request
 clock starts before ledger insertion; waiting for bookkeeping cannot grant a
 fresh execution deadline. A terminal write that fails is retried, then parked in
 a bounded queue that the maintenance loop retries every second and once more
@@ -171,11 +240,16 @@ The admin listener logs and retries accept errors with backoff (10 ms doubling
 to one second) instead of ending, and the requests the GUI submits (such as
 `admin.flows.run`) have their own 32-slot dispatcher pool, so a public flood
 cannot refuse them. On Windows, a local process can still hold the adapter's
-pending-handshake slots for the five-second handshake timeout; that limit
-remains until the listener is replaced.
+pending-handshake slots (eight on the private endpoint, 32 on the public one)
+for the five-second handshake timeout; they sit outside the served-connection
+caps and that bound is by design.
 
-Shutdown stops acceptance and gives owned asynchronous handlers five seconds to
-drain. This is not a cancellation guarantee for already-started blocking work
+While the daemon drains, both listeners keep accepting and answer each request
+with a `daemon_shutting_down` refusal frame instead of refusing the connect;
+followers and event subscribers are ended by name. When the drain is done each
+listener stops accepting, removes its socket file (`control.sock`, `pam.sock`)
+or control file while the instance lock is still held, and gives owned
+asynchronous handlers five seconds. This is not a cancellation guarantee for already-started blocking work
 (such as an OS keychain call or weight-file deletion): Rust cannot abort that
 work. Its effects can remain uncertain after a timeout, and runtime shutdown may
 wait longer. A separate process-owned runner now bounds accounted blocking work to eight

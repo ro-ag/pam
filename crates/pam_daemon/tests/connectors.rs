@@ -1,5 +1,5 @@
 //! The connector admin surface, end to end: a real daemon on a temp base
-//! dir, real zmq, a real `SQLite` store — with the OS keychain and the
+//! dir, real sockets, a real `SQLite` store — with the OS keychain and the
 //! network replaced by the harness's fakes ([`FakeSecretBackend`],
 //! [`FakeTransport`]), which is the only thing about this that is not
 //! production.

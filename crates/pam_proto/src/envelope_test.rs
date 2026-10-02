@@ -52,7 +52,7 @@ fn wire_format_is_pinned() {
     assert_eq!(
         serde_json::to_value(&envelope).unwrap(),
         json!({
-            "v": 1,
+            "v": 2,
             "id": "req_01J8ZC4V9K3W6P2Q8R5T7X9Y0Z",
             "capability": "log.summarize",
             "client_version": "0.10.1",

@@ -392,10 +392,7 @@ async fn a_first_frame_that_is_not_this_protocols_hello_is_named_and_answered_wh
         .await
         .unwrap();
     let unknown = b"\x00\x00\x00\x0f{\"t\":\"hellooo\"}".to_vec();
-    let out_of_order = wire_bytes(&Frame::Events {
-        include_probes: false,
-    })
-    .await;
+    let out_of_order = wire_bytes(&Frame::Events).await;
     let oversized = u32::try_from(MAX_HELLO_BYTES + 1)
         .unwrap()
         .to_be_bytes()

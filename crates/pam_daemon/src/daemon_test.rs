@@ -270,7 +270,6 @@ mod live {
                 .admin()
                 .submit
                 .send(IncomingRequest {
-                    identity: Vec::new(),
                     origin,
                     peer,
                     envelope,
@@ -523,7 +522,7 @@ mod live {
         let row = store.get_request("origin_unknown").await.unwrap().unwrap();
         assert_eq!(row.origin.peer_pid, Some(7_003));
 
-        // The legacy listener has no peer to report.
+        // A public request submitted with no peer records none.
         let _ = live
             .ask(request(
                 "origin_legacy",
@@ -546,35 +545,31 @@ mod live {
         live.stop().await;
     }
 
-    /// A request from a connection whose hello already went through the
-    /// version rule is not judged by its envelope's version again; one from
-    /// the legacy listener, which has no hello, still is.
+    /// The pipeline never judges a request by its envelope's version: the
+    /// hello of the connection it came on went through the version rule on
+    /// its listener, and what the administration plane submits in process
+    /// came from a connection that did. The field is recorded, nothing more.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_greeted_request_is_not_judged_by_its_envelope_version() {
+    async fn a_request_is_never_judged_by_its_envelope_version() {
         let live = Live::start("relaxed", |_| {}).await;
 
-        let mut greeted = request("greeted", "echo", serde_json::json!({ "n": 1 }), true);
-        greeted.client_version = "0.0.1".to_owned();
+        let mut public = request("ver_public", "echo", serde_json::json!({ "n": 1 }), true);
+        public.client_version = "0.0.1".to_owned();
         let response = live
-            .ask_from(greeted, Origin::Public, Some(kernel_peer(7_010, false)))
+            .ask_from(public, Origin::Public, Some(kernel_peer(7_010, false)))
             .await;
         assert!(matches!(response, Response::Result { .. }), "{response:?}");
 
-        let mut ungreeted = request("ungreeted", "echo", serde_json::json!({ "n": 2 }), true);
-        ungreeted.client_version = "0.0.1".to_owned();
-        let response = live.ask(ungreeted).await;
-        assert_eq!(
-            refusal(&response),
-            (crate::daemon::CAUSE_CLIENT_VERSION_MISMATCH, false)
-        );
-        assert!(
-            live.store()
-                .get_request("ungreeted")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let mut admin = request("ver_admin", "echo", serde_json::json!({ "n": 2 }), true);
+        admin.client_version = "0.0.1".to_owned();
+        let response = live.ask_from(admin, Origin::Admin, None).await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
 
+        // Neither moved the phase: a claimed version restarts nothing.
+        assert_eq!(
+            *live.handle.lifecycle().borrow(),
+            crate::lifecycle::LifecyclePhase::Serving
+        );
         live.stop().await;
     }
 
@@ -591,7 +586,7 @@ mod live {
 
         let live = Live::start("relaxed", |_| {}).await;
         let hub = live.handle.event_hub();
-        let mut all = hub.subscribe_all(true).expect("a subscriber slot");
+        let mut all = hub.subscribe_all().expect("a subscriber slot");
         let mut next = async || match tokio::time::timeout(PATIENCE, all.next()).await {
             Ok(Subscribed::Event(event)) => event,
             other => panic!("expected an event, got {other:?}"),
@@ -618,7 +613,6 @@ mod live {
             assert_eq!(meta.repo, REPO);
             assert_eq!(meta.agent, "claude");
             assert_eq!(meta.ingress, WireIngress::Public);
-            assert!(!meta.is_probe());
         }
 
         // The same request from the private plane is named as such.
@@ -1006,7 +1000,6 @@ mod cancel_plane {
             .admin()
             .submit
             .send(IncomingRequest {
-                identity: Vec::new(),
                 origin: Origin::Public,
                 peer: None,
                 envelope,

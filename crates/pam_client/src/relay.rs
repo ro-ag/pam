@@ -212,10 +212,10 @@ pub fn prepare(session_dir: &Path, base_dir: &Path) -> Result<RelayBindings, Rel
     let socket = directory
         .canonical
         .join(paths.public_socket().file_name().unwrap_or_default());
-    // `public_socket()` is outside the boot-time length validation (see its docs), and the
-    // canonical path can be longer than the one given.
+    // The canonical path is what is bound, and it can be longer than the one given (and
+    // validated above): the same bound, terminator included, applies to it.
     let len = socket.as_os_str().len();
-    if len > pam_daemon::runtime_dir::MAX_SOCKET_PATH_BYTES {
+    if len >= pam_daemon::runtime_dir::MAX_SOCKET_PATH_BYTES {
         return Err(
             pam_daemon::runtime_dir::RuntimeDirError::SocketPathTooLong { path: socket, len }
                 .into(),

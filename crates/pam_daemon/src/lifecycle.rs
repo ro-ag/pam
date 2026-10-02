@@ -9,8 +9,8 @@
 //!   explicitly on drop, even across a subprocess that briefly inherited the open file
 //!   description); process exit also releases it once the OS closes the last inherited handle.
 //! - **Lock-first ordering**: the lock is acquired before anything else touches the runtime
-//!   directory. Only the lock holder may remove/rebind `pam.sock`/`events.sock`, so a stale socket
-//!   with no lock holder is removed safely and a live daemon's sockets are never yanked from under
+//!   directory. Only the lock holder may remove/rebind `pam.sock`, so a stale socket
+//!   with no lock holder is removed safely and a live daemon's socket is never yanked from under
 //!   it ([`crate::transport::Transport::bind`] does the removal; [`crate::daemon::run_daemon_with`]
 //!   guarantees the ordering).
 //! - **Crash recovery**: on boot, after the lock and before lanes rebuild, [`recover_stuck_rows`]

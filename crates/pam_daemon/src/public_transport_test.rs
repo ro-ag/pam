@@ -680,7 +680,7 @@ async fn a_connection_over_the_cap_is_told_and_a_freed_slot_is_reusable() {
         FollowTimes::DEFAULT,
     );
     let dir = pam_testkit::short_tempdir();
-    let path = dir.path().join("pam.next.sock");
+    let path = dir.path().join("pam.sock");
     let listener = Listener::spawn(UnixAcceptor::bind(&path).expect("the socket binds"), policy);
 
     // Two connections sitting in their handshake hold both permits.

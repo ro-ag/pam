@@ -11,10 +11,10 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "gui:dev": "PAM_GUI_DEV=1 cargo run -p pam -- gui",
+    "gui:dev": "node scripts/gui-dev.mjs gui",
     "gui:build": "npm run build && cargo build --release -p pam --features gui-embed",
     "tauri": "cd ../crates/pam && tauri",
-    "dev:desktop": "cd ../crates/pam && PAM_GUI_DEV=1 tauri dev -- -- gui"
+    "dev:desktop": "node scripts/gui-dev.mjs desktop"
   },
   "dependencies": {
     "@fontsource-variable/archivo": "^5.3.0",

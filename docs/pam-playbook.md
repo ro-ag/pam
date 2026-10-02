@@ -36,10 +36,14 @@ pam evidence read <ev-id> --request <ticket> --json   # continue with --view/--d
 Exit codes: `0` success or ticket, `1` transport failure or observation
 timeout, `2` usage error, `3` refused, `4` unresolved verification, `5`
 blocked. With `--json` the response is one JSON document on stdout; refusals
-of a follow are `kind: refusal` objects there too. Exit `3` from `pam wait` or
-`pam subscribe` means a policy refusal: a busy or restarting daemon is retried
+of a follow are `kind: refusal` objects there too. `pam wait` follows the
+ticket on one connection and prints the durable result it ends with; a ticket
+that already finished is answered at once. Exit `3` from `pam wait` or
+`pam subscribe` means the daemon refused: a busy or restarting daemon is retried
 until `--timeout-ms`, then the follow exits `1` with cause `follow_timeout` and
-the request keeps running.
+the request keeps running. A refusal with cause `client_version_mismatch` means
+this `pam` is not the build the running daemon was started from; report its
+recovery line, the daemon keeps running and nothing was lost.
 
 If `pam flow run` loses its reply it prints `request id: <id>` and
 `follow it with: pam wait <id>`. Follow that id; never submit the run again
@@ -74,6 +78,12 @@ human: they run `pam listen <dir>` outside the sandbox and export
 works unchanged, and with the override set pam never starts a daemon itself.
 Never try to start the relay from inside the sandbox, and never route around
 the socket with files or other channels: the socket is the audited path.
+
+If a command fails saying a pre-migration pam daemon is running and this process
+may not stop it, the machine was upgraded while an old daemon kept running and
+your sandbox does not let you signal it. That too is the human's: they run
+`pam daemon stop` outside the sandbox, and your next command starts the current
+daemon.
 
 ## Drop-in for a project's AGENTS.md
 

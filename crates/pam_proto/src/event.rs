@@ -1,7 +1,9 @@
-//! Lifecycle events published on the `events.sock` `PUB` socket.
+//! Lifecycle events of a request.
 //!
-//! The `PUB` topic is the request id, so a client subscribes to exactly the
-//! requests it cares about.
+//! A public client receives them only as the follow stream of one ticket it
+//! was authorised to read ([`crate::wire::Follow`]); the private
+//! administration plane streams every ticket's events to the GUI. Events are
+//! notifications: the durable result is what a follow ends with.
 
 use serde::{Deserialize, Serialize};
 

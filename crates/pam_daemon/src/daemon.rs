@@ -54,10 +54,10 @@
 //!   cooperative cancellation, then the dispatcher stops. No explicit store flush is needed — every
 //!   write, audit included, is per-statement durable. A `waiting_approval` request is not drained;
 //!   crash recovery fails it on next boot.
-//! - **Version handshake and restart policy**: every envelope carries the client build version
-//!   (on the framed listener the connection's hello carries it instead, and
-//!   [`crate::public_transport`] applies the same rule there before the request is read, so the
-//!   pipeline does not look at such an envelope's version again).
+//! - **Version handshake and restart policy**: a connection's hello carries the client build
+//!   version, and the listener applies the rule to it before the request is read
+//!   ([`crate::framed::version_rule`], the same on both planes); the pipeline never looks at an
+//!   envelope's `client_version`.
 //!   The daemon restarts itself for one reason — the binary it was started from was replaced on
 //!   disk — and a client's claimed version is only the occasion to look ([`crate::image`]). A
 //!   differing version with a replaced image is refused with [`CAUSE_DAEMON_OUTDATED`] and moves
@@ -98,7 +98,7 @@
 //!   internal failure → `refuse`/`system`. A [`CAUSE_DAEMON_OUTDATED`] refusal carries a retry
 //!   hint, and the retry lands on the new daemon.
 //! - **Approval pause**: [`GateDecision::RequireApproval`] parks the request in [`crate::approval`]
-//!   before lane placement (`waiting_approval`, `approval_pending` on PUB, resolved via
+//!   before lane placement (`waiting_approval`, `approval_pending` published, resolved via
 //!   [`DaemonHandle::approvals`]); approval returns it to `queued`. Denial/timeout/cancellation
 //!   refuse with [`CAUSE_APPROVAL_DENIED`]/[`CAUSE_APPROVAL_TIMEOUT`]/cancelled. A caller's
 //!   `deadline_ms` elapsing mid-approval cancels the wait (resolved `denied`, note `cancelled`);
@@ -124,7 +124,7 @@ use crate::executor::{
     BuiltinCapability, CapabilityFailure, CapabilityOutput, ExecContext, outcome_str,
 };
 use crate::flow_service::FlowService;
-use crate::image::{FsProbe, ImageProbe, ImageWatch, VersionVerdict};
+use crate::image::{FsProbe, ImageProbe, ImageWatch};
 use crate::ingress::{Origin, PublicPeer};
 use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
@@ -213,8 +213,8 @@ pub const TERMINAL_ACTIONS: &[&str] = &[
     crate::lifecycle::ACTION_DAEMON_RESTART,
 ];
 
-/// This daemon build's version, compared against every envelope's
-/// `client_version` (see the module docs on the version handshake).
+/// This daemon build's version, compared against the version every
+/// connection's hello carries (see the module docs on the version handshake).
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// GUI recovery line for [`CAUSE_APPROVAL_DENIED`] refusals.
@@ -434,7 +434,7 @@ impl DaemonHandle {
         Arc::clone(self.transport.event_publisher().hub())
     }
 
-    /// Connection permits the framed public listener has free right now, of
+    /// Connection permits the public listener has free right now, of
     /// [`crate::framed::MAX_PUBLIC_CONNECTIONS`].
     #[must_use]
     pub fn public_connections_available(&self) -> usize {
@@ -634,15 +634,14 @@ pub async fn run_daemon_with(
     // the one hub, and both move the one lifecycle phase.
     let hub = EventHub::new();
     let (phase, _) = watch::channel(LifecyclePhase::Serving);
-    let transport = Transport::bind_with(
+    let transport = Transport::bind(
         &dirs,
         incoming_tx.clone(),
         Arc::clone(&store),
         phase.clone(),
         Arc::clone(&hub),
         Arc::clone(&image),
-    )
-    .await?;
+    )?;
 
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
@@ -1453,64 +1452,24 @@ impl Pipeline {
         }
     }
 
-    /// The gates that run before anything is recorded: the drain and the
-    /// version handshake. `Some` is the refusal to answer with; neither
-    /// gets a request row — the retry lands on the next (or new) daemon
-    /// and is recorded there. `greeted` says the request arrived on a
-    /// connection whose hello already went through the version rule: the
-    /// envelope's own version then decides nothing.
-    async fn lifecycle_refusal(&self, envelope: &Envelope, greeted: bool) -> Option<Response> {
+    /// The gate that runs before anything is recorded: the lifecycle phase.
+    /// `Some` is the refusal to answer with; it gets no request row — the
+    /// retry lands on the next (or new) daemon and is recorded there.
+    ///
+    /// The version handshake is not here: a connection's hello went through
+    /// the version rule on its listener before the request was read
+    /// ([`crate::framed::version_rule`], both planes), so the envelope's own
+    /// `client_version` decides nothing.
+    fn lifecycle_refusal(&self, envelope: &Envelope) -> Option<Response> {
         let id = &envelope.id;
-        let phase = *self.phase.borrow();
-        match phase {
-            LifecyclePhase::Serving => {}
-            LifecyclePhase::Restarting => {
-                return Some(outdated_refusal(
-                    id,
-                    &envelope.client_version,
-                    self.image.boot_path(),
-                ));
-            }
-            LifecyclePhase::Draining => return Some(shutting_down_refusal(id)),
-        }
-        if greeted {
-            return None;
-        }
-        match self
-            .image
-            .verdict(&envelope.client_version, DAEMON_VERSION)
-            .await
-        {
-            VersionVerdict::Match => None,
-            VersionVerdict::Restart => {
-                // The binary this daemon was started from is no longer
-                // the one on disk. Answer this request, then hand over.
-                tracing::info!(
-                    client_version = %envelope.client_version,
-                    daemon_version = DAEMON_VERSION,
-                    "the daemon's binary was replaced on disk; restarting with it"
-                );
-                request_restart(&self.phase);
-                Some(outdated_refusal(
-                    id,
-                    &envelope.client_version,
-                    self.image.boot_path(),
-                ))
-            }
-            VersionVerdict::Mismatch => {
-                // A claimed version restarts nothing: the caller is a
-                // different build and is told so.
-                tracing::debug!(
-                    client_version = %envelope.client_version,
-                    daemon_version = DAEMON_VERSION,
-                    "refused a client of a different build; the binary on disk is unchanged"
-                );
-                Some(version_mismatch_refusal(
-                    id,
-                    &envelope.client_version,
-                    self.image.boot_path(),
-                ))
-            }
+        match *self.phase.borrow() {
+            LifecyclePhase::Serving => None,
+            LifecyclePhase::Restarting => Some(outdated_refusal(
+                id,
+                &envelope.client_version,
+                self.image.boot_path(),
+            )),
+            LifecyclePhase::Draining => Some(shutting_down_refusal(id)),
         }
     }
 
@@ -1532,7 +1491,7 @@ impl Pipeline {
         }
         let id = envelope.id.clone();
 
-        if let Some(refusal) = self.lifecycle_refusal(&envelope, peer.is_some()).await {
+        if let Some(refusal) = self.lifecycle_refusal(&envelope) {
             guard.send(refusal);
             return;
         }

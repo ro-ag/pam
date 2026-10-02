@@ -22,22 +22,69 @@ export PAM_SOCKET_DIR=/absolute/path/to/.pam-session
 claude …   # or any agent harness; start it normally
 ```
 
-`pam listen` binds `pam.sock` and `events.sock` directly inside `<dir>` (created
-`0700`) and forwards bytes to the daemon's runtime sockets under the PAM base.
-Every client subcommand then works unchanged, including `pam wait` and
-`pam subscribe` (the events socket is relayed too). Stop the relay with ctrl-c;
-it removes its socket files on the way out. A stale socket file nobody answers
-is replaced on the next start; a socket that still answers belongs to a running
-relay and is refused, never taken over.
+`pam listen` binds one socket, `pam.sock`, directly inside `<dir>` (created
+`0700`) and forwards bytes to the daemon's public socket,
+`<base>/run/pam.sock`. Every client subcommand then works unchanged, including
+`pam wait` and `pam subscribe`: a follow is a long-lived connection through the
+same pipe, so there is no second socket and a sandbox policy needs to allow only
+`<dir>/pam.sock`. Stop the relay with ctrl-c; it removes its socket file on the
+way out. A stale socket file nobody answers is replaced on the next start; a
+socket that still answers belongs to a running relay and is refused, never taken
+over. An `events.sock` left in `<dir>` by a relay of version 0.4 or older is
+removed at start when it is a socket you own; nothing dials it any more.
+
+## What the relay checks before it starts
+
+**The directory and the socket entry.** The relay refuses, with the cause and
+what to do, rather than repair:
+
+- a `<dir>` that is a symbolic link (also when given with a trailing slash), or
+  is not a directory;
+- a `<dir>` owned by another user, or writable by group or others;
+- a `pam.sock` entry in it that is a symbolic link, is not a socket, or is owned
+  by another user. A regular file of that name is left where it is.
+
+A missing `<dir>` is created `0700`; an existing one you own is tightened to
+`0700`. The directory is opened once and its identity (device and inode) is
+compared before and after the bind, and the socket is bound through the
+directory's canonical path and set to `0600`, so a link swapped in between the
+checks and the bind is noticed.
+
+**The daemon behind it.** The relay dials the daemon's public socket once with a
+hello. A daemon of version 0.4 or older answers in its own protocol; the relay
+runs outside the sandbox, where its clients cannot act, so it stops that daemon
+the way `pam daemon stop` does, starts the current one and then serves. If it
+cannot (the lock file names no process, signalling is refused, the old daemon is
+still draining after 20 seconds, or the new one does not start) the relay
+removes the socket it bound and exits with the instruction, instead of
+forwarding to a daemon its clients cannot talk to. A daemon that is not running
+is reported as "not reachable yet" and the relay serves anyway. The startup
+lines say which of these it found.
 
 ## What the override changes for clients
 
-With `$PAM_SOCKET_DIR` set, the client dials the two sockets directly inside
-that directory instead of `<base>/run`, and lazy daemon auto-start is off: the
+With `$PAM_SOCKET_DIR` set, the client dials `pam.sock` directly inside that
+directory instead of `<base>/run`, and lazy daemon auto-start is off: the
 relay is the transport, so a missing relay is a clean error naming
-`pam listen` — never a spawned daemon. The override affects only the public
-dial path (`send_request`, `follow_ticket`); `pam daemon stop` and the login
-service still target the real base.
+`pam listen` — never a spawned daemon. A client that dials through the relay
+never signals anything either: if what answers is a daemon of version 0.4 or
+older, it fails with the instruction to run `pam daemon stop` outside the
+sandbox. The override affects only the public dial path (`send_request`,
+`follow_ticket`); `pam daemon stop` and the login service still target the real
+base.
+
+## What the daemon records for a relayed request
+
+The daemon records, on every request row, the plane it arrived on and the
+kernel's view of the connection (`ingress`, `peer_uid`, `peer_pid`, `relayed`).
+For a relayed connection the kernel's peer is the **relay process**, not the
+sandboxed client: `peer_uid` and `peer_pid` name `pam listen`. `relayed` is the
+client's own statement, sent in its hello because `$PAM_SOCKET_DIR` is set; the
+envelope's `caller` (agent label, repository, pid) is self-reported as always.
+None of this authorizes anything. The uid is the same owner on both paths, the
+relay's pid identifies the grant of reach the human made by starting it, and a
+relayed client that omitted the marker would still be recorded with a pid that
+resolves to a `pam listen` process.
 
 ## Boundaries
 
@@ -47,17 +94,19 @@ service still target the real base.
   or a relayed connection is a reference, not authority.
 - **A transient accept error does not end the relay.** Any accept error
   (descriptor exhaustion, an aborted connection) is retried with backoff,
-  10 ms doubling to one second. Each socket serves at most 64 concurrent
-  connections; an excess connection is closed at once, and the dial to the
-  daemon is bounded to five seconds. The symlink and check-then-act hardening of
-  the socket directory's preparation is not part of this.
+  10 ms doubling to one second. The relay serves at most 64 concurrent
+  connections, a follow included for as long as it lasts; an excess connection
+  is closed at once, and the dial to the daemon is bounded to five seconds.
 - **Placement is the trade.** A listening socket inside a writable directory
   can be unlinked and rebound by another process of the same user, which lets
   it impersonate the daemon to the agent — deception, not escalation, since a
-  same-user process could talk to the real daemon anyway. The directory is
-  created `0700` and sockets `0600`; prefer a session directory outside every
-  writable repository if the sandbox permits one, and treat the workspace
-  variant as a bench configuration.
+  same-user process could talk to the real daemon anyway. The checks above
+  narrow this and do not close it: std offers no way to bind relative to an
+  open directory, so between the last check and the bind another process **of
+  the same user** can still swap the path. The directory is `0700` and the
+  socket `0600`; prefer a session directory outside every writable repository
+  if the sandbox permits one, and treat the workspace variant as a bench
+  configuration.
 - **The prerequisite is unchanged.** The sandbox must still permit unix-socket
   connects under the relay's directory. The relay relocates a grant; it does
   not remove the need for one. If the policy is editable, allowing the daemon's

@@ -8,8 +8,8 @@
 //! held, as the caller's shutdown order guarantees.
 //!
 //! Each accepted connection comes with the kernel's view of its peer: uid, gid
-//! and pid through tokio's safe `peer_cred` (`SO_PEERCRED` on Linux,
-//! `getpeereid` and `LOCAL_PEERPID` on macOS). What is done with them is the
+//! and pid through tokio's safe `peer_cred` (`getpeereid` and
+//! `LOCAL_PEERPID` on macOS). What is done with them is the
 //! policy's business: the public plane records them, the administration plane
 //! admits by them. Nothing here refuses a peer.
 

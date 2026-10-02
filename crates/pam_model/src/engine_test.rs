@@ -23,15 +23,21 @@ fn every_ci_runner_maps_to_exactly_one_pinned_asset() {
     }
     for (os, arch, target) in [
         ("macos", "aarch64", Target::MacosArm64),
-        ("macos", "x86_64", Target::MacosX64),
-        ("linux", "x86_64", Target::UbuntuX64),
-        ("linux", "aarch64", Target::UbuntuArm64),
         ("windows", "x86_64", Target::WinCpuX64),
         ("windows", "aarch64", Target::WinCpuArm64),
     ] {
         assert_eq!(Target::for_platform(os, arch), Some(target));
     }
-    assert_eq!(Target::for_platform("freebsd", "x86_64"), None);
+    // Linux and Intel macOS are not supported: no asset, so the engine
+    // reports `unsupported_target`.
+    for (os, arch) in [
+        ("freebsd", "x86_64"),
+        ("linux", "x86_64"),
+        ("linux", "aarch64"),
+        ("macos", "x86_64"),
+    ] {
+        assert_eq!(Target::for_platform(os, arch), None, "{os} {arch}");
+    }
     assert!(
         Target::current().is_some(),
         "this host is a supported target"
@@ -56,7 +62,7 @@ fn the_layout_keeps_everything_under_the_private_engine_directory() {
         std::path::Path::new("/base/engine/llama-b1/llama-server.exe")
     );
     assert_eq!(
-        layout.server_path("b1", Target::UbuntuX64),
+        layout.server_path("b1", Target::MacosArm64),
         std::path::Path::new("/base/engine/llama-b1/llama-server")
     );
 }

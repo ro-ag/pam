@@ -9,10 +9,10 @@
 //! Two knobs make it a production-binary check rather than a harness one: `PAM_CHECKPOINT_BASE`
 //! points it at an already-running daemon's base dir (e.g. one `pam gui` started) instead of
 //! spawning a `pam_testkit` daemon, and `PAM_CHECKPOINT_MODELS_DIR` names the models directory it
-//! installs into (a fresh temp dir by default). Native administration is supported on macOS/Linux
-//! only; the bridge integration suite separately verifies explicit unsupported-platform failure.
+//! installs into (a fresh temp dir by default). This checkpoint is gated to macOS;
+//! the bridge integration suite separately verifies explicit unsupported-platform failure.
 
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

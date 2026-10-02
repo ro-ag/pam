@@ -3,7 +3,7 @@
 //! Installs the pinned llama.cpp release for this platform from GitHub,
 //! fetches the smallest GGUF llama.cpp itself tests with (tinyllamas
 //! `stories260K`, 1.2 MB), runs it under the supervisor — Unix socket on
-//! macOS/Linux, loopback TCP on Windows — and asks for one bounded
+//! macOS, loopback TCP on Windows — and asks for one bounded
 //! completion. This proves the acquisition, the transport and the server
 //! contract on the real binary; it proves nothing about model quality.
 

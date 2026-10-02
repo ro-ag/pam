@@ -9,7 +9,7 @@
 //! as one request (`--no-wait` + `subscribe` to watch step by step). `service install` writes the
 //! unit first and then stops a loose daemon; it refuses a binary in a temp or cargo `target/`
 //! directory or a group/world-writable location, and pins a base directory only when `--base-dir` is
-//! given; `uninstall` stops the managed daemon on macOS/Linux (the next command starts one lazily). Exit codes: `0` success, `1` transport/client failure, `2` usage error, `3`
+//! given; `uninstall` stops the managed daemon on macOS (the next command starts one lazily). Exit codes: `0` success, `1` transport/client failure, `2` usage error, `3`
 //! refused, `4` unresolved, `5` blocked.
 
 use std::path::Path;

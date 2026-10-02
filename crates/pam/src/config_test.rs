@@ -7,9 +7,7 @@ const TAURI_CONF: &str = include_str!("../tauri.conf.json");
 const MAIN_WINDOW_CAPABILITY: &str = include_str!("../capabilities/main-window.json");
 const BUILD_SCRIPT: &str = include_str!("../build.rs");
 const MACOS_CONF: &str = include_str!("../tauri.macos.conf.json");
-const LINUX_CONF: &str = include_str!("../tauri.linux.conf.json");
 const WINDOWS_CONF: &str = include_str!("../tauri.windows.conf.json");
-const DESKTOP_TEMPLATE: &str = include_str!("../linux/pam.desktop");
 const NSIS_HOOKS: &str = include_str!("../nsis/hooks.nsh");
 
 fn tauri_conf() -> serde_json::Value {
@@ -122,10 +120,6 @@ fn platform_overlays_name_pam_olds_targets() {
         "12.0"
     );
     assert_eq!(
-        parse(LINUX_CONF)["bundle"]["targets"],
-        serde_json::json!(["appimage", "deb"])
-    );
-    assert_eq!(
         parse(WINDOWS_CONF)["bundle"]["targets"],
         serde_json::json!(["nsis"])
     );
@@ -137,7 +131,6 @@ fn platform_overlays_name_pam_olds_targets() {
 
 #[test]
 fn desktop_entry_and_shortcuts_open_the_gui() {
-    assert!(DESKTOP_TEMPLATE.lines().any(|l| l == "Exec={{exec}} gui"));
     assert!(NSIS_HOOKS.contains("NSIS_HOOK_POSTINSTALL"));
     assert_eq!(NSIS_HOOKS.matches("\"gui\"").count(), 2);
 }

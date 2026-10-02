@@ -81,7 +81,7 @@ fn write_fake(dir: &Path, stem: &str, fake: Fake) -> PathBuf {
 
 /// [`invoke`] against a stand-in that was written moments ago.
 ///
-/// On Linux a script written by this thread can still be held open, for
+/// On Unix a script written by this thread can still be held open, for
 /// a few microseconds, by a child another test thread forked but has not
 /// exec'd yet (the write descriptor is `O_CLOEXEC`, so it dies at the
 /// child's exec, not at the fork). Executing it in that window fails

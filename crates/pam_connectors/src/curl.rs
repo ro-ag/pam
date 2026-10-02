@@ -29,7 +29,7 @@ fn untrusted_curl() -> TransportError {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn trusted_curl_path() -> Result<PathBuf, TransportError> {
     use std::os::unix::fs::MetadataExt;
     let path = std::fs::canonicalize("/usr/bin/curl").map_err(|_| untrusted_curl())?;
@@ -49,7 +49,7 @@ fn trusted_curl_path() -> Result<PathBuf, TransportError> {
     Ok(path)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn trusted_curl_path() -> Result<PathBuf, TransportError> {
     Err(untrusted_curl())
 }

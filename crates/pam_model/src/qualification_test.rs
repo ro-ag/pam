@@ -438,7 +438,7 @@ fn find_matches_digest_and_target_only() {
     static RECORDS: &[Qualification] = &[record_like("abc", &[Target::MacosArm64])];
     assert!(find_in(RECORDS, "abc", Target::MacosArm64).is_some());
     assert!(
-        find_in(RECORDS, "abc", Target::UbuntuX64).is_none(),
+        find_in(RECORDS, "abc", Target::WinCpuX64).is_none(),
         "Metal figures do not qualify a CPU build"
     );
     assert!(find_in(RECORDS, "abd", Target::MacosArm64).is_none());

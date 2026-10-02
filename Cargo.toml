@@ -67,10 +67,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 tracing-appender = "0.2"
 # desktop shell for `pam gui`. Default features off: `compression` (brotli
 # for embedded assets) and `dbus`/tray extras are not needed for the
-# scaffold; `wry` is the webview runtime, `x11` keeps Linux building.
+# scaffold; `wry` is the webview runtime.
 # Wry currently compiles an Objective-C exception helper on macOS. This
 # conflicts with the no-C-compiler constraint; see ptrack issue 16/task 142.
-tauri = { version = "2", default-features = false, features = ["wry", "x11"] }
+tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-build = { version = "2", default-features = false, features = ["config-json"] }
 
 # model integrity: SHA-256 over downloaded and installed weights. RustCrypto,

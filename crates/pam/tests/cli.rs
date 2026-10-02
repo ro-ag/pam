@@ -100,7 +100,7 @@ fn base_of(tmp: &tempfile::TempDir) -> PathBuf {
 /// macOS and `Standard` everywhere else, and only the relaxed profile
 /// auto-grants a non-destructive capability on first use. These tests
 /// drive `echo` without granting it, so without the seed they pass on
-/// macOS and refuse with `not_granted` on Linux and Windows.
+/// macOS and refuse with `not_granted` on Windows.
 async fn seed_relaxed(tmp: &tempfile::TempDir) {
     let store = Store::open(&base_of(tmp).join("state.sqlite3"))
         .await
@@ -1326,10 +1326,10 @@ async fn clean_tree_assertion_reports_clean_staged_unstaged_and_untracked_via_cl
     .expect("clean-tree CLI cases complete within deadline");
 }
 
-// The private administration adapter exists for macOS, Linux and Windows;
+// The private administration adapter exists for macOS and Windows;
 // elsewhere send_admin refuses with admin_transport_unsupported. Both the
 // helper and its only caller carry that gate, so neither becomes dead code.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 async fn flow_admin(base: &Path, op: &str, args: serde_json::Value) -> serde_json::Value {
     match client::send_admin(base, op, args, 5000).await.unwrap() {
         Response::Result { body, .. } => body,
@@ -1337,7 +1337,7 @@ async fn flow_admin(base: &Path, op: &str, args: serde_json::Value) -> serde_jso
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 #[tokio::test]
 async fn admin_created_duplicated_and_renamed_flow_runs_from_the_actual_cli() {
     timeout(DEADLINE, async {

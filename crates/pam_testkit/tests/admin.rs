@@ -1,6 +1,7 @@
 //! Administration integration through the trusted native test client.
 //!
-//! macOS/Linux exercise the private Unix socket. Unsupported platforms use
+//! macOS exercises the private Unix socket and Windows the nonce-guarded loopback
+//! adapter. Unsupported platforms use
 //! an explicit in-process fixture; GUI tests separately assert unsupported
 //! production administration. Forgery tests always use the raw public socket.
 
@@ -311,7 +312,7 @@ async fn replayed_admin_id_cannot_apply_another_mutation() {
     .await;
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn oversized_native_frame_is_closed_without_recording_or_stopping_daemon() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -348,7 +349,7 @@ async fn oversized_native_frame_is_closed_without_recording_or_stopping_daemon()
     .await;
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn unsafe_parent_and_symlink_base_are_rejected_before_state_creation() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -374,7 +375,7 @@ async fn unsafe_parent_and_symlink_base_are_rejected_before_state_creation() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 #[tokio::test]
 async fn native_client_reconnects_after_service_restart_and_interrupted_admin_is_not_replayed() {
     with_deadline(async {
@@ -425,7 +426,7 @@ async fn native_client_reconnects_after_service_restart_and_interrupted_admin_is
 /// A different client build on the private plane is refused before the
 /// mutation runs — and, the daemon's binary being unchanged on disk, the
 /// daemon does not restart on the client's say-so.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 #[tokio::test]
 async fn native_version_mismatch_refuses_mutation_and_does_not_restart() {
     with_deadline(async {

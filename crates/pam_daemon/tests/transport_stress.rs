@@ -679,9 +679,7 @@ mod cross_process {
         let thread_count = command_text("ps", &["-M", "-p", &pid_text])
             .map(|text| text.lines().count().saturating_sub(1));
         #[cfg(not(target_os = "macos"))]
-        let thread_count = std::fs::read_dir(format!("/proc/{pid_text}/task"))
-            .ok()
-            .map(Iterator::count);
+        let thread_count: Option<usize> = None;
         json!({"rss_kib_cpu_percent": rss_cpu, "numeric_fd_count": descriptors(pid), "thread_rows": thread_count})
     }
 

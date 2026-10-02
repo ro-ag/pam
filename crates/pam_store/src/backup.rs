@@ -467,6 +467,7 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 /// Makes a directory's entries durable. Windows has no way to sync a
 /// directory handle; there the rename is durable when the file system's
 /// journal says so.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

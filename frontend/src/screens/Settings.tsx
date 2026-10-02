@@ -381,8 +381,8 @@ function statusField(status: Record<string, unknown> | null | undefined, key: st
 
 /**
  * The daemon card: live status facts, stop/restart, and the login-start
- * row — whether the platform's user-scope unit (LaunchAgent, systemd
- * user unit, scheduled task) is installed, with Install / Remove.
+ * row — whether the platform's user-scope unit (LaunchAgent, scheduled
+ * task) is installed, with Install / Remove.
  */
 function DaemonPanel({ active }: { active: boolean }) {
   const queryClient = useQueryClient();

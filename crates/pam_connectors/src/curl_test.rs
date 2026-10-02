@@ -91,7 +91,7 @@ fn request() -> HttpRequest {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn connector_command_uses_only_trusted_curl_without_argv_credentials() {
     let Ok(path) = CurlTransport::trusted_path() else {
@@ -158,7 +158,7 @@ fn windows_child_keeps_the_os_roots_and_a_neutral_working_directory() {
     );
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[test]
 fn platforms_without_a_verified_system_binary_fail_closed() {
     assert!(matches!(
@@ -170,7 +170,7 @@ fn platforms_without_a_verified_system_binary_fail_closed() {
     ));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn inherited_curl_home_cannot_enable_a_trace_file() {
     if CurlTransport::trusted_path().is_err() {
@@ -196,7 +196,7 @@ fn inherited_curl_home_cannot_enable_a_trace_file() {
     assert!(!trace.exists(), "inherited curlrc wrote a host trace file");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn hostile_environment_child() {
     use tokio::io::AsyncWriteExt;
@@ -233,7 +233,7 @@ fn mutation_body_and_credentials_stay_in_escaped_stdin_config() {
         1
     );
     assert!(config.contains("data-binary = \"{\\n"));
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let transport = CurlTransport::trusted().unwrap();
         let command = transport.command(&req, 5).unwrap();

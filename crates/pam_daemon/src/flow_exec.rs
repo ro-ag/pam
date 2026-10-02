@@ -707,7 +707,7 @@ pub fn is_secret_env_name(name: &str) -> bool {
 /// Finds `program` on `extra_path` first, then on `path`.
 ///
 /// The extra directories win, which is the whole point of the setting: a
-/// daemon started by launchd or systemd inherits a minimal `PATH` where
+/// daemon started by launchd inherits a minimal `PATH` where
 /// `cargo` does not exist, and the human's answer is `~/.cargo/bin`.
 /// A program name carrying a path separator resolves to nothing —
 /// validation refuses those, and this is the second line of that fence.

@@ -8,10 +8,9 @@ use tempfile::TempDir;
 
 use crate::client::{StopError, StopOutcome};
 use crate::service::{
-    LAUNCHD_LABEL, MANAGED_STOPPED_NOTE, Platform, Runner, SYSTEMD_UNIT, ServiceEnv, ServiceError,
-    ServiceState, StopFn, WINDOWS_TASK, install_with, pinned_exe_from_plist,
-    pinned_exe_from_systemd, render_launch_agent, render_systemd_unit, status, uninstall,
-    unsafe_exe_reason_with, windows_task_action, windows_task_loaded,
+    LAUNCHD_LABEL, MANAGED_STOPPED_NOTE, Platform, Runner, ServiceEnv, ServiceError, ServiceState,
+    StopFn, WINDOWS_TASK, install_with, pinned_exe_from_plist, render_launch_agent, status,
+    uninstall, unsafe_exe_reason_with, windows_task_action, windows_task_loaded,
 };
 
 #[test]
@@ -39,29 +38,6 @@ fn launch_agent_carries_the_base_override_and_escapes_xml() {
     );
     assert!(plist.contains("<string>/tmp/a&amp;b/pam</string>"));
     assert!(plist.contains("<key>PAM_BASE_DIR</key>\n\t\t<string>/tmp/x</string>"));
-}
-
-#[test]
-fn systemd_unit_restarts_on_failure_and_wants_default_target() {
-    let unit = render_systemd_unit(Path::new("/home/me/.local/bin/pam"), None);
-    assert!(unit.contains("ExecStart=\"/home/me/.local/bin/pam\" daemon\n"));
-    assert!(unit.contains("Restart=on-failure\n"));
-    assert!(unit.contains("WantedBy=default.target\n"));
-    assert!(!unit.contains("Environment="));
-    let with_base = render_systemd_unit(Path::new("/opt/pam"), Some(Path::new("/srv/pam")));
-    assert!(with_base.contains("Environment=\"PAM_BASE_DIR=/srv/pam\"\n"));
-}
-
-#[test]
-fn systemd_unit_quotes_and_escapes_a_base_override_with_spaces_and_quotes() {
-    let unit = render_systemd_unit(
-        Path::new("/opt/pam/pam"),
-        Some(Path::new(r#"/home/me/my "pam" dir/base\x"#)),
-    );
-    assert!(
-        unit.contains(r#"Environment="PAM_BASE_DIR=/home/me/my \"pam\" dir/base\\x""#),
-        "{unit}"
-    );
 }
 
 #[test]
@@ -234,74 +210,6 @@ fn macos_uninstall_boots_out_and_removes_the_plist() {
 }
 
 #[test]
-fn linux_install_reloads_then_enables_now() {
-    let home = TempDir::new().unwrap();
-    let runner = FakeRunner::default();
-    let report = install_with(&env(Platform::Linux, home.path()), &runner, NOT_RUNNING).unwrap();
-    let unit = home.path().join(".config/systemd/user").join(SYSTEMD_UNIT);
-    assert!(
-        std::fs::read_to_string(&unit)
-            .unwrap()
-            .contains("ExecStart=\"/opt/pam/pam\" daemon")
-    );
-    assert_eq!(
-        report.state,
-        ServiceState::Installed {
-            unit: unit.display().to_string(),
-            loaded: true
-        }
-    );
-    assert_eq!(
-        runner.calls(),
-        vec![
-            "systemctl --user daemon-reload".to_owned(),
-            format!("systemctl --user enable --now {SYSTEMD_UNIT}"),
-        ]
-    );
-}
-
-#[test]
-fn linux_status_asks_is_active() {
-    let home = TempDir::new().unwrap();
-    let e = env(Platform::Linux, home.path());
-    let unit = home.path().join(".config/systemd/user").join(SYSTEMD_UNIT);
-    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-    std::fs::write(&unit, "x").unwrap();
-    let inactive = FakeRunner::default().answer("systemctl --user", 3, "inactive\n", "");
-    assert_eq!(
-        status(&e, &inactive).unwrap().state,
-        ServiceState::Installed {
-            unit: unit.display().to_string(),
-            loaded: false
-        }
-    );
-    assert_eq!(
-        inactive.calls(),
-        vec![format!("systemctl --user is-active {SYSTEMD_UNIT}")]
-    );
-}
-
-#[test]
-fn linux_uninstall_disables_removes_reloads() {
-    let home = TempDir::new().unwrap();
-    let e = env(Platform::Linux, home.path());
-    let unit = home.path().join(".config/systemd/user").join(SYSTEMD_UNIT);
-    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-    std::fs::write(&unit, "x").unwrap();
-    let runner = FakeRunner::default();
-    let report = uninstall(&e, &runner).unwrap();
-    assert!(!unit.exists());
-    assert_eq!(report.note.as_deref(), Some(MANAGED_STOPPED_NOTE));
-    assert_eq!(
-        runner.calls(),
-        vec![
-            format!("systemctl --user disable --now {SYSTEMD_UNIT}"),
-            "systemctl --user daemon-reload".to_owned(),
-        ]
-    );
-}
-
-#[test]
 fn windows_install_creates_the_logon_task_and_runs_it() {
     let home = TempDir::new().unwrap();
     let mut e = env(Platform::Windows, home.path());
@@ -400,19 +308,34 @@ fn windows_refuses_a_base_override() {
 #[test]
 fn other_platforms_are_unsupported() {
     let home = TempDir::new().unwrap();
-    let report = status(&env(Platform::Other, home.path()), &FakeRunner::default()).unwrap();
-    assert!(matches!(report.state, ServiceState::Unsupported { .. }));
+    let other = env(Platform::Other, home.path());
+    let runner = FakeRunner::default();
+    // Linux has no manager here any more: it lands on `Other`, and every
+    // operation refuses with a stated reason instead of touching the host.
+    let reports = [
+        status(&other, &runner).unwrap(),
+        install_with(&other, &runner, NOT_RUNNING).unwrap(),
+        uninstall(&other, &runner).unwrap(),
+    ];
+    for report in reports {
+        assert!(
+            matches!(report.state, ServiceState::Unsupported { ref reason } if reason.contains("no login-start integration")),
+            "{report:?}"
+        );
+    }
+    assert!(runner.calls().is_empty());
 }
 
 #[test]
 fn a_failing_manager_command_is_legible() {
     let home = TempDir::new().unwrap();
-    let runner =
-        FakeRunner::default().answer("systemctl --user", 1, "", "Failed to connect to bus\n");
-    let err = install_with(&env(Platform::Linux, home.path()), &runner, NOT_RUNNING).unwrap_err();
+    let runner = FakeRunner::default()
+        .answer("id -u", 0, "501\n", "")
+        .answer("launchctl bootstrap", 5, "", "Bootstrap failed: 5\n");
+    let err = install_with(&env(Platform::Macos, home.path()), &runner, NOT_RUNNING).unwrap_err();
     let text = err.to_string();
-    assert!(text.contains("systemctl --user daemon-reload"), "{text}");
-    assert!(text.contains("Failed to connect to bus"), "{text}");
+    assert!(text.contains("launchctl bootstrap gui/501"), "{text}");
+    assert!(text.contains("Bootstrap failed: 5"), "{text}");
     assert!(matches!(err, ServiceError::Command { .. }));
 }
 
@@ -422,7 +345,7 @@ fn install_stops_a_loose_daemon_first_and_says_so() {
     let stopped =
         |_: &Path| -> Result<StopOutcome, StopError> { Ok(StopOutcome::Stopped { pid: 4242 }) };
     let report = install_with(
-        &env(Platform::Linux, home.path()),
+        &env(Platform::Macos, home.path()),
         &FakeRunner::default(),
         &stopped,
     )
@@ -433,7 +356,7 @@ fn install_stops_a_loose_daemon_first_and_says_so() {
     );
     let unsupported = |_: &Path| -> Result<StopOutcome, StopError> { Err(StopError::Unsupported) };
     let report = install_with(
-        &env(Platform::Linux, home.path()),
+        &env(Platform::Macos, home.path()),
         &FakeRunner::default(),
         &unsupported,
     )
@@ -503,7 +426,7 @@ fn a_group_or_world_writable_binary_or_directory_is_never_pinned() {
 #[test]
 fn install_refuses_an_unsafe_binary_before_touching_anything() {
     let home = TempDir::new().unwrap();
-    let mut e = env(Platform::Linux, home.path());
+    let mut e = env(Platform::Macos, home.path());
     e.exe = std::env::temp_dir().join("agent-built").join("pam");
     let runner = FakeRunner::default();
     let stopped = |_: &Path| -> Result<StopOutcome, StopError> {
@@ -514,7 +437,7 @@ fn install_refuses_an_unsafe_binary_before_touching_anything() {
     assert!(error.to_string().contains("temporary directory"), "{error}");
     assert!(error.recovery().contains("pam service install"));
     assert!(runner.calls().is_empty());
-    assert!(!home.path().join(".config/systemd/user").exists());
+    assert!(!home.path().join("Library/LaunchAgents").exists());
 }
 
 /// The unit goes to disk **before** the loose daemon is stopped, so a failed
@@ -523,13 +446,12 @@ fn install_refuses_an_unsafe_binary_before_touching_anything() {
 fn a_failed_unit_write_never_stops_the_running_daemon() {
     let home = TempDir::new().unwrap();
     // The unit's parent path is a regular file: create_dir_all fails.
-    std::fs::create_dir_all(home.path().join(".config")).unwrap();
-    std::fs::write(home.path().join(".config/systemd"), "not a directory").unwrap();
+    std::fs::write(home.path().join("Library"), "not a directory").unwrap();
     let stopped = |_: &Path| -> Result<StopOutcome, StopError> {
         panic!("the daemon must keep running when the unit cannot be written")
     };
     let error = install_with(
-        &env(Platform::Linux, home.path()),
+        &env(Platform::Macos, home.path()),
         &FakeRunner::default(),
         &stopped,
     )
@@ -541,8 +463,11 @@ fn a_failed_unit_write_never_stops_the_running_daemon() {
 fn install_writes_the_unit_then_stops_the_daemon_then_registers() {
     use std::cell::RefCell;
     let home = TempDir::new().unwrap();
-    let e = env(Platform::Linux, home.path());
-    let unit = home.path().join(".config/systemd/user").join(SYSTEMD_UNIT);
+    let e = env(Platform::Macos, home.path());
+    let unit = home
+        .path()
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
     let order = RefCell::new(Vec::new());
     let stopped = |_: &Path| -> Result<StopOutcome, StopError> {
         order
@@ -558,7 +483,7 @@ fn install_writes_the_unit_then_stops_the_daemon_then_registers() {
     );
     assert_eq!(
         runner.calls()[0],
-        "systemctl --user daemon-reload",
+        "id -u",
         "registration comes after the stop"
     );
 }
@@ -586,7 +511,7 @@ fn the_unit_carries_a_base_override_only_when_one_was_requested() {
 // --- status reports a stale pinned executable (finding 10) -------------------
 
 #[test]
-fn the_pinned_executable_is_read_back_from_each_unit_format() {
+fn the_pinned_executable_is_read_back_from_the_launch_agent() {
     let plist = render_launch_agent(
         Path::new("/Applications/a&b/pam.app/Contents/MacOS/pam"),
         Path::new("/Users/me/.pam/log"),
@@ -596,41 +521,23 @@ fn the_pinned_executable_is_read_back_from_each_unit_format() {
         pinned_exe_from_plist(&plist).as_deref(),
         Some(Path::new("/Applications/a&b/pam.app/Contents/MacOS/pam"))
     );
-    let unit = render_systemd_unit(Path::new(r#"/opt/we "ird"/100%/$HOME/pam"#), None);
-    assert_eq!(
-        pinned_exe_from_systemd(&unit).as_deref(),
-        Some(Path::new(r#"/opt/we "ird"/100%/$HOME/pam"#)),
-        "{unit}"
-    );
-}
-
-#[test]
-fn systemd_specifiers_and_expansions_in_the_exe_path_stay_literal() {
-    let unit = render_systemd_unit(
-        Path::new("/opt/100%/$HOME/pam"),
-        Some(Path::new("/srv/50%")),
-    );
-    assert!(
-        unit.contains(r#"ExecStart="/opt/100%%/$$HOME/pam" daemon"#),
-        "{unit}"
-    );
-    assert!(
-        unit.contains(r#"Environment="PAM_BASE_DIR=/srv/50%%""#),
-        "{unit}"
-    );
 }
 
 #[test]
 fn status_names_a_pinned_binary_that_is_missing_or_not_this_one() {
     let home = TempDir::new().unwrap();
-    let e = env(Platform::Linux, home.path());
-    let unit = home.path().join(".config/systemd/user").join(SYSTEMD_UNIT);
+    let e = env(Platform::Macos, home.path());
+    let unit = home
+        .path()
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
     std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    let log_dir = Path::new("/Users/me/.pam/log");
 
     // Pinned to a binary that no longer exists.
     std::fs::write(
         &unit,
-        render_systemd_unit(Path::new("/gone/forever/pam"), None),
+        render_launch_agent(Path::new("/gone/forever/pam"), log_dir, None),
     )
     .unwrap();
     let report = status(&e, &FakeRunner::default()).unwrap();
@@ -644,7 +551,7 @@ fn status_names_a_pinned_binary_that_is_missing_or_not_this_one() {
     // Pinned to a real binary that is not the running one.
     let other = home.path().join("other-pam");
     std::fs::write(&other, "x").unwrap();
-    std::fs::write(&unit, render_systemd_unit(&other, None)).unwrap();
+    std::fs::write(&unit, render_launch_agent(&other, log_dir, None)).unwrap();
     let report = status(&e, &FakeRunner::default()).unwrap();
     assert!(
         report
@@ -658,9 +565,9 @@ fn status_names_a_pinned_binary_that_is_missing_or_not_this_one() {
     // Pinned to the running binary: not stale.
     let running = home.path().join("running-pam");
     std::fs::write(&running, "x").unwrap();
-    let mut current = env(Platform::Linux, home.path());
+    let mut current = env(Platform::Macos, home.path());
     current.exe = running.clone();
-    std::fs::write(&unit, render_systemd_unit(&running, None)).unwrap();
+    std::fs::write(&unit, render_launch_agent(&running, log_dir, None)).unwrap();
     let report = status(&current, &FakeRunner::default()).unwrap();
     assert_eq!(report.pinned_exe.as_deref(), Some(running.as_path()));
     assert_eq!(report.stale, None);

@@ -806,10 +806,6 @@ impl EngineServer {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        #[cfg(target_os = "linux")]
-        if let Some(dir) = self.binary.parent() {
-            command.env("LD_LIBRARY_PATH", dir);
-        }
         #[cfg(windows)]
         if let Some(root) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", root);

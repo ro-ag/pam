@@ -413,7 +413,7 @@ impl DaemonHandle {
     /// The path this daemon was started as, recorded at boot. A respawn
     /// after [`LifecyclePhase::Restarting`] must execute **this** path, not
     /// `std::env::current_exe()` at respawn time: after the usual
-    /// rename-into-place install the latter names a deleted file on Linux.
+    /// rename-into-place install the latter may name a replaced file.
     /// `None` only when the platform could not name the executable at boot.
     #[must_use]
     pub fn boot_image_path(&self) -> Option<PathBuf> {
@@ -759,11 +759,11 @@ pub async fn run_daemon_with(
 /// The connector credential store for this boot.
 ///
 /// The native store opens lazily, off the async threads, on its first
-/// use (see [`SecretStore::native`]) — boot never touches the keychain
-/// or the Secret Service bus. A keychain that then will not open is not
-/// a boot failure either: the daemon serves, the Connectors screen still
-/// draws (saying the store is unavailable), and anything that needs a
-/// credential refuses with the store's own cause.
+/// use (see [`SecretStore::native`]) — boot never touches the keychain.
+/// A keychain that then will not open is not a boot failure either: the
+/// daemon serves, the Connectors screen still draws (saying the store is
+/// unavailable), and anything that needs a credential refuses with the
+/// store's own cause.
 fn open_secret_store(injected: Option<Arc<dyn SecretBackend>>) -> Arc<SecretStore> {
     Arc::new(match injected {
         Some(backend) => SecretStore::new(backend),

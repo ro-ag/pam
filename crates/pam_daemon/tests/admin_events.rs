@@ -2,7 +2,7 @@
 //! the GUI's event pump connects to. The stream is opened through
 //! `admin_transport::events`, the requests whose events it carries go in
 //! through the public plane, and the daemon is stopped and restarted under it.
-#![cfg(any(target_os = "macos", target_os = "linux", windows))]
+#![cfg(any(target_os = "macos", windows))]
 
 use pam_daemon::admin_transport::{self, AdminEvents, CAUSE_SUBSCRIBER_CAPACITY};
 use pam_daemon::framed::DialError;

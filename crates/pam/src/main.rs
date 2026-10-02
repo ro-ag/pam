@@ -137,8 +137,8 @@ enum Cmd {
         #[command(subcommand)]
         action: FlowCmd,
     },
-    /// Start the daemon at login: a user-scope launch agent, systemd user
-    /// unit, or scheduled task. Never sudo or admin.
+    /// Start the daemon at login: a user-scope launch agent or
+    /// scheduled task. Never sudo or admin.
     Service {
         #[command(subcommand)]
         action: ServiceCmd,
@@ -174,7 +174,7 @@ enum ServiceCmd {
         #[arg(long, value_name = "DIR")]
         base_dir: Option<PathBuf>,
     },
-    /// Unregister and remove the unit. On macOS and Linux the manager
+    /// Unregister and remove the unit. On macOS the manager
     /// stops the managed daemon with it; the next pam command starts one.
     Uninstall {
         /// Print the report as JSON.

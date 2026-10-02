@@ -2,8 +2,8 @@
 //!
 //! Connector rows in `pam_store` hold only non-secrets (base URL, username,
 //! enabled flag, test result); the token or password lives in the OS
-//! credential store (macOS Keychain, Windows Credential Manager, Secret
-//! Service on Linux), never on disk in plaintext. [`SecretStore`] runs every
+//! credential store (macOS Keychain, Windows Credential Manager), never on
+//! disk in plaintext. [`SecretStore`] runs every
 //! backend call under [`tokio::task::spawn_blocking`] and returns only a
 //! sanitized [`SecretError`]: only the platform error's *kind* (its variant
 //! name) is logged with [`tracing::warn!`]; its text goes nowhere, since it
@@ -274,17 +274,14 @@ impl NativeSecretBackend {
         #[cfg(target_os = "windows")]
         let store: Arc<CredentialStore> = windows_native_keyring_store::Store::new()
             .map_err(|error| map_keyring_error(&error, "open the Windows credential store"))?;
-        #[cfg(target_os = "linux")]
-        let store: Arc<CredentialStore> = zbus_secret_service_keyring_store::Store::new()
-            .map_err(|error| map_keyring_error(&error, "open the Secret Service store"))?;
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             tracing::warn!("no native credential store is implemented for this platform");
             return Err(SecretError::Unavailable);
         }
 
         #[cfg_attr(
-            not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+            not(any(target_os = "macos", target_os = "windows")),
             allow(unreachable_code)
         )]
         Ok(Self {
@@ -562,9 +559,7 @@ impl SecretStore {
     /// Builds a store over the platform's native credential backend,
     /// opened lazily on first use.
     ///
-    /// Opening the native store is itself a blocking platform call — the
-    /// Linux Secret Service client spins up its own runtime and discovers
-    /// the session bus, which on a headless machine can stall — so it
+    /// Opening the native store is itself a blocking platform call, so it
     /// never runs on the daemon's async threads or at boot: the first
     /// `get`/`set`/`delete`/`present` opens it on the blocking pool, and
     /// on macOS [`Self::warm`] does that in the background right after

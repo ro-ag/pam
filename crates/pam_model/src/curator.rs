@@ -198,16 +198,10 @@ pub fn trusted_dirs(home: Option<&Path>) -> Vec<PathBuf> {
             .map(PathBuf::from)
             .collect()
     } else {
-        [
-            "/usr/bin",
-            "/bin",
-            "/usr/local/bin",
-            "/opt/homebrew/bin",
-            "/home/linuxbrew/.linuxbrew/bin",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect()
+        ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
     };
     if let Some(home) = home.filter(|home| home.is_absolute()) {
         if cfg!(windows) {

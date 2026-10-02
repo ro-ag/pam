@@ -271,17 +271,15 @@ pub struct FlowSettings {
 impl FlowSettings {
     /// What a fresh install starts with.
     ///
-    /// The extra `PATH` differs per platform because a launchd or systemd
+    /// The extra `PATH` differs per platform because a launchd
     /// daemon inherits a minimal one: without these, `cargo` simply does
     /// not exist as far as a flow step is concerned.
     #[must_use]
     pub fn platform_default() -> Self {
-        let extra_path = if cfg!(target_os = "macos") {
-            vec!["~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin"]
-        } else if cfg!(target_os = "windows") {
+        let extra_path = if cfg!(target_os = "windows") {
             vec![r"%USERPROFILE%\.cargo\bin"]
         } else {
-            vec!["~/.cargo/bin", "~/.local/bin", "/usr/local/bin"]
+            vec!["~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin"]
         };
         Self {
             allowed_programs: DEFAULT_ALLOWED_PROGRAMS

@@ -29,7 +29,7 @@
 //! tests script file states through; nothing here uses `unsafe`.
 //!
 //! The respawn after a restart must use [`BootImage::path`] — the path recorded
-//! at boot — not `current_exe()` at respawn time, which on Linux names a deleted
+//! at boot — not `current_exe()` at respawn time, which may name a replaced
 //! file after the usual rename-into-place install.
 
 use std::path::{Path, PathBuf};

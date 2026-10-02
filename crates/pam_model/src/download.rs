@@ -451,7 +451,7 @@ fn remove_if_present(path: &Path) -> Result<(), DownloadError> {
 /// Never a `PATH` lookup: the same trusted-path rule `pam_connectors` applies
 /// to connector calls (duplicated here rather than imported — this crate does
 /// not depend on `pam_connectors`, and the check is a dozen lines). On macOS
-/// and Linux that is `/usr/bin/curl`, canonicalized, executable, with every
+/// that is `/usr/bin/curl`, canonicalized, executable, with every
 /// ancestor root-owned and not group- or world-writable; on Windows it is
 /// `%SystemRoot%\System32\curl.exe`, canonicalized inside `System32`. Anything
 /// else fails closed as [`DownloadError::CurlMissing`].
@@ -1132,7 +1132,7 @@ pub(crate) fn curl_env(
 
 /// The fixed operating-system curl, or `None` when it is absent or its
 /// ownership would let an ordinary same-user process replace it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn trusted_curl() -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let path = std::fs::canonicalize("/usr/bin/curl").ok()?;
@@ -1167,7 +1167,7 @@ fn trusted_curl() -> Option<PathBuf> {
     Some(canonical)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn trusted_curl() -> Option<PathBuf> {
     None
 }

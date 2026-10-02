@@ -792,18 +792,18 @@ describe("daemon", () => {
 
   it("renders the daemon's refusal when removing the login unit fails", async () => {
     mocks.serviceStatus.mockResolvedValue({
-      platform: "linux",
-      exe: "/usr/bin/pam",
+      platform: "macos",
+      exe: "/Applications/pam.app/Contents/MacOS/pam",
       state: {
         kind: "installed",
-        unit: "/home/me/.config/systemd/user/pam-daemon.service",
+        unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
         loaded: true,
       },
       note: null,
     });
     mocks.serviceUninstall.mockRejectedValue({
       cause: "service_manager_failed",
-      detail: "systemctl --user disable --now refused",
+      detail: "launchctl bootout refused",
       recovery: "Run `pam service uninstall` from a shell to see the manager's own output.",
     });
     renderSettings("daemon");
@@ -813,7 +813,7 @@ describe("daemon", () => {
     expect(
       await card.findByText(/start at login · service_manager_failed/),
     ).toBeInTheDocument();
-    expect(card.getByText(/systemctl --user disable --now refused/)).toBeInTheDocument();
+    expect(card.getByText(/launchctl bootout refused/)).toBeInTheDocument();
     // The unit is still installed: Remove is offered again.
     expect(card.getByRole("button", { name: "Remove" })).toBeInTheDocument();
   });
@@ -830,11 +830,11 @@ describe("daemon", () => {
 
   it("removes the login unit only after the two-tap confirm", async () => {
     mocks.serviceStatus.mockResolvedValue({
-      platform: "linux",
-      exe: "/usr/bin/pam",
+      platform: "macos",
+      exe: "/Applications/pam.app/Contents/MacOS/pam",
       state: {
         kind: "installed",
-        unit: "/home/me/.config/systemd/user/pam-daemon.service",
+        unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
         loaded: false,
       },
       note: null,
@@ -854,14 +854,14 @@ describe("daemon", () => {
 
   it("warns when the login unit pins a binary that is gone, and offers to repoint it", async () => {
     mocks.serviceStatus.mockResolvedValue({
-      platform: "linux",
-      exe: "/usr/bin/pam",
+      platform: "macos",
+      exe: "/Applications/pam.app/Contents/MacOS/pam",
       pinned_exe: "/tmp/old/pam",
       stale:
         "the unit runs /tmp/old/pam, which no longer exists; run `pam service install` from the current binary",
       state: {
         kind: "installed",
-        unit: "/home/me/.config/systemd/user/pam-daemon.service",
+        unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist",
         loaded: false,
       },
       note: null,

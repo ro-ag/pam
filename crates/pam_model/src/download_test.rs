@@ -386,7 +386,7 @@ fn the_curl_pam_runs_is_the_operating_systems_own() {
     };
     assert!(curl.is_absolute(), "{curl:?}");
     assert!(curl.is_file(), "{curl:?}");
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     assert_eq!(curl, std::fs::canonicalize("/usr/bin/curl").unwrap());
     #[cfg(target_os = "windows")]
     assert!(

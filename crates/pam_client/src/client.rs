@@ -112,33 +112,10 @@ async fn ensure_daemon_for_dial(base_dir: &Path) -> Result<(), RequestError> {
 }
 
 /// The production spawner for `base_dir`: [`spawn_daemon_process`] on this
-/// binary.
+/// process's own executable ([`std::env::current_exe`]).
 fn real_spawner(base_dir: &Path) -> impl FnMut() -> io::Result<()> + Send + 'static {
     let base = base_dir.to_path_buf();
-    move || spawn_daemon_process(&daemon_exe()?, &base)
-}
-
-/// The binary a daemon is spawned from: this process's executable. On
-/// Linux a binary replaced on disk after this process started reads back as
-/// `…/pam (deleted)`; the replacement at the original path is what a newer
-/// daemon must run, so that suffix is stripped when the path exists.
-///
-/// # Errors
-///
-/// Whatever [`std::env::current_exe`] produced.
-pub fn daemon_exe() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    if cfg!(target_os = "linux")
-        && let Some(stripped) = exe
-            .to_str()
-            .and_then(|text| text.strip_suffix(" (deleted)"))
-    {
-        let replaced = PathBuf::from(stripped);
-        if replaced.exists() {
-            return Ok(replaced);
-        }
-    }
-    Ok(exe)
+    move || spawn_daemon_process(&std::env::current_exe()?, &base)
 }
 
 /// [`ensure_daemon_for_dial`] with the override and spawner injected, so
@@ -611,9 +588,6 @@ const DAEMON_ENV_ALLOWLIST: &[&str] = &[
     "LANGUAGE",
     // The daemon's own documented debug filter (`init_daemon_logging`).
     "PAM_LOG",
-    // Secret Service / keyring access on Linux.
-    "XDG_RUNTIME_DIR",
-    "DBUS_SESSION_BUS_ADDRESS",
     // Windows process, profile and credential-store basics.
     "SystemRoot",
     "SystemDrive",

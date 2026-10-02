@@ -109,7 +109,7 @@ pub async fn open_store(tmp: &tempfile::TempDir) -> Store {
 /// macOS and `Standard` everywhere else, and only the relaxed profile
 /// auto-grants a non-destructive capability on first use. Harness daemons
 /// drive `echo` without granting it, so without this seed the very same
-/// test passes on macOS and refuses with `not_granted` on Linux and
+/// test passes on macOS and refuses with `not_granted` on
 /// Windows. Tests that care about a different profile seed it themselves
 /// and spawn through [`TestDaemon::spawn_at`].
 pub async fn seed_relaxed(tmp: &tempfile::TempDir) {

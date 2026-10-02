@@ -522,12 +522,12 @@ fn service_report_prints_one_fact_per_line() {
             .contains("state     unsupported: freebsd has no login-start integration\n")
     );
     let absent = ServiceReport {
-        platform: "linux",
-        exe: "/usr/bin/pam".into(),
+        platform: "macos",
+        exe: "/Applications/pam.app/Contents/MacOS/pam".into(),
         pinned_exe: None,
         stale: None,
         state: ServiceState::NotInstalled {
-            unit: "/home/me/.config/systemd/user/pam-daemon.service".to_owned(),
+            unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist".to_owned(),
         },
         note: None,
     };
@@ -539,12 +539,12 @@ fn service_status_names_a_stale_pinned_executable() {
     use crate::render;
     use pam_client::service::{ServiceReport, ServiceState};
     let report = ServiceReport {
-        platform: "linux",
-        exe: "/usr/bin/pam".into(),
+        platform: "macos",
+        exe: "/Applications/pam.app/Contents/MacOS/pam".into(),
         pinned_exe: Some("/tmp/old/pam".into()),
         stale: Some("the unit runs /tmp/old/pam, which no longer exists".to_owned()),
         state: ServiceState::Installed {
-            unit: "/home/me/.config/systemd/user/pam-daemon.service".to_owned(),
+            unit: "/Users/me/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist".to_owned(),
             loaded: false,
         },
         note: None,

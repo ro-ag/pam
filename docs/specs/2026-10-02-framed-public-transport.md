@@ -817,8 +817,8 @@ to have changed, which the deployment assumption already places outside an
 agent's reach (docs/admin-boundary.md, "Deployment assumption").
 
 The respawn uses the path recorded at boot. Today `respawn_daemon` calls
-`current_exe()` at respawn time (main.rs:861-862), which on Linux names a
-deleted file after the usual rename-into-place install.
+`current_exe()` at respawn time (main.rs:861-862), which can name a
+deleted file after a rename-into-place install.
 
 Client and daemon ship as one binary and the protocol types are free to
 change between releases (pam_proto/src/lib.rs:3-6). The handshake therefore
@@ -1527,14 +1527,14 @@ Risks:
 - Service-manager behaviour around a self-restart is not established by any
   test in the repository. `respawn_daemon` now starts the child through the
   client's shared spawn helper (its own process group, a reduced environment),
-  but launchd or systemd may still reap it with the unit, leaving the next
+  but launchd may still reap it with the unit, leaving the next
   client to lazy-start a loose daemon. Nothing in this design depends on
   the answer. T9 observed the loose case only (the respawned daemon has
-  parent 1 and its own process group, and serves); under launchd or systemd
+  parent 1 and its own process group, and serves); under launchd
   it is still unobserved, and no document may describe it as fact.
 - The image check can miss a replacement when the daemon's recorded path
   still holds the old file (a versioned install directory reached through a
-  path the kernel had already resolved, as `/proc/self/exe` does on Linux).
+  path the kernel had already resolved).
   The result is a `client_version_mismatch` refusal that names the fix, not a
   restart loop, which is strictly better than today.
 - The first pam command after an upgrade, if it runs inside a sandbox, cannot

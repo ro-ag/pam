@@ -201,7 +201,7 @@ fn signal_term(child: &Child) {
 /// macOS and `Standard` everywhere else, and only the relaxed profile
 /// auto-grants a non-destructive capability on first use. This test
 /// drives `echo` without granting it, so without the seed it passes on
-/// macOS and refuses with `not_granted` on Linux and Windows.
+/// macOS and refuses with `not_granted` on Windows.
 async fn seed_relaxed(base: &Path) {
     let store = Store::open(&base.join("state.sqlite3"))
         .await

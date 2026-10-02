@@ -1,5 +1,7 @@
 # Flows engine + connector host — design
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 Status: approved by owner (brainstorming session, 2026-09-02)
 Umbrella vision: `docs/vision.md` §3 "Local workflows kill boilerplate",
 Scoping model ("Flows" and "Connectors" are global), Credentials.

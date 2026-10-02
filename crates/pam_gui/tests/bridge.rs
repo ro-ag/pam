@@ -18,7 +18,7 @@ use pam_gui::events::{AdminConnect, EventPayload, EventSink, PayloadEvent, pump}
 use pam_proto::wire::Ingress;
 use pam_proto::{Event, Response};
 use pam_testkit::{TestDaemon, with_deadline};
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -60,7 +60,7 @@ async fn daemon_status_call_answers_the_status_body() {
 /// `admin_call`'s happy path: a whitelisted op goes through
 /// `send_admin` and unwraps to its result body.
 #[tokio::test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
     let daemon = TestDaemon::spawn().await;
     let base = daemon.base_dir();
@@ -82,7 +82,7 @@ async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
 /// bridge whitelist against a live daemon answers the block the runtime
 /// card reads, with an empty runtime on a fresh base dir.
 #[tokio::test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", windows))]
 async fn admin_call_reads_the_model_status_block() {
     let daemon = TestDaemon::spawn().await;
     let base = daemon.base_dir();
@@ -109,7 +109,7 @@ async fn admin_call_reads_the_model_status_block() {
 }
 
 #[tokio::test]
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "macos", windows)))]
 async fn admin_call_reports_unsupported_native_administration() {
     let daemon = TestDaemon::spawn().await;
     let op = "admin.profile.get";

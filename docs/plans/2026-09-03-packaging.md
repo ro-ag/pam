@@ -1,5 +1,7 @@
 # Packaging + OS Integration Implementation Plan
 
+> Superseded in part (2026-10-02): the supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped. Linux and Intel Mac statements below are historical.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship `pam` the way pam-old shipped (Tauri CLI bundles, CI package

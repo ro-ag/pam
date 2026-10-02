@@ -15,7 +15,7 @@ concurrency:
 jobs:
   validate:
     name: Validate release tag
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -77,7 +77,7 @@ jobs:
           # tag lands late. Re-running the CI run refreshes its artifacts.
           names="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
             --jq '[.artifacts[] | select(.expired | not) | .name] | join(" ")')"
-          for artifact in pam-linux-amd64 pam-linux-arm64 pam-windows-amd64 pam-windows-arm64 pam-macos-arm64; do
+          for artifact in pam-windows-amd64 pam-windows-arm64 pam-macos-arm64; do
             if [[ " $names " != *" $artifact "* ]]; then
               echo "::error::Artifact $artifact from CI run $run_id is missing or expired; re-run that CI run, then retry the release."
               exit 1
@@ -93,27 +93,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux amd64 package
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            family: linux
-            arch: amd64
-            artifact: pam-linux-amd64
-          - name: Linux arm64 package
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            family: linux
-            arch: arm64
-            artifact: pam-linux-arm64
           - name: Windows amd64 package
             runner: windows-2025
-            target: x86_64-pc-windows-msvc
             family: windows
             arch: amd64
             artifact: pam-windows-amd64
           - name: Windows arm64 package
             runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
             family: windows
             arch: arm64
             artifact: pam-windows-arm64
@@ -132,25 +118,7 @@ jobs:
           # No checkout in this job: point gh at the repository explicitly.
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir downloaded
 
-      - name: Assemble Linux release archive
-        if: ${{ matrix.family == 'linux' }}
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.validate.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          mkdir -p bundle payload
-          tar -xzf "downloaded/pam-${TARGET}-bundle.tar.gz" -C bundle
-          # Ship the installable files only, not the bundler's staging trees
-          # (deb/<name>/data, appimage/pam.AppDir) that ride along in the CI tarball.
-          cp bundle/deb/*.deb bundle/appimage/*.AppImage payload/
-          ls -l payload
-          tar -C payload -czf "$PWD/pam_${VERSION}_linux_${ARCH}.tar.gz" .
-
       - name: Assemble Windows release archive
-        if: ${{ matrix.family == 'windows' }}
         shell: pwsh
         env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -304,7 +272,7 @@ jobs:
   release:
     name: Publish release
     needs: [validate, build, macos]
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 15
     permissions:
       contents: write
@@ -323,7 +291,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd dist && sha256sum * > checksums.txt)
+          # macOS has no sha256sum; shasum -a 256 prints the same two-column format.
+          (cd dist && shasum -a 256 * > checksums.txt)
           ls -l dist
 
       - name: Extract release notes from changelog

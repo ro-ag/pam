@@ -65,7 +65,7 @@ pub async fn service_install() -> Result<ServiceReport, BridgeError> {
     run(Op::Install).await
 }
 
-/// Unregisters and removes the unit; on macOS and Linux the manager
+/// Unregisters and removes the unit; on macOS the manager
 /// stops the managed daemon with it (the report's note says so).
 ///
 /// # Errors

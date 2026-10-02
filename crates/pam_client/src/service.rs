@@ -1,6 +1,6 @@
 //! Login-start integration for the daemon: one user-scope unit per platform (macOS `LaunchAgent`,
-//! systemd user unit, Windows per-user scheduled task), rendered and managed here, shared by `pam
-//! service …` and the GUI bridge. Every OS call goes through [`Runner`], so tests drive all three
+//! Windows per-user scheduled task), rendered and managed here, shared by `pam
+//! service …` and the GUI bridge. Every OS call goes through [`Runner`], so tests drive both
 //! platforms on any host with a fake; platform managers are compiled everywhere and selected by
 //! [`ServiceEnv::platform`]. Never sudo, admin, or root — user scope only.
 //!
@@ -12,8 +12,8 @@
 //! for one explicitly (`pam service install --base-dir`), never because the environment happened to
 //! hold one: an agent-set variable must not outlive the shell it was set in. `status` reports a
 //! pinned executable that is missing or is not the running binary. Uninstall unregisters
-//! and removes the unit; on macOS and Linux the manager also stops the managed daemon (`launchctl
-//! bootout`, `systemctl disable --now`), and the next pam command starts one lazily. `pam daemon`
+//! and removes the unit; on macOS the manager also stops the managed daemon (`launchctl
+//! bootout`), and the next pam command starts one lazily. `pam daemon`
 //! exits 0 on `already running`, so a manager never restart-loops against a loose instance.
 
 use std::ffi::OsString;
@@ -30,14 +30,12 @@ use crate::client::{self, StopError, StopOutcome};
 
 /// launchd label and plist file stem.
 pub const LAUNCHD_LABEL: &str = "com.github.ro-ag.pam.daemon";
-/// systemd user unit file name.
-pub const SYSTEMD_UNIT: &str = "pam-daemon.service";
 /// Windows Task Scheduler task path.
 pub const WINDOWS_TASK: &str = r"pam\daemon";
 /// How long `install` waits for a loose daemon to drain before the
 /// managed instance is started.
 pub const STOP_WAIT: Duration = Duration::from_secs(15);
-/// The uninstall report's note on macOS and Linux, where unregistering
+/// The uninstall report's note on macOS, where unregistering
 /// the unit also stops the daemon it was running.
 pub const MANAGED_STOPPED_NOTE: &str = "the manager stopped the managed daemon along with its unit; the next pam command starts one lazily";
 
@@ -47,8 +45,6 @@ pub const MANAGED_STOPPED_NOTE: &str = "the manager stopped the managed daemon a
 pub enum Platform {
     /// macOS, managed with a `LaunchAgent`.
     Macos,
-    /// Linux, managed with a systemd user unit.
-    Linux,
     /// Windows, managed with a per-user scheduled task.
     Windows,
     /// Anything else: no login-start integration.
@@ -61,8 +57,6 @@ impl Platform {
     pub fn current() -> Self {
         if cfg!(target_os = "macos") {
             Self::Macos
-        } else if cfg!(target_os = "linux") {
-            Self::Linux
         } else if cfg!(windows) {
             Self::Windows
         } else {
@@ -75,7 +69,6 @@ impl Platform {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Macos => "macos",
-            Self::Linux => "linux",
             Self::Windows => "windows",
             Self::Other => "other",
         }
@@ -87,7 +80,7 @@ impl Platform {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServiceState {
     /// The unit is registered; `loaded` is the manager's own verdict
-    /// (launchd print / systemctl is-active / task exists).
+    /// (launchd print / task exists).
     Installed {
         /// Unit file path, or the task name on Windows.
         unit: String,
@@ -339,57 +332,6 @@ pub fn render_launch_agent(exe: &Path, log_dir: &Path, base_override: Option<&Pa
     plist
 }
 
-/// The systemd user unit: restart on failure only, part of the user's
-/// default target.
-#[must_use]
-pub fn render_systemd_unit(exe: &Path, base_override: Option<&Path>) -> String {
-    let mut unit = String::new();
-    unit.push_str(
-        "[Unit]\nDescription=pam daemon (local lifeguard for developers and AI agents)\n\n",
-    );
-    unit.push_str("[Service]\n");
-    let _ = writeln!(
-        unit,
-        "ExecStart=\"{}\" daemon",
-        systemd_exec_quote(&exe.display().to_string())
-    );
-    unit.push_str("Restart=on-failure\nRestartSec=2\n");
-    if let Some(base) = base_override {
-        let _ = writeln!(
-            unit,
-            "Environment=\"PAM_BASE_DIR={}\"",
-            systemd_quote(&base.display().to_string())
-        );
-    }
-    unit.push_str("\n[Install]\nWantedBy=default.target\n");
-    unit
-}
-
-/// Escapes `value` for the inside of a double-quoted systemd assignment
-/// (`Environment="KEY=value"`): a bare value splits on whitespace, and
-/// inside the quotes only backslash and the quote itself need escaping.
-/// `%` starts a unit specifier (`%h`, `%t`, …) in every setting, so a
-/// literal one is doubled.
-fn systemd_quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '"') {
-            quoted.push('\\');
-        }
-        if ch == '%' {
-            quoted.push('%');
-        }
-        quoted.push(ch);
-    }
-    quoted
-}
-
-/// [`systemd_quote`] for an `ExecStart=` word, where `$` also starts a
-/// variable expansion and is doubled to stay literal.
-fn systemd_exec_quote(value: &str) -> String {
-    systemd_quote(value).replace('$', "$$")
-}
-
 /// Reads the `Status:` line of `schtasks /Query /FO LIST` output. A task
 /// the scheduler will run at logon reports `Ready` (or `Running` while the
 /// daemon is up); `Disabled` — and any status this parser does not know —
@@ -520,30 +462,6 @@ pub fn pinned_exe_from_plist(plist: &str) -> Option<PathBuf> {
     Some(PathBuf::from(xml_unescape(value)))
 }
 
-/// The executable a systemd unit runs: the first word of `ExecStart=`,
-/// undoing `systemd_quote`'s escaping.
-#[must_use]
-pub fn pinned_exe_from_systemd(unit: &str) -> Option<PathBuf> {
-    let line = unit
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("ExecStart="))?;
-    let rest = line.trim().strip_prefix('"')?;
-    let mut word = String::new();
-    let mut chars = rest.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => return Some(PathBuf::from(word)),
-            '\\' => word.extend(chars.next()),
-            '%' | '$' if chars.peek() == Some(&ch) => {
-                chars.next();
-                word.push(ch);
-            }
-            other => word.push(other),
-        }
-    }
-    None
-}
-
 /// Whether the unit's pinned executable still matches this binary: `None`
 /// when it does, else why not.
 fn stale_reason(pinned: &Path, running: &Path) -> Option<String> {
@@ -578,7 +496,6 @@ fn unit_path(env: &ServiceEnv) -> PathBuf {
             .home
             .join("Library/LaunchAgents")
             .join(format!("{LAUNCHD_LABEL}.plist")),
-        Platform::Linux => env.home.join(".config/systemd/user").join(SYSTEMD_UNIT),
         Platform::Windows | Platform::Other => PathBuf::from(WINDOWS_TASK),
     }
 }
@@ -667,7 +584,6 @@ fn installed_report(
 ) -> ServiceReport {
     let pinned_exe = unit_text.and_then(|text| match env.platform {
         Platform::Macos => pinned_exe_from_plist(text),
-        Platform::Linux => pinned_exe_from_systemd(text),
         Platform::Windows | Platform::Other => None,
     });
     let stale_why = pinned_exe
@@ -722,21 +638,6 @@ pub fn status(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport, Se
                     runner,
                     "launchctl",
                     &args(&["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")]),
-                )?;
-                ServiceState::Installed {
-                    unit: unit_name,
-                    loaded,
-                }
-            } else {
-                ServiceState::NotInstalled { unit: unit_name }
-            }
-        }
-        Platform::Linux => {
-            if unit.is_file() {
-                let loaded = probe(
-                    runner,
-                    "systemctl",
-                    &args(&["--user", "is-active", SYSTEMD_UNIT]),
                 )?;
                 ServiceState::Installed {
                     unit: unit_name,
@@ -834,25 +735,6 @@ fn register_macos(runner: &dyn Runner, unit: &Path) -> Result<(), ServiceError> 
     Ok(())
 }
 
-/// Writes the systemd user unit file (nothing is enabled yet).
-fn write_linux_unit(env: &ServiceEnv, unit: &Path) -> Result<(), ServiceError> {
-    write_unit(
-        unit,
-        &render_systemd_unit(&env.exe, env.base_override.as_deref()),
-    )
-}
-
-/// Enables the written systemd unit now.
-fn register_linux(runner: &dyn Runner) -> Result<(), ServiceError> {
-    must(runner, "systemctl", &args(&["--user", "daemon-reload"]))?;
-    must(
-        runner,
-        "systemctl",
-        &args(&["--user", "enable", "--now", SYSTEMD_UNIT]),
-    )?;
-    Ok(())
-}
-
 /// Creates the per-user logon task and runs it now.
 fn install_windows(env: &ServiceEnv, runner: &dyn Runner) -> Result<(), ServiceError> {
     let action = windows_task_action(&env.exe);
@@ -904,13 +786,11 @@ pub fn install_with(
     let unit_name = unit.display().to_string();
     match env.platform {
         Platform::Macos => write_macos_unit(env, &unit)?,
-        Platform::Linux => write_linux_unit(env, &unit)?,
         Platform::Windows | Platform::Other => {}
     }
     let note = stop_note(stop, &env.base)?;
     match env.platform {
         Platform::Macos => register_macos(runner, &unit)?,
-        Platform::Linux => register_linux(runner)?,
         Platform::Windows => install_windows(env, runner)?,
         Platform::Other => unreachable!("filtered by unsupported()"),
     }
@@ -922,13 +802,13 @@ pub fn install_with(
         },
         note,
     );
-    if matches!(env.platform, Platform::Macos | Platform::Linux) {
+    if env.platform == Platform::Macos {
         done.pinned_exe = Some(env.exe.clone());
     }
     Ok(done)
 }
 
-/// Unregisters and removes the unit. On macOS and Linux the manager
+/// Unregisters and removes the unit. On macOS the manager
 /// stops the managed daemon with it; the report's note says so, and the
 /// next pam command starts one lazily. A loose daemon is never touched.
 ///
@@ -942,7 +822,7 @@ pub fn uninstall(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport,
     let unit = unit_path(env);
     let unit_name = unit.display().to_string();
     let note = match env.platform {
-        Platform::Macos | Platform::Linux => Some(MANAGED_STOPPED_NOTE.to_owned()),
+        Platform::Macos => Some(MANAGED_STOPPED_NOTE.to_owned()),
         Platform::Windows | Platform::Other => None,
     };
     match env.platform {
@@ -954,15 +834,6 @@ pub fn uninstall(env: &ServiceEnv, runner: &dyn Runner) -> Result<ServiceReport,
                 &args(&["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")]),
             )?;
             remove_unit(&unit)?;
-        }
-        Platform::Linux => {
-            let _ = probe(
-                runner,
-                "systemctl",
-                &args(&["--user", "disable", "--now", SYSTEMD_UNIT]),
-            )?;
-            remove_unit(&unit)?;
-            let _ = probe(runner, "systemctl", &args(&["--user", "daemon-reload"]))?;
         }
         Platform::Windows => {
             let _ = probe(

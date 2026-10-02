@@ -260,7 +260,9 @@ async fn a_follow_streams_the_tickets_events_and_ends_with_the_durable_answer() 
         let store = fixture.daemon.store();
         let hub = fixture.handle().event_hub();
 
-        let ticket = fixture.ticket("req_followed", 700).await;
+        // Long enough that a slow runner cannot finish it before the follow
+        // attaches: an attach after terminal is `end` at once, by design.
+        let ticket = fixture.ticket("req_followed", 4_000).await;
         fixture.wait_for_state(&ticket, RequestState::Running).await;
         // Another ticket's events must never reach this follower.
         let other = fixture.ticket("req_other", 5_000).await;

@@ -42,12 +42,6 @@ pub const ENGINE_RELEASE_BASE: &str =
 pub enum Target {
     /// Apple Silicon macOS; the asset ships Metal.
     MacosArm64,
-    /// Intel macOS.
-    MacosX64,
-    /// x86-64 Linux built on Ubuntu.
-    UbuntuX64,
-    /// aarch64 Linux built on Ubuntu.
-    UbuntuArm64,
     /// x86-64 Windows, CPU build.
     WinCpuX64,
     /// aarch64 Windows, CPU build.
@@ -66,9 +60,6 @@ impl Target {
     pub fn for_platform(os: &str, arch: &str) -> Option<Self> {
         match (os, arch) {
             ("macos", "aarch64") => Some(Self::MacosArm64),
-            ("macos", "x86_64") => Some(Self::MacosX64),
-            ("linux", "x86_64") => Some(Self::UbuntuX64),
-            ("linux", "aarch64") => Some(Self::UbuntuArm64),
             ("windows", "x86_64") => Some(Self::WinCpuX64),
             ("windows", "aarch64") => Some(Self::WinCpuArm64),
             _ => None,
@@ -89,9 +80,6 @@ impl Target {
     pub fn name(self) -> &'static str {
         match self {
             Self::MacosArm64 => "macos-arm64",
-            Self::MacosX64 => "macos-x64",
-            Self::UbuntuX64 => "ubuntu-x64",
-            Self::UbuntuArm64 => "ubuntu-arm64",
             Self::WinCpuX64 => "win-cpu-x64",
             Self::WinCpuArm64 => "win-cpu-arm64",
         }
@@ -100,7 +88,7 @@ impl Target {
     fn server_file_name(self) -> &'static str {
         match self {
             Self::WinCpuX64 | Self::WinCpuArm64 => "llama-server.exe",
-            _ => "llama-server",
+            Self::MacosArm64 => "llama-server",
         }
     }
 }
@@ -119,30 +107,12 @@ pub struct EngineAsset {
 }
 
 /// Every pinned asset for [`ENGINE_TAG`], one per supported target.
-pub const ENGINE_ASSETS: [EngineAsset; 6] = [
+pub const ENGINE_ASSETS: [EngineAsset; 3] = [
     EngineAsset {
         target: Target::MacosArm64,
         name: "llama-b10938-bin-macos-arm64.tar.gz",
         sha256: "69f236c8aa148eb32bfd76774a0a449e2f9b754c595e8f6d90b12cf7fecb8399",
         bytes: 11_146_574,
-    },
-    EngineAsset {
-        target: Target::MacosX64,
-        name: "llama-b10938-bin-macos-x64.tar.gz",
-        sha256: "13179741dd10cc0642cc5d09a69a08b6e3f59af40e70d4803c9f6f0b5a0bc10a",
-        bytes: 11_194_750,
-    },
-    EngineAsset {
-        target: Target::UbuntuX64,
-        name: "llama-b10938-bin-ubuntu-x64.tar.gz",
-        sha256: "adbd216b2453b79e3874a406bee21e59d1b0ba06df567102ab8a69aa3dd200dd",
-        bytes: 16_820_989,
-    },
-    EngineAsset {
-        target: Target::UbuntuArm64,
-        name: "llama-b10938-bin-ubuntu-arm64.tar.gz",
-        sha256: "647e257dbdd08ebe28143b3ade534d2659a0360e7c82b7505df22a4b6608ccc3",
-        bytes: 13_449_176,
     },
     EngineAsset {
         target: Target::WinCpuX64,
@@ -568,7 +538,7 @@ fn create_private_dir(path: &Path) -> Result<(), EngineError> {
         .map_err(|e| io("create engine directory", &e))
 }
 
-/// The operating system's own `tar`: `/usr/bin/tar` on macOS and Linux,
+/// The operating system's own `tar`: `/usr/bin/tar` on macOS,
 /// `%SystemRoot%\System32\tar.exe` on Windows (it reads zip archives too).
 pub fn trusted_tar_path() -> Result<PathBuf, EngineError> {
     #[cfg(windows)]
@@ -673,10 +643,6 @@ async fn verify_build(server: &Path, build: u64) -> Result<String, EngineError> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    if let Some(dir) = server.parent() {
-        command.env("LD_LIBRARY_PATH", dir);
-    }
     #[cfg(windows)]
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);

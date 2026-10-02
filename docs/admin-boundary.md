@@ -46,7 +46,7 @@ receives events only as the follow of one ticket (see
 
 ## The private endpoint
 
-On macOS and Linux, the native GUI client uses a separate Unix socket at
+On macOS, the native GUI client uses a separate Unix socket at
 `<base>/admin/control.sock`. The transport obtains the connected peer's UID and
 PID from the kernel rather than trusting the request envelope. These credentials
 authenticate the peer's operating-system owner and process identity; they do
@@ -118,7 +118,7 @@ argv value, or self-reported PID is not a substitute for that isolation.
 
 A daemon that a client starts lazily is started with an environment allowlist
 (home, user, locale, temp directory, absolute `PATH` entries, `PAM_LOG`, an
-explicit `PAM_BASE_DIR`, and on Linux the keyring session variables), in its own
+explicit `PAM_BASE_DIR`), in its own
 process group, with `/` as its directory and null standard streams. It does not
 inherit the caller's environment, descriptors or process group. Flow steps build
 their environment from the daemon's, so they no longer see the first caller's

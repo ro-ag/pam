@@ -51,7 +51,7 @@ mod events_stream;
 #[path = "admin_transport_events_test.rs"]
 mod events_stream_test;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[path = "admin_transport_unix.rs"]
 mod platform;
 
@@ -68,7 +68,7 @@ use loopback as platform;
 #[path = "admin_transport_windows_test.rs"]
 mod loopback_test;
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, target_os = "macos"))]
 #[path = "admin_transport_unix_test.rs"]
 mod platform_test;
 
@@ -77,13 +77,13 @@ pub use events_stream::{AdminEvents, CAUSE_SUBSCRIBER_CAPACITY};
 /// Whether this build has a validated native administration adapter.
 #[must_use]
 pub const fn supported() -> bool {
-    cfg!(any(target_os = "macos", target_os = "linux", windows))
+    cfg!(any(target_os = "macos", windows))
 }
 
 /// Owned privileged listener. Unsupported platforms retain public read-only
 /// operation but expose no administration fallback.
 pub struct AdminTransport {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", windows))]
     inner: platform::Listener,
 }
 
@@ -107,14 +107,14 @@ impl AdminTransport {
         image: Arc<ImageWatch>,
         hub: Arc<EventHub>,
     ) -> io::Result<Self> {
-        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let lifecycle = frame::AdminLifecycle { phase, image };
             Ok(Self {
                 inner: platform::Listener::bind(base, admin, lifecycle, hub)?,
             })
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = (base, admin, phase, image, hub);
             Ok(Self {})
@@ -122,12 +122,12 @@ impl AdminTransport {
     }
 
     pub(crate) async fn shutdown(self) {
-        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        #[cfg(any(target_os = "macos", windows))]
         self.inner.shutdown().await;
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -155,7 +155,7 @@ fn unsupported() -> io::Error {
 /// was accepted an error means the effect is unknown: inspect state, do not
 /// replay.
 pub async fn exchange(base: &Path, envelope: &Envelope) -> io::Result<Response> {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let request = frame::encode_request(envelope)?;
         tokio::time::timeout(Duration::from_millis(envelope.deadline_ms), async {
@@ -165,7 +165,7 @@ pub async fn exchange(base: &Path, envelope: &Envelope) -> io::Result<Response> 
         .await
         .map_err(|_| frame::timed_out())?
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (base, envelope, Duration::ZERO);
         Err(unsupported())
@@ -195,7 +195,7 @@ pub async fn exchange(base: &Path, envelope: &Envelope) -> io::Result<Response> 
 ///   `connection_capacity_exhausted`, [`CAUSE_SUBSCRIBER_CAPACITY`], or
 ///   `daemon_shutting_down`.
 pub async fn events(base: &Path) -> Result<AdminEvents, DialError> {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let opened = tokio::time::timeout(framed::HANDSHAKE_TIMEOUT, async {
             let stream = platform::connect(base).await?;
@@ -210,7 +210,7 @@ pub async fn events(base: &Path) -> Result<AdminEvents, DialError> {
             )))
         })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (base, Via::Direct, framed::HANDSHAKE_TIMEOUT);
         Err(DialError::Io(unsupported()))
@@ -219,11 +219,11 @@ pub async fn events(base: &Path) -> Result<AdminEvents, DialError> {
 
 /// Validate the private base before runtime files or state are opened.
 pub(crate) fn prepare_base(base: &Path) -> io::Result<std::path::PathBuf> {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", windows))]
     {
         platform::prepare_base(base)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         Ok(base.to_path_buf())
     }

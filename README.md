@@ -35,9 +35,13 @@ Grab the latest packaged build from the
 
 | Platform | Architecture | Package | CLI location |
 | --- | --- | --- | --- |
-| macOS 12+ | arm64 | signed, notarized `.dmg` | drag `pam.app` to Applications; the CLI is `/Applications/pam.app/Contents/MacOS/pam` — symlink it into your `PATH` |
-| Linux | amd64, arm64 | AppImage or `.deb` | `/usr/bin/pam` |
+| macOS 12+ | arm64 (Apple Silicon) | signed, notarized `.dmg` | drag `pam.app` to Applications; the CLI is `/Applications/pam.app/Contents/MacOS/pam` — symlink it into your `PATH` |
 | Windows | amd64, arm64 | NSIS per-user installer | `%LOCALAPPDATA%\pam\pam.exe`; the Start-menu shortcut opens the GUI (a console window behind it is expected) |
+
+### Supported platforms
+
+macOS 12+ on Apple Silicon, and Windows 10/11 on amd64 and arm64. Linux and
+Intel Macs are not supported.
 
 ## Quickstart
 
@@ -121,7 +125,6 @@ Each platform gets one user-scope unit, never sudo or admin:
 | Platform | Unit |
 | --- | --- |
 | macOS | LaunchAgent at `~/Library/LaunchAgents/com.github.ro-ag.pam.daemon.plist` |
-| Linux | systemd user unit at `~/.config/systemd/user/pam-daemon.service` |
 | Windows | scheduled task `pam\daemon` |
 
 `install` writes the unit first and then stops a loose daemon so the managed one
@@ -144,7 +147,7 @@ rustup show                          # picks up rust-toolchain.toml
 npm --prefix frontend ci             # Node 22.22.2+, 24.15+, or 26+
 tools/check.sh                       # the whole local gate: fmt, clippy, rustdoc, tests, eslint, tsc + vite build, vitest
 npm --prefix frontend run gui:build  # embedded-frontend binary
-npm --prefix frontend run tauri -- build   # platform bundles (dmg, AppImage/deb, NSIS)
+npm --prefix frontend run tauri -- build   # platform bundles (dmg, NSIS)
 ```
 
 A binary built without the embedded frontend (any plain `cargo build`) opens

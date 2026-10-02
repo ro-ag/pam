@@ -20,16 +20,12 @@ env:
   CARGO_INCREMENTAL: "0"
 jobs:
   gate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: macos-15
+    timeout-minutes: 45
     outputs:
       packages: ${{ steps.packages.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Tauri system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev patchelf
       # stable here and the rust-toolchain.toml pin must stay in lockstep
       # (1.98.1): the action's toolchain wins on CI, the pin wins locally
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -48,16 +44,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          linux_amd64='{"name":"Linux amd64 package","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb","family":"linux","artifact":"pam-linux-amd64"}'
-          linux_arm64='{"name":"Linux arm64 package","runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","bundles":"appimage,deb","family":"linux","artifact":"pam-linux-arm64"}'
-          windows_amd64='{"name":"Windows amd64 package","runner":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis","family":"windows","artifact":"pam-windows-amd64"}'
-          windows_arm64='{"name":"Windows arm64 package","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc","bundles":"nsis","family":"windows","artifact":"pam-windows-arm64"}'
+          windows_amd64='{"name":"Windows amd64 package","runner":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"nsis","artifact":"pam-windows-amd64"}'
+          windows_arm64='{"name":"Windows arm64 package","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc","bundles":"nsis","artifact":"pam-windows-arm64"}'
           # Pull requests build the cheapest package only; main, tags and
-          # dispatch build the four that release.yml reuses.
+          # dispatch build both Windows packages that release.yml reuses
+          # (macos-package builds the third).
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            echo "matrix={\"include\":[$linux_amd64]}" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$windows_amd64]}" >> "$GITHUB_OUTPUT"
           else
-            echo "matrix={\"include\":[$linux_amd64,$linux_arm64,$windows_amd64,$windows_arm64]}" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$windows_amd64,$windows_arm64]}" >> "$GITHUB_OUTPUT"
           fi
   targets:
     needs: gate
@@ -65,21 +60,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm, macos-15, windows-2025, windows-11-arm]
+        os: [macos-15, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --workspace
+      # gate already runs the whole workspace suite on macos-15 (check.sh), so
+      # the macOS row adds only what gate lacks: the live engine proof. The
+      # Windows rows are the only place their suites run.
+      - if: runner.os == 'Windows'
+        run: cargo test --workspace
         env:
           # tests/engine_live.rs: install the pinned llama.cpp release for
           # this target, fetch the 1.2 MB tinyllamas model, load it and ask
           # for one bounded completion (Unix socket, loopback TCP on Windows).
+          PAM_ENGINE_LIVE: "1"
+      - if: runner.os == 'macOS'
+        run: cargo test -p pam_model --test engine_live
+        env:
           PAM_ENGINE_LIVE: "1"
       - if: matrix.os == 'macos-15'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -99,11 +98,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Tauri system deps
-        if: ${{ matrix.family == 'linux' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev patchelf xdg-utils
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
@@ -118,60 +112,7 @@ jobs:
       - run: npm --prefix frontend ci
       - name: Build desktop packages
         run: npm --prefix frontend run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-      - name: Verify Linux package contract
-        if: ${{ matrix.family == 'linux' }}
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          bundle="target/$TARGET/release/bundle"
-          binary="target/$TARGET/release/pam"
-          mapfile -t appimages < <(find "$bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
-          mapfile -t debs < <(find "$bundle/deb" -maxdepth 1 -type f -name '*.deb' -print)
-          (( ${#appimages[@]} == 1 ))
-          (( ${#debs[@]} == 1 ))
-          case "$TARGET" in
-            x86_64-unknown-linux-gnu) expected_machine="Advanced Micro Devices X86-64"; expected_deb_arch="amd64" ;;
-            aarch64-unknown-linux-gnu) expected_machine="AArch64"; expected_deb_arch="arm64" ;;
-            *) echo "unsupported Linux verification target: $TARGET" >&2; exit 2 ;;
-          esac
-          for candidate in "$binary" "${appimages[0]}"; do
-            machine="$(readelf -h "$candidate" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
-            [[ "$machine" == "$expected_machine" ]]
-          done
-          [[ "$(dpkg-deb --field "${debs[0]}" Architecture)" == "$expected_deb_arch" ]]
-          expected_version="$(cargo metadata --no-deps --format-version 1 | node -e '
-            let input = ""; process.stdin.on("data", c => input += c);
-            process.stdin.on("end", () => { const m = JSON.parse(input); process.stdout.write(m.packages.find(p => p.name === "pam").version); });')"
-          verify_cli_contract() {
-            local candidate="$1"
-            [[ "$("$candidate" --version)" == "pam $expected_version" ]]
-            "$candidate" --help > "$RUNNER_TEMP/pam-help.txt"
-            grep -Fq "A local lifeguard for developers and AI agents." "$RUNNER_TEMP/pam-help.txt"
-            grep -Eq '^Usage: pam( |$)' "$RUNNER_TEMP/pam-help.txt"
-          }
-          verify_cli_contract "$binary"
-          deb_root="$RUNNER_TEMP/pam-deb-payload"; appimage_root="$RUNNER_TEMP/pam-appimage-payload"
-          mkdir -p "$deb_root" "$appimage_root"
-          dpkg-deb --extract "${debs[0]}" "$deb_root"
-          ( cd "$appimage_root" && "$GITHUB_WORKSPACE/${appimages[0]}" --appimage-extract >/dev/null )
-          verify_payload() {
-            local root="$1"
-            # Single-binary product; the AppImage additionally carries the
-            # xdg-open helper linuxdeploy bundles. Nothing else belongs here.
-            mapfile -t binaries < <(find "$root/usr/bin" -maxdepth 1 -type f -printf '%f\n' | sort)
-            [[ "${binaries[*]}" == "pam" || "${binaries[*]}" == "pam xdg-open" ]]
-            machine="$(readelf -h "$root/usr/bin/pam" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
-            [[ "$machine" == "$expected_machine" ]]
-            verify_cli_contract "$root/usr/bin/pam"
-            # The desktop entry opens the GUI, not the help text.
-            grep -Eq '^Exec=.*pam gui' "$root/usr/share/applications/pam.desktop"
-          }
-          verify_payload "$deb_root"
-          verify_payload "$appimage_root/squashfs-root"
       - name: Verify Windows package contract
-        if: ${{ matrix.family == 'windows' }}
         shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
@@ -227,13 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle="target/$TARGET/release/bundle"
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            archive="target/$TARGET/release/pam-$TARGET-bundle.tar.gz"
-            tar -C "$bundle" -czf "$PWD/$archive" .
-            echo "path=$archive" >> "$GITHUB_OUTPUT"
-          else
-            echo "path=$bundle" >> "$GITHUB_OUTPUT"
-          fi
+          echo "path=$bundle" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.artifact }}

@@ -161,9 +161,14 @@ All notable changes to pam are documented in this file. The format follows
 - On Windows a daemon started lazily by a command no longer inherits that
   command's output pipe, so a program capturing `pam`'s output (an agent
   harness) gets its answer instead of waiting until the daemon exits. The
-  daemon is started through the system PowerShell's `Start-Process`; where
-  policy blocks PowerShell the command reports that, and `pam service install`
-  runs the daemon at login without a lazy start.
+  daemon is started through the system PowerShell's `Start-Process`, loaded
+  from its module under `System32` by path, so the start takes the same
+  fraction of a second however many PowerShell modules the machine has; where
+  policy blocks PowerShell the command says so, quotes PowerShell's reason and
+  names `pam service install`, which runs the daemon at login without a lazy
+  start. A `pam.exe` that still carries a browser's downloaded-file mark is
+  not started in the background by Windows; the error names the mark and how
+  to remove it.
 - On Windows a crashed daemon's stale control file is refused in 0.3 s instead
   of being mistaken for a busy daemon.
 - `pam listen` no longer panics at startup (it did in 0.4.0 to 0.4.3).

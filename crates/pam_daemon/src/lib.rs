@@ -72,6 +72,12 @@ pub mod ingress;
 #[cfg(test)]
 mod ingress_test;
 pub mod lifecycle;
+pub mod managed_policy;
+#[cfg(test)]
+mod managed_policy_test;
+pub mod managed_policy_trust;
+#[cfg(test)]
+mod managed_policy_trust_test;
 pub mod log_service;
 pub mod model_readiness;
 pub mod model_service;

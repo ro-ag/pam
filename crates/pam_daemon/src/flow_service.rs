@@ -1322,7 +1322,7 @@ impl FlowService {
 }
 
 /// Refuses an allowlist entry that is not a bare, non-shell program name.
-fn check_allowed_program(program: &str) -> Result<(), FlowRefusal> {
+pub(crate) fn check_allowed_program(program: &str) -> Result<(), FlowRefusal> {
     let program = program.trim();
     if is_shell(program) {
         return Err(FlowRefusal::new(

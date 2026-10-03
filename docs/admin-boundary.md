@@ -33,12 +33,16 @@ The daemon **records** the kernel's view of every public connection and never
 authorizes by it: each request row carries the plane it arrived on (`ingress`:
 `public` or `admin`), the peer's uid and pid as the kernel reports them
 (`peer_uid`, `peer_pid`), and whether the client said it came through a session
-relay (`relayed`). `admin.activity.list` returns them. On Windows there is no
-kernel peer identity on a loopback connection, so both are empty there: the
-recorded standing is "could read the owner's control file". A peer whose uid is
-not the daemon's is served and logged. The pid names a short-lived `pam` process
-and can be reused; it is attribution, like `caller.agent`, and the audit actor
-is decided by the plane alone.
+relay (`relayed`). `admin.activity.list` returns them. On macOS the daemon also
+resolves, at receipt, the executable of that pid and the harness it can find in
+the pid's ancestry (`peer_exe`, `peer_harness`; `relay` when the peer is `pam
+listen`), and keeps both on the row. On Windows there is no kernel peer identity
+on a loopback connection, so all of these are empty there: the recorded standing
+is "could read the owner's control file". A peer whose uid is not the daemon's
+is served and logged. The pid names a short-lived `pam` process and can be
+reused; the executable path and the ancestry are what a copied binary or a
+renamed parent defeats. All of it is attribution, like `caller.agent`, and the
+audit actor is decided by the plane alone.
 
 There is no event broadcast and no second public socket. A public client
 receives events only as the follow of one ticket (see
@@ -76,7 +80,7 @@ its ticket, capability, repository, agent label, plane and the real progress
 note. At most four such subscribers are attached at once, each holding one of
 the 32 connections; a subscriber that falls more than 1,024 events behind is
 closed with `subscriber_lagged` and reconnects. Requests the daemon publishes
-nothing for (`status`, `query`, `cancel`) never appear on it. This richer view
+nothing for (`status`, `query`, `cancel`, `doctor.report`) never appear on it. This richer view
 is acceptable here because the peer has already proved it is the daemon's
 owner; it is the reason the stream is not offered on the public endpoint.
 
@@ -112,9 +116,27 @@ keychain files. A fake credential backend verifies PAM behavior, not OS credenti
 isolation. Negative deployment tests must establish absence of privileged effects,
 not merely a nonzero client exit code.
 
-PAM does not automatically install or verify the agent's sandbox policy. The
+PAM does not install, edit or lock the agent's sandbox policy: the harness
+enforces it, and the [reference profiles](sandbox/README.md) are text you put in
+the harness's own configuration. PAM does check it, from the agent's position,
+with `pam doctor` (see [Verifying the boundary](#verifying-the-boundary)). The
 deployment must establish and maintain these exclusions. An executable name,
 argv value, or self-reported PID is not a substitute for that isolation.
+
+**The engine's runtime files sit inside the run directory.** The model engine's
+private socket, `<base>/run/engine.sock`, and its transient API key and pid file,
+`<base>/run/engine/`, live in the same `run` directory the agent must traverse
+to reach `pam.sock` and to probe `daemon.lock` (and, on Windows, to read
+`public.json`). A sandbox rule that allows `<base>/run` by subpath therefore
+also exposes the key for the moments it exists and, as a unix-socket allowance,
+the engine's OpenAI-compatible endpoint. This was found while designing the
+boundary check (ptrack issue 44). The operational closure is in force now: every
+reference profile allows the literal `pam.sock` and the read of `daemon.lock`
+only, and denies `<base>/run/engine.sock` and `<base>/run/engine/` by name, and
+`pam doctor` probes both (`engine.socket`, `engine.runtime_read`). The structural
+fix is to move the engine's runtime under `<base>/engine/run`, a directory the
+agent is never granted; that relocation is under way (plan 53, task T10), and a
+profile written to the invariant above keeps working after it lands.
 
 A daemon that a client starts lazily is started with an environment allowlist
 (home, user, locale, temp directory, absolute `PATH` entries, `PAM_LOG`, an
@@ -123,6 +145,219 @@ process group, with `/` as its directory and null standard streams. It does not
 inherit the caller's environment, descriptors or process group. Flow steps build
 their environment from the daemon's, so they no longer see the first caller's
 variables either.
+
+## Verifying the boundary
+
+The deployment assumption above is checkable. `pam doctor` runs from where the
+agent runs, probes what that position can reach, and reports to the daemon,
+which keeps the report next to what it saw on its own side. The design and its
+rationale are in the [boundary self-check spec](specs/2026-10-02-boundary-self-check.md);
+this section is what the shipped behavior establishes and what it does not.
+
+A report changes no authority. No gate, grant, approval, scope or profile reads
+it; a machine whose verdict is `not_established` is served exactly as before.
+The record is a fact for the human and for fleet tooling.
+
+### What `pam doctor` probes
+
+From the caller's position, with the caller's own base (`$PAM_BASE_DIR` or
+`~/.pam`) and endpoint (`$PAM_SOCKET_DIR` under the relay). One row per probe,
+each with a class: `must_allow` (the agent needs it), `must_deny` (the boundary
+requires it denied) or `info` (reported, never judged); each result is
+`allowed`, `denied`, `absent` (the path does not exist) or `unknown` (it could
+not be classified).
+
+- **The one door, must be allowed.** `public.reach`: the same `hello` the client
+  sends, on the public endpoint, then the connection is dropped. It reports the
+  daemon's version, protocol, epoch and whether it came `direct` or through the
+  relay. `run.lock_probe` (info) is the client's own readiness test: open and
+  try a shared lock on `<base>/run/daemon.lock`, never written.
+- **Must be denied, by file operation.** Connecting to the private endpoint
+  (`admin.endpoint`, and through the `run/../admin` alias); listing `admin/`;
+  opening `state.sqlite3`, `-wal` and `-shm` for read and for write; opening
+  `daemon.lock` for write; listing `backup/`, `model-trust/`, `engine/`,
+  `flows/`, `log/` and `<base>/run/engine`; connecting to
+  `<base>/run/engine.sock`. No probe writes, creates, truncates, unlinks,
+  renames, sends a frame or reads a private byte. The admin connect holds the
+  socket for 150 ms, sending and reading nothing, so the daemon can read the
+  peer's pid before it drops, and then drops it. The only bytes read from the
+  base are the lock file's pid (and, on Windows, `public.json`, which the
+  ordinary client reads too).
+- **Must be denied, by helper.** Each runs by absolute path with a cleared
+  environment, no stdin and a five-second bound: a keychain search for the
+  `dev.pam.connector` service with an account that does not exist (nothing is
+  created, read or prompted for); `kill -0` of the daemon's pid, which delivers
+  no signal; a read-only LaunchServices query and a property read through the
+  AppleEvents broker, which launch and send nothing; and the writability of the
+  `pam` executable and of the `.app` bundle's `Info.plist`, asked with
+  `/bin/test -w`, which is `access(2)`. **Neither the executable nor anything
+  in the bundle is ever opened.** (On macOS, opening a mapped Mach-O for write
+  invalidates the kernel's cached code signature, and every later exec of that
+  file is killed until it is replaced. A first version of the probe did exactly
+  that, and a regression test now pins it.)
+- **Not probed.** Unlinking `pam.sock` has no side-effect-free test and is left
+  to the [macOS sandbox fixture](macos-sandbox-acceptance.md). Rows that do not
+  apply to the platform are `not_applicable`.
+
+The human output lists every row; `--json` prints one document (the
+probes, `failed`, `unverified`, `skipped`, the environment facts and whether the
+report was recorded) and nothing else.
+
+### What the daemon records
+
+The report goes to the daemon as `doctor.report`, an ordinary public request in
+the control class: a request row with the plane, the kernel's peer uid and pid,
+`relayed` and the self-reported caller, plus the daemon-resolved `peer_exe` and
+`peer_harness`; the pipeline's terminal audit row; and one `doctor.report`
+audit row (so two rows per report, both `system`). The document is validated
+(size, members, bounds, and that the verdict and the failed list follow from the
+probe rows); a forged or malformed one is refused `invalid_args` and nothing is
+stored. The daemon keeps the newest 64 reports.
+
+Separately, the daemon records what it saw itself, and the report plays no part
+in those rows:
+
+- **Admin contacts.** Every connection the private listener accepts is
+  observed. One that sends nothing, or that speaks from an executable other than
+  the daemon's own boot image, is an `admin_contact` with the kernel pid and the
+  executable. The GUI is the same image and its contacts are counted as expected
+  and kept apart so they cannot push an unexplained one out. On Windows the
+  adapter records `admin_handshake_failed` for a loopback peer that failed the
+  nonce proof (no pid; a doctor run never produces one).
+- **Public requests from an unrecognised harness.** A request whose resolved
+  harness is neither a known agent, nor `relay`, nor the GUI's own image is
+  counted as `public_unknown_harness` with the executable. Nothing is refused.
+
+Observations are bounded (the newest 256 unexpected, 32 expected) and lifetime
+counters outlive the rows, so a flood neither grows the store nor erases the
+fact that a contact happened. `pam status` serves the result from memory as a
+`boundary` block (`last_report`, `reports`, `admin_contacts`,
+`public_unknown_harness`, a one-line `summary`); the CLI's `pam status` prints the line,
+Settings › Daemon shows the rows with a copyable `pam doctor` command, and Home
+shows one line. The beacon does not change colour: liveness and the boundary
+are different questions, and a red beacon on an unsandboxed developer machine
+would train people to ignore red.
+
+### How the two views combine
+
+The report is the client's claim, stored as such under the kernel's peer facts
+the daemon recorded itself. What the daemon vouches for is only what it
+observed: that a request with those peer facts arrived, the executable and
+ancestry it resolved, the admin contacts it accepted, and whether a contact was
+followed by a report from the same kernel pid.
+
+That last match is the daemon joining two things it saw: a `doctor.report` from
+a pid within 60 seconds of an unexplained admin contact from that pid sets the
+contact's `attributed` to the report's request and removes it from the
+unattributed count. The client's document plays no part in it. The reply to the
+report also says whether the harness the client claimed (`claimed_harness`)
+agrees with the one the daemon resolved (`harness_agrees`; `null` where it
+has none, as on Windows or through the relay).
+
+An admin contact nobody explains stays unattributed and is the headline of the
+block. A fabricated `established` beside an unattributed admin contact is
+visibly inconsistent, and a fabricated report never changes authority anyway.
+Two limits follow, and the docs state them rather than hide them: the field can
+only understate the risk (a report is one process at one moment, and a harness
+that lets the model retry a blocked command outside its sandbox makes
+`established` a statement about one command, not the session), and the daemon's
+own observations are the only part it can vouch for.
+
+### The verdict and exit code 6
+
+```
+established      public.reach allowed, and every must_deny probe is denied,
+                 absent or not probed
+not_established  public.reach allowed, and some must_deny probe is allowed
+                 or unknown
+cannot_probe     public.reach is not allowed, or the base cannot be resolved
+```
+
+`unknown` on a must-deny probe fails the verdict: the boundary is claimed only
+from evidence. The JSON separates `failed` (allowed where denial was required)
+from `unverified` (unknown); `absent`, `not_probed` and rows that do not apply to
+the platform are listed under `skipped` with their reason and count neither way.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | `established` |
+| `6` | `not_established` (new, distinct from `3` refused and `5` blocked: a sandbox finding must not look like a daemon decision) |
+| `1` | `cannot_probe`: the daemon is unreachable, a legacy build, or refused the hello; `pam doctor` never starts a daemon |
+| `2` | usage |
+
+Failing to deliver the report to the daemon is a line on stderr and leaves the
+code alone: the verdict is the client's, the record is best-effort.
+`--no-report` skips the record and does not change the code either.
+
+### On an unsandboxed machine
+
+On a developer machine where nothing confines the agent, every must-deny probe
+is `allowed` and the verdict is `not_established`. That is correct, and it is
+the expected state until a profile is applied; the human output says what it
+means: this process can reach PAM's private state, so GUI-only administration is
+a convention on this machine, not a boundary. A run outside any sandbox proves
+installation and reachability, not the boundary. An MDM script that runs
+`pam doctor` unsandboxed will therefore always read `not_established`; the
+signal is the run from inside the harness's sandbox. Never list `pam doctor`
+among a harness's sandbox exclusions: an excluded run reports the honest
+result for the wrong position.
+
+### On Windows
+
+**On Windows no supported configuration establishes the boundary today. `pam
+doctor` reports `not_established` and lists every private path as reachable.
+GUI-only administration there is a convention enforced by the harness's
+permission prompts and by the absence of a hostile same-user process, not by
+the OS. The enterprise choices are: a dedicated machine or VM per agent with PAM
+inside it; or accept the convention and collect the `doctor` record so the fact
+is visible.**
+
+Windows differs in mechanism, not in rule. The probes open `control.json` for
+read and close it without reading a byte (the nonce never enters the doctor's
+memory and the admin port is never dialled), list the private directories, open
+the state files and the running executable for write (a sharing violation counts
+as `allowed`: the ACL granted it, only the share mode refused), search the
+credential store for an absent account, query the daemon's process (query rights
+are attribution, not control) and check that process creation, the broker, is
+reachable. Windows has no kernel peer identity on the public plane, so the
+daemon's `peer_*` columns, `harness_agrees` and `public_unknown_harness` are
+empty there, and the `boundary` block's `peer_identity` says `none`. A
+differently-identified account cannot read the owner's `public.json`, so a
+harness that runs commands as another local user cannot reach PAM at all: that
+bounds the agent and also excludes it, which is a statement, not a profile. See
+[sandbox/windows/README.md](sandbox/windows/README.md) for each harness's
+position, with sources.
+
+### Reference profiles
+
+[`docs/sandbox/`](sandbox/README.md) holds a reference profile per harness
+(Claude Code, Codex, Gemini CLI, Copilot CLI) and a harness-independent
+`sandbox-exec` profile, each embedded in the binary: `pam doctor --profile
+<claude-code|codex|gemini-cli|copilot-cli|sandbox-exec> [--base DIR]
+[--managed]` prints it with the base filled in and exits `0` without probing or
+dialing. Every profile allows the literal public socket and the read of the lock
+file, denies the rest of the base (including the engine's runtime paths named
+above), denies writes to the trusted executable and bundle, and says what its
+harness leaves outside. A profile is a claim; the proof is a `pam doctor` run
+from inside it.
+
+### Fleet signal
+
+Two commands, both machine-readable:
+
+1. From the agent's position (a harness hook, a wrapper, or the human once per
+   setup): `pam doctor --json`. Exit `6` is the compliance signal and `failed`
+   is the remediation list. The document's `report` member says whether the
+   daemon recorded it, and `daemon_reply` (a top-level member, present when the
+   daemon answered) carries the daemon's view of the caller.
+2. From the host, any time: `pam status --json`, reading
+   `.boundary.last_report.verdict`, `.boundary.last_report.age_s` and
+   `.boundary.admin_contacts.unattributed`. A non-zero unattributed count, a
+   `not_established` verdict, or a stale or missing report is the alert.
+
+Harness policy delivery is the harness's own (Claude Code managed settings, Codex
+`config.toml` under MDM, Gemini's `~/.gemini` profile file); PAM prints the
+fragments and does not deliver them.
 
 ## Confirmation in the GUI bridge
 
@@ -141,12 +376,33 @@ approval waited refuses as `flow_changed` and the approval stays pending.
 
 ## Global target authority
 
-GUI grants and repository/product scopes apply globally to public PAM clients.
-Caller labels and PIDs provide attribution; clients may select any approved
-repository. Binding a ticket to its original canonical repository prevents
-relabeling that ticket under another root. It does not isolate agents or keep
-evidence confidential from another public client authorized through the same
-global policy. Per-agent repository authentication is not implemented.
+**Authority is per operating-system user.** GUI grants, approvals, profiles and
+repository/product scopes apply to every process that can reach the public
+socket as that user: all of them hold the whole approved set, and clients may
+select any approved repository. `caller.agent`, `caller.repo`, `caller.pid`,
+the kernel's `peer_pid`, and the daemon-resolved `peer_exe` and `peer_harness`
+are attribution and filters in the audit and the GUI, never a boundary. The only
+facts the kernel attests are the peer's uid and pid; the uid is always the
+daemon's own, the pid names a short-lived `pam` process that can be reused, its
+executable and ancestry are defeated by a copied binary or a renamed parent, the
+session relay collapses every client to `pam listen`, and on Windows there is
+no peer identity at all. No harness hands PAM a per-session credential it could
+verify. A grant keyed to any of these would be label-keyed authority with a GUI
+that implies otherwise, so PAM has none.
+
+Binding a ticket to its original canonical repository prevents relabeling that
+ticket under another root. It does not isolate agents or keep evidence
+confidential from another public client authorized through the same global
+policy.
+
+Two agents that need different authority on one machine run as different
+operating-system users: a separate user has a separate base, daemon, keychain
+and approved set, which PAM already supports (on Windows the same separation
+also makes PAM unreachable from the other account, see
+[Windows](#on-windows)). What `pam doctor` proves is the other half: that each
+agent's sandbox holds it to the public socket. If a harness ever offers an
+identity the daemon can verify with the harness, the recorded peer facts are
+where a per-agent grant model would hang from; nothing here forecloses it.
 
 Events are per follow, not broadcast. A public client that wants a ticket's
 events opens a follow for that one ticket; the daemon authorizes it by the same
@@ -218,7 +474,8 @@ precisely which positive and negative operations are tested.
 Those tests do not establish the deployed sandbox's filesystem, process, or
 credential restrictions. Deployment verification must separately confirm that
 an agent can reach its permitted public operations while it cannot reach or
-modify the private resources listed above.
+modify the private resources listed above; `pam doctor` is that confirmation,
+run from the agent's position (next section).
 
 ## Resource and recovery limits
 

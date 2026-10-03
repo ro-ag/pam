@@ -1,5 +1,12 @@
 # Boundary self-check: `pam doctor`, a status field and reference sandbox profiles — design and implementation plan
 
+Status: implemented (T1–T6, T8); T7/T9 acceptance in progress. Built on
+`feat/boundary-doctor`, 2026-10-02. What was built, where it departs from the
+design below, is in [As built](#as-built-2026-10-02); where the two disagree, As
+built is the behavior. The statement the docs now carry on authority is in
+[the administration boundary](../admin-boundary.md#global-target-authority) and
+the verification section after it.
+
 ptrack plan 53; closes the first half of issue 41 and records the position on
 the second half (per-agent authority). Written 2026-10-02 against branch
 `feat/enterprise-network` (head `2708857`), read-only; line references are to
@@ -271,7 +278,7 @@ public endpoint, which is `<dir>/pam.sock` under `PAM_SOCKET_DIR`):
 | `run.lock_probe` | info | `File::open` + `try_lock_shared` + `unlock` on `<base>/run/daemon.lock` (the client's own readiness test) | `allowed` is what lazy start needs; `denied` is fine under the relay and is noted as "lazy start unavailable here" otherwise. Never written. |
 | `run.lock_write` | must_deny | `OpenOptions::new().write(true).create(false).truncate(false).open(lock)`; close | never writes a byte. |
 | `public.unlink` | must_deny | — | **not probed**: the only test is `remove_file`, which has a side effect. `doctor` reports `not_probed` with that reason; the macOS fixture keeps covering it (`sandbox_macos.rs:39`). |
-| `admin.endpoint` | must_deny | `UnixStream::connect("<base>/admin/control.sock")`; on success, drop at once | sends nothing, reads nothing. The daemon sees an admitted peer that went away before a hello and records it (see "Admin contacts"). Also probed through the alias `<base>/run/../admin/control.sock` as `admin.endpoint_alias`, as the fixture does (`sandbox_macos.rs:28-32`). |
+| `admin.endpoint` | must_deny | `UnixStream::connect("<base>/admin/control.sock")`; on success, hold 150 ms (As built, 2), then drop | sends nothing, reads nothing. The daemon sees an admitted peer that went away before a hello and records it (see "Admin contacts"). Also probed through the alias `<base>/run/../admin/control.sock` as `admin.endpoint_alias`, as the fixture does (`sandbox_macos.rs:28-32`). |
 | `admin.dir` | must_deny | `read_dir("<base>/admin")`; take at most one entry | |
 | `store.read`, `store.write` | must_deny | open `state.sqlite3` read-only / write (`create(false)`); close; same for `-wal` and `-shm` as `store.wal_*`, `store.shm_*` | reads no byte. |
 | `backup.read` | must_deny | `read_dir("<base>/backup")` | usually `absent` |
@@ -283,8 +290,8 @@ public endpoint, which is `<dir>/pam.sock` under `PAM_SOCKET_DIR`):
 | `log.read` | must_deny | `read_dir("<base>/log")` | |
 | `keychain.search` | must_deny | spawn `/usr/bin/security find-generic-password -s dev.pam.connector -a pam.doctor.absent.<pid>.<random>` with a cleared environment, null stdin, 5 s | `denied` on `SecKeychainSearchCreateFromAttributes:` in stderr; `allowed` on exit 44 / "could not be found" (the keychain answered); `unknown` otherwise. No item is created, read or changed; a search for an absent item never prompts. Same method and same evidence rule as the fixture (`sandbox_macos.rs:66-83`). |
 | `daemon.signal` | must_deny | spawn `/bin/kill -0 <pid>` where `<pid>` is the lock file's content (readable under every profile that keeps the lock probe) | `denied` on "Operation not permitted"; `allowed` on exit 0; `unknown` when the lock is unreadable or the pid is gone. Signal 0 delivers nothing (`sandbox_macos.rs:60-65`). Through the relay the lock is usually unreadable → `unknown`; the report says so. |
-| `broker.launchservices` | must_deny | spawn `/usr/bin/open -b dev.pam.doctor.absent.<random>` | the bundle id does not exist, so nothing can launch; `allowed` when LaunchServices answered "Unable to find application"; `denied` when the lookup itself failed (the Mach bootstrap was refused). The exact strings are pinned by the acceptance test on the real OS, never guessed: until pinned, an unrecognised message is `unknown`, which is fail-closed. |
-| `broker.appleevents` | must_deny | spawn `/usr/bin/osascript -e 'tell application id "dev.pam.doctor.absent.<random>" to activate'` | same shape: an absent application id cannot be launched and does not trigger an automation consent prompt (prompts arise when targeting a running application). `allowed` when the AppleEvent runtime resolved the id and reported it absent; `denied` when the runtime could not start. Strings pinned by the acceptance test. |
+| `broker.launchservices` | must_deny | **superseded (As built, 1):** `/usr/bin/lsappinfo find bundleid=com.apple.loginwindow`. Designed as: spawn `/usr/bin/open -b dev.pam.doctor.absent.<random>` | the bundle id does not exist, so nothing can launch; `allowed` when LaunchServices answered "Unable to find application"; `denied` when the lookup itself failed (the Mach bootstrap was refused). The exact strings are pinned by the acceptance test on the real OS, never guessed: until pinned, an unrecognised message is `unknown`, which is fail-closed. |
+| `broker.appleevents` | must_deny | **superseded (As built, 1):** `/usr/bin/osascript -e 'id of application "Finder"'`. Designed as: spawn `/usr/bin/osascript -e 'tell application id "dev.pam.doctor.absent.<random>" to activate'` | same shape: an absent application id cannot be launched and does not trigger an automation consent prompt (prompts arise when targeting a running application). `allowed` when the AppleEvent runtime resolved the id and reported it absent; `denied` when the runtime could not start. Strings pinned by the acceptance test. |
 | `exe.write` | must_deny | `/bin/test -w <std::env::current_exe()>` through the helper runner (absolute path, cleared environment, bounded) — `access(2)` with `W_OK`; the executable is **never opened** | exit 0 → `allowed`; exit 1 → `denied` with the note `access(W_OK) refused` (no errno to carry; `test -e` then tells a refused path from a missing one, which is `absent`); spawn failure, timeout or any other status → `unknown`. Never an open-for-write: on macOS, opening a Mach-O that another process is mapped from (the daemon, always, in production) for write invalidates the kernel's cached code signature for that inode, and every later exec of the file is `SIGKILL`ed until the file is replaced — one unsandboxed run would have left `pam` and `PAM.app` unrunnable until reinstalled. |
 | `bundle.write` | must_deny | when the exe sits under a `.app`: `/bin/test -w <bundle>/Contents/Info.plist`, the same shape — nothing in the bundle is ever opened for write | `absent` outside a bundle, or when the plist is gone |
 | `frontend` | info | the binary's own build: `embedded` (`gui-embed`) or `development_server` | a dev build is not a trusted surface (`admin-boundary.md:100-107`) and is reported as such; the daemon's build is what matters and is the same binary in production. |
@@ -300,7 +307,7 @@ Windows differs where the mechanism differs:
 | `store.*`, `backup.read`, `model_trust.read`, `engine.read`, `engine.runtime_read`, `flows.read`, `log.read`, `run.lock_write` | as macOS | | `engine.socket` is `not_probed` on Windows (the engine binds loopback there). |
 | `exe.write` | must_deny | open `std::env::current_exe()` for write through the seam (`create(false)`, `truncate(false)`, no byte written); close | **Decision**: the open stays on Windows. The image section of a running executable makes `CreateFile` refuse write access at the share check — after the ACL's access check, so `ERROR_SHARING_VIOLATION` is `allowed` and `ERROR_ACCESS_DENIED` is `denied` — before any handle exists, and Windows keeps no code-signature cache the attempt could invalidate (the macOS hazard above). The non-opening alternatives answer a different question: the read-only attribute is not the ACL, and a directory opened for write is always `ERROR_ACCESS_DENIED`, which would read `denied` unsandboxed — a false pass. |
 | `keychain.search` | must_deny | `keyring_core` read of service `dev.pam.connector`, account `pam.doctor.absent.<pid>.<random>` | `NoEntry` → `allowed` (Credential Manager answered); an access error → `denied`; else `unknown`. No entry is created. |
-| `daemon.process_query` | must_deny | `sysinfo` refresh of the lock file's pid and read of its exe path | `allowed` when the process is visible with its executable (query rights were granted); `denied` when the refresh yields nothing for a pid the lock names and the lock is fresh. Query rights are attribution, not control: a termination-rights probe needs `OpenProcess` through FFI, which the workspace forbids, and is **not** done. The report says "query only". |
+| `daemon.process_query` | must_deny | (as built, a PowerShell `Get-Process`, As built 4) `sysinfo` refresh of the lock file's pid and read of its exe path | `allowed` when the process is visible with its executable (query rights were granted); `denied` when the refresh yields nothing for a pid the lock names and the lock is fresh. Query rights are attribution, not control: a termination-rights probe needs `OpenProcess` through FFI, which the workspace forbids, and is **not** done. The report says "query only". |
 | `broker.shellexecute` | must_deny | spawn `%SystemRoot%\System32\where.exe` with a cleared environment | process creation is the broker (`broker_windows.rs:9-13`): if `doctor` itself was created, this is `allowed`. It exists so the Windows verdict lists the right reason. |
 | `bundle.write`, `broker.launchservices`, `broker.appleevents` | — | `not_probed` on Windows | |
 
@@ -375,29 +382,42 @@ then `report: recorded as <request id>` or `report: not sent (<reason>)`.
   "ts": 1759400000,
   "daemon": { "version": "0.5.0", "proto": 2, "epoch": "01JB…", "via": "direct" },
   "probes": [
-    { "id": "public.reach", "class": "must_allow", "result": "allowed" },
-    { "id": "admin.endpoint", "class": "must_deny", "result": "allowed" },
+    { "id": "public.reach", "class": "must_allow", "result": "allowed", "elapsed_ms": 3 },
+    { "id": "admin.endpoint", "class": "must_deny", "result": "allowed", "elapsed_ms": 151 },
     { "id": "store.read", "class": "must_deny", "result": "denied",
-      "os_error": { "kind": "PermissionDenied", "code": 1 } },
-    { "id": "backup.read", "class": "must_deny", "result": "absent" },
+      "os_error": { "kind": "PermissionDenied", "code": 1 }, "elapsed_ms": 0 },
+    { "id": "backup.read", "class": "must_deny", "result": "absent",
+      "os_error": { "kind": "NotFound", "code": 2 }, "elapsed_ms": 0 },
     { "id": "daemon.signal", "class": "must_deny", "result": "unknown",
-      "note": "lock file unreadable: no pid to probe" }
+      "note": "lock file unreadable: no pid to probe", "elapsed_ms": 0 }
   ],
   "failed": ["admin.endpoint"],
   "unverified": ["daemon.signal"],
-  "skipped": [{ "id": "backup.read", "why": "absent" }, { "id": "public.unlink", "why": "not_probed: side effect" }],
+  "skipped": [{ "id": "backup.read", "why": "absent" },
+              { "id": "public.unlink", "why": "not_probed: side effect" }],
   "env": {
     "socket_dir": null, "base_dir_override": null,
     "resolved_base": "/Users/me/.pam", "resolved_endpoint": "/Users/me/.pam/run/pam.sock",
     "client_version": "0.5.0", "exe": "/Applications/PAM.app/Contents/MacOS/pam",
-    "frontend": "embedded", "harness_chain": ["zsh", "claude"]
+    "cwd_repo": "/work/app", "frontend": "embedded",
+    "harness_chain": ["pam", "zsh", "claude", "launchd"]
   },
-  "report": { "request_id": "01JB…", "recorded": true }
+  "report": { "recorded": true, "request_id": "req_01JB…" },
+  "daemon_reply": {
+    "accepted": true, "report_id": 7, "request_id": "req_01JB…", "verdict": "not_established",
+    "peer": { "uid": 501, "pid": 48122, "exe": "/Applications/PAM.app/Contents/MacOS/pam",
+              "harness": "claude", "relayed": false },
+    "claimed_harness": "claude", "harness_agrees": true, "attributed_admin_contacts": 1
+  }
 }
 ```
 
 The schema is versioned and additive; MDM scripts key on `verdict`, `failed`
-and the exit code.
+and the exit code. `daemon_reply` is not part of the report the daemon stores
+(the client sends the document with `report: null`); it is the daemon's answer,
+added by the CLI as a sibling of `daemon`, which stays the hello's facts. It is
+absent with `--no-report`, with `cannot_probe`, and when the daemon refused or
+did not answer, in which case `report` is `{"recorded": false, "reason": …}`.
 
 ### The report: `doctor.report`
 
@@ -906,3 +926,203 @@ Parallelism: T1 first; then T2 ‖ T4 ‖ T6; then T3 (needs T1, T2) ‖ T5 (nee
    `last_report.verdict` and age? The block names private paths, which are
    documented anyway; the spec includes the block. Say if the agent-facing
    `status` should be trimmed.
+
+## As built (2026-10-02)
+
+What shipped on `feat/boundary-doctor` for T1 to T6 and T8, and where it departs
+from the design above. Where this section and an earlier one disagree, this one
+is the behavior; the sections above stay as the reasoning. T7 (macOS acceptance
+under `sandbox-exec`) and T9 (Windows runs in the Parallels VM) are in progress
+and record their measurements in `docs/macos-sandbox-acceptance.md` and
+`docs/sandbox/windows/README.md`; T10 (relocating the engine runtime) is under
+way. Line references in the design sections are to the tree it was written
+against and have moved.
+
+### Probes
+
+1. **The broker probes are replaced, because the specified ones cannot tell
+   allowed from denied.** `open -b <absent id>` and `osascript` against an absent
+   application id print the same line inside the fixture's profile and outside
+   it: the absent id is resolved in the calling process and the broker is never
+   asked. As built, `broker.launchservices` runs `/usr/bin/lsappinfo find
+   bundleid=com.apple.loginwindow` (a read-only query of the LaunchServices
+   server: an `ASN:` line is `allowed`; exit 0 with no output, which is what a
+   profile that denies the Mach lookup produces, is `denied`; anything else is
+   `unknown`), and `broker.appleevents` runs `/usr/bin/osascript -e 'id of
+   application "Finder"'` (a property read of the running Finder through the
+   application-services broker, which sends no event, launches nothing and
+   prompts for nothing: stdout exactly `com.apple.finder` is `allowed`; stderr
+   containing `Connection Invalid` is `denied`; a bare `(-1728)` or anything else
+   is `unknown`). Strings were pinned on macOS 26 (Darwin 27.0.0), 2026-10-02,
+   outside and under both `crates/pam/tests/support/broker-macos.sb` and
+   `docs/sandbox/macos/pam-agent.sb`, and T7 pins them again under
+   `sandbox-exec`. Both need a login session with Finder and the login window
+   registered to read `allowed`: in a headless session they read `denied` and
+   `unknown`, never `allowed`. A profile that allow-lists Mach lookups must also
+   deny `com.apple.hiservices-xpcservice`, or the AppleEvents probe reads
+   `allowed` under it.
+2. **The admin connect holds its socket for 150 ms.** `admin.endpoint`,
+   `admin.endpoint_alias` and `engine.socket` connect, send and read nothing,
+   hold the connection for 150 ms and drop it, instead of dropping at once. A
+   peer that is already gone when the daemon's accept loop asks the kernel for
+   its credentials cannot be identified, so the daemon could only record a
+   contact with no pid, which no report could explain. With the hold, the daemon
+   reads the pid and the report from that pid attributes the contact. A refused
+   connect (`ECONNREFUSED` on a stale socket) is `allowed`: the sandbox let the
+   connect reach the socket.
+3. **`exe.write` and `bundle.write` never open their target.** The first version
+   opened the running executable for write with `create(false)` and no byte
+   written. On macOS an open-for-write of a Mach-O that another process is mapped
+   from (the daemon, always, in production) invalidates the kernel's cached code
+   signature for that inode, and every later exec of the file is killed
+   (`Killed: 9`, exit 137) until the file is replaced; `codesign -vv` still says
+   valid. One unsandboxed run would have left `pam` and `PAM.app` unrunnable
+   until reinstalled. The probes now run `/bin/test -w <path>` through the helper
+   runner, which is `access(2)` with `W_OK` and opens nothing (exit 0 is
+   `allowed`; exit 1 is `denied` with the note `access(W_OK) refused`, unless
+   `test -e` says the path is not there, which is `absent`). For `bundle.write`
+   the path is `<bundle>/Contents/Info.plist`, and outside a bundle the row is
+   `absent` ("not inside an application bundle"). `doctor_poisons_nothing_it_runs_from`
+   in `crates/pam/tests/doctor_cli.rs` reproduces the failure on the old probe
+   and passes on the new one. **Windows keeps the open**, through the seam:
+   Windows has no signature cache, and the image section of a running executable
+   makes `CreateFile` fail at the share check, after the ACL's access check, so
+   `ERROR_SHARING_VIOLATION` is `allowed`, `ERROR_ACCESS_DENIED` is `denied`, and
+   no handle ever exists. The non-opening alternatives answer another question or
+   fail the wrong way (the read-only attribute is not the ACL; a directory opened
+   for write is always `ERROR_ACCESS_DENIED`, a false pass).
+4. **`daemon.process_query` on Windows is a PowerShell `Get-Process` of the
+   lock's pid**, not `sysinfo`: the `pam` crate has no such dependency and none
+   was approved. The evidence is the same (the executable path is visible if and
+   only if query rights were granted) and the note still says "query only".
+5. **The harness chain is read with `/bin/ps` (macOS) or one PowerShell
+   `Win32_Process` walk (Windows)**, because the client's own walk is private. It
+   includes the root (`launchd`) as a real ancestry walk does, and is empty when
+   the helper cannot run, for example under a deny-default profile (`/bin/ps`
+   cannot exec under either shipped profile). It is information only; the daemon
+   walks its own.
+6. **Helpers get a minimal environment, not an empty one**: an allowlist (home,
+   user, locale, temp directory; on Windows the system and profile variables;
+   never `PATH`), because `security` needs the session identity to find the login
+   keychain. Absolute program, null stdin, both pipes drained and capped at
+   64 KiB, killed at the bound, as designed.
+7. **`unknown` on `public.reach`** (connection refused, a legacy build, a
+   refusal, no acknowledgement) carries its reason as a note and yields
+   `cannot_probe` with every other row still probed, instead of ending the run.
+   `pam doctor` never starts a daemon, and with `cannot_probe` it does not send a
+   report (the daemon would refuse it).
+
+### The document and the verdict
+
+8. **`ProbeId` is a closed enum** (`pam_proto::doctor`, 29 ids, one
+   `INVENTORY` row each, in report order). An id the binary does not know fails
+   to deserialize and the daemon refuses the document, instead of storing ids "as
+   sent". Client and daemon ship as one binary and a version mismatch is refused
+   at the hello, so a new probe is a new inventory row and additive. The
+   `env.*` facts and `frontend` are `EnvFacts` members, not probe rows (a probe
+   row means allowed or denied; `frontend: embedded` does not), and
+   `run.lock_probe` is encoded for both platforms as an info row.
+9. **`judge` outcomes.** Classes come from the inventory, never from a row's own
+   `class`; info rows are never counted. `cannot_probe` is no `public.reach` row,
+   or any must-allow row not `allowed`. Otherwise, over must-deny rows in order:
+   `allowed` is `failed`, `unknown` is `unverified`, `absent` and `not_probed`
+   are `skipped` with `why` equal to the state or `<state>: <note>`, and `denied`
+   appears nowhere. Rows for a probe that does not exist on the platform are
+   `not_probed` with the note `not probed on <platform>` and are listed under
+   `skipped`. `established` is `failed` and `unverified` both empty. The daemon
+   recomputes `judge` from the probe rows and refuses a document whose
+   `verdict`, `failed`, `unverified` or `skipped` differ, and refuses a
+   `cannot_probe` document (`NotRecordable`). Limits: 16 KiB, 64 rows, 256 bytes
+   of text per note, 1,024 per path, 16 chain names, no control characters.
+10. **`--json` is the document plus a top-level `daemon_reply`.** `daemon` stays
+    the hello's facts (`version`, `proto`, `epoch`, `via`; `null` when the
+    daemon was not reached); the `doctor.report` reply body is its own top-level
+    member, present only when the daemon answered with a result. `report` is
+    `{"recorded": true, "request_id": …}` or `{"recorded": false, "reason":
+    …}` (`--no-report`, a refusal, a transport failure). Options serialize as
+    `null`. The corrected example is under "Output" above.
+11. **Delivery never changes the exit code.** `established` 0,
+    `not_established` 6, `cannot_probe` and a run that cannot start 1, usage 2;
+    a refusal or transport failure of the report is a stderr line and
+    `report.recorded = false` with the cause. `--profile` answers before any
+    runtime, base resolution or dial, and conflicts with `--json`, `--no-report`
+    and `--timeout-ms`; `--base` and `--managed` require it.
+
+### The daemon
+
+12. **Two audit rows per report, not one.** The pipeline writes the terminal
+    `execute` row for every request and cannot be replaced; the capability adds
+    one non-terminal `doctor.report` / `allow` / `system` row (detail: verdict,
+    `failed`, `unverified`, `peer_harness`) in the same transaction as the report
+    row. A refused document leaves nothing stored and the pipeline's
+    `execution_refused` row.
+13. **Schema (migration 16)** differs from the DDL above: `boundary_report.request_id`
+    is nullable with `ON DELETE SET NULL` (retention deletes request rows by an
+    explicit child list); `report_ts` (the client's clock) sits beside `ts`
+    (receipt); observations gain `expected`, `peer_uid` and `peer_harness`;
+    `report_json` is checked at 16,384 bytes. Retention keeps the newest 64
+    reports, the newest 256 unexpected observations and the newest 32 expected
+    ones, with lifetime counters in `setting` (`boundary.admin_contacts_total`,
+    `boundary.admin_contacts_expected_total`, `boundary.public_unknown_total`).
+    Events per kernel pid are deduplicated in memory (5 s for unexpected, 1 h for
+    expected) and still move the counters.
+14. **Admin contacts.** Every connection the private listener accepts is
+    observed; one that sends nothing, or that speaks from an executable other than
+    the daemon's boot image, is recorded. A contact whose hello comes from the
+    daemon's own image (the GUI) is `expected` and kept apart. A peer gone before
+    its credentials could be read is recorded with no pid and stays unattributed.
+    Attribution matches the same kernel pid within 60 s, a contact born after the
+    report included. The unix and Windows adapters reach the observer through a
+    registry keyed by the canonical base (`boundary::register_admin_sink`), because
+    `admin_transport.rs` was outside T4's file set; threading a parameter through
+    `AdminTransport::bind` would remove the registry.
+15. **The block carries more than the design's.** Beyond the fields above:
+    `peer_identity` (`kernel_pid`, or `none` on Windows), `received_ts` beside the
+    report's `ts`, `unattributed_24h`, `expected_total`, `last_expected`, and a
+    `summary` line the CLI prints verbatim. `pam status` prints a second line
+    with the request id and age when a report exists. The Settings › Daemon rows
+    also show the harness and the last foreign peer, with every daemon-supplied
+    string escaped; Home shows one line linking to Settings.
+16. **Windows peer facts are null.** `peer_uid`, `peer_pid`, `peer_exe` and
+    `peer_harness` are null on every row and reply, `harness_agrees` is null,
+    `public_unknown_harness` never counts, and admin observations are
+    `admin_handshake_failed` only. The report is still stored and the block still
+    served.
+17. **Peer resolution** runs on the blocking pool under a 300 ms budget for every
+    public request with a kernel pid (a miss is null), excludes the peer itself
+    from the chain, and is skipped for attached duplicates and admin submissions.
+18. **Not yet exposed:** `admin.activity.list` does not return `peer_exe` and
+    `peer_harness` (`admin.rs` was outside T4's set); the store reads them
+    through `request_peer_facts`.
+
+### Profiles and documents
+
+19. `profiles::render` returns a `Result` and fails closed on a base that cannot
+    be written safely (not absolute, a `.` or `..` component, control
+    characters, glob characters in a JSON or TOML path). `--profile --base` is
+    made absolute and, on unix, canonicalised when it exists, because Seatbelt
+    matches resolved paths.
+20. Codex's permission profile does have a unix-socket key
+    (`[permissions.<name>.network.unix_sockets]`), contrary to what the design
+    could confirm, but it applies only with network access enabled, so the
+    shipped file enables network and says egress is not restricted by it. The
+    Gemini profile is our own, modelled on the permissive base, without the
+    SecurityServer Mach lookup and with outbound limited to IP and the system
+    resolver's socket; the PAM block is last.
+21. The unverified-on-this-host list: every `cfg(windows)` line (the keyring
+    read, the PowerShell helpers, `where.exe /?`, the loopback handshake hook)
+    compiled and ran only through the code that builds on macOS; T9 runs them in
+    the VM. The `established` exit-0 path through the binary is T7's, under
+    `sandbox-exec`.
+
+### Open at this status
+
+- **Through the relay, `daemon.signal` reads `unknown`.** Its pid comes from
+  `<base>/run/daemon.lock`, which a relay profile (nothing under the base) does
+  not leave readable, and an unknown on a must-deny probe fails the verdict. A
+  relayed run is `not_established` with `daemon.signal` unverified until the probe
+  is judged another way; the design's remark that "the report says so" does not
+  make the verdict reachable. Decision needed: treat a missing pid under
+  `PAM_SOCKET_DIR` as `not_probed`, or keep the lock readable in the relay profile.
+- The engine runtime is still under `<base>/run` (issue 44, T10); the profiles
+  and both `engine.*` probes close it operationally.

@@ -89,7 +89,48 @@ envelope's `caller` (agent label, repository, pid) is self-reported as always.
 None of this authorizes anything. The uid is the same owner on both paths, the
 relay's pid identifies the grant of reach the human made by starting it, and a
 relayed client that omitted the marker would still be recorded with a pid that
-resolves to a `pam listen` process.
+resolves to a `pam listen` process. The daemon's resolution of that pid
+(`peer_exe`, `peer_harness`) therefore names the relay: `peer_harness` is
+`relay`, and the harness the agent actually runs under is known only from the
+client's own statement.
+
+## `pam doctor` through the relay
+
+`pam doctor` works through the relay and says so. With `$PAM_SOCKET_DIR` set it
+dials `<dir>/pam.sock`, the hello carries `via: relay`, and the report's
+`daemon.via` reads `relay`. It never starts a relay or a daemon: with no relay
+the verdict is `cannot_probe` (exit `1`).
+
+What the daemon records is the relay's peer, not the agent's. The
+`doctor.report` request row has `relayed` set and the kernel's uid and pid of
+`pam listen`, with `peer_harness = relay`; the status block's `last_report`
+shows `relay` for it. The harness chain of the client (`env.harness_chain`, and
+the `claimed_harness` the reply derives from it) is carried in the report as a
+self-report, never as the daemon's own finding; `harness_agrees` is `null`
+because the daemon has no harness of its own to compare it with.
+
+Two consequences for reading a relayed report:
+
+- **Nothing under `<base>` is expected to be reachable.** The relay profile
+  allows `<dir>/pam.sock` and no path under the base, so the lock-file probe is
+  `denied` ("unreadable under the relay"), which is informational, and every
+  private path should read `denied` or `absent`. `daemon.signal` takes its pid
+  from the lock file, which the relay profile does not leave readable, so it has
+  no pid to probe and reads `unknown` ("lock file unreadable: no pid to probe").
+  An unknown on a must-deny probe fails the verdict, so a run through the relay
+  is `not_established` with `daemon.signal` under `unverified` until that probe
+  can be judged another way; the `failed` list is what to act on.
+- **A relayed run cannot attribute its own admin contact.** The daemon matches
+  an unexplained admin contact to a report by kernel pid. The contact, if the
+  sandbox lets the client reach the private endpoint at all, comes from the
+  client's pid; the report arrives from the relay's pid. The two never match, so
+  such a contact stays unattributed and shows on `pam status` as one — which is
+  the right outcome: the sandbox let a process reach the private endpoint.
+
+The relay is still a byte pipe: it does not know a doctor report from any other
+request, and a `doctor.report` through it is admitted, validated and recorded
+like one from a direct client. See
+[Verifying the boundary](admin-boundary.md#verifying-the-boundary).
 
 ## Boundaries
 

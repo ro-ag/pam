@@ -89,6 +89,9 @@ daemon. Read `verdict`:
 
 The daemon keeps the report (`pam status --json` shows it under `boundary`),
 and a report changes no authority: an established boundary grants nothing.
+Authority is per operating-system user, not per agent: whatever the human
+approved applies to every process that can reach the socket as that user, and
+your agent label, repository and pid are attribution, never a limit or a grant.
 
 ## Under an agent sandbox
 

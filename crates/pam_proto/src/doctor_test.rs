@@ -234,10 +234,12 @@ fn current_platform_is_supported_here() {
 
 #[test]
 fn os_error_from_io_keeps_kind_and_code() {
-    let error = std::io::Error::from_raw_os_error(13);
+    // EACCES on unix, ERROR_ACCESS_DENIED on Windows.
+    let access_denied = if cfg!(windows) { 5 } else { 13 };
+    let error = std::io::Error::from_raw_os_error(access_denied);
     let os_error = OsError::from_io(&error);
     assert_eq!(os_error.kind, "PermissionDenied");
-    assert_eq!(os_error.code, Some(13));
+    assert_eq!(os_error.code, Some(access_denied));
     assert_eq!(os_error.detail, None);
     let timeout = OsError::of_kind("timeout").with_detail("2 s elapsed");
     assert_eq!(timeout.code, None);

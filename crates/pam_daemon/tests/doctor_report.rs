@@ -3,6 +3,7 @@
 //! the request and audit rows, the attribution, and the `boundary` block of
 //! `status`.
 
+#[cfg(unix)]
 use std::time::Duration;
 
 use pam_daemon::boundary::{ACTION_DOCTOR_REPORT, CAP_DOCTOR_REPORT, CAUSE_INVALID_REPORT};
@@ -16,8 +17,16 @@ use pam_store::{Actor, Decision, RequestIngress, RequestState};
 use pam_testkit::{TestDaemon, envelope, with_deadline};
 use serde_json::{Value, json};
 
+/// The must-deny probe the test reaches for real: the admin socket on
+/// macOS; on Windows the control file, which the document claims open.
+const ADMIN_PROBE: ProbeId = if cfg!(windows) {
+    ProbeId::AdminControlRead
+} else {
+    ProbeId::AdminEndpoint
+};
+
 /// A full document for this platform: every must-deny probe denied except
-/// `admin.endpoint`, which the probe below really reaches.
+/// the admin probe, which the probe below really reaches.
 fn document() -> Value {
     let platform = Platform::current().expect("a supported platform");
     let probes = ProbeId::all()
@@ -27,9 +36,10 @@ fn document() -> Value {
             }
             match id {
                 ProbeId::PublicUnlink => Probe::not_probed(id, "side effect"),
-                ProbeId::PublicReach | ProbeId::RunLockProbe | ProbeId::AdminEndpoint => {
+                ProbeId::PublicReach | ProbeId::RunLockProbe => {
                     Probe::new(id, ProbeResult::allowed())
                 }
+                id if id == ADMIN_PROBE => Probe::new(id, ProbeResult::allowed()),
                 _ => Probe::new(
                     id,
                     ProbeResult::denied(OsError::of_kind("PermissionDenied")),
@@ -110,7 +120,10 @@ fn assert_block_after_run(boundary: &Value) {
     assert_eq!(boundary["last_report"]["verdict"], "not_established");
     assert_eq!(boundary["last_report"]["request_id"], "req_doc");
     assert_eq!(boundary["last_report"]["agent"], "claude");
-    assert_eq!(boundary["last_report"]["failed"], json!(["admin.endpoint"]));
+    assert_eq!(
+        boundary["last_report"]["failed"],
+        json!([ADMIN_PROBE.as_str()])
+    );
     assert!(boundary["last_report"]["age_s"].is_u64());
     assert_eq!(boundary["reports"]["retained"], 1);
     assert_eq!(boundary["admin_contacts"]["unattributed"], 0);
@@ -205,12 +218,12 @@ async fn a_doctor_run_is_recorded_with_the_daemon_view_of_its_peer_and_explains_
         assert_eq!(audit[0].decision, Decision::Allow);
         assert_eq!(audit[0].actor, Actor::System);
         let detail: Value = serde_json::from_str(audit[0].detail.as_deref().unwrap()).unwrap();
-        assert_eq!(detail["failed"], json!(["admin.endpoint"]));
+        assert_eq!(detail["failed"], json!([ADMIN_PROBE.as_str()]));
 
         let reports = store.list_boundary_reports(10).await.unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].request_id.as_deref(), Some("req_doc"));
-        assert_eq!(reports[0].failed, ["admin.endpoint"]);
+        assert_eq!(reports[0].failed, [ADMIN_PROBE.as_str()]);
         assert_eq!(reports[0].client_version, env!("CARGO_PKG_VERSION"));
 
         // The admin probe was seen, from this pid, and the report from the

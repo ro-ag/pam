@@ -769,9 +769,16 @@ mod doctor_report {
 
     const IMAGE: &str = "/Applications/PAM.app/Contents/MacOS/pam";
     const PID: u32 = 4242;
+    /// The must-deny probe that stands for reaching the admin plane: the
+    /// socket on macOS, the control file on Windows.
+    const ADMIN_PROBE: ProbeId = if cfg!(windows) {
+        ProbeId::AdminControlRead
+    } else {
+        ProbeId::AdminEndpoint
+    };
 
     /// A full document for this platform: every probe denied except
-    /// `admin.endpoint` when `reachable`, which makes it `not_established`.
+    /// the admin probe when `reachable`, which makes it `not_established`.
     pub(crate) fn document(admin_reachable: bool) -> Value {
         let platform = Platform::current().expect("a supported platform");
         let probes = ProbeId::all()
@@ -784,7 +791,7 @@ mod doctor_report {
                     ProbeId::PublicReach | ProbeId::RunLockProbe => {
                         Probe::new(id, ProbeResult::allowed())
                     }
-                    ProbeId::AdminEndpoint if admin_reachable => {
+                    id if id == ADMIN_PROBE && admin_reachable => {
                         Probe::new(id, ProbeResult::allowed())
                     }
                     _ => Probe::new(
@@ -905,7 +912,7 @@ mod doctor_report {
         assert_eq!(row.id, report_id);
         assert_eq!(row.request_id.as_deref(), Some("req_doc"));
         assert_eq!(row.verdict, "not_established");
-        assert_eq!(row.failed, ["admin.endpoint"]);
+        assert_eq!(row.failed, [ADMIN_PROBE.as_str()]);
         assert!(row.unverified.is_empty());
         assert_eq!(row.agent, "claude");
         assert_eq!(row.repo, "/repo/test");
@@ -930,7 +937,7 @@ mod doctor_report {
         assert_eq!(audit[0].actor, pam_store::Actor::System);
         let detail: Value = serde_json::from_str(audit[0].detail.as_deref().unwrap()).unwrap();
         assert_eq!(detail["verdict"], "not_established");
-        assert_eq!(detail["failed"], json!(["admin.endpoint"]));
+        assert_eq!(detail["failed"], json!([ADMIN_PROBE.as_str()]));
         assert_eq!(detail["unverified"], json!([]));
         assert_eq!(detail["peer_harness"], "claude");
 
@@ -940,7 +947,10 @@ mod doctor_report {
         assert_eq!(block["last_report"]["request_id"], "req_doc");
         assert_eq!(block["last_report"]["peer_pid"], PID);
         assert_eq!(block["last_report"]["peer_harness"], "claude");
-        assert_eq!(block["last_report"]["failed"], json!(["admin.endpoint"]));
+        assert_eq!(
+            block["last_report"]["failed"],
+            json!([ADMIN_PROBE.as_str()])
+        );
         assert_eq!(block["last_report"]["ts"], 1_759_400_000);
         assert_eq!(block["reports"]["not_established"], 1);
         assert!(

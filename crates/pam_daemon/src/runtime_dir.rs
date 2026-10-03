@@ -1,5 +1,15 @@
 //! Runtime directory setup: `<base>/run` and the endpoint paths inside it.
 //!
+//! The run directory is the public plane, and nothing else: it holds the
+//! public socket `pam.sock` (unix), the instance lock `daemon.lock`
+//! (`crate::lifecycle`), and on Windows the public adapter's control file
+//! `public.json`. It is the one directory under the base an agent's sandbox
+//! must let the agent traverse, so nothing private is placed in it: the
+//! engine's socket, API key file and pid file live under `<base>/engine/run`
+//! (`pam_model::engine_server`), and the administration endpoint under
+//! `<base>/admin`. A daemon that finds the engine runtime an older version
+//! kept here removes it at start (`ModelService::reap_orphan_engine`).
+//!
 //! The default base is `~/.pam`; tests point it at a temporary directory.
 //! A unix domain socket path must fit `sun_path` in `sockaddr_un` with its
 //! terminator (104 bytes on macOS), so the public socket path is validated
@@ -102,7 +112,8 @@ impl RuntimeDir {
         })
     }
 
-    /// The `<base>/run` directory holding the public endpoint.
+    /// The `<base>/run` directory holding the public endpoint: `pam.sock`,
+    /// `daemon.lock` and, on Windows, `public.json` — nothing private.
     #[must_use]
     pub fn run_dir(&self) -> &Path {
         &self.run

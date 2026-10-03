@@ -41,8 +41,8 @@ use super::classify::{
 };
 use super::helpers::{Helper, HelperOutcome};
 use super::inventory::{
-    ADMIN_DIR, ADMIN_SOCKET, Context, ENGINE_SOCKET, Planned, RUN_DIR, current_exe, file_op,
-    lock_pid,
+    ADMIN_DIR, ADMIN_SOCKET, Context, ENGINE_SOCKET, Planned, RUN_DIR, current_exe,
+    engine_runtime_dir, file_op, lock_pid,
 };
 use super::os::Os;
 
@@ -88,7 +88,7 @@ pub fn plan(id: ProbeId, context: &Context) -> Option<Planned> {
                 .join(ADMIN_DIR)
                 .join(ADMIN_SOCKET),
         ),
-        ProbeId::EngineSocket => connect(context, id, base.join(RUN_DIR).join(ENGINE_SOCKET)),
+        ProbeId::EngineSocket => connect(context, id, engine_runtime_dir(base).join(ENGINE_SOCKET)),
         ProbeId::KeychainSearch => helper(
             context,
             id,

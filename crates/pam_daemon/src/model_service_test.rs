@@ -1655,6 +1655,184 @@ async fn an_engine_a_dead_daemon_left_behind_is_stopped_but_a_stranger_is_not() 
     let _ = stranger.wait();
 }
 
+/// Sorted entry names of a directory; empty when it does not exist.
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The engine runtime lives under `<base>/engine/run`: with an engine loaded,
+/// the public run directory holds exactly what the daemon put there (the
+/// public socket and the instance lock) and the engine's socket and pid
+/// record sit in the engine's own runtime directory, owner-only.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_run_directory_holds_only_the_public_plane_while_an_engine_runs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some((service, dir)) = loaded_fake_service("pam-mr-").await else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    let base = dir.path().join("base");
+    let dirs = crate::runtime_dir::RuntimeDir::at_base(&base).unwrap();
+    std::fs::write(dirs.public_socket(), b"").unwrap();
+    std::fs::write(dirs.run_dir().join(crate::lifecycle::LOCK_FILE), b"1").unwrap();
+    service
+        .generate_bounded(Tier::Light, echo_request("one"), 4096)
+        .await
+        .unwrap();
+    let engine = service.engine_server().unwrap();
+    let runtime = pam_model::engine::EngineLayout::new(&base).runtime_dir();
+    assert_eq!(engine.runtime_dir(), runtime);
+    assert_eq!(engine.socket(), runtime.join("engine.sock"));
+    assert_eq!(engine.pid_file(), runtime.join("engine.pid"));
+    assert_eq!(names(&runtime), ["engine.pid", "engine.sock"]);
+    assert_eq!(
+        std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        names(dirs.run_dir()),
+        [crate::lifecycle::LOCK_FILE, "pam.sock"],
+        "nothing of the engine lands in the public run directory"
+    );
+    service.unload_all().await.unwrap();
+    assert_eq!(names(&runtime), Vec::<String>::new());
+    assert_eq!(
+        names(dirs.run_dir()),
+        [crate::lifecycle::LOCK_FILE, "pam.sock"]
+    );
+}
+
+/// A daemon before the `<base>/engine/run` layout kept the engine runtime inside the
+/// public run directory. The next daemon's start pass adopts the pid record from there,
+/// so the engine that daemon left is still stopped, and removes the leftovers, saying so.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_engine_recorded_in_the_old_run_directory_layout_is_reaped_and_the_leftovers_removed() {
+    use crate::model_service::OrphanReap;
+    let Some((first, dir)) = loaded_fake_service("pam-ml-").await else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    first
+        .generate_bounded(Tier::Light, echo_request("one"), 4096)
+        .await
+        .unwrap();
+    let engine = first.engine_server().unwrap();
+    let orphan = engine.model().unwrap().pid;
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(orphan));
+
+    // Lay the record out as the old daemon did: `<base>/run/engine/engine.pid`
+    // beside its key file, and the socket at `<base>/run/engine.sock`.
+    let base = dir.path().join("base");
+    let old_run = base.join("run");
+    let old_dir = old_run.join("engine");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::rename(engine.pid_file(), old_dir.join("engine.pid")).unwrap();
+    std::fs::write(old_dir.join("api.key"), b"old-key\n").unwrap();
+    std::fs::write(old_run.join("engine.sock"), b"").unwrap();
+    std::fs::write(old_run.join("pam.sock"), b"").unwrap();
+    std::fs::write(old_run.join(crate::lifecycle::LOCK_FILE), b"1").unwrap();
+    assert!(engine.pid_record().is_none(), "the new location is empty");
+    drop(engine);
+
+    // "The daemon restarted" (the first service is leaked, as a SIGKILLed process would be).
+    let second = service(dir.path()).await;
+    second.set_engine_base(base.clone());
+    std::mem::forget(Arc::clone(&first));
+    let (log, logging) = Captured::start();
+    let reaped = second.reap_orphan_engine().await;
+    drop(logging);
+    assert_eq!(reaped, OrphanReap::Killed { pid: orphan });
+    let started = std::time::Instant::now();
+    while alive(orphan) && started.elapsed() < std::time::Duration::from_secs(10) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!alive(orphan), "the leftover engine is gone");
+    assert!(second.engine_server().unwrap().pid_record().is_none());
+    assert!(
+        !old_dir.exists(),
+        "the old key-and-pid directory is removed"
+    );
+    assert!(
+        !old_run.join("engine.sock").exists(),
+        "the old socket is removed"
+    );
+    assert_eq!(
+        names(&old_run),
+        [crate::lifecycle::LOCK_FILE, "pam.sock"],
+        "the public plane stays"
+    );
+    assert_eq!(
+        log.lines_with("adopted the engine pid record").len(),
+        1,
+        "{}",
+        log.text()
+    );
+    let removed = log.lines_with("removed the engine runtime an older daemon kept");
+    assert_eq!(removed.len(), 1, "{}", log.text());
+    assert!(removed[0].contains("run/engine.sock"), "{}", removed[0]);
+    assert!(removed[0].contains("run/engine\""), "{}", removed[0]);
+
+    // The pass runs once per base: a second call is a no-op and logs nothing.
+    let (log, logging) = Captured::start();
+    assert_eq!(second.reap_orphan_engine().await, OrphanReap::NothingToDo);
+    drop(logging);
+    assert!(log.text().is_empty(), "{}", log.text());
+}
+
+/// With no engine installed there is nothing to reap, but the runtime an older daemon
+/// kept inside the run directory still goes.
+#[tokio::test]
+async fn the_old_engine_runtime_is_removed_even_with_no_engine_installed() {
+    use crate::model_service::OrphanReap;
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    let base = dir.path().join("base");
+    service.set_engine_base(base.clone());
+    let old_run = base.join("run");
+    let old_dir = old_run.join("engine");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(old_dir.join("api.key"), b"old-key\n").unwrap();
+    std::fs::write(old_run.join("engine.sock"), b"").unwrap();
+    std::fs::write(old_run.join("pam.sock"), b"").unwrap();
+
+    let (log, logging) = Captured::start();
+    assert_eq!(service.reap_orphan_engine().await, OrphanReap::NothingToDo);
+    drop(logging);
+    assert!(!old_dir.exists());
+    assert!(!old_run.join("engine.sock").exists());
+    assert_eq!(names(&old_run), ["pam.sock"]);
+    assert_eq!(
+        log.lines_with("removed the engine runtime an older daemon kept")
+            .len(),
+        1,
+        "{}",
+        log.text()
+    );
+    // Nothing left: the next pass (no engine installed, so it looks again) is silent.
+    let (log, logging) = Captured::start();
+    assert_eq!(service.reap_orphan_engine().await, OrphanReap::NothingToDo);
+    drop(logging);
+    assert!(log.text().is_empty(), "{}", log.text());
+}
+
 /// The cancel receiver and the total deadline stop a generation that is stuck behind
 /// the service-wide lock, instead of queueing for a quarter hour.
 #[tokio::test]

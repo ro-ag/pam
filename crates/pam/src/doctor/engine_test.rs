@@ -110,7 +110,7 @@ fn absent_private_state_counts_neither_way() {
         .with(Op::ListDir, format!("{BASE}/backup"), Answer::Absent)
         .with(
             Op::Connect,
-            format!("{BASE}/run/engine.sock"),
+            format!("{BASE}/engine/run/engine.sock"),
             Answer::Absent,
         );
     let report = run_fake(os);
@@ -327,7 +327,7 @@ fn the_probes_target_exactly_the_spec_paths_and_absent_names() {
         "OpenWrite /tmp/pamdoc-base/run/daemon.lock",
         "Connect /tmp/pamdoc-base/admin/control.sock",
         "Connect /tmp/pamdoc-base/run/../admin/control.sock",
-        "Connect /tmp/pamdoc-base/run/engine.sock",
+        "Connect /tmp/pamdoc-base/engine/run/engine.sock",
         "ListDir /tmp/pamdoc-base/admin",
         "OpenRead /tmp/pamdoc-base/state.sqlite3",
         "OpenWrite /tmp/pamdoc-base/state.sqlite3",
@@ -338,7 +338,7 @@ fn the_probes_target_exactly_the_spec_paths_and_absent_names() {
         "ListDir /tmp/pamdoc-base/backup",
         "ListDir /tmp/pamdoc-base/model-trust",
         "ListDir /tmp/pamdoc-base/engine",
-        "ListDir /tmp/pamdoc-base/run/engine",
+        "ListDir /tmp/pamdoc-base/engine/run",
         "ListDir /tmp/pamdoc-base/flows",
         "ListDir /tmp/pamdoc-base/log",
         "ReadPid /tmp/pamdoc-base/run/daemon.lock",
@@ -432,7 +432,7 @@ impl FixtureBase {
         private_dir(&base);
         for dir in [
             "run",
-            "run/engine",
+            "engine/run",
             "admin",
             "backup",
             "model-trust",
@@ -446,20 +446,24 @@ impl FixtureBase {
             &base.join("run/daemon.lock"),
             std::process::id().to_string().as_bytes(),
         );
-        private_file(&base.join("run/engine/api.key"), b"engine-key");
+        private_file(&base.join("engine/run/api.key"), b"engine-key");
         private_file(&base.join("state.sqlite3"), b"sqlite");
         private_file(&base.join("state.sqlite3-wal"), b"wal");
         private_file(&base.join("state.sqlite3-shm"), b"shm");
         private_file(&base.join("log/daemon.log"), b"log");
-        let listeners = ["run/pam.sock", "run/engine.sock", "admin/control.sock"]
-            .into_iter()
-            .map(|socket| {
-                let listener = UnixListener::bind(base.join(socket)).unwrap();
-                std::fs::set_permissions(base.join(socket), std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
-                listener
-            })
-            .collect();
+        let listeners = [
+            "run/pam.sock",
+            "engine/run/engine.sock",
+            "admin/control.sock",
+        ]
+        .into_iter()
+        .map(|socket| {
+            let listener = UnixListener::bind(base.join(socket)).unwrap();
+            std::fs::set_permissions(base.join(socket), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            listener
+        })
+        .collect();
         Self {
             tmp,
             base,
@@ -518,7 +522,7 @@ fn two_runs_against_a_real_base_change_nothing_on_disk() {
         lock_before
     );
     assert_eq!(
-        std::fs::read(fixture.base.join("run/engine/api.key")).unwrap(),
+        std::fs::read(fixture.base.join("engine/run/api.key")).unwrap(),
         b"engine-key"
     );
     for report in [&first, &second] {
@@ -567,7 +571,9 @@ fn two_runs_against_a_real_base_change_nothing_on_disk() {
     }
 }
 
-/// Restores the fixture's modes so the temp dir can be removed.
+/// Restores the fixture's modes so the temp dir can be removed. The modes
+/// are closed children first (the list order) and reopened parents first
+/// (its reverse): a closed parent would hide its child from both steps.
 #[cfg(unix)]
 struct ModeGuard(Vec<(PathBuf, u32)>);
 
@@ -575,7 +581,7 @@ struct ModeGuard(Vec<(PathBuf, u32)>);
 impl Drop for ModeGuard {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
-        for (path, mode) in &self.0 {
+        for (path, mode) in self.0.iter().rev() {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
         }
     }
@@ -599,10 +605,10 @@ fn private_state_the_user_cannot_open_classifies_denied() {
         ("admin", 0o700),
         ("backup", 0o700),
         ("model-trust", 0o700),
+        ("engine/run", 0o700),
         ("engine", 0o700),
         ("flows", 0o700),
         ("log", 0o700),
-        ("run/engine", 0o700),
     ]
     .into_iter()
     .map(|(path, mode)| (fixture.base.join(path), mode))
@@ -706,8 +712,8 @@ async fn an_unsandboxed_run_against_a_real_daemon_is_not_established() {
             ProbeId::BackupRead => present("backup"),
             ProbeId::ModelTrustRead => present("model-trust"),
             ProbeId::EngineRead => present("engine"),
-            ProbeId::EngineRuntimeRead => present("run/engine"),
-            ProbeId::EngineSocket => present("run/engine.sock"),
+            ProbeId::EngineRuntimeRead => present("engine/run"),
+            ProbeId::EngineSocket => present("engine/run/engine.sock"),
             ProbeId::FlowsRead => present("flows"),
             ProbeId::LogRead => present("log"),
             _ => true,

@@ -55,13 +55,21 @@ pub const MODEL_TRUST_DIR: &str = "model-trust";
 pub const ENGINE_DIR: &str = "engine";
 /// The run directory under the base.
 pub const RUN_DIR: &str = "run";
-/// The engine's transient runtime directory (API key, pid) inside the run
-/// directory.
-pub const ENGINE_RUNTIME_DIR: &str = "engine";
-/// The engine's private socket inside the run directory (macOS).
+/// The engine's transient runtime directory (API key, pid) inside the
+/// engine directory: `<base>/engine/run`.
+pub const ENGINE_RUNTIME_DIR: &str = "run";
+/// The engine's private socket inside the engine runtime directory (macOS).
 pub const ENGINE_SOCKET: &str = "engine.sock";
 /// The flow library.
 pub const FLOWS_DIR: &str = "flows";
+
+/// The engine's runtime directory under `base`: `<base>/engine/run`, where
+/// the daemon's supervisor keeps the engine socket, its API key file and its
+/// pid file (`pam_model::engine::EngineLayout::runtime_dir`).
+#[must_use]
+pub fn engine_runtime_dir(base: &Path) -> PathBuf {
+    base.join(ENGINE_DIR).join(ENGINE_RUNTIME_DIR)
+}
 
 /// The reason `public.unlink` is never probed (decision 3).
 pub const UNLINK_NOT_PROBED: &str = "side effect";
@@ -273,7 +281,6 @@ fn harness_chain(_os: &dyn Os, _pid: u32, _bound: Duration) -> Vec<String> {
 fn plan_common(id: ProbeId, context: &Context) -> Option<Planned> {
     let base = &context.base;
     let platform = context.platform;
-    let run = base.join(RUN_DIR);
     Some(match id {
         ProbeId::PublicReach => reach(context),
         ProbeId::RunLockProbe => {
@@ -294,7 +301,7 @@ fn plan_common(id: ProbeId, context: &Context) -> Option<Planned> {
         ProbeId::BackupRead => list_dir(context, id, base.join(BACKUP_DIR)),
         ProbeId::ModelTrustRead => list_dir(context, id, base.join(MODEL_TRUST_DIR)),
         ProbeId::EngineRead => list_dir(context, id, base.join(ENGINE_DIR)),
-        ProbeId::EngineRuntimeRead => list_dir(context, id, run.join(ENGINE_RUNTIME_DIR)),
+        ProbeId::EngineRuntimeRead => list_dir(context, id, engine_runtime_dir(base)),
         ProbeId::FlowsRead => list_dir(context, id, base.join(FLOWS_DIR)),
         ProbeId::LogRead => list_dir(context, id, base.join(LOG_DIR)),
         _ => return None,

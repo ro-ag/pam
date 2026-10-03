@@ -116,20 +116,29 @@ async fn status_bypasses_the_lanes_and_verifies() {
         // below is that the body comes from a snapshot the task produced,
         // not that this host produced one within the bound.
         daemon.handle().refresh_status().await;
-        client
-            .send(&envelope(
-                "req_status",
-                "status",
-                serde_json::json!({}),
-                true,
-            ))
-            .await;
-
-        let response = client.recv().await;
-        let Response::Result { outcome, body, .. } = response else {
-            panic!("expected a result, got {response:?}");
+        // A loaded Windows runner can miss the count's 250 ms read bound
+        // even after the slow snapshot was refreshed. A stale poll still
+        // proves liveness; wait for the fresh answer this test inspects,
+        // within the enclosing harness deadline.
+        let body = loop {
+            client
+                .send(&envelope(
+                    "req_status",
+                    "status",
+                    serde_json::json!({}),
+                    true,
+                ))
+                .await;
+            let response = client.recv().await;
+            let Response::Result { outcome, body, .. } = response else {
+                panic!("expected a result, got {response:?}");
+            };
+            assert_eq!(outcome, Outcome::Verified);
+            if body["snapshot"]["stale"] == false {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         };
-        assert_eq!(outcome, Outcome::Verified);
         assert_eq!(body["protocol"], PROTOCOL_VERSION);
         assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
         // A poll is not an active request: nothing else is in flight.

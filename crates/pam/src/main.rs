@@ -4,7 +4,9 @@
 //! The CLI surface is deliberately static — agents interact exclusively
 //! through these subcommands (no raw-protocol escape hatch), and there
 //! are **no security commands**: grants, approvals, revocations, and
-//! profile changes live in the GUI only. The subcommand table lives in
+//! profile changes live in the GUI only. `pam policy check` is not one: it
+//! reads a managed policy file the administrator names and changes
+//! nothing (no daemon, no store, no write). The subcommand table lives in
 //! `README.md` ("CLI surface"); the exit-code table is in the crate docs
 //! of [`pam`] (`lib.rs`).
 
@@ -20,6 +22,7 @@ use pam::render;
 use pam::request::{DEFAULT_DEADLINE_MS, parse_args_object};
 use pam_daemon::daemon::{DaemonError, run_daemon};
 use pam_daemon::lifecycle::{LifecycleError, LifecyclePhase, init_daemon_logging};
+use pam_daemon::managed_policy::TargetPlatform;
 use pam_proto::{Event, Response};
 
 /// Exit code for usage errors.
@@ -179,6 +182,12 @@ enum Cmd {
         #[arg(long, requires = "profile")]
         managed: bool,
     },
+    /// Check a managed policy file (the organisation's, delivered by MDM)
+    /// without a daemon. Reads the file named; writes nothing.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyCmd,
+    },
     /// Start the daemon at login: a user-scope launch agent or
     /// scheduled task. Never sudo or admin.
     Service {
@@ -192,6 +201,42 @@ enum Cmd {
     },
     /// Open the desktop control center.
     Gui,
+}
+
+/// `pam policy`: the managed policy file, read-only.
+#[derive(Subcommand)]
+enum PolicyCmd {
+    /// Validate a policy file exactly as the daemon would read it.
+    ///
+    /// Prints every key the file sets with its tier, modes, what each mode
+    /// means and the value (or why it was rejected), the digest, and what
+    /// the file locks. Exit 0 valid, 13 valid with rejected leaves (the
+    /// rest applies), 12 invalid as a whole (the daemon would use none of
+    /// it), 11 not trusted (`--trust` only), 1 the file cannot be read.
+    /// Paths in the file are checked for syntax on the target platform,
+    /// never for presence or ownership. Contacts no daemon and writes
+    /// nothing.
+    Check {
+        /// The policy file (any path: it is the administrator's file).
+        file: PathBuf,
+        /// Print the result as one JSON document.
+        #[arg(long)]
+        json: bool,
+        /// The platform whose path syntax the file is checked for
+        /// (default: this machine's).
+        #[arg(long, alias = "for", value_name = "macos|windows", value_parser = parse_platform)]
+        platform: Option<TargetPlatform>,
+        /// Also run this machine's production trust check (owner, modes,
+        /// symlinks, parent directories, write probe) on the file where it
+        /// sits, as the daemon does at the fixed path.
+        #[arg(long)]
+        trust: bool,
+    },
+}
+
+/// `--platform`: `macos` or `windows`.
+fn parse_platform(raw: &str) -> Result<TargetPlatform, String> {
+    TargetPlatform::parse(raw).ok_or_else(|| format!("{raw:?} is not macos or windows"))
 }
 
 #[derive(Subcommand)]
@@ -418,6 +463,17 @@ fn main() -> ExitCode {
         } => daemon_stop(),
         Cmd::Gui => gui_mode(),
         Cmd::Service { action } => service_command(&action),
+        // The policy file is the administrator's: checked here, with no
+        // base directory, no runtime and no daemon.
+        Cmd::Policy {
+            action:
+                PolicyCmd::Check {
+                    file,
+                    json,
+                    platform,
+                    trust,
+                },
+        } => policy_check(&file, json, platform, trust),
         // A profile is static text: printed without a runtime, a base
         // directory that exists, or a daemon.
         Cmd::Doctor {
@@ -541,6 +597,7 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
         Cmd::Daemon { .. }
         | Cmd::Gui
         | Cmd::Service { .. }
+        | Cmd::Policy { .. }
         | Cmd::Playbook
         | Cmd::Doctor {
             profile: Some(_), ..
@@ -609,6 +666,50 @@ async fn doctor_mode(base: &Path, json: bool, no_report: bool, timeout_ms: u64) 
         eprintln!("{stderr}");
     }
     ExitCode::from(render::doctor_exit_code(report.verdict))
+}
+
+/// `pam policy check <file>`: inspects the file for `platform` (default:
+/// this machine's) and, with `trust`, runs this machine's production trust
+/// check on it; prints the result and exits with
+/// [`render::policy_check_exit_code`]. `--trust` judges this machine's
+/// rules, so with another platform it is a usage error (exit `2`). A file
+/// that cannot be read is exit `1`, with the reason on stderr.
+fn policy_check(
+    file: &Path,
+    json: bool,
+    platform: Option<TargetPlatform>,
+    trust: bool,
+) -> ExitCode {
+    let host = TargetPlatform::host();
+    let platform = platform.unwrap_or(host);
+    if trust && platform != host {
+        eprintln!(
+            "pam policy check: --trust applies this machine's ({}) trust rules; \
+             check a {} file with --trust on a {} machine",
+            host.as_str(),
+            platform.as_str(),
+            platform.as_str()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    match pam::check_policy_file(file, platform, trust) {
+        Ok(check) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&render::policy_check_json(&check))
+                        .unwrap_or_default()
+                );
+            } else {
+                print!("{}", render::render_policy_check(&check));
+            }
+            ExitCode::from(render::policy_check_exit_code(&check))
+        }
+        Err(err) => {
+            eprintln!("pam policy check: cannot read {}: {err}", file.display());
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `pam doctor --profile <harness>`: prints the reference sandbox profile

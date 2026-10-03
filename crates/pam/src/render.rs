@@ -1,6 +1,8 @@
 //! Human and machine rendering of daemon responses and events. Exit codes: `0`
 //! solved/changed/verified (or a ticket), `1` transport/client failure, `2` usage error, `3`
-//! refused, `4` unresolved, `5` blocked, `6` boundary not established (`pam doctor` only).
+//! refused, `4` unresolved, `5` blocked, `6` boundary not established (`pam doctor` only); `11`
+//! not trusted, `12` invalid file, `13` rejected leaves (`pam policy check` only,
+//! [`policy_check_exit_code`]).
 //!
 //! A refusal always renders all three fields the daemon sends — machine cause, human detail, and
 //! the recovery sentence (points at the GUI, never a security command):
@@ -26,12 +28,20 @@
 //! document's `report` member, [`render_doctor_reply`] prints how the daemon saw the caller,
 //! [`render_doctor_json`] adds that reply to the `--json` document, and [`doctor_exit_code`]
 //! maps the local verdict to the exit code.
+//!
+//! `pam policy check` needs no daemon: [`render_policy_check`] prints one line per key the file
+//! sets, [`policy_check_json`] the same as one document, and [`policy_check_exit_code`] maps the
+//! verdict.
 
 use std::fmt::Write as _;
 
+use pam_daemon::managed_policy::{self, Key, KeyReport, PolicyView, Verdict as PolicyVerdict};
+use pam_daemon::managed_policy_trust::{Untrusted, UntrustedReason};
 use pam_proto::doctor::{DoctorReport, ReportRecord, Verdict};
 use pam_proto::{Event, Outcome, Response};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use crate::{PolicyCheck, PolicyContent, PolicyTrust};
 
 /// Exit code for a refusal.
 pub const EXIT_REFUSED: u8 = 3;
@@ -46,6 +56,503 @@ pub const EXIT_BLOCKED: u8 = 5;
 /// and distinct, so a script never mistakes a sandbox finding for a daemon
 /// decision (`3` refused, `5` blocked).
 pub const EXIT_BOUNDARY: u8 = 6;
+
+/// Exit code of `pam policy check --trust` when this machine's production
+/// trust rules refuse the file (or a writer was replacing it): the daemon
+/// would ignore it, whatever it says.
+pub const EXIT_POLICY_UNTRUSTED: u8 = 11;
+
+/// Exit code of `pam policy check` for a file invalid as a whole (not
+/// JSON, too large, a duplicate key, an unsupported `version`, ...): the
+/// daemon would use none of it.
+pub const EXIT_POLICY_INVALID: u8 = 12;
+
+/// Exit code of `pam policy check` for a file that parses but has at least
+/// one rejected leaf or unknown key: the rest of it applies.
+pub const EXIT_POLICY_LEAF_PROBLEMS: u8 = 13;
+
+/// Maps a `pam policy check` result to the exit code: a trust refusal
+/// first ([`EXIT_POLICY_UNTRUSTED`]; the daemon never reads an untrusted
+/// file's content), then the document's verdict as the daemon's reader
+/// gives it — valid `0`, [`EXIT_POLICY_LEAF_PROBLEMS`],
+/// [`EXIT_POLICY_INVALID`] (a file refused for its size is invalid).
+#[must_use]
+pub fn policy_check_exit_code(check: &PolicyCheck) -> u8 {
+    if check
+        .trust
+        .as_ref()
+        .is_some_and(|trust| trust.outcome.is_err())
+    {
+        return EXIT_POLICY_UNTRUSTED;
+    }
+    match policy_verdict(check) {
+        PolicyVerdict::Valid => 0,
+        PolicyVerdict::LeafProblems => EXIT_POLICY_LEAF_PROBLEMS,
+        PolicyVerdict::FileInvalid => EXIT_POLICY_INVALID,
+    }
+}
+
+/// The document's verdict: the daemon reader's own
+/// ([`managed_policy::Inspection::verdict`]); a file over the size bound is
+/// invalid as a whole, as the reader would say.
+fn policy_verdict(check: &PolicyCheck) -> PolicyVerdict {
+    match &check.content {
+        PolicyContent::Inspected { inspection, .. } => inspection.verdict(),
+        PolicyContent::TooLarge { .. } => PolicyVerdict::FileInvalid,
+    }
+}
+
+/// The verdict's wire word.
+fn policy_verdict_word(verdict: PolicyVerdict) -> &'static str {
+    match verdict {
+        PolicyVerdict::Valid => "valid",
+        PolicyVerdict::LeafProblems => "leaf_problems",
+        PolicyVerdict::FileInvalid => "file_invalid",
+    }
+}
+
+/// What a mode means for the human's setting, in a few words.
+fn mode_semantics(key: &str, mode: &str) -> &'static str {
+    if Key::parse(key).is_some_and(|key| key.section().is_none()) {
+        return "label shown to the human";
+    }
+    match mode {
+        "locked" => "forced; the human cannot change it",
+        "default" => "used until the human sets their own",
+        "floor" => "the human may choose this level or stricter",
+        "min" => "lower bound on the human's value",
+        "max" => "upper bound on the human's value",
+        "allow" => "the human's list is intersected with this set",
+        "forbid" => "policy-only constraint",
+        _ => "unknown mode",
+    }
+}
+
+/// The document value a dotted key names, as written in the file.
+fn leaf_value<'a>(document: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    key.split('.')
+        .try_fold(document?, |value, segment| value.get(segment))
+}
+
+/// The file-level failure, when the file cannot be used at all.
+fn policy_failure(check: &PolicyCheck) -> Option<(&'static str, String)> {
+    match &check.content {
+        PolicyContent::Inspected { inspection, .. } => inspection
+            .result
+            .as_ref()
+            .err()
+            .map(|failure| (failure.code, failure.detail.clone())),
+        PolicyContent::TooLarge { size } => Some((
+            managed_policy::CODE_TOO_LARGE,
+            format!(
+                "the file has {size} bytes; a policy may have at most {} (it was not read)",
+                managed_policy::MAX_POLICY_BYTES
+            ),
+        )),
+    }
+}
+
+/// The trust facts `--trust` reports, each with the reasons that fail it,
+/// in the spirit of `admin.policy.get`'s `origin.trust`. The check stops at
+/// the first failure, so once one fact fails the others are `unknown`.
+const POLICY_TRUST_FACTS: [(&str, &[UntrustedReason]); 7] = [
+    ("owner", &[UntrustedReason::NotOwnedByRoot]),
+    ("writable_by_user", &[UntrustedReason::WritableByUser]),
+    ("symlink", &[UntrustedReason::Symlink]),
+    ("parents", &[UntrustedReason::ParentWritable]),
+    ("regular", &[UntrustedReason::NotRegular]),
+    (
+        "readable",
+        &[UntrustedReason::Unreadable, UntrustedReason::Busy],
+    ),
+    ("size", &[UntrustedReason::TooLarge]),
+];
+
+/// Each trust fact as `ok`, `failed`, `unknown` (not reached: the check
+/// stopped at an earlier failure) or, for the owner on Windows,
+/// `not_checked` (the Windows rule probes what this process's token may
+/// do; it cannot read the owner).
+fn policy_trust_facts(trust: &PolicyTrust) -> Vec<(&'static str, &'static str)> {
+    let failed = trust
+        .outcome
+        .as_ref()
+        .err()
+        .map(|untrusted| untrusted.reason);
+    POLICY_TRUST_FACTS
+        .iter()
+        .map(|(name, reasons)| {
+            let state = match failed {
+                Some(reason) if reasons.contains(&reason) => "failed",
+                _ if *name == "owner" && cfg!(windows) => "not_checked",
+                Some(_) => "unknown",
+                None => "ok",
+            };
+            (*name, state)
+        })
+        .collect()
+}
+
+/// `trusted`, `busy` (a writer was replacing the file) or `untrusted`.
+fn policy_trust_verdict(trust: &PolicyTrust) -> &'static str {
+    match &trust.outcome {
+        Ok(()) => "trusted",
+        Err(untrusted) if untrusted.reason == UntrustedReason::Busy => "busy",
+        Err(_) => "untrusted",
+    }
+}
+
+/// The `trust` member of [`policy_check_json`].
+fn policy_trust_json(trust: &PolicyTrust) -> Value {
+    let refusal = trust.outcome.as_ref().err();
+    let facts: serde_json::Map<String, Value> = policy_trust_facts(trust)
+        .into_iter()
+        .map(|(name, state)| (name.to_owned(), json!(state)))
+        .collect();
+    json!({
+        "rules": "production",
+        "checked_path": trust.checked_path.to_string_lossy(),
+        "fixed_path": trust.fixed_path.to_string_lossy(),
+        "at_fixed_path": trust.at_fixed_path(),
+        "verdict": policy_trust_verdict(trust),
+        "code": refusal.map(Untrusted::code),
+        "detail": refusal.map(ToString::to_string),
+        "recovery": refusal.map(Untrusted::recovery),
+        "facts": facts,
+        "observed": trust.observed.map(|(uid, mode)| json!({
+            "uid": uid,
+            "mode": format!("{mode:04o}"),
+        })),
+    })
+}
+
+/// One `keys` entry of [`policy_check_json`]: the daemon's per-key row,
+/// plus what each mode means and, for an applied leaf, its value as the
+/// file writes it.
+fn policy_key_json(report: &KeyReport, document: Option<&Value>) -> Value {
+    let mut entry = json!({
+        "key": report.key,
+        "tier": report.tier,
+        "mode": report.mode,
+        "semantics": report
+            .mode
+            .iter()
+            .map(|mode| mode_semantics(report.key, mode))
+            .collect::<Vec<_>>(),
+        "state": report.state,
+    });
+    if report.state == "applied"
+        && let Some(value) = leaf_value(document, report.key)
+    {
+        entry["value"] = value.clone();
+    }
+    if let Some(code) = report.code {
+        entry["code"] = json!(code);
+    }
+    if let Some(detail) = &report.detail {
+        entry["detail"] = json!(detail);
+    }
+    entry
+}
+
+/// `pam policy check --json`: one document.
+///
+/// `{ path, platform, verdict: valid|leaf_problems|file_invalid,
+/// exit_code, digest, size, failure: {code, detail} | null, meta:
+/// {revision, organization, contact, comment}, keys: [{key, tier, mode[],
+/// semantics[], state, value?, code?, detail?}], diagnostics: [{code, key,
+/// detail}], rejected_leaves, locks: [key], trust: {rules, checked_path,
+/// fixed_path, at_fixed_path, verdict: trusted|untrusted|busy, code,
+/// detail, recovery, facts: {owner, writable_by_user, symlink, parents,
+/// regular, readable, size}, observed: {uid, mode} | null} | null }`.
+/// `digest` is the SHA-256 of the raw bytes (null for a file refused
+/// unread); `value` is present for an applied leaf.
+#[must_use]
+pub fn policy_check_json(check: &PolicyCheck) -> Value {
+    let (digest, size) = match &check.content {
+        PolicyContent::Inspected { inspection, .. } => {
+            (Some(inspection.digest.as_str()), inspection.size as u64)
+        }
+        PolicyContent::TooLarge { size } => (None, *size),
+    };
+    let (view, document) = match &check.content {
+        PolicyContent::Inspected {
+            inspection,
+            document,
+        } => (inspection.result.as_ref().ok(), document.as_ref()),
+        PolicyContent::TooLarge { .. } => (None, None),
+    };
+    let reports = view.map(PolicyView::key_reports).unwrap_or_default();
+    json!({
+        "path": check.path.to_string_lossy(),
+        "platform": check.platform.as_str(),
+        "verdict": policy_verdict_word(policy_verdict(check)),
+        "exit_code": policy_check_exit_code(check),
+        "digest": digest,
+        "size": size,
+        "failure": policy_failure(check).map(|(code, detail)| json!({
+            "code": code,
+            "detail": detail,
+        })),
+        "meta": view.map(|view| json!({
+            "revision": view.meta().revision,
+            "organization": view.meta().organization,
+            "contact": view.meta().contact,
+            "comment": view.meta().comment,
+        })),
+        "keys": reports
+            .iter()
+            .map(|report| policy_key_json(report, document))
+            .collect::<Vec<_>>(),
+        "diagnostics": view.map(|view| view.diagnostics().to_vec()).unwrap_or_default(),
+        "rejected_leaves": view.map_or(0, PolicyView::rejected_leaves),
+        "locks": policy_locks(&reports),
+        "trust": check.trust.as_ref().map(policy_trust_json),
+    })
+}
+
+/// The keys the file locks (a `locked` mode that applied).
+fn policy_locks(reports: &[KeyReport]) -> Vec<&'static str> {
+    reports
+        .iter()
+        .filter(|report| report.state == "applied" && report.mode.contains(&"locked"))
+        .map(|report| report.key)
+        .collect()
+}
+
+/// How long a printed leaf value may be before it is cut.
+const POLICY_VALUE_WIDTH: usize = 120;
+
+/// `text` with control and bidirectional-formatting characters escaped, so
+/// a file under review cannot reorder or hide what the terminal shows.
+fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .flat_map(|ch| {
+            let hidden = ch.is_control()
+                || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{feff}')
+                || ('\u{202a}'..='\u{202e}').contains(&ch)
+                || ('\u{2066}'..='\u{2069}').contains(&ch);
+            if hidden {
+                ch.escape_unicode().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+
+/// A leaf value as compact JSON, cut at [`POLICY_VALUE_WIDTH`] characters.
+fn policy_value_text(value: &Value) -> String {
+    let text = terminal_safe(&value.to_string());
+    if text.chars().count() <= POLICY_VALUE_WIDTH {
+        return text;
+    }
+    let cut: String = text.chars().take(POLICY_VALUE_WIDTH).collect();
+    format!("{cut}\u{2026}")
+}
+
+/// `pam policy check` human output: the file, its digest and labels, one
+/// line per key it sets (state, tier, key, each mode with what it means,
+/// and the value or the reason it was rejected), any finding not tied to a
+/// key, what the file locks, the trust check when asked, and the verdict
+/// with its exit code.
+#[must_use]
+pub fn render_policy_check(check: &PolicyCheck) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "policy       {} (checked for {})",
+        terminal_safe(&check.path.to_string_lossy()),
+        check.platform.as_str()
+    );
+    let json = policy_check_json(check);
+    match json["digest"].as_str() {
+        Some(digest) => {
+            let _ = writeln!(out, "digest       {digest} ({} bytes)", json["size"]);
+        }
+        None => {
+            let _ = writeln!(out, "size         {} bytes", json["size"]);
+        }
+    }
+    for label in ["organization", "revision", "contact"] {
+        if let Some(text) = json["meta"][label].as_str() {
+            let _ = writeln!(out, "{label:<13}{}", terminal_safe(text));
+        }
+    }
+    let keys = json["keys"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !keys.is_empty() {
+        out.push_str("keys\n");
+    }
+    for entry in keys {
+        render_policy_key(&mut out, entry, width_of(keys));
+    }
+    let reported: Vec<&str> = keys
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect();
+    let others: Vec<&Value> = json["diagnostics"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|diagnostic| !reported.contains(&field(diagnostic, "key")))
+        .collect();
+    if !others.is_empty() {
+        out.push_str("findings\n");
+        for diagnostic in others {
+            let _ = writeln!(
+                out,
+                "  {}  {}: {}",
+                terminal_safe(field(diagnostic, "key")),
+                field(diagnostic, "code"),
+                terminal_safe(field(diagnostic, "detail"))
+            );
+        }
+    }
+    let locks: Vec<&str> = json["locks"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !locks.is_empty() {
+        let _ = writeln!(out, "locks        {}", locks.join(", "));
+    }
+    if let Some(trust) = &check.trust {
+        render_policy_trust(&mut out, trust);
+    }
+    render_policy_verdict(&mut out, check, &json);
+    out
+}
+
+/// The widest key name, for aligning the rows.
+fn width_of(keys: &[Value]) -> usize {
+    keys.iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .map(str::len)
+        .max()
+        .unwrap_or_default()
+}
+
+/// One key row of [`render_policy_check`]: state, tier, key, each mode with
+/// what it means (`label` for the meta keys), then the value or the reason
+/// it was rejected.
+fn render_policy_key(out: &mut String, entry: &Value, width: usize) {
+    let is_label = Key::parse(field(entry, "key")).is_some_and(|key| key.section().is_none());
+    let modes: Vec<String> = entry["mode"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .zip(
+            entry["semantics"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+        .map(|(mode, meaning)| {
+            format!(
+                "{} ({})",
+                mode.as_str().unwrap_or_default(),
+                meaning.as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    let modes = if is_label {
+        "label".to_owned()
+    } else {
+        modes.join(", ")
+    };
+    let tail = match entry.get("value") {
+        Some(value) => policy_value_text(value),
+        None => format!(
+            "{}: {}",
+            field(entry, "code"),
+            terminal_safe(field(entry, "detail"))
+        ),
+    };
+    let _ = writeln!(
+        out,
+        "  {:<8}  {}  {:<width$}  {modes}  = {tail}",
+        field(entry, "state"),
+        field(entry, "tier"),
+        field(entry, "key"),
+    );
+}
+
+/// The `trust` block of [`render_policy_check`].
+fn render_policy_trust(out: &mut String, trust: &PolicyTrust) {
+    let _ = writeln!(
+        out,
+        "trust        {} under this machine's production rules",
+        policy_trust_verdict(trust)
+    );
+    let _ = writeln!(
+        out,
+        "  checked   {}",
+        terminal_safe(&trust.checked_path.to_string_lossy())
+    );
+    let _ = writeln!(
+        out,
+        "  daemon    reads {}{}",
+        trust.fixed_path.display(),
+        if trust.at_fixed_path() {
+            " (this file)"
+        } else {
+            "; the rules were applied to the file where it sits"
+        }
+    );
+    let facts: Vec<String> = policy_trust_facts(trust)
+        .into_iter()
+        .map(|(name, state)| format!("{name} {state}"))
+        .collect();
+    let _ = writeln!(out, "  rules     {}", facts.join(", "));
+    if let Some((uid, mode)) = trust.observed {
+        let _ = writeln!(out, "  observed  owner uid {uid}, mode {mode:04o}");
+    }
+    if let Err(untrusted) = &trust.outcome {
+        let _ = writeln!(out, "  refused   {}", terminal_safe(&untrusted.to_string()));
+        let _ = writeln!(out, "  \u{2192} {}", untrusted.recovery());
+    }
+}
+
+/// The last line of [`render_policy_check`]: the verdict and its exit
+/// code, in words.
+fn render_policy_verdict(out: &mut String, check: &PolicyCheck, json: &Value) {
+    let code = policy_check_exit_code(check);
+    let sentence = if code == EXIT_POLICY_UNTRUSTED {
+        "not trusted: the daemon would ignore this file and say why".to_owned()
+    } else if let Some((failure, detail)) = policy_failure(check) {
+        format!(
+            "invalid ({failure}): {}; the daemon would use none of it",
+            terminal_safe(&detail)
+        )
+    } else {
+        let rejected = json["rejected_leaves"].as_u64().unwrap_or_default();
+        let applied = json["keys"].as_array().map_or(0, |keys| {
+            keys.iter().filter(|key| key["state"] == "applied").count()
+        });
+        let keys = |count: usize| {
+            if count == 1 {
+                "1 key applies".to_owned()
+            } else {
+                format!("{count} keys apply")
+            }
+        };
+        if rejected == 0 {
+            format!("valid: {}", keys(applied))
+        } else {
+            format!(
+                "valid with {rejected} rejected: {}; the rejected leaves and unknown keys do not",
+                keys(applied)
+            )
+        }
+    };
+    let _ = writeln!(out, "verdict      {sentence} (exit {code})");
+}
 
 /// Maps a `pam doctor` verdict to the exit code: `established` `0`,
 /// `not_established` [`EXIT_BOUNDARY`], `cannot_probe` `1` (the daemon was

@@ -1139,3 +1139,249 @@ fn status_prints_the_boundary_summary_and_the_last_report() {
     let missing = render_status(&serde_json::json!({ "daemon_version": "0.1.0" }));
     assert!(missing.contains("boundary:        ?"), "{missing}");
 }
+
+// --- pam policy check -------------------------------------------------------
+
+mod policy_check {
+    use std::path::{Path, PathBuf};
+
+    use pam_daemon::managed_policy::{self, TargetPlatform};
+    use pam_daemon::managed_policy_trust::{self, TrustRules};
+    use serde_json::json;
+
+    use crate::render::{
+        EXIT_POLICY_INVALID, EXIT_POLICY_LEAF_PROBLEMS, EXIT_POLICY_UNTRUSTED,
+        policy_check_exit_code, policy_check_json, render_policy_check,
+    };
+    use crate::{PolicyCheck, PolicyContent, PolicyTrust};
+
+    /// A check of `text` for macOS, as `check_policy_file` builds it.
+    fn checked(text: &str) -> PolicyCheck {
+        let inspection = managed_policy::inspect_bytes(text.as_bytes(), TargetPlatform::Macos);
+        let document = inspection
+            .result
+            .is_ok()
+            .then(|| serde_json::from_str(text).unwrap());
+        PolicyCheck {
+            path: PathBuf::from("policy.json"),
+            platform: TargetPlatform::Macos,
+            content: PolicyContent::Inspected {
+                inspection: Box::new(inspection),
+                document,
+            },
+            trust: None,
+        }
+    }
+
+    /// The production rules' verdict on a file this test owns: untrusted on
+    /// every platform (not root-owned on unix, writable by this token on
+    /// Windows).
+    fn untrusted_trust(dir: &Path) -> PolicyTrust {
+        let file = dir.canonicalize().unwrap().join("policy.json");
+        std::fs::write(&file, "{}").unwrap();
+        let file = PathBuf::from(
+            managed_policy::without_verbatim_prefix(&file.to_string_lossy()).into_owned(),
+        );
+        let outcome =
+            managed_policy_trust::verify_and_read(&file, &TrustRules::production()).map(drop);
+        assert!(outcome.is_err(), "a file this test wrote is never trusted");
+        PolicyTrust {
+            checked_path: file,
+            fixed_path: managed_policy_trust::policy_path(),
+            outcome,
+            observed: None,
+        }
+    }
+
+    const VALID: &str = r#"{"version":1,"organization":"Example Corp",
+        "security":{"profile":{"locked":"strict","reason":"SEC-114"},"grants":{"remember":"deny"}}}"#;
+
+    const LEAF_PROBLEMS: &str = r#"{"version":1,
+        "connectors":{"allowed_base_hosts":["*.example.com"]},"bogus":true,
+        "security":{"grants":{"remember":"deny"}}}"#;
+
+    #[test]
+    fn each_verdict_maps_to_its_exit_code() {
+        assert_eq!(policy_check_exit_code(&checked(VALID)), 0);
+        assert_eq!(
+            policy_check_exit_code(&checked(LEAF_PROBLEMS)),
+            EXIT_POLICY_LEAF_PROBLEMS
+        );
+        assert_eq!(policy_check_exit_code(&checked("{")), EXIT_POLICY_INVALID);
+        assert_eq!(
+            policy_check_exit_code(&checked(r#"{"version":2}"#)),
+            EXIT_POLICY_INVALID
+        );
+        let too_large = PolicyCheck {
+            content: PolicyContent::TooLarge { size: 70_000 },
+            ..checked(VALID)
+        };
+        assert_eq!(policy_check_exit_code(&too_large), EXIT_POLICY_INVALID);
+        assert_eq!(
+            (
+                EXIT_POLICY_UNTRUSTED,
+                EXIT_POLICY_INVALID,
+                EXIT_POLICY_LEAF_PROBLEMS
+            ),
+            (11, 12, 13)
+        );
+    }
+
+    #[test]
+    fn an_untrusted_file_exits_untrusted_whatever_its_content_says() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [VALID, LEAF_PROBLEMS, "{"] {
+            let check = PolicyCheck {
+                trust: Some(untrusted_trust(dir.path())),
+                ..checked(text)
+            };
+            assert_eq!(policy_check_exit_code(&check), EXIT_POLICY_UNTRUSTED);
+            let json = policy_check_json(&check);
+            assert_eq!(json["exit_code"], EXIT_POLICY_UNTRUSTED);
+            assert_eq!(json["trust"]["verdict"], "untrusted");
+            assert_eq!(json["trust"]["rules"], "production");
+            assert_eq!(json["trust"]["at_fixed_path"], false);
+            // The check stops at its first failure: exactly one fact
+            // failed, and it is the one the refusal's code names.
+            let facts = json["trust"]["facts"].as_object().unwrap();
+            let failed: Vec<&String> = facts
+                .iter()
+                .filter(|(_, state)| *state == "failed")
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(failed.len(), 1, "{facts:?}");
+            assert!(facts.values().all(|state| state != "ok"), "{facts:?}");
+            assert!(json["trust"]["recovery"].as_str().is_some());
+            let text = render_policy_check(&check);
+            assert!(text.contains("trust        untrusted"), "{text}");
+            assert!(text.contains("(exit 11)"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_json_document_carries_each_key_with_its_value_or_its_reason() {
+        let json = policy_check_json(&checked(LEAF_PROBLEMS));
+        assert_eq!(json["verdict"], "leaf_problems");
+        assert_eq!(json["exit_code"], 13);
+        assert_eq!(json["platform"], "macos");
+        assert_eq!(json["digest"].as_str().unwrap().len(), 64);
+        assert_eq!(json["failure"], serde_json::Value::Null);
+        assert_eq!(json["trust"], serde_json::Value::Null);
+        // Two findings: the wildcard host and the unknown name.
+        assert_eq!(json["rejected_leaves"], 2);
+        let keys = json["keys"].as_array().unwrap();
+        let hosts = keys
+            .iter()
+            .find(|key| key["key"] == "connectors.allowed_base_hosts")
+            .unwrap();
+        assert_eq!(hosts["state"], "rejected");
+        assert_eq!(hosts["tier"], "A");
+        assert_eq!(hosts["code"], "policy_value_invalid");
+        assert!(hosts.get("value").is_none(), "a rejected leaf has no value");
+        let remember = keys
+            .iter()
+            .find(|key| key["key"] == "security.grants.remember")
+            .unwrap();
+        assert_eq!(
+            remember,
+            &json!({
+                "key": "security.grants.remember", "tier": "A", "mode": ["forbid"],
+                "semantics": ["policy-only constraint"], "state": "applied", "value": "deny",
+            })
+        );
+        let unknown: Vec<&serde_json::Value> = json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == "policy_unknown_key")
+            .collect();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0]["key"], "bogus");
+    }
+
+    #[test]
+    fn the_json_document_names_the_modes_labels_and_locks() {
+        let json = policy_check_json(&checked(VALID));
+        assert_eq!(json["verdict"], "valid");
+        assert_eq!(json["meta"]["organization"], "Example Corp");
+        assert_eq!(json["meta"]["revision"], serde_json::Value::Null);
+        assert_eq!(json["locks"], json!(["security.profile"]));
+        let profile = json["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["key"] == "security.profile")
+            .unwrap();
+        assert_eq!(profile["mode"], json!(["locked"]));
+        assert_eq!(
+            profile["semantics"],
+            json!(["forced; the human cannot change it"])
+        );
+        assert_eq!(
+            profile["value"],
+            json!({"locked": "strict", "reason": "SEC-114"})
+        );
+    }
+
+    #[test]
+    fn a_file_invalid_as_a_whole_names_its_failure_and_no_keys() {
+        let json = policy_check_json(&checked(r#"{"version":1,"version":1}"#));
+        assert_eq!(json["verdict"], "file_invalid");
+        assert_eq!(json["failure"]["code"], "policy_duplicate_key");
+        assert_eq!(json["keys"], json!([]));
+        assert_eq!(json["meta"], serde_json::Value::Null);
+        let too_large = PolicyCheck {
+            content: PolicyContent::TooLarge { size: 70_000 },
+            ..checked(VALID)
+        };
+        let json = policy_check_json(&too_large);
+        assert_eq!(json["failure"]["code"], managed_policy::CODE_TOO_LARGE);
+        assert_eq!(json["digest"], serde_json::Value::Null, "it was not read");
+        assert_eq!(json["size"], 70_000);
+        let text = render_policy_check(&too_large);
+        assert!(text.contains("invalid (policy_too_large)"), "{text}");
+        assert!(text.contains("(exit 12)"), "{text}");
+    }
+
+    #[test]
+    fn the_human_output_has_one_line_per_key_and_the_unknown_names_apart() {
+        let text = render_policy_check(&checked(LEAF_PROBLEMS));
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("  applied") || line.starts_with("  rejected"))
+            .collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("connectors.allowed_base_hosts")
+                    && row.contains("policy_value_invalid")),
+            "{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("security.grants.remember") && row.ends_with("= \"deny\"")),
+            "{text}"
+        );
+        assert!(
+            text.contains("findings\n  bogus  policy_unknown_key"),
+            "{text}"
+        );
+        assert!(
+            text.contains("valid with 2 rejected: 1 key applies"),
+            "{text}"
+        );
+        assert!(text.ends_with("(exit 13)\n"), "{text}");
+    }
+
+    #[test]
+    fn the_human_output_escapes_characters_that_hide_or_reorder_text() {
+        let text = render_policy_check(&checked(
+            "{\"version\":1,\"organization\":\"Corp\u{202e}evil\",\"comment\":\"a\u{2066}b\"}",
+        ));
+        assert!(
+            !text.contains('\u{202e}') && !text.contains('\u{2066}'),
+            "{text}"
+        );
+        assert!(text.contains("Corp\\u{202e}evil"), "{text}");
+    }
+}

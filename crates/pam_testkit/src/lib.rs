@@ -317,8 +317,9 @@ pub struct TestDaemon {
 
 impl TestDaemon {
     /// Spawns a daemon on a fresh short-path temp dir with the default
-    /// [`DaemonConfig`], no managed policy file ([`ScriptedPolicy::absent`])
-    /// and the relaxed profile ([`seed_relaxed`]).
+    /// [`DaemonConfig`], no managed policy file ([`ScriptedPolicy::absent`]),
+    /// an in-memory keychain ([`FakeSecretBackend`]) and the relaxed profile
+    /// ([`seed_relaxed`]).
     pub async fn spawn() -> Self {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
@@ -365,9 +366,14 @@ impl TestDaemon {
     ) -> Self {
         let base = base_of(&tmp);
         assert_socket_paths_fit(&base);
+        // A keychain in memory unless the mutator injects its own: the
+        // status snapshot and the boot warm-up probe the credential store,
+        // and the real macOS keychain can take longer than the snapshot's
+        // bound (and is not the tests' to touch).
         let mut config = DaemonConfig {
             base_dir: Some(base),
             policy_source: Some(ScriptedPolicy::absent()),
+            secret_backend: Some(Arc::new(FakeSecretBackend::default())),
             ..DaemonConfig::default()
         };
         mutate(&mut config);

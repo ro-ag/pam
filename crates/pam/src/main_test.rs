@@ -1,8 +1,9 @@
 use super::{
-    Cli, Cmd, DOCTOR_TIMEOUT_MS, EvidenceCmd, EvidenceReadArgs, ServiceCmd, evidence_read_args,
-    render_evidence, resolved_profile_base,
+    Cli, Cmd, DOCTOR_TIMEOUT_MS, EvidenceCmd, EvidenceReadArgs, PolicyCmd, ServiceCmd,
+    evidence_read_args, render_evidence, resolved_profile_base,
 };
 use clap::Parser;
+use pam_daemon::managed_policy::TargetPlatform;
 use serde_json::json;
 
 fn parse(extra: &[&str]) -> EvidenceReadArgs {
@@ -369,4 +370,41 @@ fn the_gui_offers_every_profile_name_the_cli_takes() {
         offered, expected,
         "ipc.ts offers the CLI's profile names in order"
     );
+}
+
+/// `pam policy check`'s arguments: the platform defaults to the host,
+/// `--for` is the spec's spelling of `--platform`, and nothing but
+/// `macos` or `windows` is a platform.
+#[test]
+fn policy_check_takes_a_file_a_platform_and_the_trust_switch() {
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["pam", "policy", "check"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).map(|cli| match cli.command {
+            Cmd::Policy {
+                action:
+                    PolicyCmd::Check {
+                        file,
+                        json,
+                        platform,
+                        trust,
+                    },
+            } => (file, json, platform, trust),
+            _ => panic!("expected pam policy check"),
+        })
+    };
+    assert_eq!(
+        parse(&["policy.json"]).unwrap(),
+        ("policy.json".into(), false, None, false)
+    );
+    assert_eq!(
+        parse(&["p.json", "--json", "--platform", "windows", "--trust"]).unwrap(),
+        ("p.json".into(), true, Some(TargetPlatform::Windows), true)
+    );
+    assert_eq!(
+        parse(&["p.json", "--for", "macos"]).unwrap().2,
+        Some(TargetPlatform::Macos)
+    );
+    assert!(parse(&["p.json", "--platform", "linux"]).is_err());
+    assert!(parse(&[]).is_err(), "the file is required");
 }

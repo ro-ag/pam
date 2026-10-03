@@ -51,6 +51,10 @@ async fn boot(base: &Path) -> Result<(), DaemonError> {
     let config = DaemonConfig {
         base_dir: Some(base.to_owned()),
         policy_source: Some(pam_testkit::ScriptedPolicy::absent()),
+        // An in-memory keychain: tests never touch the real one.
+        secret_backend: Some(std::sync::Arc::new(
+            pam_testkit::FakeSecretBackend::default(),
+        )),
         ..DaemonConfig::default()
     };
     run_daemon_with(config, shutdown).await.map(|_| ())

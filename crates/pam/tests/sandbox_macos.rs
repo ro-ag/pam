@@ -171,6 +171,8 @@ async fn sandbox_allows_brokered_evidence_but_denies_private_authority() {
             DaemonConfig {
                 base_dir: Some(base.clone()),
                 policy_source: Some(pam_testkit::ScriptedPolicy::absent()),
+                // An in-memory keychain: tests never touch the real one.
+                secret_backend: Some(std::sync::Arc::new(pam_testkit::FakeSecretBackend::default())),
                 ..DaemonConfig::default()
             },
             receiver,

@@ -100,7 +100,11 @@ function unmanagedPolicy(overrides: Partial<PolicyBody> = {}): PolicyBody {
     state: "none",
     reason_code: null,
     reason_detail: null,
-    origin: { path: null, platform: "macos", trust: { verdict: "absent", code: null, recovery: null } },
+    origin: {
+      path: null,
+      platform: "macos",
+      trust: { verdict: "absent", code: null, recovery: null },
+    },
     digest: null,
     file_digest: null,
     revision: null,
@@ -736,6 +740,38 @@ describe("daemon", () => {
     expect(card.getByText(/base dir: \/Users\/me\/\.pam/)).toBeInTheDocument();
   });
 
+  it("shows whether command steps can be contained, only from a daemon that says", async () => {
+    mocks.daemonStatus.mockResolvedValue({
+      connected: true,
+      status: {
+        daemon_version: "0.10.1",
+        containment: {
+          available: false,
+          cause: "command_containment_unavailable",
+          detail: "command containment is supported only on macOS",
+          affects: ["flow command steps", "guarded landing"],
+        },
+      },
+      base_dir: "/Users/me/.pam",
+    });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("Command steps")).toBeInTheDocument();
+    expect(card.getByText("unavailable")).toBeInTheDocument();
+    expect(
+      card.getByText(
+        "command containment is supported only on macOS; flow command steps and guarded landing refuse command_containment_unavailable",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("has no command steps row for a daemon that publishes no containment block", async () => {
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("0.10.1")).toBeInTheDocument();
+    expect(card.queryByText("Command steps")).not.toBeInTheDocument();
+  });
+
   it("stops the daemon only after the two-tap confirm", async () => {
     renderSettings("daemon");
     const stop = await screen.findByRole("button", { name: "Stop daemon" });
@@ -1069,7 +1105,8 @@ describe("boundary", () => {
       boundaryBlock({
         last_report: lastReport("established", 7_200),
         reports: { retained: 1, established: 1, not_established: 0 },
-        summary: "established 2 h ago by claude (pid 48122, direct); admin contacts unattributed: 0",
+        summary:
+          "established 2 h ago by claude (pid 48122, direct); admin contacts unattributed: 0",
       }),
     );
     renderSettings("daemon");
@@ -1111,7 +1148,8 @@ describe("boundary", () => {
           },
           last_expected: null,
         },
-        summary: "not_established 2 min ago by codex (no pid, relay); admin contacts unattributed: 2",
+        summary:
+          "not_established 2 min ago by codex (no pid, relay); admin contacts unattributed: 2",
       }),
     );
     renderSettings("daemon");
@@ -1138,7 +1176,9 @@ describe("boundary", () => {
     renderSettings("daemon");
     const rows = within(await screen.findByRole("group", { name: "Boundary" }));
     expect(rows.getByText("not probed")).toBeInTheDocument();
-    expect(rows.getByText("could not be probed · 10m ago · by gemini (direct)")).toBeInTheDocument();
+    expect(
+      rows.getByText("could not be probed · 10m ago · by gemini (direct)"),
+    ).toBeInTheDocument();
     const select = rows.getByRole("combobox", { name: "harness" });
     expect(select).toHaveValue("gemini-cli");
     fireEvent.change(select, { target: { value: "copilot-cli" } });
@@ -1152,20 +1192,24 @@ describe("boundary", () => {
     renderSettings("daemon");
     const rows = within(await screen.findByRole("group", { name: "Boundary" }));
     fireEvent.click(rows.getByRole("button", { name: "copy doctor command" }));
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith("pam doctor --profile sandbox-exec"));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("pam doctor --profile sandbox-exec"),
+    );
     expect(await rows.findByText("Copied")).toBeInTheDocument();
   });
 
   it("phrases every verdict as one line", () => {
     const now = nowSec * 1000;
     const block = (last_report: unknown) =>
-      ({ ...boundaryBlock(), last_report }) as unknown as Parameters<typeof boundaryVerdictLine>[0];
+      ({ ...boundaryBlock(), last_report }) as unknown as Parameters<
+        typeof boundaryVerdictLine
+      >[0];
     expect(boundaryVerdictLine(block(null), now)).toBe(
       "not verified — run pam doctor from the agent",
     );
-    expect(
-      boundaryVerdictLine(block(lastReport("established", 3_600 * 5)), now),
-    ).toBe("established · 5h ago · by claude (direct)");
+    expect(boundaryVerdictLine(block(lastReport("established", 3_600 * 5)), now)).toBe(
+      "established · 5h ago · by claude (direct)",
+    );
     expect(
       boundaryVerdictLine(block(lastReport("not_established", 0, { relayed: true })), now),
     ).toBe("not established · now · by claude (relay)");
@@ -1287,14 +1331,18 @@ describe("managed policy in Settings", () => {
     const profileReads = mocks.profileGet.mock.calls.length;
     fireEvent.click(screen.getByRole("button", { name: /Check now/ }));
     await waitFor(() => expect(mocks.policyReload).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(mocks.profileGet.mock.calls.length).toBeGreaterThan(profileReads));
+    await waitFor(() =>
+      expect(mocks.profileGet.mock.calls.length).toBeGreaterThan(profileReads),
+    );
   });
 
   describe("profile", () => {
     it("disables every profile and says who owns it when the policy locks it", async () => {
       mocks.profileGet.mockResolvedValue({
         profile: "strict",
-        effective: { profile: { source: "policy", locked: true, mode: "locked", reason: "SEC-114" } },
+        effective: {
+          profile: { source: "policy", locked: true, mode: "locked", reason: "SEC-114" },
+        },
       });
       renderSettings("security");
       await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeChecked());
@@ -1319,7 +1367,9 @@ describe("managed policy in Settings", () => {
         },
       });
       renderSettings("security");
-      await waitFor(() => expect(screen.getByRole("radio", { name: /standard/ })).toBeChecked());
+      await waitFor(() =>
+        expect(screen.getByRole("radio", { name: /standard/ })).toBeChecked(),
+      );
       expect(screen.getByRole("radio", { name: /relaxed/ })).toBeDisabled();
       expect(screen.getByRole("radio", { name: /standard/ })).toBeEnabled();
       expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled();
@@ -1343,19 +1393,24 @@ describe("managed policy in Settings", () => {
       ["setting_locked", "the profile is managed by your organization's policy"],
       ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
       ["policy_not_allowed", "relaxed is below the floor your organization set"],
-    ])("renders a %s refusal's detail and recovery through the failure note", async (cause, detail) => {
-      mocks.profileSet.mockRejectedValue({
-        cause,
-        detail,
-        recovery: "Managed by your organization's policy; ask your administrator.",
-      });
-      renderSettings("security");
-      await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled());
-      fireEvent.click(screen.getByRole("radio", { name: /strict/ }));
-      expect(await screen.findByText(new RegExp(`profile · ${cause}`))).toBeInTheDocument();
-      expect(screen.getByText(`${detail}.`)).toBeInTheDocument();
-      expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
-    });
+    ])(
+      "renders a %s refusal's detail and recovery through the failure note",
+      async (cause, detail) => {
+        mocks.profileSet.mockRejectedValue({
+          cause,
+          detail,
+          recovery: "Managed by your organization's policy; ask your administrator.",
+        });
+        renderSettings("security");
+        await waitFor(() =>
+          expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled(),
+        );
+        fireEvent.click(screen.getByRole("radio", { name: /strict/ }));
+        expect(await screen.findByText(new RegExp(`profile · ${cause}`))).toBeInTheDocument();
+        expect(screen.getByText(`${detail}.`)).toBeInTheDocument();
+        expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+      },
+    );
   });
 
   describe("grants", () => {
@@ -1400,11 +1455,18 @@ describe("managed policy in Settings", () => {
     it("lists what the policy never allows", async () => {
       mocks.grantsList.mockResolvedValue({
         grants: [],
-        policy: { manual: null, remember: null, never: ["flow.step:prod/*"], never_classes: ["destructive"] },
+        policy: {
+          manual: null,
+          remember: null,
+          never: ["flow.step:prod/*"],
+          never_classes: ["destructive"],
+        },
       });
       renderSettings("security");
       const note = await screen.findByLabelText("capabilities the policy never allows");
-      expect(note).toHaveTextContent("never allows flow.step:prod/* and the classes destructive");
+      expect(note).toHaveTextContent(
+        "never allows flow.step:prod/* and the classes destructive",
+      );
     });
 
     it("disables Add with the reason when the policy forbids manual grants", async () => {
@@ -1426,7 +1488,7 @@ describe("managed policy in Settings", () => {
     it("renders a refused add through the failure note", async () => {
       mocks.grantsAdd.mockRejectedValue({
         cause: "policy_not_allowed",
-        detail: "capability \"echo\" is not allowed by your organization",
+        detail: 'capability "echo" is not allowed by your organization',
         recovery: "Managed by your organization's policy; ask your administrator.",
       });
       renderSettings("security");

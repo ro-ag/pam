@@ -19,6 +19,7 @@ import { cn } from "../lib/cn";
 import { PageTabs } from "../components/ui/PageTabs";
 import { Panel } from "../components/ui/Panel";
 import { PageHeader } from "../components/ui/PageHeader";
+import { ContainmentNotice } from "./ContainmentNotice";
 import {
   connectorsList,
   flowsGet,
@@ -769,6 +770,9 @@ export function FlowsScreen({
       </PageHeader>
 
       {controls.dialogs}
+      <div className="pt-4 empty:hidden">
+        <ContainmentNotice subject="flows" />
+      </div>
       {failure && (
         <div className="pt-4">
           <FailureNote failure={failure} label="flows">

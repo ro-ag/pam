@@ -1,5 +1,5 @@
 import { createMemoryHistory } from "@tanstack/react-router";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { rephraseStorageKey } from "../lib/ask/prefs";
@@ -219,6 +219,38 @@ describe("Home shell", () => {
       expect(within(overview).getByText(/Active requests/)).toBeInTheDocument(),
     );
     expect(within(overview).queryByText(/Keychain/)).not.toBeInTheDocument();
+  });
+
+  it("says when command steps cannot run here and stays quiet when they can", async () => {
+    const block = (available: boolean) => ({
+      available,
+      cause: available ? null : "command_containment_unavailable",
+      detail: available
+        ? "macOS system sandbox (/usr/bin/sandbox-exec)"
+        : "command containment is supported only on macOS",
+      affects: ["flow command steps", "guarded landing"],
+    });
+    mocks.daemonStatus.mockResolvedValue({
+      connected: true,
+      status: { daemon_version: "0.1.0", active_requests: 0, containment: block(false) },
+    });
+    renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    expect(
+      await within(overview).findByText(
+        "Command steps and guarded landing cannot run on this machine",
+      ),
+    ).toHaveAttribute("href", "/settings#daemon");
+    cleanup();
+
+    mocks.daemonStatus.mockResolvedValue({
+      connected: true,
+      status: { daemon_version: "0.1.0", active_requests: 0, containment: block(true) },
+    });
+    renderHome();
+    const quiet = await screen.findByRole("complementary", { name: "Workspace overview" });
+    await waitFor(() => expect(within(quiet).getByText(/Active requests/)).toBeInTheDocument());
+    expect(within(quiet).queryByText(/cannot run on this machine/)).not.toBeInTheDocument();
   });
 
   it("says the sandbox boundary is not verified when the daemon has no report", async () => {

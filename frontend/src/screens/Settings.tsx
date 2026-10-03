@@ -26,6 +26,7 @@ import {
   CONFIRM_RELAXED,
   HARNESS_PROFILES,
   boundaryStatus,
+  containmentStatus,
   daemonStatus,
   daemonStart,
   daemonStop,
@@ -158,8 +159,7 @@ function ProfilePanel() {
               className={cn(
                 "flex cursor-pointer items-start gap-3 rounded-card border p-3 transition-colors duration-150",
                 selected ? "border-accent-strong bg-accent-soft/40" : "border-line",
-                (current === undefined || blocker !== undefined) &&
-                  "cursor-default opacity-50",
+                (current === undefined || blocker !== undefined) && "cursor-default opacity-50",
               )}
             >
               <input
@@ -623,8 +623,7 @@ function BoundaryRows({ boundary }: { boundary: BoundaryStatus }) {
             {lastContact && lastContact.peer_exe !== null && (
               <span className="text-ink-muted">
                 {" "}
-                · last from <SafeText value={lastContact.peer_exe} />
-                {" "}
+                · last from <SafeText value={lastContact.peer_exe} />{" "}
                 {relativeTime(lastContact.ts)}
               </span>
             )}
@@ -811,6 +810,7 @@ function DaemonPanel({ active }: { active: boolean }) {
   // Only a daemon that publishes the block gets the rows: an older one
   // shows nothing rather than an invented verdict.
   const boundary = connected ? boundaryStatus(body) : null;
+  const containment = connected ? containmentStatus(body) : null;
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
@@ -842,6 +842,28 @@ function DaemonPanel({ active }: { active: boolean }) {
       )}
 
       {!bridgeDown && boundary && <BoundaryRows boundary={boundary} />}
+
+      {/* Whether this machine can contain command workloads: flow command
+          steps and guarded landing need it, and on Windows they refuse. */}
+      {!bridgeDown && containment && (
+        <div className="flex flex-wrap items-center gap-3 border-t border-line pt-4">
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <p className="font-data text-xs text-ink-faint">Command steps</p>
+            <p className="select-text font-data text-xs text-ink-muted">
+              <SafeText
+                value={
+                  containment.available
+                    ? containment.detail
+                    : `${containment.detail}; ${containment.affects.join(" and ") || "command workloads"} refuse ${containment.cause ?? "command_containment_unavailable"}`
+                }
+              />
+            </p>
+          </div>
+          <Badge tone={containment.available ? "success" : "warning"}>
+            {containment.available ? "contained" : "unavailable"}
+          </Badge>
+        </div>
+      )}
 
       {/* Login-start: the unit is a property of this machine's session,
           not of the running daemon, so the row stands whether or not the

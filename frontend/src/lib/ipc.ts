@@ -226,6 +226,45 @@ export function keyringHealth(status: StatusBody | null | undefined): KeyringHea
   };
 }
 
+// --- command containment -----------------------------------------------------
+
+/**
+ * Whether this machine can contain command workloads (`status.containment`):
+ * flow command steps and guarded landing run only when it can. On Windows and
+ * on a macOS host whose sandbox launcher is missing they refuse
+ * `command_containment_unavailable`.
+ */
+export interface ContainmentStatus {
+  available: boolean;
+  cause: string | null;
+  /** The mechanism when available, or why not, in the daemon's words. */
+  detail: string;
+  /** What cannot run without it, e.g. "flow command steps". */
+  affects: string[];
+}
+
+/**
+ * The `containment` block of a daemon status body, when the daemon publishes
+ * one. An older daemon has none, and the caller shows nothing rather than
+ * guessing from the operating system.
+ */
+export function containmentStatus(
+  status: StatusBody | null | undefined,
+): ContainmentStatus | null {
+  const block = status?.containment;
+  if (typeof block !== "object" || block === null) return null;
+  const row = block as Record<string, unknown>;
+  if (typeof row.available !== "boolean") return null;
+  return {
+    available: row.available,
+    cause: typeof row.cause === "string" ? row.cause : null,
+    detail: typeof row.detail === "string" ? row.detail : "",
+    affects: Array.isArray(row.affects)
+      ? row.affects.filter((item): item is string => typeof item === "string")
+      : [],
+  };
+}
+
 // --- boundary (pam doctor) --------------------------------------------------
 
 /**
@@ -347,11 +386,15 @@ function numberOrNull(value: unknown): number | null {
 }
 
 function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 function record(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function boundaryContact(value: unknown): BoundaryContact | null {
@@ -371,7 +414,11 @@ function boundaryLastReport(value: unknown): BoundaryLastReport | null {
   const row = record(value);
   if (row === null) return null;
   const verdict = row.verdict;
-  if (verdict !== "established" && verdict !== "not_established" && verdict !== "cannot_probe") {
+  if (
+    verdict !== "established" &&
+    verdict !== "not_established" &&
+    verdict !== "cannot_probe"
+  ) {
     return null;
   }
   return {

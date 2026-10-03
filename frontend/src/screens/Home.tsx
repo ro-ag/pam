@@ -20,6 +20,7 @@ import { cn } from "../lib/cn";
 import {
   approvalsPending,
   boundaryStatus,
+  containmentStatus,
   daemonStatus,
   keyringHealth,
   modelsStatus,
@@ -152,6 +153,8 @@ export function HomeScreen() {
   // The boundary is a fact for the human, never the beacon's colour: it
   // gets its own line, and only from a daemon that publishes the block.
   const boundary = boundaryStatus(status.data?.status);
+  // Like the keychain: only said when command steps cannot run here.
+  const containment = containmentStatus(status.data?.status);
   const greeting = pending.isPending
     ? "Checking approvals…"
     : pending.isError
@@ -221,6 +224,15 @@ export function HomeScreen() {
                 className="rounded-control text-danger hover:underline"
               >
                 Keychain {keyring.state} — connector credentials cannot be used
+              </Link>
+            )}
+            {connected && containment && !containment.available && (
+              <Link
+                to="/settings"
+                hash="daemon"
+                className="rounded-control text-warning hover:underline"
+              >
+                Command steps and guarded landing cannot run on this machine
               </Link>
             )}
             {connected && boundary && (

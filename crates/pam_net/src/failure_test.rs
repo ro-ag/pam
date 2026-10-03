@@ -184,6 +184,15 @@ fn the_credential_and_the_bundle_change_the_name() {
     let without = transfer(Some(77), unreadable, "ssl_verify=1 num_connects=1", &direct);
     assert_eq!(classify(&without).cause(), "tls_error");
 
+    // `Schannel`'s curl refuses a missing file while reading its config:
+    // exit 2, no transfer, no diagnostics line.
+    let missing = "curl: The file 'C:\\x\\ca.pem' provided to --cacert does not exist";
+    let mut at_config = transfer(Some(2), missing, "", &direct);
+    at_config.cacert_set = true;
+    assert_eq!(classify(&at_config), NetFailure::CaBundleUnreadable);
+    let no_bundle = transfer(Some(2), missing, "", &direct);
+    assert_eq!(classify(&no_bundle).cause(), "curl_failed");
+
     let mut named = transfer(
         Some(60),
         "curl: (60) SSL certificate problem: unable to get local issuer certificate",
@@ -249,6 +258,40 @@ fn schannel_text_is_matched_only_on_fixed_tokens() {
             "curl: (60) schannel: SEC_E_CERT_EXPIRED (0x80090328) - The received certificate has expired."
         ),
         "tls_expired"
+    );
+    // The texts curl 8.21.0 printed on the Windows 11 VM, which name no
+    // Windows error code.
+    assert_eq!(
+        case(60, "curl: (60) schannel: the revocation status is unknown"),
+        "tls_revocation_unavailable"
+    );
+    assert_eq!(
+        case(
+            60,
+            "curl: (60) schannel: the certificate chain is incomplete"
+        ),
+        "tls_untrusted_issuer"
+    );
+    assert_eq!(
+        case(
+            60,
+            "curl: (60) schannel: the certificate or certificate chain is based on an untrusted root"
+        ),
+        "tls_untrusted_issuer"
+    );
+    assert_eq!(
+        case(
+            60,
+            "curl: (60) schannel: this certificate or one of the certificates in the certificate chain is not time valid"
+        ),
+        "tls_expired"
+    );
+    assert_eq!(
+        case(
+            60,
+            "curl: (60) schannel: CertGetNameString() failed to match connection hostname (localhost) against server certificate names"
+        ),
+        "tls_hostname_mismatch"
     );
     assert_eq!(
         case(

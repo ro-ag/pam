@@ -34,9 +34,28 @@
 //! The `write-out` line is printed on failed transfers too, after curl's own
 //! error line. With `verbose`, this curl prints `issuer:` and `subject:`
 //! only after a *successful* verification, so an untrusted issuer cannot be
-//! named on this backend; the sentence says so instead. The Windows
-//! (`Schannel`) rows are recorded by the Windows evidence task; the tokens
-//! matched for it are the `SEC_E_…`/`CRYPT_E_…` names curl prints there.
+//! named on this backend; the sentence says so instead.
+//!
+//! Recorded on Windows 11 (build 26200, ARM64), `System32\curl.exe` 8.21.0
+//! (`Schannel`), 2026-10-02. `Schannel` reports no verify result
+//! (`ssl_verify=0` on every row), so these are matched on the text, which
+//! names no Windows error code:
+//!
+//! | Situation | exit | error text |
+//! | --- | --- | --- |
+//! | issuer not in the store, no bundle | 60 | `schannel: SEC_E_UNTRUSTED_ROOT (0x80090325) - The certificate chain was issued by an authority that is not trusted.` |
+//! | bundle of another CA | 60 | `schannel: the certificate chain is incomplete` |
+//! | public site, bundle of the test CA | 60 | `schannel: the certificate or certificate chain is based on an untrusted root` |
+//! | issuer in the bundle, leaf with no CRL or OCSP address | 60 | `schannel: the revocation status is unknown` |
+//! | name not in the certificate (revocation not checked) | 60 | `schannel: CertGetNameString() failed to match connection hostname (…) against server certificate names` |
+//! | certificate expired | 60 | `schannel: this certificate or one of the certificates in the certificate chain is not time valid` |
+//! | CA file missing | 2 | `The file '…' provided to --cacert does not exist` (rejected while reading the config, so no `write-out` line) |
+//! | CA file not PEM | 60 | `schannel: the certificate chain is incomplete` (no certificate was added) |
+//! | closed proxy port | 7 | `Failed to connect to … over proxy … Could not connect to server` |
+//!
+//! With the bundle, `Schannel` checks revocation before the name, so a wrong
+//! name behind a leaf with no revocation address is reported as the
+//! revocation failure.
 
 use std::fmt;
 
@@ -566,6 +585,13 @@ pub(crate) fn classify(transfer: &Transfer<'_>) -> NetFailure {
             maximum: transfer.max_filesize.unwrap_or(0),
         },
         (77, _) if transfer.cacert_set => NetFailure::CaBundleUnreadable,
+        // Schannel's curl refuses a missing file while it reads the config,
+        // before any transfer: exit 2 naming the option.
+        (2, _)
+            if transfer.cacert_set && transfer.stderr.to_ascii_lowercase().contains("cacert") =>
+        {
+            NetFailure::CaBundleUnreadable
+        }
         (35 | 51 | 53 | 54 | 58 | 59 | 60 | 66 | 77 | 80 | 82 | 83 | 90 | 91 | 98, _) => {
             classify_tls(transfer, host)
         }
@@ -605,6 +631,7 @@ fn classify_tls(transfer: &Transfer<'_>, host: String) -> NetFailure {
     if has(&[
         "no alternative certificate subject name matches",
         "does not match target host",
+        "failed to match connection hostname",
         "sec_e_wrong_principal",
         "cert_e_cn_no_match",
     ]) {
@@ -614,12 +641,14 @@ fn classify_tls(transfer: &Transfer<'_>, host: String) -> NetFailure {
         "crypt_e_no_revocation_check",
         "crypt_e_revocation_offline",
         "unable to check revocation",
+        "revocation status is unknown",
     ]) {
         return NetFailure::TlsRevocationUnavailable { host };
     }
     if has(&[
         "certificate has expired",
         "not yet valid",
+        "not time valid",
         "sec_e_cert_expired",
         "cert_e_expired",
     ]) {
@@ -631,6 +660,8 @@ fn classify_tls(transfer: &Transfer<'_>, host: String) -> NetFailure {
         "self-signed certificate",
         "sec_e_untrusted_root",
         "cert_e_untrustedroot",
+        "certificate chain is incomplete",
+        "based on an untrusted root",
         "unknown ca",
     ]) {
         return untrusted(host);

@@ -676,7 +676,13 @@ async fn a_download_goes_to_its_file_and_wait_survives_being_cancelled() {
     let settings = NetSettings::direct();
     let scratch = tempfile::tempdir().expect("a temp directory");
     // A path with a space and a quote: one config value, not two arguments.
-    let part = scratch.path().join("model \"part\".bin");
+    // Windows file names cannot hold a quote; the space and the backslashes
+    // of its paths still prove it.
+    let part = scratch.path().join(if cfg!(windows) {
+        "model part.bin"
+    } else {
+        "model \"part\".bin"
+    });
     let etag = scratch.path().join("model.etag");
 
     let mut child = curl

@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use pam_net::testing::{Origin, OriginMode, TlsCert, TlsOrigin, test_ca, trusted_curl_or_skip};
-use pam_net::{NetFailure, NetSettings};
+use pam_net::{NetFailure, NetSettings, TlsBackend};
 
 const MARKER: &str = "PAM_NET_HOSTILE_ENVIRONMENT";
 
@@ -118,9 +118,21 @@ async fn inside_the_hostile_environment() {
 
     // … until the settings say so.
     let settings = NetSettings::new(None, None, Vec::new(), Some(test_ca())).unwrap();
-    curl.request(&settings, &server.local_url())
+    let result = curl
+        .request(&settings, &server.local_url())
         .max_time(10)
         .run(Duration::from_secs(20))
-        .await
-        .expect("the settings trust the test CA");
+        .await;
+    if curl.info().backend == TlsBackend::Schannel {
+        // Trusted through the settings, then stopped by the revocation
+        // check: the committed leaf names no CRL or OCSP responder.
+        assert_eq!(
+            result.expect_err("no revocation address to check"),
+            NetFailure::TlsRevocationUnavailable {
+                host: "localhost".to_owned()
+            }
+        );
+        return;
+    }
+    result.expect("the settings trust the test CA");
 }

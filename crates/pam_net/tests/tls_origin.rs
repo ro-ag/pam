@@ -33,6 +33,17 @@ async fn origin(cert: TlsCert) -> Option<TlsOrigin> {
     started
 }
 
+/// `Schannel` checks revocation of every leaf, and the committed leaves name
+/// neither a CRL nor an OCSP responder, so a chain that the bundle did make
+/// trusted ends as this failure on Windows (recorded in `failure.rs`: it is
+/// what a private CA without a reachable CRL gets there). Where a test below
+/// is about the step after trust, it asserts this instead.
+fn revocation_unknown(host: &str) -> NetFailure {
+    NetFailure::TlsRevocationUnavailable {
+        host: host.to_owned(),
+    }
+}
+
 #[tokio::test]
 async fn the_bundle_makes_the_private_issuer_trusted() {
     let Some(curl) = trusted_curl_or_skip() else {
@@ -44,13 +55,22 @@ async fn the_bundle_makes_the_private_issuer_trusted() {
     let settings = trusting(Some(test_ca()));
 
     // Production mode: https, no test allowance.
-    let output = curl
+    let result = curl
         .request(&settings, &server.local_url())
         .include_headers()
         .max_time(10)
         .run(LIMIT)
-        .await
-        .expect("the bundle trusts the test CA");
+        .await;
+    if curl.info().backend == TlsBackend::Schannel {
+        // Trusted by the bundle (the next test: without it the issuer is
+        // untrusted), then stopped by the revocation check.
+        assert_eq!(
+            result.expect_err("no revocation address to check"),
+            revocation_unknown("localhost")
+        );
+        return;
+    }
+    let output = result.expect("the bundle trusts the test CA");
 
     assert!(
         output.stdout.starts_with(b"HTTP/1.0 200"),
@@ -117,12 +137,19 @@ async fn a_wrong_name_and_an_expired_leaf_are_named() {
         .run(LIMIT)
         .await
         .expect_err("the leaf is for another name");
-    assert_eq!(
-        failure,
-        NetFailure::TlsHostnameMismatch {
-            host: "localhost".to_owned()
-        }
-    );
+    if curl.info().backend == TlsBackend::Schannel {
+        // Revocation is checked before the name, and the leaf has no
+        // revocation address; the name check itself is recorded in
+        // `failure_test.rs` from a run with revocation switched off by hand.
+        assert_eq!(failure, revocation_unknown("localhost"));
+    } else {
+        assert_eq!(
+            failure,
+            NetFailure::TlsHostnameMismatch {
+                host: "localhost".to_owned()
+            }
+        );
+    }
     drop(server);
 
     let Some(server) = origin(TlsCert::Expired).await else {
@@ -163,6 +190,13 @@ async fn a_bundle_curl_cannot_read_is_named() {
             .run(LIMIT)
             .await
             .expect_err("the bundle cannot be read");
+        if curl.info().backend == TlsBackend::Schannel && bundle.ends_with("garbage.pem") {
+            // `Schannel` adds no certificate from a file that holds none and
+            // fails on the missing issuer; PAM's own CA import refuses such
+            // a file long before a request (`ca_test.rs`).
+            assert_eq!(failure.cause(), "tls_untrusted_issuer", "{failure:?}");
+            continue;
+        }
         assert_eq!(
             failure,
             NetFailure::CaBundleUnreadable,
@@ -185,23 +219,33 @@ async fn tls_through_the_proxy_is_a_connect_to_443() {
     let settings = NetSettings::new(Some(via), None, Vec::new(), Some(test_ca())).unwrap();
     let url = Url::parse(&format!("https://{TEST_HOST}/")).unwrap();
 
-    let output = curl
+    let result = curl
         .request(&settings, &url)
         .diagnostic()
         .max_time(10)
         .run(LIMIT)
-        .await
-        .expect("the proxy tunnels to the TLS origin");
-
-    assert_eq!(output.http_code, Some(200));
-    assert_eq!(output.http_connect, Some(200));
+        .await;
     assert_eq!(
         proxy.request_lines(),
         vec![format!("CONNECT {TEST_HOST}:443 HTTP/1.1")]
     );
+    let output = if curl.info().backend == TlsBackend::Schannel {
+        // The tunnel was made and the handshake inside it reached the
+        // revocation check (see `revocation_unknown`).
+        assert_eq!(
+            result.expect_err("no revocation address to check"),
+            revocation_unknown(TEST_HOST)
+        );
+        None
+    } else {
+        let output = result.expect("the proxy tunnels to the TLS origin");
+        assert_eq!(output.http_code, Some(200));
+        assert_eq!(output.http_connect, Some(200));
+        Some(output)
+    };
     // Diagnostic mode reads the peer certificate from the verbose trace
     // once verification succeeded.
-    if curl.info().backend == TlsBackend::LibreSsl {
+    if let (Some(output), TlsBackend::LibreSsl) = (&output, &curl.info().backend) {
         assert!(
             output
                 .issuer

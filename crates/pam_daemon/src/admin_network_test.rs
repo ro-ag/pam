@@ -1165,8 +1165,20 @@ async fn test_probes_the_configured_targets_through_the_saved_settings() {
             .run(OP_NETWORK_TEST, json!({ "target": "jira" }))
             .await;
         let results = body_of(response, Outcome::Verified)["results"].clone();
-        assert_ne!(results[0]["stage"], "tls", "{results}");
-        assert_ne!(results[0]["cause"], "tls_untrusted_issuer", "{results}");
+        if cfg!(windows) {
+            // `Schannel` trusts the chain through the bundle and then
+            // checks revocation, which the committed leaf cannot satisfy
+            // (no CRL or OCSP address): the verdict moved from the issuer
+            // to the revocation check.
+            assert_eq!(results[0]["stage"], "tls", "{results}");
+            assert_eq!(
+                results[0]["cause"], "tls_revocation_unavailable",
+                "{results}"
+            );
+        } else {
+            assert_ne!(results[0]["stage"], "tls", "{results}");
+            assert_ne!(results[0]["cause"], "tls_untrusted_issuer", "{results}");
+        }
     } else {
         eprintln!("no openssl for the TLS origin; skipping the issuer probes");
         assert!(!pam_net::testing::tls_fixture_required());

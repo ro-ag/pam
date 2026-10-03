@@ -270,9 +270,9 @@ async fn close_with_another_connection_mid_read_still_closes_and_loses_nothing()
     store.close().await.unwrap();
 }
 
-/// The closing checkpoint is best effort, so a lock another connection holds
-/// costs a close a short wait, never the five-second statement timeout: a
-/// daemon's shutdown on Windows used to stall exactly that long.
+/// The closing checkpoint is best effort, so a lock that does not clear costs
+/// a close a bounded wait (about two seconds), never the five-second statement
+/// timeout: a daemon's shutdown on Windows used to stall exactly that long.
 #[tokio::test]
 async fn close_does_not_sit_out_the_statement_busy_timeout_behind_another_reader() {
     let dir = tempfile::tempdir().unwrap();
@@ -292,7 +292,7 @@ async fn close_does_not_sit_out_the_statement_busy_timeout_behind_another_reader
     store.close().await.unwrap();
     let took = started.elapsed();
     assert!(
-        took < Duration::from_secs(2),
+        took < Duration::from_millis(4_000),
         "close waited {took:?} behind another connection's read"
     );
 
@@ -301,4 +301,41 @@ async fn close_does_not_sit_out_the_statement_busy_timeout_behind_another_reader
     let store = Store::open(&path).await.unwrap();
     assert_eq!(request_count(&store).await, 6);
     store.close().await.unwrap();
+}
+
+/// A lock that clears within the close's bound is waited out, so the log is
+/// still folded and the main file alone is the whole database.
+#[tokio::test]
+async fn close_waits_out_a_brief_read_and_still_folds_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let log = dir.path().join("state.sqlite3-wal");
+    let store = Store::open(&path).await.unwrap();
+    finished_requests(&store, "before", 3).await;
+
+    let (began, began_rx) = mpsc::channel();
+    let reader_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        let other = rusqlite::Connection::open(&reader_path).unwrap();
+        other.execute_batch("BEGIN").unwrap();
+        let _: i64 = other
+            .query_row("SELECT COUNT(*) FROM request", (), |row| row.get(0))
+            .unwrap();
+        began.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        other.execute_batch("COMMIT").unwrap();
+    });
+    began_rx.recv().unwrap();
+    finished_requests(&store, "after", 3).await;
+
+    store.close().await.unwrap();
+    reader.join().unwrap();
+    assert_eq!(len(&log), 0, "the log should have been folded");
+
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy = copy_dir.path().join("state.sqlite3");
+    std::fs::copy(&path, &copy).unwrap();
+    let restored = Store::open(&copy).await.unwrap();
+    assert_eq!(request_count(&restored).await, 6);
+    restored.close().await.unwrap();
 }

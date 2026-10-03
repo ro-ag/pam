@@ -59,12 +59,15 @@ use crate::migrations::{self, Migration};
 /// shell, a backup tool) before it answers busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the closing checkpoint waits for another connection's lock. The
-/// fold at close is best effort (a log it cannot fold stays for the next
-/// open, nothing is lost), so it must not hold a daemon's shutdown for the
-/// whole [`BUSY_TIMEOUT`]: on Windows a lock still held by another
-/// connection made every such close wait the full five seconds.
+/// How long one attempt of the closing checkpoint waits for a lock, and how
+/// many attempts it makes. The fold at close is best effort (a log it cannot
+/// fold stays for the next open, nothing is lost), but a folded log is what
+/// makes the main file alone a complete copy, so a lock that clears quickly
+/// is waited out. On Windows another process (not a connection of this one)
+/// sometimes holds the file for seconds; the bound keeps that from holding a
+/// daemon's shutdown for the whole [`BUSY_TIMEOUT`].
 const CLOSE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const CLOSE_ATTEMPTS: u32 = 8;
 
 /// Largest string or blob the connection accepts. Evidence blobs and views
 /// run to 64 MiB; nothing the store writes comes near twice that.
@@ -464,12 +467,27 @@ pub(crate) fn shut(conn: Connection, fold_log: bool) -> Result<(), StoreError> {
     }
     // With the log empty, let the close delete it and its index.
     if fold_log
-        && checkpoint(&conn, "at close")
+        && fold_at_close(&conn)
         && let Err(error) = set(&conn, DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)
     {
         tracing::warn!(%error, "the log files could not be released for removal at close");
     }
     conn.close().map_err(|(_, error)| engine(error))
+}
+
+/// The closing checkpoint: up to [`CLOSE_ATTEMPTS`] tries of
+/// [`CLOSE_BUSY_TIMEOUT`] each, quietly until the last one.
+fn fold_at_close(conn: &Connection) -> bool {
+    for _ in 1..CLOSE_ATTEMPTS {
+        if matches!(
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| row
+                .get::<_, i64>(0)),
+            Ok(0)
+        ) {
+            return true;
+        }
+    }
+    checkpoint(conn, "at close")
 }
 
 /// Folds the write-ahead log into the main file and truncates it. True when

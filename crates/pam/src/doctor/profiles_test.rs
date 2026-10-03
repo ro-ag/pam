@@ -3,9 +3,11 @@ use std::path::Path;
 use pam_proto::caller::KNOWN_AGENTS;
 use pam_proto::doctor::{INVENTORY, Platform, ProbeClass, ProbeId};
 
+#[cfg(windows)]
+use super::WINDOWS_STATEMENT;
 use super::{
-    BASE_PLACEHOLDER, Format, Harness, Profile, RenderError, Variant, WINDOWS_STATEMENT,
-    harness_for_agent, list, render, render_guide, render_variant,
+    BASE_PLACEHOLDER, Format, Harness, Profile, RenderError, Variant, harness_for_agent, list,
+    render, render_guide, render_variant,
 };
 
 const BASE: &str = "/Users/tester/.pam";

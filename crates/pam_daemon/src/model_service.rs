@@ -40,7 +40,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pam_model::download::{DownloadError, DownloadHandle, DownloadRequest, DownloadState};
+use pam_model::download::{
+    DownloadError, DownloadHandle, DownloadRequest, DownloadState, ImportRequest, TransferLimits,
+};
 use pam_model::engine;
 use pam_model::engine_server::{EngineContract, EngineServer, EngineServerError, ServerOptions};
 use pam_model::qualification::{PromptContract, QUALIFIED, Qualification};
@@ -52,6 +54,7 @@ use pam_model::runtime::{
     RuntimeState, frame_evidence_with,
 };
 use pam_model::weights::{Control, WeightsError};
+use pam_net::{NetFailure, NetSettings, NetworkSource};
 use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
@@ -80,6 +83,13 @@ pub const KIND_DOWNLOAD: &str = "download";
 
 /// `model_job.kind` for a verification.
 pub const KIND_VERIFY: &str = "verify";
+
+/// `model_job.kind` for an import from a local file: a copy into the
+/// models directory with the same progress, verdict and cancel as a
+/// download. Its `source` is the absolute path of the file, where a
+/// download's is an `https://` address. The store admits the kind since
+/// schema version 15.
+pub const KIND_IMPORT: &str = "import";
 
 /// `model_job.state` for a job that finished cleanly.
 pub const JOB_DONE: &str = "done";
@@ -381,6 +391,24 @@ pub struct ModelService {
     /// the daemon from its base directory. Unset (tests) falls back to a
     /// private directory beside the models.
     engine_base: RwLock<Option<PathBuf>>,
+    /// Where a transfer's network profile (proxy, no-proxy list, CA
+    /// bundle) comes from, asked once per transfer start so a setting the
+    /// human saves applies to the next download. Until the daemon sets its
+    /// own, a direct connection with the platform's trust.
+    network: RwLock<Arc<dyn NetworkSource>>,
+    /// The daemon's network settings service, when it has one: where the
+    /// engine and models mirrors are read from, per transfer. Unset (tests)
+    /// means no mirror.
+    mirrors: RwLock<Option<Arc<crate::network_service::NetworkService>>>,
+    /// Lets the in-crate tests fetch from a plain-http loopback origin;
+    /// production has no such switch.
+    #[cfg(test)]
+    plain_http_for_tests: AtomicBool,
+    /// The release the engine ops install, import and disclose instead of
+    /// the pinned one: a fake archive the in-crate tests built. Production
+    /// has no such switch; [`Self::engine_release`] is the only reader.
+    #[cfg(test)]
+    engine_release_for_tests: RwLock<Option<engine::EngineRelease>>,
     /// The llama.cpp supervisor, built the first time an installed engine
     /// is needed and rebuilt if the installed binary changes.
     engine: std::sync::Mutex<Option<Arc<EngineServer>>>,
@@ -457,6 +485,12 @@ impl ModelService {
             models_dir: RwLock::new(models_dir),
             qualifications: RwLock::new(QUALIFIED),
             engine_base: RwLock::new(None),
+            network: RwLock::new(Arc::new(Arc::new(NetSettings::direct()))),
+            mirrors: RwLock::new(None),
+            #[cfg(test)]
+            plain_http_for_tests: AtomicBool::new(false),
+            #[cfg(test)]
+            engine_release_for_tests: RwLock::new(None),
             engine: std::sync::Mutex::new(None),
             busy: AtomicBool::new(false),
             resident: RwLock::new(None),
@@ -480,8 +514,9 @@ impl ModelService {
     }
 
     /// Spawns one of the service's own tasks where [`Self::shutdown`] can
-    /// join it, forgetting the ones that have already ended.
-    fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+    /// join it, forgetting the ones that have already ended. Crate-visible
+    /// so a test can plant a task that ends only when it says.
+    pub(crate) fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self
             .tasks
             .lock()
@@ -859,6 +894,111 @@ impl ModelService {
         }
     }
 
+    /// Points transfers at the daemon's network settings. Read per transfer
+    /// start, never cached: the next download runs under whatever the human
+    /// last saved.
+    pub fn set_network_source(&self, source: Arc<dyn NetworkSource>) {
+        *self
+            .network
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
+    }
+
+    /// Points transfers at the daemon's network settings service: the
+    /// profile source and the mirrors in one. What the daemon calls at boot.
+    pub fn set_network_service(&self, network: Arc<crate::network_service::NetworkService>) {
+        self.set_network_source(Arc::clone(&network) as Arc<dyn NetworkSource>);
+        *self
+            .mirrors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(network);
+    }
+
+    /// The engine and models mirrors the next transfer would use, read
+    /// now from the network settings; `(None, None)` when the daemon set no
+    /// service. Settings that cannot be used refuse, never fall back.
+    pub async fn mirrors(
+        &self,
+    ) -> Result<(Option<pam_net::MirrorBase>, Option<pam_net::MirrorBase>), NetFailure> {
+        let service = self
+            .mirrors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match service {
+            Some(network) => network.mirrors().await,
+            None => Ok((None, None)),
+        }
+    }
+
+    /// The source transfers read their network profile from.
+    #[must_use]
+    pub fn network_source(&self) -> Arc<dyn NetworkSource> {
+        Arc::clone(
+            &self
+                .network
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// The network profile the next transfer runs under, resolved now. A
+    /// source that cannot produce one refuses; nothing falls back to a
+    /// direct connection.
+    pub async fn network_settings(&self) -> Result<Arc<NetSettings>, NetFailure> {
+        let source = self.network_source();
+        source.settings().await
+    }
+
+    /// Lets this service's downloads fetch from a plain-`http` loopback
+    /// origin, the way the download suite's own fixtures are served. Test
+    /// builds only.
+    #[cfg(test)]
+    pub(crate) fn allow_plain_http_downloads_for_tests(&self) {
+        self.plain_http_for_tests.store(true, Ordering::Release);
+    }
+
+    /// The release the engine ops work with: the pinned one for this
+    /// platform, `None` where the platform has no pinned asset. In test
+    /// builds a release pinned through `pin_engine_release_for_tests`
+    /// takes its place; production reads only the compiled-in constants.
+    #[must_use]
+    pub fn engine_release(&self) -> Option<engine::EngineRelease> {
+        #[cfg(test)]
+        if let Some(release) = self
+            .engine_release_for_tests
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Some(release);
+        }
+        engine::Target::current().map(engine::EngineRelease::pinned)
+    }
+
+    /// Makes the engine ops install, import and disclose `release` — a fake
+    /// archive the test built — in place of the pinned one. Keep its tag and
+    /// build the pinned ones: `engine::status` reads those constants, not
+    /// this. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn pin_engine_release_for_tests(&self, release: engine::EngineRelease) {
+        *self
+            .engine_release_for_tests
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release);
+    }
+
+    /// Forgets the supervisor built over the installed engine, so the next
+    /// use reads the manifest again. Called after the engine is removed;
+    /// the caller has made sure nothing is loaded.
+    pub fn forget_engine(&self) {
+        *self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.set_resident(None);
+    }
+
     /// Stops an engine a previous daemon left running (SIGKILL, crash), once per
     /// engine base. The supervisor's pid file names the process; it is killed only when
     /// the live process with that pid has the recorded executable, was started with the
@@ -1193,8 +1333,10 @@ impl ModelService {
     ///
     /// Everything refusable is refused before the row exists: a second
     /// download of the same destination, a file already installed, a
-    /// missing `curl`. Only once curl is running does a `model_job` row
-    /// appear, so the history holds transfers, not rejected clicks.
+    /// missing `curl`, a plain-http address, network settings that cannot
+    /// be used. Only once curl is running does a `model_job` row appear, so
+    /// the history holds transfers, not rejected clicks. The network
+    /// profile is resolved here, for this transfer.
     pub async fn start_download(
         &self,
         request: DownloadRequest,
@@ -1207,11 +1349,28 @@ impl ModelService {
         if self.is_downloading(&dest).await {
             return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
         }
+        let net = self
+            .network_settings()
+            .await
+            .map_err(|failure| ModelServiceError::Download(DownloadError::Network(failure)))?;
         let source = request.url.clone();
         let total = request
             .expected_size
             .and_then(|bytes| i64::try_from(bytes).ok());
-        let handle = pam_model::download::start(request).map_err(|err| match err {
+        #[cfg(test)]
+        let started = if self.plain_http_for_tests.load(Ordering::Acquire) {
+            pam_model::download::start_over_plain_http_for_tests(
+                request,
+                net,
+                TransferLimits::default(),
+            )
+        } else {
+            pam_model::download::start_with_limits(request, net, TransferLimits::default())
+        };
+        #[cfg(not(test))]
+        let started =
+            pam_model::download::start_with_limits(request, net, TransferLimits::default());
+        let handle = started.map_err(|err| match err {
             DownloadError::AlreadyExists(_) => {
                 ModelServiceError::AlreadyInstalled(model_id.to_owned())
             }
@@ -1238,6 +1397,55 @@ impl ModelService {
             self.stopping.subscribe(),
         ));
         tracing::info!(job = %job_id, model = model_id, "download started");
+        Ok(job_id)
+    }
+
+    /// Copies weights in from a file on this machine behind a job row
+    /// (kind [`KIND_IMPORT`]) and returns its id: the copy runs with the
+    /// same handle, progress, cancel and verdict as a download, and lands
+    /// recorded as verified when the request carried an expected digest
+    /// that the copy matched. Refusals happen before any row exists; no
+    /// network profile is resolved, because no network is used.
+    pub async fn start_import(
+        &self,
+        request: ImportRequest,
+        model_id: &str,
+    ) -> Result<String, ModelServiceError> {
+        let dest = request.dest.clone();
+        let dest_for_record = request.dest.clone();
+        let expected_digest = request.expected_sha256.is_some();
+        let source = request.source.display().to_string();
+        let total = request
+            .expected_size
+            .and_then(|bytes| i64::try_from(bytes).ok());
+        self.sweep_private_copies_once().await;
+        if self.is_downloading(&dest).await {
+            return Err(ModelServiceError::AlreadyDownloading(model_id.to_owned()));
+        }
+        let handle = pam_model::download::start_import(request).map_err(|err| match err {
+            DownloadError::AlreadyExists(_) => {
+                ModelServiceError::AlreadyInstalled(model_id.to_owned())
+            }
+            DownloadError::Locked(_) => ModelServiceError::AlreadyDownloading(model_id.to_owned()),
+            other => ModelServiceError::Download(other),
+        })?;
+        let job_id = new_job_id();
+        self.store
+            .insert_model_job(&job_id, KIND_IMPORT, model_id, Some(&source), total)
+            .await?;
+        self.downloads
+            .lock()
+            .await
+            .insert(job_id.clone(), (dest, handle.clone()));
+        self.spawn_task(follow_download(
+            Arc::clone(&self.store),
+            Arc::clone(&self.downloads),
+            job_id.clone(),
+            handle,
+            expected_digest.then(|| (self.registry(), dest_for_record)),
+            self.stopping.subscribe(),
+        ));
+        tracing::info!(job = %job_id, model = model_id, "import started");
         Ok(job_id)
     }
 

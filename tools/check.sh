@@ -31,7 +31,9 @@ echo "==> cargo doc (no deps, -D warnings)"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 echo "==> cargo test --workspace"
-cargo test --workspace
+# The TLS fixtures (pam_net) must run, not skip: a machine without the
+# system openssl fails the gate loudly instead of passing quietly.
+PAM_REQUIRE_TLS_FIXTURE=1 cargo test --workspace
 
 echo "==> frontend lint"
 npm --prefix frontend run lint

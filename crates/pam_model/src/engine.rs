@@ -3,28 +3,44 @@
 //! PAM itself stays pure Rust; the engine is `llama-server` from one exact
 //! upstream GitHub release (`ENGINE_TAG`), one asset per supported target,
 //! each pinned by the SHA-256 digest the release API publishes. The archive
-//! is fetched with the same resumable curl transfer models use, unpacked by
-//! the operating system's own `tar` (which also reads the Windows zip), and
-//! the unpacked server must report the pinned build number before it is
-//! accepted. Nothing here runs a model; that is the supervisor's job.
+//! is fetched with the same resumable curl transfer models use — under the
+//! same network profile, from upstream or from an internal mirror that must
+//! serve the identical bytes — unpacked by the operating system's own `tar`
+//! (which also reads the Windows zip), and the unpacked server must report
+//! the pinned build number before it is accepted. The same archive can be
+//! supplied from a file on disk ([`import`]): it is copied into the private
+//! engine directory and hashed in the same pass, held to the same size and
+//! digest, and unpacked and checked the same way, with no network involved.
+//! [`remove`] deletes everything under the engine directory. Nothing here
+//! runs a model; that is the supervisor's job.
 //!
 //! Layout under the private base directory:
 //!
 //! ```text
 //! <base>/engine/<asset archive>          transfer target (removed after install)
 //! <base>/engine/llama-<tag>/llama-server unpacked release, plus its libraries
-//! <base>/engine/.pam-engine.json         manifest: tag, target, digest, version line
+//! <base>/engine/.pam-engine.json         manifest: tag, target, digest, version line, source
+//! <base>/engine/weights/<sha256>.gguf    the registry's private copies of verified weights
 //! ```
 
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
+use pam_net::{MirrorBase, NetSettings};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+#[cfg(any(test, feature = "testing"))]
+use crate::download::TransferLimits;
 use crate::download::{self, DownloadRequest, DownloadState};
 use crate::registry::verified_sidecar_path;
+use crate::weights::{FREE_SPACE_HEADROOM_BYTES, platform_free_bytes};
+
+/// Chunk size for the import copy: one read is one write is one hash update.
+const IMPORT_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// The upstream release tag every target is pinned to.
 pub const ENGINE_TAG: &str = "b10938";
@@ -164,9 +180,81 @@ impl EngineRelease {
         }
     }
 
-    fn url(&self) -> String {
-        format!("{}{}", self.url_base, self.asset_name)
+    /// Where the archive is fetched from: the pinned asset name under the
+    /// release base, or under `mirror` when one is set. Only the host
+    /// changes; the name, size and digest the bytes are held to do not.
+    pub fn url(&self, mirror: Option<&MirrorBase>) -> Result<String, EngineError> {
+        match mirror {
+            Some(mirror) => mirror
+                .join(&self.asset_name)
+                .map(String::from)
+                .map_err(|error| EngineError::Download {
+                    cause: "mirror_invalid".to_owned(),
+                    detail: error.to_string(),
+                }),
+            None => Ok(format!("{}{}", self.url_base, self.asset_name)),
+        }
     }
+
+    /// The host of [`Self::url`]: the mirror's, or the upstream release
+    /// host.
+    #[must_use]
+    pub fn host(&self, mirror: Option<&MirrorBase>) -> String {
+        match mirror {
+            Some(mirror) => mirror.host().to_owned(),
+            None => url_host(&self.url_base),
+        }
+    }
+
+    /// The source a download of this release records in the manifest.
+    fn download_source(&self, mirror: Option<&MirrorBase>) -> EngineSource {
+        match mirror {
+            Some(mirror) => EngineSource::Mirror {
+                host: mirror.host().to_owned(),
+                url: self.url(Some(mirror)).unwrap_or_default(),
+            },
+            None => EngineSource::Download {
+                host: url_host(&self.url_base),
+            },
+        }
+    }
+}
+
+/// The host part of an `https://host/...` string, without a URL parser:
+/// the release base is a compiled-in constant.
+fn url_host(url: &str) -> String {
+    url.split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Where an installed engine's archive came from, as the manifest records
+/// it and the GUI shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EngineSource {
+    /// Fetched from the upstream release host.
+    Download {
+        /// The host the archive was fetched from.
+        host: String,
+    },
+    /// Fetched from the human's configured mirror.
+    Mirror {
+        /// The mirror's host.
+        host: String,
+        /// The exact URL fetched.
+        url: String,
+    },
+    /// Copied from a file on this machine; the original was left as it was.
+    Import {
+        /// The path the human gave (the file, or the folder holding it).
+        path: String,
+        /// Unix milliseconds when the copy was made.
+        imported_at_ms: i64,
+    },
 }
 
 /// Where the engine lives under a private base directory.
@@ -234,6 +322,9 @@ pub struct EngineManifest {
     pub version_line: String,
     /// Unix milliseconds when the install completed.
     pub installed_at_ms: i64,
+    /// Where the archive came from. Absent in manifests an older PAM wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EngineSource>,
 }
 
 /// The engine's state for the GUI and the supervisor.
@@ -298,6 +389,78 @@ pub enum EngineError {
         /// Which step.
         detail: String,
     },
+    /// The path given to [`import`] does not exist or cannot be read.
+    #[error("{path} does not exist or cannot be read")]
+    SourceMissing {
+        /// The path as given.
+        path: String,
+    },
+    /// The path given to [`import`] is not the pinned archive: a file with
+    /// another name, a folder without the archive in it, or an unpacked
+    /// tree (which has no digest to check).
+    #[error(
+        "{found} is not the pinned engine archive; this build of PAM needs `{expected}` \
+         ({bytes} bytes, SHA-256 {sha256}), the release archive itself, or a folder that \
+         contains it under that exact name"
+    )]
+    NotTheAsset {
+        /// What was found at the path.
+        found: String,
+        /// The pinned asset's file name.
+        expected: String,
+        /// The pinned asset's size.
+        bytes: u64,
+        /// The pinned asset's digest.
+        sha256: String,
+    },
+    /// The source, or the archive inside the given folder, is a symbolic link.
+    #[error("{path} is a symbolic link; give the path of the archive file itself")]
+    SourceSymlink {
+        /// The link.
+        path: String,
+    },
+    /// The source sits inside the engine directory the install would rewrite.
+    #[error("{path} is inside PAM's engine directory, which the install replaces")]
+    SourceInsideEngineDir {
+        /// The source.
+        path: String,
+    },
+    /// The source file's size is not the pinned size; nothing was copied.
+    #[error("the file is {actual} bytes; the pinned archive {expected_name} is {expected} bytes")]
+    SizeMismatch {
+        /// The pinned size.
+        expected: u64,
+        /// The file's size.
+        actual: u64,
+        /// The pinned asset's file name.
+        expected_name: String,
+    },
+    /// The copied bytes do not hash to the pinned digest; the copy was deleted.
+    #[error(
+        "the file hashes to sha256:{actual}; this build of PAM pins llama.cpp {tag} with \
+         sha256:{expected}, and installs nothing else"
+    )]
+    DigestMismatch {
+        /// The pinned digest.
+        expected: String,
+        /// What the bytes hashed to.
+        actual: String,
+        /// The pinned tag.
+        tag: String,
+    },
+    /// The volume holding the engine directory cannot take the copy.
+    #[error(
+        "not enough disk space under {dir} for the engine archive: {needed} bytes needed, {} free",
+        free.map_or_else(|| "an unknown amount".to_owned(), |bytes| format!("{bytes} bytes"))
+    )]
+    NoSpace {
+        /// The engine directory.
+        dir: PathBuf,
+        /// Bytes the copy needs, headroom included.
+        needed: u64,
+        /// Bytes free there, when known.
+        free: Option<u64>,
+    },
 }
 
 fn io(step: &str, error: &std::io::Error) -> EngineError {
@@ -353,37 +516,159 @@ fn status_for(base: &Path, tag: &str, build: u64, target: Option<Target>) -> Eng
 }
 
 /// Installs the pinned release for this platform under `base`, or reports
-/// the installed one. `cancel` stops the transfer; a cancelled transfer
-/// keeps its part file for a resume.
+/// the installed one. The archive is fetched under the network profile
+/// `net`, from upstream or from `mirror`; either way it must hash to the
+/// pinned digest. `cancel` stops the transfer; a cancelled transfer keeps
+/// its part file for a resume.
 pub async fn install(
     base: &Path,
+    cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+) -> Result<EngineStatus, EngineError> {
+    let target = Target::current().ok_or_else(|| EngineError::UnsupportedTarget {
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+    })?;
+    install_with(
+        base,
+        &EngineRelease::pinned(target),
+        cancel,
+        net,
+        mirror,
+        false,
+    )
+    .await
+}
+
+/// [`install`] for an explicit release. Test builds and the `testing`
+/// feature only: production has no entry point that takes a release, so no
+/// setting, argument or file can install anything but the pinned one.
+#[cfg(any(test, feature = "testing"))]
+pub async fn install_release(
+    base: &Path,
+    release: &EngineRelease,
+    cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+) -> Result<EngineStatus, EngineError> {
+    install_with(base, release, cancel, net, mirror, false).await
+}
+
+/// [`install_release`] with the archive fetched over plain `http` from a
+/// loopback origin: the test allowance, for the fake-release tests here and
+/// in the daemon. Test builds and the `testing` feature only.
+#[cfg(any(test, feature = "testing"))]
+pub async fn install_release_over_plain_http_for_tests(
+    base: &Path,
+    release: &EngineRelease,
+    cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+) -> Result<EngineStatus, EngineError> {
+    install_with(base, release, cancel, net, mirror, true).await
+}
+
+async fn install_with(
+    base: &Path,
+    release: &EngineRelease,
+    cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+    plain_http: bool,
+) -> Result<EngineStatus, EngineError> {
+    let layout = EngineLayout::new(base);
+    if let Some(current) = already_installed(base, release) {
+        return Ok(current);
+    }
+    create_private_dir(layout.root())?;
+    let archive = fetch_archive(&layout, release, cancel, net, mirror, plain_http).await?;
+    finish_install(base, release, &archive, release.download_source(mirror)).await
+}
+
+/// Installs the pinned release for this platform from `path`: the pinned
+/// archive file by its exact name, or a folder holding it under that name.
+/// The file is copied into the engine directory and hashed in the same
+/// pass, held to the pinned size and digest, and from there installed
+/// exactly like a downloaded archive. The original is never modified, moved
+/// or deleted, and no network is used. `cancel` stops the copy.
+pub async fn import(
+    base: &Path,
+    path: &Path,
     cancel: watch::Receiver<bool>,
 ) -> Result<EngineStatus, EngineError> {
     let target = Target::current().ok_or_else(|| EngineError::UnsupportedTarget {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
     })?;
-    install_release(base, &EngineRelease::pinned(target), cancel).await
+    import_with(base, &EngineRelease::pinned(target), path, cancel).await
 }
 
-/// [`install`] for an explicit release; production passes the pinned one.
-pub async fn install_release(
+/// [`import`] for an explicit release. Test builds and the `testing`
+/// feature only, for the same reason as [`install_release`].
+#[cfg(any(test, feature = "testing"))]
+pub async fn import_release(
     base: &Path,
     release: &EngineRelease,
+    path: &Path,
+    cancel: watch::Receiver<bool>,
+) -> Result<EngineStatus, EngineError> {
+    import_with(base, release, path, cancel).await
+}
+
+async fn import_with(
+    base: &Path,
+    release: &EngineRelease,
+    path: &Path,
     cancel: watch::Receiver<bool>,
 ) -> Result<EngineStatus, EngineError> {
     let layout = EngineLayout::new(base);
+    if let Some(current) = already_installed(base, release) {
+        return Ok(current);
+    }
+    let source = locate_source(&layout, release, path)?;
+    create_private_dir(layout.root())?;
+    let archive = layout.archive_path(&release.asset_name);
+    if archive.exists() {
+        std::fs::remove_file(&archive).map_err(|e| io("remove stale archive", &e))?;
+        let _ = std::fs::remove_file(verified_sidecar_path(&archive));
+    }
+    copy_archive(&layout, release, &source, &archive, cancel).await?;
+    let given = path.display().to_string();
+    finish_install(
+        base,
+        release,
+        &archive,
+        EngineSource::Import {
+            path: given,
+            imported_at_ms: now_ms(),
+        },
+    )
+    .await
+}
+
+/// The installed status when the manifest already records this exact
+/// release and digest and its server is present: nothing to do.
+fn already_installed(base: &Path, release: &EngineRelease) -> Option<EngineStatus> {
     let current = status_for(base, &release.tag, release.build, Some(release.target));
-    if current.installed
+    (current.installed
         && current
             .manifest
             .as_ref()
-            .is_some_and(|m| m.sha256 == release.sha256)
-    {
-        return Ok(current);
-    }
-    create_private_dir(layout.root())?;
-    let archive = fetch_archive(&layout, release, cancel).await?;
+            .is_some_and(|m| m.sha256 == release.sha256))
+    .then_some(current)
+}
+
+/// Unpacks a verified archive, requires the server to report the pinned
+/// build, moves the release into place and writes the manifest. The archive
+/// is removed whatever happens.
+async fn finish_install(
+    base: &Path,
+    release: &EngineRelease,
+    archive: &Path,
+    source: EngineSource,
+) -> Result<EngineStatus, EngineError> {
+    let layout = EngineLayout::new(base);
     let scratch = layout.root().join(format!(
         ".unpack-{}-{}",
         std::process::id(),
@@ -392,11 +677,11 @@ pub async fn install_release(
             .map(|d| d.as_nanos())
             .unwrap_or_default()
     ));
-    let verified = unpack_and_verify(&archive, &scratch, release).await;
-    let _ = std::fs::remove_file(&archive);
+    let verified = unpack_and_verify(archive, &scratch, release).await;
+    let _ = std::fs::remove_file(archive);
     // The downloader no longer writes a verification sidecar, but an older pam
     // did; one left beside an archive that is about to be deleted is litter.
-    let _ = std::fs::remove_file(verified_sidecar_path(&archive));
+    let _ = std::fs::remove_file(verified_sidecar_path(archive));
     let (server_dir, version_line) = match verified {
         Ok(found) => found,
         Err(error) => {
@@ -409,7 +694,7 @@ pub async fn install_release(
     let moved = std::fs::rename(&server_dir, &install_dir);
     let _ = std::fs::remove_dir_all(&scratch);
     moved.map_err(|e| io("install unpacked release", &e))?;
-    write_manifest(&layout, release, version_line)?;
+    write_manifest(&layout, release, version_line, source)?;
     Ok(status_for(
         base,
         &release.tag,
@@ -418,27 +703,304 @@ pub async fn install_release(
     ))
 }
 
+/// The archive file an import reads: `path` itself when it is a file named
+/// exactly like the pinned asset, `path/<asset>` when it is a folder.
+/// Anything else is refused by name; a symbolic link at either level is
+/// refused rather than followed; a source inside the engine directory is
+/// refused because the install would delete it.
+fn locate_source(
+    layout: &EngineLayout,
+    release: &EngineRelease,
+    path: &Path,
+) -> Result<PathBuf, EngineError> {
+    let not_the_asset = |found: String| EngineError::NotTheAsset {
+        found,
+        expected: release.asset_name.clone(),
+        bytes: release.bytes,
+        sha256: release.sha256.clone(),
+    };
+    let given = std::fs::symlink_metadata(path).map_err(|_| EngineError::SourceMissing {
+        path: path.display().to_string(),
+    })?;
+    if given.file_type().is_symlink() {
+        return Err(EngineError::SourceSymlink {
+            path: path.display().to_string(),
+        });
+    }
+    let candidate = if given.is_dir() {
+        let inside = path.join(&release.asset_name);
+        let meta = std::fs::symlink_metadata(&inside).map_err(|_| {
+            not_the_asset(format!(
+                "the folder {} holds no `{}`",
+                path.display(),
+                release.asset_name
+            ))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(EngineError::SourceSymlink {
+                path: inside.display().to_string(),
+            });
+        }
+        if !meta.is_file() {
+            return Err(not_the_asset(format!(
+                "{} is not a regular file",
+                inside.display()
+            )));
+        }
+        inside
+    } else if given.is_file() {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name != release.asset_name {
+            return Err(not_the_asset(format!("the file `{name}`")));
+        }
+        path.to_path_buf()
+    } else {
+        return Err(not_the_asset(format!(
+            "{} is neither a file nor a folder",
+            path.display()
+        )));
+    };
+    // Compared canonicalized so a path spelled differently (a `..`, a
+    // symlinked parent) cannot name a file under the engine directory.
+    if let (Ok(root), Ok(real)) = (layout.root().canonicalize(), candidate.canonicalize())
+        && real.starts_with(root)
+    {
+        return Err(EngineError::SourceInsideEngineDir {
+            path: candidate.display().to_string(),
+        });
+    }
+    Ok(candidate)
+}
+
+/// Copies the located source into `archive` while hashing the same bytes,
+/// off the async threads. The handle is opened once and its size checked on
+/// that handle before a byte is written; the digest is compared when the
+/// copy is complete, and a copy that does not match, is cancelled or fails
+/// is deleted.
+async fn copy_archive(
+    layout: &EngineLayout,
+    release: &EngineRelease,
+    source: &Path,
+    archive: &Path,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), EngineError> {
+    let mut file = std::fs::File::open(source).map_err(|_| EngineError::SourceMissing {
+        path: source.display().to_string(),
+    })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| io("read source metadata", &e))?;
+    if !meta.is_file() {
+        return Err(EngineError::NotTheAsset {
+            found: format!("{} is not a regular file", source.display()),
+            expected: release.asset_name.clone(),
+            bytes: release.bytes,
+            sha256: release.sha256.clone(),
+        });
+    }
+    if meta.len() != release.bytes {
+        return Err(EngineError::SizeMismatch {
+            expected: release.bytes,
+            actual: meta.len(),
+            expected_name: release.asset_name.clone(),
+        });
+    }
+    let needed = release.bytes.saturating_add(FREE_SPACE_HEADROOM_BYTES);
+    let free = platform_free_bytes(layout.root());
+    if free.is_some_and(|free| free < needed) {
+        return Err(EngineError::NoSpace {
+            dir: layout.root().to_path_buf(),
+            needed,
+            free,
+        });
+    }
+    let dest = archive.to_path_buf();
+    let expected_len = release.bytes;
+    let copied = tokio::task::spawn_blocking(move || {
+        let outcome = copy_hashing_from(&mut file, &dest, expected_len, &cancel);
+        if outcome.is_err() {
+            let _ = std::fs::remove_file(&dest);
+        }
+        outcome
+    })
+    .await
+    .map_err(|e| EngineError::Io {
+        detail: format!("the copy task panicked: {e}"),
+    })?;
+    let (sha256, copied_bytes) = copied?;
+    if copied_bytes != release.bytes {
+        let _ = std::fs::remove_file(archive);
+        return Err(EngineError::SizeMismatch {
+            expected: release.bytes,
+            actual: copied_bytes,
+            expected_name: release.asset_name.clone(),
+        });
+    }
+    if sha256 != release.sha256 {
+        let _ = std::fs::remove_file(archive);
+        return Err(EngineError::DigestMismatch {
+            expected: release.sha256.clone(),
+            actual: sha256,
+            tag: release.tag.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Streams `source` into a new owner-only file at `dest`, hashing exactly
+/// the bytes written; stops at `expected_len` so a file that grows under
+/// the copy cannot fill the disk, and stops when `cancel` says so.
+fn copy_hashing_from(
+    source: &mut std::fs::File,
+    dest: &Path,
+    expected_len: u64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<(String, u64), EngineError> {
+    use sha2::Digest as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut writer = options
+        .open(dest)
+        .map_err(|e| io("create private archive", &e))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; IMPORT_CHUNK_BYTES];
+    let mut total: u64 = 0;
+    while total < expected_len {
+        if *cancel.borrow() {
+            return Err(EngineError::Cancelled);
+        }
+        let want = usize::try_from((expected_len - total).min(IMPORT_CHUNK_BYTES as u64))
+            .unwrap_or(IMPORT_CHUNK_BYTES);
+        let read = source
+            .read(&mut buffer[..want])
+            .map_err(|e| io("read source archive", &e))?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|e| io("write private archive", &e))?;
+        hasher.update(&buffer[..read]);
+        total = total.saturating_add(u64::try_from(read).unwrap_or(0));
+    }
+    writer
+        .sync_all()
+        .map_err(|e| io("sync private archive", &e))?;
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+/// What [`remove`] deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoveReport {
+    /// The engine directory.
+    pub engine_dir: PathBuf,
+    /// The names of the top-level entries removed from it.
+    pub removed: Vec<String>,
+}
+
+/// Deletes everything under `<base>/engine`: the archive if one is there,
+/// the unpacked release, the manifest, the registry's private weight copies,
+/// the server's key file and any scratch directory. The directory itself
+/// stays (private, empty). The models directory is never touched. Whether
+/// a model is loaded is the caller's knowledge, and the caller refuses then.
+pub fn remove(base: &Path) -> Result<RemoveReport, EngineError> {
+    let layout = EngineLayout::new(base);
+    let mut report = RemoveReport {
+        engine_dir: layout.root().to_path_buf(),
+        removed: Vec::new(),
+    };
+    let entries = match std::fs::read_dir(layout.root()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(error) => return Err(io("read engine directory", &error)),
+    };
+    let mut names: Vec<(String, PathBuf, bool)> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| io("read engine directory", &e))?;
+        let is_dir = entry
+            .file_type()
+            .map_err(|e| io("read engine directory", &e))?
+            .is_dir();
+        names.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            entry.path(),
+            is_dir,
+        ));
+    }
+    // The manifest goes first: a failure part-way then reads as "not
+    // installed" rather than as an install whose files are half gone.
+    names.sort_by_key(|(name, _, _)| name != ".pam-engine.json");
+    for (name, path, is_dir) in names {
+        let gone = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        gone.map_err(|e| io(&format!("remove {name}"), &e))?;
+        report.removed.push(name);
+    }
+    Ok(report)
+}
+
+/// Unix milliseconds now, saturating.
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
 /// Fetches the archive with the resumable transfer models use; the
 /// downloader refuses a digest or size mismatch before the file lands.
 async fn fetch_archive(
     layout: &EngineLayout,
     release: &EngineRelease,
     mut cancel: watch::Receiver<bool>,
+    net: Arc<NetSettings>,
+    mirror: Option<&MirrorBase>,
+    plain_http: bool,
 ) -> Result<PathBuf, EngineError> {
     let archive = layout.archive_path(&release.asset_name);
     if archive.exists() {
         std::fs::remove_file(&archive).map_err(|e| io("remove stale archive", &e))?;
         let _ = std::fs::remove_file(verified_sidecar_path(&archive));
     }
-    let handle = download::start(DownloadRequest {
-        url: release.url(),
+    let request = DownloadRequest {
+        url: release.url(mirror)?,
         dest: archive.clone(),
         expected_size: Some(release.bytes),
         expected_sha256: Some(release.sha256.clone()),
         license_id: None,
-    })
-    .map_err(|e| EngineError::Download {
-        cause: "start".to_owned(),
+    };
+    #[cfg(any(test, feature = "testing"))]
+    let started = if plain_http {
+        download::start_over_plain_http_for_tests(request, net, TransferLimits::default())
+    } else {
+        download::start(request, net)
+    };
+    #[cfg(not(any(test, feature = "testing")))]
+    let started = {
+        // Production has no plain-http path: the flag is never set outside tests.
+        let _ = plain_http;
+        download::start(request, net)
+    };
+    let handle = started.map_err(|e| EngineError::Download {
+        cause: match &e {
+            download::DownloadError::Network(failure) => failure.cause().to_owned(),
+            download::DownloadError::CurlMissing => "curl_missing".to_owned(),
+            _ => "start".to_owned(),
+        },
         detail: e.to_string(),
     })?;
     let outcome = tokio::select! {
@@ -482,6 +1044,7 @@ fn write_manifest(
     layout: &EngineLayout,
     release: &EngineRelease,
     version_line: String,
+    source: EngineSource,
 ) -> Result<(), EngineError> {
     let manifest = EngineManifest {
         tag: release.tag.clone(),
@@ -491,13 +1054,8 @@ fn write_manifest(
         sha256: release.sha256.clone(),
         bytes: release.bytes,
         version_line,
-        installed_at_ms: i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default(),
-        )
-        .unwrap_or(i64::MAX),
+        installed_at_ms: now_ms(),
+        source: Some(source),
     };
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| EngineError::Io {
         detail: format!("encode manifest: {e}"),

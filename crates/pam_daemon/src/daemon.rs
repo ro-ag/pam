@@ -111,7 +111,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pam_connectors::{CurlTransport, HttpTransport};
+use pam_connectors::{CurlTransport, HttpTransport, NetworkSource};
 use pam_proto::{Envelope, Event, Response};
 use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
 use thiserror::Error;
@@ -133,6 +133,7 @@ use crate::lifecycle::{
 };
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
+use crate::network_service::NetworkService;
 use crate::policy::{
     AdmissionPool, CAP_STATUS, CapabilityClass, GateDecision, PolicyError, PolicyGate,
     admission_pool, classify,
@@ -655,10 +656,19 @@ pub async fn run_daemon_with(
     // slow, and paying for it right after boot keeps it off the first
     // flow step.
     secrets.warm();
+    // One source of the network profile (proxy, no-proxy list, CA bundle)
+    // for the connector transport, the downloads, the engine install and
+    // the Network screen: the `net.settings` document plus the keychain.
+    let network = Arc::new(NetworkService::new(
+        Arc::clone(&store),
+        Some(Arc::clone(&secrets)),
+        base.clone(),
+    ));
+    models.set_network_service(Arc::clone(&network));
     let connectors = Arc::new(ConnectorService::from_parts(
         Arc::clone(&store),
         Some(Arc::clone(&secrets)),
-        open_http_transport(config.http_transport),
+        open_http_transport(config.http_transport, Arc::clone(&network)),
     ));
     let queue = Arc::new(
         QueueManager::new(Arc::clone(&store))
@@ -710,15 +720,18 @@ pub async fn run_daemon_with(
     // dispatch keeps answering (with refusals) until the drain is done.
     let (drain_tx, drain_rx) = watch::channel(false);
     let (dispatch_stop_tx, dispatch_stop_rx) = watch::channel(false);
-    let admin = Arc::new(AdminService::new(
-        Arc::clone(&store),
-        Arc::clone(&approvals),
-        Arc::clone(&models),
-        logs,
-        connectors,
-        Arc::clone(&flows),
-        incoming_tx.clone(),
-    ));
+    let admin = Arc::new(
+        AdminService::new(
+            Arc::clone(&store),
+            Arc::clone(&approvals),
+            Arc::clone(&models),
+            logs,
+            connectors,
+            Arc::clone(&flows),
+            incoming_tx.clone(),
+        )
+        .with_network(network),
+    );
     let admin_transport = match crate::admin_transport::AdminTransport::bind(
         &base,
         Arc::clone(&admin),
@@ -821,16 +834,21 @@ fn open_secret_store(injected: Option<Arc<dyn SecretBackend>>) -> Arc<SecretStor
     })
 }
 
-/// Builds the transport connector calls run over.
+/// Builds the transport connector calls run over, reading its network
+/// profile from `network` before every spawn.
 ///
 /// Like the credential store, a missing `curl` degrades rather than stops:
 /// every connector then refuses with `connector_cli_missing` and the
 /// platform's install line.
-fn open_http_transport(injected: Option<Arc<dyn HttpTransport>>) -> Option<Arc<dyn HttpTransport>> {
+fn open_http_transport(
+    injected: Option<Arc<dyn HttpTransport>>,
+    network: Arc<NetworkService>,
+) -> Option<Arc<dyn HttpTransport>> {
     if injected.is_some() {
         return injected;
     }
-    match CurlTransport::trusted() {
+    let network: Arc<dyn NetworkSource> = network;
+    match CurlTransport::trusted(network) {
         Ok(transport) => Some(Arc::new(transport)),
         Err(error) => {
             tracing::warn!(

@@ -409,6 +409,13 @@ impl ConnectorService {
         }
     }
 
+    /// The keychain this host reads credentials from, when it opened at
+    /// boot; the network settings file the proxy password in the same one.
+    #[must_use]
+    pub fn secret_store(&self) -> Option<Arc<SecretStore>> {
+        self.store_available.then(|| Arc::clone(&self.secrets))
+    }
+
     /// Every connector, static shape merged with its row and its
     /// credential's presence, in [`ConnectorId::ALL`] order.
     /// Whether the platform credential store answers right now.

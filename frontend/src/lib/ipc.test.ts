@@ -3,6 +3,7 @@ import {
   BRIDGE_TIMEOUT_MS,
   BridgeUnavailable,
   CONFIRM_GRANT,
+  CONFIRM_NETWORK,
   CONFIRM_RELAXED,
   STATUS_TIMEOUT_MS,
   approvalsResolve,
@@ -22,6 +23,8 @@ import {
   daemonStatus,
   daemonStop,
   engineInstall,
+  engineImport,
+  engineRemove,
   engineStatus,
   evidenceGet,
   evidenceList,
@@ -36,10 +39,14 @@ import {
   flowsSettingsSet,
   grantsList,
   logCompress,
+  networkGet,
+  networkSet,
+  networkTest,
   modelsCatalog,
   modelsDefaultsSet,
   modelsDelete,
   modelsDownload,
+  modelsImport,
   modelsDownloadCancel,
   modelsList,
   modelsLoad,
@@ -186,6 +193,30 @@ describe("authority-expanding wrappers pass the typed confirmation to the bridge
       op: "admin.approvals.resolve",
       args: { request_id: "req_1", resolution: "approved", remember: true, note: "ok" },
       confirmation: "grant",
+    });
+  });
+
+  it("sends the network phrase beside the op, and the password only inside the patch", async () => {
+    await networkSet(
+      {
+        proxy: { url: "http://proxy.corp.example:3128", auth: "basic", username: "svc" },
+        credential: { set: "hunter2" },
+      },
+      CONFIRM_NETWORK,
+    );
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.network.set",
+      args: {
+        proxy: { url: "http://proxy.corp.example:3128", auth: "basic", username: "svc" },
+        credential: { set: "hunter2" },
+      },
+      confirmation: "network",
+    });
+    await networkSet({ ca_bundle: null });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("admin_call", {
+      op: "admin.network.set",
+      args: { ca_bundle: null },
+      confirmation: undefined,
     });
   });
 
@@ -376,6 +407,26 @@ describe("model wrappers speak the daemon's op names and arg shapes", () => {
     ["modelsUnload", () => modelsUnload(), "admin.models.unload", {}],
     ["engineStatus", () => engineStatus(), "admin.models.engine.status", {}],
     ["engineInstall", () => engineInstall(), "admin.models.engine.install", { confirm: true }],
+    [
+      "engineImport",
+      () => engineImport("/opt/pam/llama.tar.gz"),
+      "admin.models.engine.import",
+      { path: "/opt/pam/llama.tar.gz", confirm: true },
+    ],
+    ["engineRemove", () => engineRemove(), "admin.models.engine.remove", { confirm: true }],
+    [
+      "modelsImport (path only)",
+      () => modelsImport({ path: "/srv/m.gguf" }),
+      "admin.models.import",
+      { path: "/srv/m.gguf", confirm: true },
+    ],
+    [
+      "modelsImport (vendor and digest)",
+      () =>
+        modelsImport({ path: "/srv/x.gguf", vendor: "qwen", expected_sha256: "ab".repeat(32) }),
+      "admin.models.import",
+      { path: "/srv/x.gguf", vendor: "qwen", expected_sha256: "ab".repeat(32), confirm: true },
+    ],
     ["curatorList", () => curatorList(), "admin.curator.list", {}],
     ["curatorTest", () => curatorTest(), "admin.curator.test", {}],
     [
@@ -563,6 +614,20 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       "admin.connectors.configure",
       { id: "jira", username: null },
     ],
+    ["networkGet", () => networkGet(), "admin.network.get", {}],
+    [
+      "networkSet (a patch: absent keeps, null clears)",
+      () => networkSet({ proxy: null, no_proxy: ["corp.example"], engine_mirror: null }),
+      "admin.network.set",
+      { proxy: null, no_proxy: ["corp.example"], engine_mirror: null },
+    ],
+    [
+      "networkTest (one connector)",
+      () => networkTest("jenkins"),
+      "admin.network.test",
+      { target: "jenkins" },
+    ],
+    ["networkTest (everything configured)", () => networkTest(), "admin.network.test", {}],
     [
       "connectorsTest",
       () => connectorsTest("github"),

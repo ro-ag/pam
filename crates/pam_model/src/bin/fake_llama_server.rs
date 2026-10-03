@@ -13,7 +13,10 @@
 //! environment. `PAM_FAKE_HEALTH_DELAY_MS` delays readiness;
 //! `PAM_FAKE_EXIT_EARLY=1` exits at once, like a crashed server;
 //! `PAM_FAKE_MODEL_PATH` makes `/props` report that path instead of `-m`,
-//! like a stranger squatting the endpoint.
+//! like a stranger squatting the endpoint. `--version` prints a version
+//! line naming the pinned build (`pam_model::engine::ENGINE_BUILD`) and
+//! exits, so an archive holding this binary passes the installer's build
+//! check and the engine import can be exercised end to end.
 #![allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
@@ -36,6 +39,14 @@ struct Fake {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--version") {
+        println!(
+            "version: 0.0.0 (build {}, commit fake)",
+            pam_model::engine::ENGINE_BUILD
+        );
+        println!("built with pam-fake-llama-server");
+        return;
+    }
     let value = |flag: &str| {
         args.iter()
             .position(|a| a == flag)

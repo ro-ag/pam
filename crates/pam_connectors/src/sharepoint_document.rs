@@ -175,7 +175,11 @@ async fn capture(
                 "download exceeded the text capture limit",
             ));
         }
-        Err(crate::TransportError::Network(_) | crate::TransportError::Spawn(_)) => {
+        Err(
+            crate::TransportError::Net(_)
+            | crate::TransportError::Network(_)
+            | crate::TransportError::Spawn(_),
+        ) => {
             return Ok(Capture::Unavailable(
                 "download_unavailable",
                 "signed document download failed",

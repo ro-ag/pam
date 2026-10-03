@@ -1,15 +1,47 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use pam_net::testing::{FakeProxy, ProxyMode, TEST_HOST, base64};
+use pam_net::{MirrorBase, NetFailure, NetSettings, Proxy, ProxyAuth, ProxyPassword};
 use sha2::{Digest, Sha256};
 
+use crate::catalog::UPSTREAM_PREFIX;
 use crate::download::{
     Checkpoint, DownloadError, DownloadHandle, DownloadProgress, DownloadRequest, DownloadState,
-    TransferLimits, curl_env, curl_path, curl_recovery_line, discard_partial, failure_cause,
-    failure_recovery, inspect_partial, sidecar_paths, start, start_with_limits,
+    ImportRequest, TransferLimits, curl_path, curl_recovery_line, discard_partial,
+    failure_recovery, inspect_partial, sidecar_paths, start_import,
+    start_over_plain_http_for_tests,
 };
 use crate::registry::verified_sidecar_path;
 use crate::testing as origin;
+
+/// A direct profile: no proxy, the platform's trust.
+fn direct() -> Arc<NetSettings> {
+    Arc::new(NetSettings::direct())
+}
+
+/// Every origin here is a plain-http loopback listener, so every transfer
+/// goes through the test allowance; production `start` refuses `http://`
+/// (`plain_http_is_refused_in_production`).
+fn start(request: DownloadRequest) -> Result<DownloadHandle, DownloadError> {
+    start_over_plain_http_for_tests(request, direct(), TransferLimits::default())
+}
+
+fn start_with_limits(
+    request: DownloadRequest,
+    limits: TransferLimits,
+) -> Result<DownloadHandle, DownloadError> {
+    start_over_plain_http_for_tests(request, direct(), limits)
+}
+
+/// A transfer under `net`: a proxied profile, in the tests that have one.
+fn start_under(
+    request: DownloadRequest,
+    net: NetSettings,
+) -> Result<DownloadHandle, DownloadError> {
+    start_over_plain_http_for_tests(request, Arc::new(net), TransferLimits::default())
+}
 
 /// Every CI runner ships curl, so this never skips there; a machine without
 /// it should still get a green suite and a legible reason.
@@ -340,8 +372,17 @@ async fn a_file_that_appears_mid_transfer_is_never_overwritten() {
 }
 
 #[test]
-fn a_url_that_is_not_http_is_refused_before_curl_runs() {
+fn a_url_that_is_not_https_is_refused_before_curl_runs() {
     let fixture = fixture();
+    let request = |url: &str| DownloadRequest {
+        url: url.to_owned(),
+        dest: fixture.dest.clone(),
+        expected_size: None,
+        expected_sha256: None,
+        license_id: None,
+    };
+    // Refused by the test allowance as well: never an option, a file, a
+    // scheme curl would speak, user information, or a control character.
     for url in [
         "-K/tmp/x/a.gguf",
         "--config=/tmp/evil",
@@ -349,19 +390,13 @@ fn a_url_that_is_not_http_is_refused_before_curl_runs() {
         "ftp://example.invalid/x.gguf",
         "http://",
         "https:///nohost",
+        "https://user:pw@example.com/x.gguf",
         "example.com/x.gguf",
         "http://example.com/x\n.gguf",
         "",
     ] {
-        let request = DownloadRequest {
-            url: url.to_owned(),
-            dest: fixture.dest.clone(),
-            expected_size: None,
-            expected_sha256: None,
-            license_id: None,
-        };
         assert!(
-            matches!(&start(request), Err(DownloadError::InvalidUrl(bad)) if bad == url),
+            matches!(&start(request(url)), Err(DownloadError::InvalidUrl(bad)) if bad == url),
             "{url:?} must be refused as a URL"
         );
     }
@@ -371,11 +406,50 @@ fn a_url_that_is_not_http_is_refused_before_curl_runs() {
     );
     for url in [
         "https://example.com/x.gguf",
-        "HTTP://127.0.0.1:1/x",
-        "http://[::1]:1/x",
+        "HTTPS://127.0.0.1:1/x",
+        "https://[::1]:1/x",
     ] {
         assert!(crate::download::check_url(url).is_ok(), "{url}");
     }
+    for url in ["http://example.com/x.gguf", "HTTP://127.0.0.1:1/x"] {
+        assert!(
+            matches!(
+                crate::download::check_url(url),
+                Err(DownloadError::InvalidUrl(_))
+            ),
+            "{url} is plain http"
+        );
+    }
+}
+
+/// Production refuses a plain-`http` address outright, before curl, the
+/// lock or a part file exist; the refusal names the address and says why.
+#[tokio::test]
+async fn plain_http_is_refused_in_production() {
+    let fixture = fixture();
+    let bytes = body(1024);
+    let server = origin::serve(bytes.clone(), "v1").await;
+    let request = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    assert!(request.url.starts_with("http://"));
+
+    let refused = crate::download::start(request.clone(), direct());
+    let Err(DownloadError::InvalidUrl(named)) = refused else {
+        panic!("a plain-http address must be refused, got {refused:?}");
+    };
+    assert_eq!(named, request.url);
+    let sentence = DownloadError::InvalidUrl(named).to_string();
+    assert!(
+        sentence.contains("only https addresses are downloaded"),
+        "{sentence}"
+    );
+    assert!(server.requests().is_empty(), "curl never ran");
+    assert!(!sidecar_paths(&fixture.dest).lock.exists());
+    assert!(!sidecar_paths(&fixture.dest).part.exists());
+
+    // The same request under the allowance is what the rest of this suite
+    // runs on; the allowance admits only what the origin fixture needs.
+    let refused = crate::download::start_with_limits(request, direct(), impatient());
+    assert!(matches!(refused, Err(DownloadError::InvalidUrl(_))));
 }
 
 #[test]
@@ -541,13 +615,10 @@ async fn a_stalled_transfer_is_abandoned_and_stays_resumable() {
         panic!("a transfer under the rate floor must be abandoned, got {state:?}");
     };
     assert_eq!(
-        cause, "network_timeout",
+        cause, "timeout",
         "a stall is named as one, not as a generic failure: {detail}"
     );
-    assert!(
-        detail.contains("curl exited 28"),
-        "the exit code survives: {detail}"
-    );
+    assert_eq!(detail, NetFailure::Timeout.sentence());
 
     let paths = sidecar_paths(&fixture.dest);
     assert!(
@@ -573,39 +644,26 @@ async fn a_refused_connection_is_named_as_one() {
         panic!("a refused connection must fail the transfer, got {state:?}");
     };
     assert_eq!(cause, "connect_failed", "detail was {detail}");
-}
-
-#[test]
-fn curl_exit_codes_become_causes_a_human_can_act_on() {
-    assert_eq!(failure_cause(Some(6)), "dns_failed");
-    assert_eq!(failure_cause(Some(7)), "connect_failed");
-    assert_eq!(failure_cause(Some(28)), "network_timeout");
-    assert_eq!(failure_cause(Some(22)), "http_error");
-    assert_eq!(failure_cause(Some(23)), "disk_error");
-    assert_eq!(failure_cause(Some(18)), "transfer_interrupted");
-    assert_eq!(failure_cause(Some(33)), "resume_unsupported");
-    assert_eq!(failure_cause(Some(60)), "tls_error");
-    assert_eq!(failure_cause(Some(1)), "download_failed");
     assert_eq!(
-        failure_cause(None),
-        "download_failed",
-        "a killed curl has no code to read"
+        detail,
+        NetFailure::ConnectFailed {
+            host: "127.0.0.1".to_owned()
+        }
+        .sentence()
+    );
+    assert_ne!(
+        failure_recovery(&cause),
+        failure_recovery("something new"),
+        "the launcher's cause has a download recovery line"
     );
 }
 
 #[test]
 fn every_cause_carries_its_own_recovery_sentence() {
     let fallback = failure_recovery("something new");
-    for cause in [
+    // This module's own causes, then every cause the launcher can answer.
+    let own = [
         "curl_missing",
-        "dns_failed",
-        "connect_failed",
-        "network_timeout",
-        "http_error",
-        "tls_error",
-        "transfer_interrupted",
-        "resume_unsupported",
-        "disk_error",
         "io",
         "digest_mismatch",
         "size_mismatch",
@@ -615,11 +673,74 @@ fn every_cause_carries_its_own_recovery_sentence() {
         "daemon_restart",
         "verify_failed",
         "lock_release_failed",
-    ] {
+        "no_space",
+        "model_changed",
+    ];
+    let host = || "h.example".to_owned();
+    let proxy = || "proxy.example:3128".to_owned();
+    let launcher = [
+        NetFailure::CurlUnavailable,
+        NetFailure::CurlTooOld {
+            found: "7.0.0".to_owned(),
+            needed: "7.63.0",
+            feature: "a proxy",
+        },
+        NetFailure::SettingsInvalid("x".to_owned()),
+        NetFailure::CaBundleTampered,
+        NetFailure::RequestInvalid {
+            field: "url",
+            detail: "x".to_owned(),
+        },
+        NetFailure::Spawn("x".to_owned()),
+        NetFailure::ProxyDnsFailed { proxy: proxy() },
+        NetFailure::ProxyUnreachable { proxy: proxy() },
+        NetFailure::ProxyAuthRequired {
+            proxy: proxy(),
+            offered: Vec::new(),
+        },
+        NetFailure::ProxyAuthRejected { proxy: proxy() },
+        NetFailure::ProxyDenied {
+            proxy: proxy(),
+            target: host(),
+            status: 403,
+        },
+        NetFailure::DnsFailed { host: host() },
+        NetFailure::ConnectFailed { host: host() },
+        NetFailure::ConnectTimeout { host: host() },
+        NetFailure::TlsUntrustedIssuer {
+            host: host(),
+            issuer: None,
+            backend: "LibreSSL".to_owned(),
+        },
+        NetFailure::TlsHostnameMismatch { host: host() },
+        NetFailure::TlsExpired { host: host() },
+        NetFailure::TlsRevocationUnavailable { host: host() },
+        NetFailure::TlsFailed {
+            host: host(),
+            detail: "x".to_owned(),
+        },
+        NetFailure::CaBundleUnreadable,
+        NetFailure::Timeout,
+        NetFailure::Deadline,
+        NetFailure::TooLarge { maximum: 1 },
+        NetFailure::HttpStatus { status: Some(403) },
+        NetFailure::WriteFailed,
+        NetFailure::TransferInterrupted { exit: 18 },
+        NetFailure::ResumeUnsupported,
+        NetFailure::Other {
+            exit: Some(1),
+            detail: "x".to_owned(),
+        },
+    ];
+    for cause in own
+        .into_iter()
+        .chain(launcher.iter().map(NetFailure::cause))
+    {
         let line = failure_recovery(cause);
         assert_ne!(line, fallback, "{cause} deserves better than the fallback");
         assert!(!line.is_empty(), "{cause} has no recovery line");
     }
+    assert_eq!(failure_recovery("curl_missing"), curl_recovery_line());
 }
 
 #[tokio::test]
@@ -901,29 +1022,478 @@ fn terminal_publication_unlocks_even_while_a_duplicate_handle_survives() {
     assert_eq!(discard_partial(&fixture.dest).unwrap(), 7);
 }
 
-#[test]
-fn a_downloads_curl_keeps_only_the_named_network_variables() {
-    let vars = [
-        ("SSLKEYLOGFILE", "/tmp/keys"),
-        ("CURL_HOME", "/tmp/planted"),
-        ("HOME", "/Users/someone"),
-        ("PATH", "/tmp/agent-bin"),
-        ("LD_PRELOAD", "/tmp/evil.so"),
-        ("HTTPS_PROXY", "http://proxy.corp:3128"),
-        ("CURL_CA_BUNDLE", "/etc/corp-ca.pem"),
-        ("SystemRoot", "C:\\Windows"),
-    ]
-    .map(|(name, value)| {
-        (
-            std::ffi::OsString::from(name),
-            std::ffi::OsString::from(value),
+/// A profile with the fake proxy in it, with or without a credential.
+fn through(proxy: &FakeProxy, auth: ProxyAuth, password: Option<&str>) -> NetSettings {
+    let username = (auth != ProxyAuth::None).then_some("svc-pam");
+    let proxy = Proxy::parse(&proxy.url(), auth, username).unwrap();
+    let password = password.map(|value| ProxyPassword::new(value).unwrap());
+    NetSettings::new(Some(proxy), password, Vec::new(), None).unwrap()
+}
+
+/// `http://origin.pam-test.invalid/<name>`: a name only the proxy reaches.
+fn far(name: &str) -> String {
+    format!("http://{TEST_HOST}/{name}")
+}
+
+#[tokio::test]
+async fn a_proxied_transfer_resumes_through_the_proxy_and_lands() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(256 * 1024);
+    let server = origin::serve_interrupting(bytes.clone(), "v1", 64 * 1024).await;
+    let proxy = FakeProxy::start(ProxyMode::Allow, server_address(&server)).await;
+    let request = request_for(far("Qwen3.gguf"), &fixture.dest, &bytes);
+    let paths = sidecar_paths(&fixture.dest);
+
+    let broken =
+        settled(&start_under(request.clone(), through(&proxy, ProxyAuth::None, None)).unwrap())
+            .await;
+    assert!(
+        matches!(&broken, DownloadState::Failed { cause, .. } if cause == "transfer_interrupted"),
+        "{broken:?}"
+    );
+    assert_eq!(std::fs::metadata(&paths.part).unwrap().len(), 64 * 1024);
+
+    assert_eq!(
+        settled(&start_under(request, through(&proxy, ProxyAuth::None, None)).unwrap()).await,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: size_of(&bytes),
+        }
+    );
+    assert_eq!(std::fs::read(&fixture.dest).unwrap(), bytes);
+    assert_eq!(
+        proxy.request_lines(),
+        vec![
+            format!("CONNECT {TEST_HOST}:80 HTTP/1.1"),
+            format!("CONNECT {TEST_HOST}:80 HTTP/1.1"),
+        ],
+        "both runs went through the proxy, as a CONNECT tunnel"
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|line| line.trim() == "Range: bytes=65536-"),
+        "the resume still asks for a range: {:?}",
+        server.requests()
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|line| !line.starts_with("Proxy-Authorization")),
+        "nothing for the proxy reaches the origin"
+    );
+}
+
+/// The proxy password the fake proxy is asked for, and must never echo.
+const PROXY_PASSWORD: &str = "pr0xy \"secret\\ with:colon";
+
+#[tokio::test]
+async fn a_rejected_proxy_credential_fails_the_transfer_without_the_password() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(4 * 1024);
+    let server = origin::serve(bytes.clone(), "v1").await;
+    let proxy = FakeProxy::start(
+        ProxyMode::RequireAuth {
+            username: "svc-pam".to_owned(),
+            password: "something else".to_owned(),
+            offer: vec!["Basic realm=\"pam-test\"".to_owned()],
+        },
+        server_address(&server),
+    )
+    .await;
+    let request = request_for(far("Qwen3.gguf"), &fixture.dest, &bytes);
+
+    let state = settled(
+        &start_under(
+            request,
+            through(&proxy, ProxyAuth::Basic, Some(PROXY_PASSWORD)),
         )
-    });
+        .unwrap(),
+    )
+    .await;
+    let DownloadState::Failed { cause, detail } = &state else {
+        panic!("the proxy refused the credential, got {state:?}");
+    };
+    assert_eq!(cause, "proxy_auth_rejected");
+    let encoded = base64(format!("svc-pam:{PROXY_PASSWORD}").as_bytes());
+    for rendering in [
+        detail.clone(),
+        format!("{state:?}"),
+        serde_json::to_string(&state).unwrap(),
+        failure_recovery(cause).to_owned(),
+    ] {
+        assert!(!rendering.contains(PROXY_PASSWORD), "{rendering}");
+        assert!(!rendering.contains(&encoded), "{rendering}");
+        assert!(!rendering.contains("secret"), "{rendering}");
+    }
+    assert!(
+        detail.contains(&proxy.address().to_string()),
+        "the proxy is named: {detail}"
+    );
+    assert!(server.requests().is_empty(), "nothing reached the origin");
+    assert!(
+        !fixture.dest.exists(),
+        "nothing lands under the model's name"
+    );
+}
 
-    let kept: Vec<String> = curl_env(vars.into_iter())
-        .into_iter()
-        .map(|(name, _)| name.to_string_lossy().into_owned())
-        .collect();
+/// A catalog address under the upstream prefix is fetched from the mirror,
+/// same path, same digest; the local origin plays the mirror.
+#[tokio::test]
+async fn a_catalog_download_goes_to_the_mirror_under_the_same_path_and_digest() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(96 * 1024);
+    let server = origin::serve(bytes.clone(), "v1").await;
+    let mirror = MirrorBase::for_tests(&server.url("hf"));
+    let upstream = format!("{UPSTREAM_PREFIX}org/model/resolve/main/Qwen3.gguf");
 
-    assert_eq!(kept, vec!["HTTPS_PROXY", "CURL_CA_BUNDLE", "SystemRoot"]);
+    let request = request_for(upstream.clone(), &fixture.dest, &bytes)
+        .via_mirror(Some(&mirror), UPSTREAM_PREFIX);
+    assert_eq!(
+        request.url,
+        server.url("hf/org/model/resolve/main/Qwen3.gguf"),
+        "the prefix is replaced, the rest of the path is kept"
+    );
+    assert_eq!(request.expected_sha256, Some(sha256_of(&bytes)));
+
+    assert_eq!(
+        settled(&start(request).unwrap()).await,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: size_of(&bytes),
+        }
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|line| line.starts_with("GET /hf/org/model/resolve/main/Qwen3.gguf ")),
+        "the mirror is asked for the catalog path: {:?}",
+        server.requests()
+    );
+
+    // Not under the prefix: a pasted address is never rewritten.
+    let pasted = request_for(
+        "https://files.example/other.gguf".to_owned(),
+        &fixture.dest,
+        &bytes,
+    )
+    .via_mirror(Some(&mirror), UPSTREAM_PREFIX);
+    assert_eq!(pasted.url, "https://files.example/other.gguf");
+    let direct =
+        request_for(upstream.clone(), &fixture.dest, &bytes).via_mirror(None, UPSTREAM_PREFIX);
+    assert_eq!(direct.url, upstream);
+}
+
+/// The mirror serves the same bytes or nothing: a mirror that serves
+/// something else is a digest mismatch, like a corrupted upstream transfer.
+#[tokio::test]
+async fn a_mirror_that_serves_other_bytes_is_a_digest_mismatch() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(8 * 1024);
+    let server = origin::serve(body(8 * 1024 + 1), "v1").await;
+    let mirror = MirrorBase::for_tests(&server.url(""));
+    let request = request_for(
+        format!("{UPSTREAM_PREFIX}org/model/resolve/main/Qwen3.gguf"),
+        &fixture.dest,
+        &bytes,
+    )
+    .via_mirror(Some(&mirror), UPSTREAM_PREFIX);
+    let mut request = request;
+    request.expected_size = None;
+
+    let state = settled(&start(request).unwrap()).await;
+    assert!(
+        matches!(&state, DownloadState::Failed { cause, .. } if cause == "digest_mismatch"),
+        "{state:?}"
+    );
+    assert!(!fixture.dest.exists());
+    assert!(!sidecar_paths(&fixture.dest).part.exists());
+}
+
+/// The checkpoint records the effective address, so bytes fetched from
+/// upstream are never glued onto a mirror transfer.
+#[tokio::test]
+async fn a_partial_from_upstream_conflicts_with_a_mirror_request() {
+    require_curl!();
+    let fixture = fixture();
+    let bytes = body(256 * 1024);
+    let server = origin::serve_interrupting(bytes.clone(), "v1", 64 * 1024).await;
+    let upstream = request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes);
+    let broken = settled(&start(upstream.clone()).unwrap()).await;
+    assert!(matches!(broken, DownloadState::Failed { .. }), "{broken:?}");
+    assert_eq!(
+        inspect_partial(&fixture.dest).unwrap().source.as_deref(),
+        Some(upstream.url.as_str())
+    );
+
+    let mirror = MirrorBase::for_tests(&server.url("mirror"));
+    let mut via_mirror = upstream.clone();
+    via_mirror.url = mirror.join("Qwen3.gguf").unwrap().into();
+    let refused = start(via_mirror);
+    assert!(
+        matches!(refused, Err(DownloadError::CheckpointConflict(_))),
+        "a mirror request over an upstream partial is a conflict, got {refused:?}"
+    );
+    assert_eq!(discard_partial(&fixture.dest).unwrap(), 64 * 1024);
+}
+
+/// The fixture's loopback address, as the fake proxy's upstream.
+fn server_address(server: &origin::TestServer) -> std::net::SocketAddr {
+    server
+        .url("")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap()
+}
+
+// ---- importing weights from a file on this machine ----
+
+/// A `.gguf` source outside the models directory, holding `bytes`.
+fn import_source(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Qwen3.gguf");
+    std::fs::write(&path, bytes).unwrap();
+    (dir, path)
+}
+
+fn import_request(source: &Path, dest: &Path, bytes: &[u8]) -> ImportRequest {
+    ImportRequest {
+        source: source.to_path_buf(),
+        dest: dest.to_path_buf(),
+        expected_size: Some(size_of(bytes)),
+        expected_sha256: Some(sha256_of(bytes)),
+    }
+}
+
+/// An import copies the file in through the same part file and link as a
+/// download, reports the digest of the copy, leaves the source as it was
+/// and no sidecar behind; a second import of the same file is refused.
+#[tokio::test]
+async fn an_import_copies_hashes_and_lands_without_touching_the_source() {
+    let bytes = body(3 * 1024 * 1024 + 17);
+    let (_src, source) = import_source(&bytes);
+    let before = std::fs::metadata(&source).unwrap();
+    let fixture = fixture();
+    let handle = start_import(import_request(&source, &fixture.dest, &bytes)).unwrap();
+    assert!(
+        matches!(handle.state(), DownloadState::Running(DownloadProgress { bytes: 0, total: Some(t) }) if t == size_of(&bytes))
+    );
+    let state = settled(&handle).await;
+    assert_eq!(
+        state,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: size_of(&bytes)
+        }
+    );
+    assert_eq!(std::fs::read(&fixture.dest).unwrap(), bytes);
+    assert_eq!(dir_entries(fixture.dest.parent().unwrap()), ["Qwen3.gguf"]);
+    let after = std::fs::metadata(&source).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        bytes,
+        "the original is untouched"
+    );
+    let again = start_import(import_request(&source, &fixture.dest, &bytes));
+    assert!(
+        matches!(again, Err(DownloadError::AlreadyExists(_))),
+        "{again:?}"
+    );
+}
+
+/// The expected digest is the trust anchor: a file that hashes to anything
+/// else is not imported, and no copy of it is left anywhere.
+#[tokio::test]
+async fn an_import_with_the_wrong_digest_removes_the_copy() {
+    let bytes = body(70_000);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let mut request = import_request(&source, &fixture.dest, &bytes);
+    request.expected_sha256 = Some("f".repeat(64));
+    let handle = start_import(request).unwrap();
+    let state = settled(&handle).await;
+    assert!(
+        matches!(state, DownloadState::Failed { ref cause, .. } if cause == "digest_mismatch"),
+        "{state:?}"
+    );
+    assert!(!fixture.dest.exists());
+    assert!(
+        dir_entries(fixture.dest.parent().unwrap()).is_empty(),
+        "no part, no lock"
+    );
+    assert!(source.is_file(), "the original is untouched");
+}
+
+/// Without an expected digest the file is still copied and its digest
+/// reported; the caller decides what that means (unverified).
+#[tokio::test]
+async fn an_import_without_a_digest_lands_and_reports_what_it_hashed_to() {
+    let bytes = body(1000);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let handle = start_import(ImportRequest {
+        source: source.clone(),
+        dest: fixture.dest.clone(),
+        expected_size: None,
+        expected_sha256: None,
+    })
+    .unwrap();
+    assert_eq!(
+        settled(&handle).await,
+        DownloadState::Done {
+            sha256: sha256_of(&bytes),
+            size_bytes: 1000
+        }
+    );
+    assert!(fixture.dest.is_file());
+}
+
+/// A wrong size is named before any digest is talked about.
+#[tokio::test]
+async fn an_import_of_the_wrong_size_is_named_as_one() {
+    let bytes = body(500);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let mut request = import_request(&source, &fixture.dest, &bytes);
+    request.expected_size = Some(499);
+    let state = settled(&start_import(request).unwrap()).await;
+    assert!(
+        matches!(state, DownloadState::Failed { ref cause, .. } if cause == "size_mismatch"),
+        "{state:?}"
+    );
+    assert!(!fixture.dest.exists());
+}
+
+/// What is refused before a copy starts: a missing file, a symbolic link, a
+/// directory, a file that is not a `.gguf`, a relative path, and a file
+/// already inside the models directory.
+#[cfg(unix)]
+#[test]
+fn an_import_source_that_breaks_a_rule_is_refused_by_name() {
+    let bytes = body(10);
+    let (src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let request = |path: &Path| ImportRequest {
+        source: path.to_path_buf(),
+        dest: fixture.dest.clone(),
+        expected_size: None,
+        expected_sha256: None,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+
+    let missing = start_import(request(&src.path().join("absent.gguf")));
+    assert!(
+        matches!(missing, Err(DownloadError::ImportSourceMissing(_))),
+        "{missing:?}"
+    );
+
+    let link = src.path().join("link.gguf");
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    let linked = start_import(request(&link));
+    assert!(
+        matches!(linked, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("symbolic link")),
+        "{linked:?}"
+    );
+
+    let dir = src.path().join("tree.gguf");
+    std::fs::create_dir(&dir).unwrap();
+    let directory = start_import(request(&dir));
+    assert!(
+        matches!(directory, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("regular file")),
+        "{directory:?}"
+    );
+
+    let text = src.path().join("notes.txt");
+    std::fs::write(&text, b"x").unwrap();
+    let not_gguf = start_import(request(&text));
+    assert!(
+        matches!(not_gguf, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains(".gguf")),
+        "{not_gguf:?}"
+    );
+
+    let relative = start_import(request(Path::new("relative/Qwen3.gguf")));
+    assert!(
+        matches!(relative, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("absolute")),
+        "{relative:?}"
+    );
+
+    let inside = fixture.dest.parent().unwrap().join("Already.gguf");
+    std::fs::write(&inside, b"x").unwrap();
+    let in_models = start_import(request(&inside));
+    assert!(
+        matches!(in_models, Err(DownloadError::ImportSourceRefused { ref reason, .. }) if reason.contains("models directory")),
+        "{in_models:?}"
+    );
+    assert!(!fixture.dest.exists());
+    assert_eq!(
+        dir_entries(fixture.dest.parent().unwrap()),
+        ["Already.gguf"]
+    );
+}
+
+/// A download holding the destination's lock, or a partial download beside
+/// it, refuses the import: an import never writes under a transfer and
+/// never glues onto downloaded bytes.
+#[tokio::test]
+async fn an_import_over_a_running_or_partial_download_is_refused() {
+    require_curl!();
+    let bytes = body(256 * 1024);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let server = origin::serve_slowly(
+        bytes.clone(),
+        "\"etag\"",
+        4 * 1024,
+        Duration::from_millis(40),
+    )
+    .await;
+    let download = start(request_for(server.url("Qwen3.gguf"), &fixture.dest, &bytes)).unwrap();
+    let paths = sidecar_paths(&fixture.dest);
+    assert!(wait_for_path(&paths.part).await);
+    let locked = start_import(import_request(&source, &fixture.dest, &bytes));
+    assert!(
+        matches!(locked, Err(DownloadError::Locked(_))),
+        "{locked:?}"
+    );
+    download.cancel();
+    assert_eq!(settled(&download).await, DownloadState::Cancelled);
+    assert!(paths.part.exists(), "the cancelled download keeps its part");
+    let conflict = start_import(import_request(&source, &fixture.dest, &bytes));
+    assert!(
+        matches!(conflict, Err(DownloadError::CheckpointConflict(_))),
+        "{conflict:?}"
+    );
+    assert!(paths.part.exists(), "the partial download is not touched");
+    discard_partial(&fixture.dest).unwrap();
+    let ok = start_import(import_request(&source, &fixture.dest, &bytes)).unwrap();
+    assert!(matches!(settled(&ok).await, DownloadState::Done { .. }));
+}
+
+/// Cancelling an import deletes the partial copy: there is nothing to
+/// resume, and a part file would read as a partial download.
+#[tokio::test]
+async fn cancelling_an_import_leaves_nothing_behind() {
+    let bytes = body(64 * 1024 * 1024);
+    let (_src, source) = import_source(&bytes);
+    let fixture = fixture();
+    let handle = start_import(import_request(&source, &fixture.dest, &bytes)).unwrap();
+    handle.cancel();
+    assert_eq!(settled(&handle).await, DownloadState::Cancelled);
+    assert!(!fixture.dest.exists());
+    assert!(
+        dir_entries(fixture.dest.parent().unwrap()).is_empty(),
+        "no part, no lock"
+    );
+    assert!(source.is_file());
 }

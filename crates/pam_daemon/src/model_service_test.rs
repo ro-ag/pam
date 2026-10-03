@@ -11,11 +11,14 @@ use crate::model_service::{
 };
 use crate::test_log::Captured;
 
-/// A service over a fresh in-memory store, pointed at `dir`.
+/// A service over a fresh in-memory store, pointed at `dir`. Its
+/// downloads may fetch from the plain-http loopback origin the fixtures
+/// serve; production refuses `http://`.
 async fn service(dir: &std::path::Path) -> Arc<ModelService> {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let service = ModelService::new(Arc::clone(&store)).await.unwrap();
     service.set_models_dir(dir).await.unwrap();
+    service.allow_plain_http_downloads_for_tests();
     service
 }
 
@@ -437,10 +440,10 @@ async fn a_registry_switch_rejects_an_entry_resolved_from_the_old_directory() {
 
 /// The fake llama-server `cargo test` builds for `pam_model`, found next to
 /// this test binary's directory; `None` when it was not built.
-#[cfg(unix)]
-fn fake_engine_binary() -> Option<std::path::PathBuf> {
+pub(crate) fn fake_engine_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.parent()?.join("pam-fake-llama-server");
+    let name = format!("pam-fake-llama-server{}", std::env::consts::EXE_SUFFIX);
+    let path = exe.parent()?.parent()?.join(name);
     path.is_file().then_some(path)
 }
 
@@ -462,6 +465,7 @@ fn install_fake_engine(service: &ModelService, fake: &std::path::Path) {
         bytes: target.asset().bytes,
         version_line: "version: fake".into(),
         installed_at_ms: 0,
+        source: None,
     };
     std::fs::write(
         layout.manifest_path(),
@@ -978,6 +982,7 @@ async fn shutdown_stops_running_transfers_and_their_followers_before_the_store_c
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let service = ModelService::new(Arc::clone(&store)).await.unwrap();
     service.set_models_dir(dir.path()).await.unwrap();
+    service.allow_plain_http_downloads_for_tests();
     service.set_engine_base(dir.path().join("base"));
 
     // A verification that is still hashing when the shutdown comes (sparse:
@@ -1071,6 +1076,14 @@ async fn shutdown_stops_running_transfers_and_their_followers_before_the_store_c
 
 /// The wait for the followers is bounded: one that has not ended in time is
 /// reported and left running, and the shutdown returns.
+///
+/// The task that does not end in time is one this test holds shut: a
+/// zero wait is not "no time" on tokio — `timeout(ZERO, ..)` yields once
+/// when the task's cooperative budget is spent, and in that one yield a
+/// cancelled follower can finish on a fast host, which left nothing to
+/// report and an empty log to assert on (1 run in 11 on Windows). The
+/// verify follower is still started and still checked below: left, not
+/// aborted, it records why its job ended.
 #[tokio::test]
 async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
@@ -1084,8 +1097,15 @@ async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
         .unwrap();
     let entry = service.find("qwen/big").await.unwrap().unwrap();
     let job = service.start_verify(entry).await.unwrap();
+    // A task of the service's own that ends only when this test says so:
+    // whatever the scheduler does, the join cannot complete before the
+    // wait does.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    service.spawn_task({
+        let gate = Arc::clone(&gate);
+        async move { gate.notified().await }
+    });
 
-    // No time at all: the follower cannot have recorded its verdict yet.
     let (log, logging) = Captured::start();
     let started = std::time::Instant::now();
     service.shutdown_within(std::time::Duration::ZERO).await;
@@ -1094,7 +1114,16 @@ async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
     let text = log.text();
     assert!(text.contains("WARN"), "{text}");
     assert!(text.contains("did not stop in time"), "{text}");
-    assert!(text.contains("left=1") || text.contains("left=2"), "{text}");
+    // The held task for certain; the follower and the idle ticker if they
+    // had not ended by then.
+    let left: usize = text
+        .lines()
+        .find_map(|line| line.split("left=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("the warning names how many were left: {text}"));
+    assert!((1..=3).contains(&left), "{text}");
+    gate.notify_one();
 
     // Left, not aborted: it still records why its job ended.
     let row = finished_job(&service, &job).await;

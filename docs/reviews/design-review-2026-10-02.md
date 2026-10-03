@@ -111,8 +111,8 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 6 | Medium | The advisory model sits on the flow's critical path with a 15-minute, uncancellable, globally serialized call | `model_service.rs:612-1197`, `log_service.rs:473-515` | fixed: 5 minutes in all, 2 minutes in the engine, cancel threaded from the flow step |
 | 7 | Medium | The summary prompt mixes the host's exit status with untrusted log text, and the summary reaches the agent unlabelled | `compact.rs:657`, `log_service.rs:42-648` | fixed: host facts in the system turn, evidence fenced by a per-call token, `[untrusted local-model summary]` in the CLI; the GUI summary is still unlabelled |
 | 8 | Medium | The structured diagnosis stack has no production caller and two latent authority bugs | `diagnosis_service.rs:512` | partly fixed: both latent bugs fixed; wiring or deleting the stack is an owner decision |
-| 9 | Medium | Two curl launchers with divergent policy; connectors cannot be configured for enterprise networks | `curl.rs:154`, `download.rs:818-853` | partly fixed: downloads clear the environment but a proxy and certificate allowlist; one module and daemon-owned proxy and CA settings need an owner decision |
-| 10 | Low-medium | The log redirect hop has no host or port constraint, and a second weaker redirect implementation exists | `connector_service.rs:876-902`, `curl.rs:320-339` | partly fixed: IP literals, local-looking names and ports other than 443 refused; a strict host allowlist is an owner decision |
+| 9 | Medium | Two curl launchers with divergent policy; connectors cannot be configured for enterprise networks | `curl.rs:154`, `download.rs:818-853` | fixed (2026-10-02, [enterprise network and engine delivery](../specs/2026-10-02-enterprise-network-and-engine-delivery.md)): one launcher in `pam_net` with a constant argv, a cleared environment and https-only; daemon-owned proxy, no-proxy, CA bundle and mirror settings set in Settings › Network, applied to connectors and downloads alike; no environment variable is read |
+| 10 | Low-medium | The log redirect hop has no host or port constraint, and a second weaker redirect implementation exists | `connector_service.rs:876-902`, `curl.rs:320-339` | partly fixed: IP literals, local-looking names and ports other than 443 refused; since 2026-10-02 every redirect, download and mirror hop may only go to https (`proto-redir`), mirror hosts must be https and never loopback or link-local, and a managed `mirror_allowed_hosts` allowlist exists for mirrors; a strict host allowlist for the log redirect itself is still an owner decision |
 | 11 | Low-medium | Credentials are stored untrimmed; control characters round-trip into the header | `admin_connectors.rs:307`, `curl.rs:218-406` | fixed |
 | 12 | Low | One hung keychain prompt stalls every connector | `blocking_jobs.rs:151`, `secrets.rs:631` | fixed for reads (20 s bound); writes stay unbounded; a per-request credential cache is deferred |
 | 13 | Low | The AWS refusal is a single `if` in the daemon; the adapter is unsafe if it moves | `connector_service.rs:514`, `aws.rs:126-287` | fixed: the adapter's one spawn point refuses; deleting or containing the adapter is an owner decision |
@@ -204,7 +204,13 @@ From the fix reports:
   fingerprint check and the engine's open.
 - Daemon-owned proxy and certificate settings so connector reads and downloads
   work on an enterprise network, and unifying the two curl launchers.
-- A strict host allowlist for log redirects.
+  **Done 2026-10-02** ([spec](../specs/2026-10-02-enterprise-network-and-engine-delivery.md)):
+  Settings › Network, `pam_net`, mirrors, install from a file, import weights
+  from a file, remove engine, and the disclosure on the engine card and in the
+  README that closes ptrack issue 43 (the owner had not been told that
+  inference runs a downloaded `llama-server` process).
+- A strict host allowlist for log redirects (mirrors have a policy-only
+  allowlist since 2026-10-02; the log redirect hop does not).
 - Bind the model qualification record to the prompt and server options, so a
   change in framing drops the "qualified" badge.
 - Whether the AWS adapter stays, is contained, or is deleted.
@@ -239,7 +245,8 @@ Not done, with the reason.
 - **A dedicated `client_version_mismatch` message in the client and a Settings
   surface in the GUI**: the cause is an ordinary refusal today.
 - **Unifying the two trusted-curl path checks** (model 9): the two crates share no
-  dependency.
+  dependency. **Done 2026-10-02**: the leaf crate `pam_net` owns the one check
+  and the one launcher.
 - **A per-request credential cache** (model 12).
 - **The development-build GUI URL** (client 3): a known development-only caveat.
 - **Relay `prepare` symlink hardening** (client 11), and client 15 items (a),

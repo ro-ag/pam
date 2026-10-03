@@ -124,6 +124,11 @@ admission capacity.
 | Command/connector attempts per request | 256 |
 | Physical HTTP calls per request | 128 |
 | Accepted HTTP bodies per request | 128 MiB cumulative |
+| `admin.network.test` | 20 seconds in the daemon (25 in the GUI bridge); at most 12 targets, 4 probed at a time, each one credential-free `HEAD` with an 8-second transfer limit and a 5-second connect limit; targets come from configured state only, never a free-form address |
+| Network settings document (`net.settings`) | 16 KiB; proxy address 255 bytes with an explicit port; proxy user name 128 bytes; no-proxy list 64 entries of 255 bytes; a mirror address 512 bytes |
+| CA bundle import | A 4 MiB source file holding at most 512 certificate blocks; the private copy holds certificates only |
+| Engine install and import (`admin.models.engine.install`, `.import`) | One synchronous op under the GUI bridge's 120-second deadline; a timed-out download resumes on the next Install, an import copies again |
+| Engine and weights imports, free space | Refused before the copy when the volume holding the destination has less than the file's size plus 64 MiB free (measured on macOS; elsewhere a full volume is reported from the write) |
 | Command capture per request | 128 MiB cumulative |
 | Accounted blocking jobs | Eight executing; 128 outstanding including waiting lanes |
 | Store calls queued per connection | 1,024, waiting plus running, on the writing connection and on the read-only one. The next call is refused before it runs and writes nothing; a public request that meets it is refused `store_overloaded`, marked retryable (a follow and a patient read retry it with backoff), and the admin plane shows the store's sentence |

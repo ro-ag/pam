@@ -9,6 +9,7 @@ members = [
     "crates/pam_flow",
     "crates/pam_gui",
     "crates/pam_model",
+    "crates/pam_net",
     "crates/pam_proto",
     "crates/pam_store",
     "crates/pam_testkit",
@@ -28,6 +29,7 @@ pam_daemon = { path = "crates/pam_daemon" }
 pam_flow = { path = "crates/pam_flow" }
 pam_gui = { path = "crates/pam_gui" }
 pam_model = { path = "crates/pam_model" }
+pam_net = { path = "crates/pam_net" }
 pam_proto = { path = "crates/pam_proto" }
 pam_store = { path = "crates/pam_store" }
 # test-only harness; never published (dev-dependency cycles are fine —

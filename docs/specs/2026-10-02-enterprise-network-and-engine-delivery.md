@@ -1,12 +1,85 @@
 # Enterprise network settings and engine delivery — design and implementation plan
 
-Status: design for review, 2026-10-02. Implements the owner directive of
+Status: implemented, 2026-10-02, on `feat/enterprise-network` (tasks T1–T7
+below); Windows evidence pending (T8). What was built where it differs from
+the design is in [As built](#as-built). Implements the owner directive of
 2026-10-02 ("do what is best for the product and make it easy for enterprise
 environments") and closes the design review's deferred items "two curl
 launchers with divergent policy" and "proxy and certificate settings need an
 owner decision" ([review, model 9](../reviews/design-review-2026-10-02.md)).
 Companion to [the llama.cpp engine spec](2026-09-13-llama-cpp-engine.md) and
 [command containment](../command-containment.md).
+
+## As built
+
+The design above the fold is the contract; these are the places the
+implementation settled differently, each recorded by the task that made the
+call, and the items still open.
+
+Contract differences:
+
+- **The local engine archive is its own op.** `admin.models.engine.import
+  { path, confirm }` (120 s bridge deadline), not `install { source: { kind:
+  "local" } }`. `install { confirm }` keeps its shape and uses the configured
+  mirror when one is set; both refuse any key they do not list.
+- **Weights import** is `admin.models.import { path, confirm, vendor?,
+  expected_sha256? }`. The catalog preset is chosen by the file's size (no
+  `preset_id`); a size match holds the copy to that preset's SHA-256 and
+  records it verified; otherwise the file lands under `vendor` (default
+  `imported`) and is verified only when `expected_sha256` was given and
+  matched. A cancelled import is deleted, not resumed. The job row is kind
+  `import` (store schema 15; it was `download` until that migration).
+- **Disclosure fields are flat** on the `admin.models.engine.status` body
+  (`expected_asset`, `expected_size`, `expected_sha256`, `download_url`,
+  `download_host`, `mirror_in_use`, `mirror_host`, `upstream_host`,
+  `engine_dir`, `install_dir`, `source`, `loaded`, `removable`,
+  `network_issue`) rather than a `plan` object, and catalog presets carry
+  `fetch { url, host, source }`. Neither carries `route` or `proxy`: that
+  would need a keychain-backed profile resolution on every status poll, and
+  the route is what the Network tab's Test shows. The engine card and the
+  download confirmation therefore have no "Route:" line.
+- **Manifest source kinds** are `download | mirror | import` (not `upstream |
+  mirror | local_archive`), with `host` for a download, `host` and `url` for a
+  mirror, `path` and `imported_at_ms` for an import.
+- **No engine cancel op.** Install and import stay synchronous under the
+  bridge deadline, as decided; dropping the deadline cancels the transfer or
+  the copy, and the card shows the two-minute resume note instead of a Cancel
+  button.
+- **`stage` gains `connect`.** A failed first connection on a direct or
+  bypassed route (target DNS, connect, connect timeout) is reported at stage
+  `connect`; `proxy` is only for proxy-side failures; a failure before any
+  connection (no usable curl, unusable settings) reports the first stage the
+  route has. The reply carries `route` as specified and no `proxy` field.
+- **`EngineRelease` fields stay public.** What is gated is the entry point:
+  `install(base, cancel, net, mirror)` and `import(base, path, cancel)` build
+  `EngineRelease::pinned` themselves; `install_release` and `import_release`
+  exist only under `cfg(any(test, feature = "testing"))`.
+- **`engine_busy`.** Install, import and remove are refused while a model is
+  loaded, under the operation lock, so a load cannot slip in.
+- **The managed layer** ships as the `ManagedNetworkLayer` trait with a fixed
+  stub (`FixedManagedNetwork`); `mirror_allowed_hosts` is policy-only and is
+  enforced on the resolved value; the policy file is a later plan.
+- **`ignored_env`** lists eleven names (the proxy variables in both cases,
+  `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`); the page prints them.
+- **`tools/check.sh`** does not yet export `PAM_REQUIRE_TLS_FIXTURE=1`; that
+  one-line edit is T8's. T7 ran the gate with the variable in the environment.
+
+Open:
+
+- Windows evidence (T8, in the Parallels VM): `curl --version` and backend;
+  whether `write-out` prints on a failed transfer; what `cacert` does on
+  Schannel; the exact stderr for an untrusted issuer, a name mismatch, a
+  proxy 407 and a refused proxy; the revocation failure text for a private
+  CA; whether an issuer is printed; "Test network settings" against the
+  fixtures. Also: the wording when an import source is held with exclusive
+  sharing (reported as `engine_import_source_missing`), and a full volume off
+  macOS, where `platform_free_bytes` is `None` and the engine copy reports
+  `engine_io_failed` with the OS text rather than `engine_no_space`.
+- macOS: the fixtures prove that a private issuer is untrusted until its root
+  is imported and trusted afterwards; whether `cacert` replaces or extends
+  the keychain's trust for the same request is not measured.
+- The two owner questions below (Windows revocation, proxy single sign-on)
+  are unchanged, and the landing git broker stays proxy-disabled as scoped.
 
 Supported platforms for this work (owner scope change, 2026-10-02): macOS arm64
 and Windows amd64/arm64. Linux and Intel macOS are not supported and nothing here
@@ -541,13 +614,13 @@ root shows up the moment it is saved.
 | Trusted curl | `/usr/bin/curl`, Apple's build; on the development host `curl 8.7.1 … libcurl/8.7.1 (SecureTransport) LibreSSL/3.3.6` | `%SystemRoot%\System32\curl.exe`, Microsoft's build, Schannel; version depends on the Windows build and updates |
 | Default trust (no bundle) | the macOS keychain through SecureTransport: system roots plus roots an administrator or MDM profile has marked trusted | the Windows certificate store (machine and user), which is where Group Policy and Intune deploy enterprise and TLS-inspection roots |
 | Common enterprise case | the inspection root is already trusted by an MDM profile: **leave the bundle empty** | the root is already in the store by GPO: **leave the bundle empty** |
-| With a bundle | `cacert` is honoured by the SecureTransport/LibreSSL build; it is expected to replace keychain trust for that request (T8 records what this host does) | curl documents Schannel support for `cacert` since 7.60; the chain is expected to be required to end in a certificate from the file, instead of the store (T8 records it on the Windows 11 VM). Revocation checking stays on and fails for private CAs with no reachable CRL or OCSP responder. |
+| With a bundle | `cacert` is honoured by the SecureTransport/LibreSSL build; it is expected to replace keychain trust for that request (not measured on macOS; the save warns) | **Not offered.** Measured on the Windows 11 VM ([Windows evidence](#windows-evidence-2026-10-02)): a `cacert` file replaces the store's trust, so public hosts stop verifying, and a private CA with no http CRL fails revocation. `admin.network.set` refuses a bundle there; the CA goes in the Windows certificate store. |
 | What PAM does if the backend does not honour the file | the Test fails with the real cause; the field help then tells the human to install the root in the keychain instead | same, naming the Windows certificate store (Trusted Root Certification Authorities); PAM never writes to the OS certificate store itself |
 
-The setting is therefore present and functional on both platforms, led on each by
-"if your organisation's root is already trusted by this computer, leave this
-empty", and the Test is the arbiter of whether a given curl/backend/bundle
-combination works. The page shows `curl.backend` from the probe next to the
+The setting is therefore functional on macOS only, led there by "if your
+organisation's root is already trusted by this computer, leave this empty". On
+Windows `get` reports `ca_bundle: { supported: false, reason }` and the page shows
+it read-only; the Test is the arbiter of whether the store's trust works. The page shows `curl.backend` from the probe next to the
 field. On Windows, a failure of `tls_revocation_unavailable` is reported
 verbatim; PAM does not offer to switch revocation off (see
 [Open questions](#open-questions)).
@@ -1232,7 +1305,9 @@ Decided here, not open:
 
 Only two need the owner.
 
-1. **Windows certificate revocation.** On Windows, Schannel checks revocation and
+1. **Windows certificate revocation. Decided 2026-10-02 (owner-delegated, enterprise
+   first): see [Windows evidence](#windows-evidence-2026-10-02); the OS store is the
+   supported route and `tls_revocation_unavailable` keeps its cause.** On Windows, Schannel checks revocation and
    fails for private CAs and TLS-inspection leaves whose CRL or OCSP responder is
    unreachable (`CRYPT_E_NO_REVOCATION_CHECK`, curl's `--ssl-no-revoke` exists for
    exactly this). That is a common enterprise failure. This design offers no
@@ -1252,3 +1327,62 @@ Only two need the owner.
    fixture-tested here (it needs a domain), so it would ship unproven. Recommendation:
    defer, and ask the first enterprise pilot which proxy it uses before building
    it.
+
+## Windows evidence (2026-10-02)
+
+Measured on the Parallels Windows 11 VM (build 26200, ARM64) with the real
+`C:\Windows\System32\curl.exe`: `curl 8.21.0 (Windows) libcurl/8.21.0 Schannel
+zlib/1.3.2 WinIDN WinLDAP`, features including SSPI, SPNEGO, Kerberos and
+HTTPS-proxy. The requests used PAM's own config shape on stdin (`-q --config -`,
+`silent`, `show-error`, the `write-out` diagnostics line) against `openssl s_server`
+(Git for Windows, OpenSSL 3.5.7) presenting the committed `pam_net` test leaf.
+
+- **`write-out`** prints on failed transfers, after curl's error line, with
+  `ssl_verify_result=0` on every Schannel row, so Schannel failures are classified from
+  text. The one exception is a missing `cacert` file: curl rejects it while reading the
+  config (exit 2, `The file '…' provided to --cacert does not exist`) and prints no line.
+  No issuer is printed on a failed handshake, with or without `verbose`.
+- **(a) No `cacert`:** the test leaf is refused, exit 60,
+  `schannel: SEC_E_UNTRUSTED_ROOT (0x80090325) - The certificate chain was issued by an
+  authority that is not trusted.`
+- **(b) `cacert = <test CA pem>`:** the chain is accepted, then exit 60,
+  `schannel: the revocation status is unknown`. The same configuration to a public host
+  (`example.com`, `www.microsoft.com`) fails with `schannel: the certificate chain is
+  incomplete` / `…is based on an untrusted root`, while both verify (exit 0) with no
+  `cacert`. A `cacert` therefore **replaces** the Windows store's trust; it does not add
+  to it. A bundle of another CA gives `the certificate chain is incomplete`; a file with
+  no certificate does the same.
+- **(c) Revocation:** the leaf names no CRL or OCSP address, and Schannel fails the
+  chain. `--ssl-no-revoke` and `--ssl-revoke-best-effort` each turn it into HTTP 200 (a
+  reference measurement only; PAM never uses either). With revocation off, a wrong-name
+  leaf gives `CertGetNameString() failed to match connection hostname`; an expired leaf
+  gives `this certificate or one of the certificates in the certificate chain is not time
+  valid` with or without it. With revocation on, a wrong name is reported as the
+  revocation failure first.
+- **CRL finding:** a private CA whose leaf carries an `http://` CRL distribution point
+  that serves the CA's CRL verifies with default settings (exit 0, no `--ssl-no-revoke`).
+  A `file://` distribution point did not.
+- **Classification:** none of these texts names a `SEC_E_`/`CRYPT_E_` code except
+  `SEC_E_UNTRUSTED_ROOT`; `pam_net` now matches the recorded texts (`failure.rs`).
+  A closed proxy port is exit 7, `Failed to connect to … over proxy … Could not connect
+  to server`.
+- **Real daemon, saved settings:** a Basic proxy with the password in the keychain under
+  `network.proxy` carried `CONNECT origin.pam-test.invalid:443` with one
+  `Proxy-Authorization`; the engine Test then ended `tls_revocation_unavailable` with the
+  bundle and `tls_untrusted_issuer` without it. This was before the decision below.
+
+### Decision
+
+The Windows certificate store is the supported way to trust a private CA: MDM and Group
+Policy install CAs there and Schannel applies each CA's own CRL. Therefore:
+
+1. On Windows, `admin.network.set` with a `ca_bundle` import is refused with
+   `network_ca_unsupported_on_windows`, stating the two facts above; recovery: install the
+   CA in the Windows certificate store (machine or user). `get` reports
+   `ca_bundle: { supported: false, reason }` and the GUI shows the field read-only.
+   Clearing is still accepted.
+2. On macOS the bundle stays, and the save reply carries a `warning` that it is expected to
+   replace system trust for every connector call and download. That is not measured on
+   macOS.
+3. `tls_revocation_unavailable` stays, with the recovery "publish the CA's CRL over http,
+   or install the CA in the OS store". No revocation switch is offered.

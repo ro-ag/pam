@@ -89,7 +89,9 @@ export function isModelSummary(step: FlowStepReport): boolean {
   const fields = step as unknown as Record<string, unknown>;
   const model = fields.summary_model;
   if (typeof model === "object" && model !== null) return true;
-  return ["model_summary", "untrusted", "summary_untrusted"].some((key) => fields[key] === true);
+  return ["model_summary", "untrusted", "summary_untrusted"].some(
+    (key) => fields[key] === true,
+  );
 }
 
 /** What every model-written summary is, whatever the model: said beside each one. */
@@ -144,7 +146,9 @@ function StepSummary({
     <span className="mt-1 block max-w-md">
       {modelWritten && (
         <>
-          <span className="block font-data text-xs text-warning">{UNTRUSTED_SUMMARY_LABEL}</span>
+          <span className="block font-data text-xs text-warning">
+            {UNTRUSTED_SUMMARY_LABEL}
+          </span>
           <span className="block font-sans text-xs text-ink-faint">
             <SafeText value={provenance} />
           </span>

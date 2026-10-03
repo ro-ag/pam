@@ -2256,6 +2256,7 @@ name = "pam_connectors"
 version = "0.4.3"
 dependencies = [
  "pam_flow",
+ "pam_net",
  "serde",
  "serde_json",
  "tempfile",
@@ -2278,6 +2279,7 @@ dependencies = [
  "pam_connectors",
  "pam_flow",
  "pam_model",
+ "pam_net",
  "pam_proto",
  "pam_store",
  "pam_testkit",
@@ -2328,12 +2330,23 @@ name = "pam_model"
 version = "0.4.3"
 dependencies = [
  "hex",
+ "pam_net",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "pam_net"
+version = "0.4.3"
+dependencies = [
+ "pam_net",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]

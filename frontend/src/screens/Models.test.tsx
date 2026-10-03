@@ -33,6 +33,7 @@ const mocks = vi.hoisted(() => ({
   modelsDownload: vi.fn(),
   modelsDownloadCancel: vi.fn(),
   modelsDownloadDiscard: vi.fn(),
+  modelsImport: vi.fn(),
   modelsDelete: vi.fn(),
   modelsVerify: vi.fn(),
   modelsDefaultsSet: vi.fn(),
@@ -549,14 +550,16 @@ describe("catalog", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
     const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
     fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
+    // Pressing Download only opens the confirmation; nothing is fetched yet.
+    expect(mocks.modelsDownload).not.toHaveBeenCalled();
+    expect(
+      catalog.getByRole("link", { name: "https://spdx.org/licenses/Apache-2.0.html" }),
+    ).toHaveAttribute("href", "https://spdx.org/licenses/Apache-2.0.html");
+    fireEvent.click(catalog.getByRole("button", { name: "Start download" }));
     await waitFor(() =>
       expect(mocks.modelsDownload).toHaveBeenCalledWith({
         preset_id: "qwen3-coder-30b-a3b-q4_k_m",
       }),
-    );
-    expect(catalog.getByRole("link", { name: "Apache-2.0 license" })).toHaveAttribute(
-      "href",
-      "https://spdx.org/licenses/Apache-2.0.html",
     );
   });
 
@@ -687,6 +690,15 @@ describe("catalog", () => {
     });
     fireEvent.change(catalog.getByLabelText("vendor"), { target: { value: "qwen" } });
     fireEvent.click(catalog.getByRole("button", { name: "Fetch" }));
+    // The pasted address waits for a confirmation that says what it means.
+    expect(mocks.modelsDownload).not.toHaveBeenCalled();
+    const confirm = within(catalog.getByRole("group", { name: "confirm unverified download" }));
+    expect(
+      confirm.getByText(/PAM has no expected SHA-256 for this address/),
+    ).toBeInTheDocument();
+    expect(confirm.getByText(/Mirrors do not apply to pasted addresses/)).toBeInTheDocument();
+    expect(confirm.getByText("example.test")).toBeInTheDocument();
+    fireEvent.click(confirm.getByRole("button", { name: "Start download" }));
     await waitFor(() =>
       expect(mocks.modelsDownload).toHaveBeenCalledWith({
         url: "https://example.test/model.gguf",
@@ -695,6 +707,271 @@ describe("catalog", () => {
     );
     expect(catalog.getByText(/stays unverified until you run Verify/)).toBeInTheDocument();
     expect(catalog.getByText(/Unverified models load only as test-only/)).toBeInTheDocument();
+  });
+});
+
+describe("download confirmation", () => {
+  async function openCatalog() {
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    return within(await screen.findByRole("region", { name: "Downloads" }));
+  }
+
+  it("names the file, host, size, digest, location and licence before anything is fetched", async () => {
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [
+        preset({
+          sha256: "fadc3e5f0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+          fetch: {
+            url: "https://huggingface.co/qwen/x/resolve/main/Q4_K_M.gguf",
+            host: "huggingface.co",
+            source: "upstream",
+          },
+        }),
+      ],
+      host_ram_bytes: 64_000_000_000,
+    });
+    const catalog = await openCatalog();
+    fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
+    const confirm = within(
+      catalog.getByRole("group", { name: "confirm download Qwen3-Coder-30B-A3B Q4_K_M" }),
+    );
+    expect(confirm.getByText("Download Qwen3-Coder-30B-A3B Q4_K_M?")).toBeInTheDocument();
+    expect(confirm.getByText("18.6 GB")).toBeInTheDocument();
+    expect(confirm.getByText("huggingface.co")).toBeInTheDocument();
+    expect(
+      confirm.getByText("https://huggingface.co/qwen/x/resolve/main/Q4_K_M.gguf"),
+    ).toBeInTheDocument();
+    expect(confirm.getByText(/the catalog source/)).toBeInTheDocument();
+    expect(confirm.getByText("fadc3e5f0123…234567")).toBeInTheDocument();
+    expect(confirm.getByText(/a file that differs is deleted/)).toBeInTheDocument();
+    expect(
+      confirm.getByText("/Users/dev/llm/qwen/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"),
+    ).toBeInTheDocument();
+    expect(confirm.getByText(/This is model data, not a program/)).toBeInTheDocument();
+    expect(mocks.modelsDownload).not.toHaveBeenCalled();
+  });
+
+  it("says when the models mirror is the host, and names the catalog source", async () => {
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [
+        preset({
+          fetch: {
+            url: "https://artifacts.corp.example/hf/qwen/x/resolve/main/Q4_K_M.gguf",
+            host: "artifacts.corp.example",
+            source: "mirror",
+          },
+        }),
+      ],
+      host_ram_bytes: 64_000_000_000,
+    });
+    const catalog = await openCatalog();
+    fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
+    const confirm = within(catalog.getByRole("group", { name: /confirm download/ }));
+    expect(confirm.getByText("artifacts.corp.example")).toBeInTheDocument();
+    expect(confirm.getByText(/your configured mirror/)).toBeInTheDocument();
+    expect(confirm.getByText(/the catalog source is huggingface.co/)).toBeInTheDocument();
+  });
+
+  it("falls back to the catalog address when the daemon sent no resolved fetch", async () => {
+    const catalog = await openCatalog();
+    fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
+    const confirm = within(catalog.getByRole("group", { name: /confirm download/ }));
+    expect(confirm.getByText("huggingface.test")).toBeInTheDocument();
+    expect(confirm.queryByText(/your configured mirror/)).not.toBeInTheDocument();
+  });
+
+  it("Cancel closes it without fetching and brings the Download button back", async () => {
+    const catalog = await openCatalog();
+    fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
+    expect(catalog.queryByRole("button", { name: "Download" })).not.toBeInTheDocument();
+    fireEvent.click(
+      within(catalog.getByRole("group", { name: /confirm download/ })).getByRole("button", {
+        name: "Cancel",
+      }),
+    );
+    expect(catalog.queryByRole("group", { name: /confirm download/ })).not.toBeInTheDocument();
+    expect(catalog.getByRole("button", { name: "Download" })).toBeInTheDocument();
+    expect(mocks.modelsDownload).not.toHaveBeenCalled();
+  });
+
+  it("asks before a Resume too, and says it is a resume", async () => {
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [preset({ partial_bytes: 9_278_344_784 })],
+      host_ram_bytes: 64_000_000_000,
+    });
+    const catalog = await openCatalog();
+    fireEvent.click(await catalog.findByRole("button", { name: "Resume" }));
+    expect(mocks.modelsDownload).not.toHaveBeenCalled();
+    expect(
+      within(catalog.getByRole("group", { name: /confirm download/ })).getByText(
+        "Resume Qwen3-Coder-30B-A3B Q4_K_M?",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("points at Settings › Network when the catalog could not read the network settings", async () => {
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [preset()],
+      host_ram_bytes: 64_000_000_000,
+      network_issue: {
+        cause: "network_settings_invalid",
+        detail: "The stored network settings could not be read",
+        recovery: "Re-save them in Settings › Network.",
+      },
+    });
+    const catalog = await openCatalog();
+    expect(
+      await catalog.findByText(/network settings · network_settings_invalid/),
+    ).toBeInTheDocument();
+    expect(
+      catalog.getAllByRole("button", { name: "Open Settings › Network" }).length,
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe("import weights from a file", () => {
+  async function openImport() {
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
+    fireEvent.click(await catalog.findByRole("button", { name: "Import weights from file…" }));
+    return catalog;
+  }
+
+  it("says plainly that an unknown digest lands unverified and needs Verify, and that no file picker exists", async () => {
+    const catalog = await openImport();
+    expect(catalog.getByText(/this app has no file picker/)).toBeInTheDocument();
+    expect(catalog.getByText(/saved as an\s+unverified, test-only model/)).toBeInTheDocument();
+    expect(catalog.getByText(/it needs Verify/)).toBeInTheDocument();
+    expect(catalog.getByText(/no network is\s+used/)).toBeInTheDocument();
+  });
+
+  it("needs a path, then a two-tap confirm, then sends the path with confirm", async () => {
+    mocks.modelsImport.mockResolvedValue({
+      job_id: "job_imp",
+      model_id: "imported/model",
+      dest: "/Users/dev/llm/imported/model.gguf",
+      source: "/srv/model.gguf",
+      size_bytes: 10,
+      catalog: null,
+      expected_sha256: null,
+      verified_on_completion: false,
+      note: "PAM has no expected SHA-256 for this file: it is imported as an unverified, test-only model. Run Verify on it before it can serve jobs.",
+    });
+    const catalog = await openImport();
+    const importGroup = within(
+      catalog.getByRole("group", { name: "import weights from a file" }),
+    );
+    expect(importGroup.getByRole("button", { name: "Import" })).toBeDisabled();
+    fireEvent.change(importGroup.getByLabelText("weights file path"), {
+      target: { value: "/srv/model.gguf" },
+    });
+    fireEvent.click(importGroup.getByRole("button", { name: "Import" }));
+    expect(mocks.modelsImport).not.toHaveBeenCalled();
+    fireEvent.click(importGroup.getByRole("button", { name: "Copy this file in?" }));
+    await waitFor(() =>
+      expect(mocks.modelsImport).toHaveBeenCalledWith({ path: "/srv/model.gguf" }),
+    );
+    // The daemon's own note about what will be trusted is shown as it answered.
+    expect(
+      await catalog.findByText(/imported as an unverified, test-only model. Run Verify/),
+    ).toBeInTheDocument();
+    expect(catalog.getByText("/Users/dev/llm/imported/model.gguf")).toBeInTheDocument();
+  });
+
+  it("sends the vendor and the digest to expect when they are given", async () => {
+    mocks.modelsImport.mockResolvedValue({
+      job_id: "job_imp",
+      model_id: "qwen/m",
+      dest: "/Users/dev/llm/qwen/m.gguf",
+      source: "/srv/m.gguf",
+      size_bytes: 10,
+      catalog: null,
+      expected_sha256: "ab".repeat(32),
+      verified_on_completion: true,
+      note: "PAM copies the file and checks its SHA-256.",
+    });
+    const catalog = await openImport();
+    const importGroup = within(
+      catalog.getByRole("group", { name: "import weights from a file" }),
+    );
+    fireEvent.change(importGroup.getByLabelText("weights file path"), {
+      target: { value: "/srv/m.gguf" },
+    });
+    fireEvent.change(importGroup.getByLabelText("import vendor"), {
+      target: { value: "qwen" },
+    });
+    fireEvent.change(importGroup.getByLabelText("expected sha256"), {
+      target: { value: "AB".repeat(32) },
+    });
+    fireEvent.click(importGroup.getByRole("button", { name: "Import" }));
+    fireEvent.click(importGroup.getByRole("button", { name: "Copy this file in?" }));
+    await waitFor(() =>
+      expect(mocks.modelsImport).toHaveBeenCalledWith({
+        path: "/srv/m.gguf",
+        vendor: "qwen",
+        expected_sha256: "ab".repeat(32),
+      }),
+    );
+  });
+
+  it.each([
+    ["import_source_refused", "The path is a symbolic link", "Give the real file, not a link."],
+    ["import_source_missing", "No such file: /srv/nope.gguf", "Check the path and try again."],
+    ["already_installed", "A model already exists at that destination", "Delete it first."],
+    ["no_space", "12 GB needed, 3 GB free", "Free space on the models volume."],
+  ])("renders the refusal %s through the failure note", async (cause, detail, recovery) => {
+    mocks.modelsImport.mockRejectedValue({ cause, detail, recovery });
+    const catalog = await openImport();
+    const importGroup = within(
+      catalog.getByRole("group", { name: "import weights from a file" }),
+    );
+    fireEvent.change(importGroup.getByLabelText("weights file path"), {
+      target: { value: "/srv/nope.gguf" },
+    });
+    fireEvent.click(importGroup.getByRole("button", { name: "Import" }));
+    fireEvent.click(importGroup.getByRole("button", { name: "Copy this file in?" }));
+    expect(await catalog.findByText(new RegExp(`catalog · ${cause}`))).toBeInTheDocument();
+    expect(catalog.getByText(new RegExp(detail))).toBeInTheDocument();
+    expect(catalog.getByText(recovery)).toBeInTheDocument();
+  });
+
+  it("shows a running import's progress and cancels that job", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      idleStatus({ jobs: [job({ id: "job_imp", kind: "import", source: "/srv/m.gguf" })] }),
+    );
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
+    expect(await catalog.findByLabelText("import progress")).toBeInTheDocument();
+    fireEvent.click(catalog.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(mocks.modelsDownloadCancel).toHaveBeenCalledWith("job_imp"));
+  });
+
+  it("renders a failed import job's cause, sentence and recovery", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      idleStatus({
+        jobs: [
+          job({
+            id: "job_imp",
+            kind: "import",
+            state: "failed",
+            detail: JSON.stringify({
+              cause: "digest_mismatch",
+              detail: "the copy hashes to 1234, the catalog expects fadc",
+              recovery: "The file is not that model; the copy was deleted.",
+            }),
+          }),
+        ],
+      }),
+    );
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    const catalog = within(await screen.findByRole("region", { name: "Downloads" }));
+    expect(await catalog.findByText(/import · digest_mismatch/)).toBeInTheDocument();
+    expect(catalog.getByText(/the catalog expects fadc/)).toBeInTheDocument();
+    expect(catalog.getByText(/the copy was deleted/)).toBeInTheDocument();
   });
 });
 

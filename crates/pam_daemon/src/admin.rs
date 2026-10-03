@@ -41,10 +41,12 @@
 //!   `cancel` is always `system`, whatever its `caller.agent` claims.
 //! - Op names are `OP_*` constants under [`ADMIN_PREFIX`]; an unrecognized `admin.*` capability is
 //!   refused with [`CAUSE_UNKNOWN_ADMIN_OP`] — new ops are added here or in
-//!   [`crate::admin_models`]/[`crate::admin_logs`]/[`crate::admin_retention`], nowhere else.
+//!   [`crate::admin_models`]/[`crate::admin_logs`]/[`crate::admin_retention`]/
+//!   [`crate::admin_network`], nowhere else.
 //! - [`crate::admin_models`] holds `admin.models.*`/`admin.curator.*`, [`crate::admin_logs`] holds
 //!   `admin.log.*`/`admin.evidence.*`, [`crate::admin_connectors`] holds `admin.connectors.*`,
-//!   [`crate::admin_retention`] holds `admin.retention.*` — dispatched from [`AdminService`] before
+//!   [`crate::admin_retention`] holds `admin.retention.*`, [`crate::admin_network`] holds
+//!   `admin.network.*` — dispatched from [`AdminService`] before
 //!   this module's own `match`, under identical rules (same tripwire, deadline, request row, single
 //!   terminal audit row, no classify entry, no grant, no approval); the split is file size, not
 //!   privilege.
@@ -70,6 +72,7 @@ use crate::flow_service::FlowService;
 use crate::ingress::Origin;
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
+use crate::network_service::NetworkService;
 use crate::policy::{CAP_CANCEL, Profile};
 use crate::terminal::{TerminalWriter, Written};
 use crate::transport::IncomingRequest;
@@ -274,6 +277,10 @@ pub struct AdminService {
     /// The flow engine the `admin.flows.*` ops act through (see
     /// [`crate::admin_flows`]).
     pub(crate) flows: Arc<FlowService>,
+    /// The network settings the `admin.network.*` ops act through (see
+    /// [`crate::admin_network`]); the same service the connector transport
+    /// and the model downloads read their profile from.
+    pub(crate) network: Arc<NetworkService>,
     /// The pipeline's own ingress. `admin.flows.run` builds a `flow.run`
     /// envelope and sends it through here rather than executing anything
     /// itself, so a run started from the GUI passes the same gate, lanes
@@ -305,6 +312,13 @@ impl AdminService {
         flows: Arc<FlowService>,
         submit: mpsc::Sender<IncomingRequest>,
     ) -> Self {
+        // A network service of its own until the daemon hands over the one
+        // its transport and downloads read; test fixtures keep this one.
+        let network = Arc::new(NetworkService::new(
+            Arc::clone(&store),
+            connectors.secret_store(),
+            models.engine_base(),
+        ));
         Self {
             terminals: TerminalWriter::new(Arc::clone(&store)),
             store,
@@ -313,10 +327,19 @@ impl AdminService {
             logs,
             connectors,
             flows,
+            network,
             submit,
             #[cfg(test)]
             retention_clock_ahead: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// The same service over the daemon's network settings service, so the
+    /// ops, the connector transport and the downloads read one source.
+    #[must_use]
+    pub fn with_network(mut self, network: Arc<NetworkService>) -> Self {
+        self.network = network;
+        self
     }
 
     /// Handles one `admin.*` envelope end to end: records the request
@@ -387,14 +410,14 @@ impl AdminService {
 
     /// Routes one (tripwire-cleared) envelope to its op.
     ///
-    /// The flow, model, log, connector and retention surfaces get first
-    /// refusal: [`Self::dispatch_flows`], [`Self::dispatch_models`],
-    /// [`Self::dispatch_logs`], [`Self::dispatch_connectors`] and
-    /// [`Self::dispatch_retention`] answer `None` for anything that is
-    /// not one of their ops, and the match below takes over. The log and
-    /// connector surfaces are handed the envelope's id because a compress
-    /// files its evidence, and a configure its change, under this very
-    /// request row.
+    /// The flow, model, log, connector, retention and network surfaces get
+    /// first refusal: [`Self::dispatch_flows`], [`Self::dispatch_models`],
+    /// [`Self::dispatch_logs`], [`Self::dispatch_connectors`],
+    /// [`Self::dispatch_retention`] and [`Self::dispatch_network`] answer
+    /// `None` for anything that is not one of their ops, and the match below
+    /// takes over. The log, connector and network surfaces are handed the
+    /// envelope's id because a compress files its evidence, and a configure
+    /// its change, under this very request row.
     async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, OwnedRefusal> {
         let args = &envelope.args;
         if let Some(answer) = self.dispatch_flows(&envelope.capability, args).await {
@@ -416,6 +439,12 @@ impl AdminService {
             return answer.map_err(OwnedRefusal::from);
         }
         if let Some(answer) = self.dispatch_retention(&envelope.capability, args).await {
+            return answer.map_err(OwnedRefusal::from);
+        }
+        if let Some(answer) = self
+            .dispatch_network(&envelope.id, &envelope.capability, args)
+            .await
+        {
             return answer.map_err(OwnedRefusal::from);
         }
         let answer: Result<AdminOk, AdminRefusal> = match envelope.capability.as_str() {

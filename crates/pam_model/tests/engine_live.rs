@@ -8,12 +8,14 @@
 //! contract on the real binary; it proves nothing about model quality.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pam_model::download::{self, DownloadRequest, DownloadState};
 use pam_model::engine;
 use pam_model::engine_server::{EngineServer, ServerOptions};
 use pam_model::runtime::GenerateRequest;
+use pam_net::NetSettings;
 
 /// The smallest model llama.cpp's own CI uses, pinned by digest.
 const MODEL_URL: &str =
@@ -42,7 +44,8 @@ async fn the_pinned_engine_serves_the_smallest_model_on_this_platform() {
     let base = short_base();
     let (_keep, cancel) = tokio::sync::watch::channel(false);
 
-    let installed = engine::install(base.path(), cancel.clone())
+    let net = Arc::new(NetSettings::direct());
+    let installed = engine::install(base.path(), cancel.clone(), Arc::clone(&net), None)
         .await
         .expect("the pinned engine installs on this platform");
     let server_binary: PathBuf = installed.server_path.clone().expect("server path");
@@ -53,13 +56,16 @@ async fn the_pinned_engine_serves_the_smallest_model_on_this_platform() {
     );
 
     let model_path = base.path().join("stories260K.gguf");
-    let handle = download::start(DownloadRequest {
-        url: MODEL_URL.to_owned(),
-        dest: model_path.clone(),
-        expected_size: Some(MODEL_BYTES),
-        expected_sha256: Some(MODEL_SHA256.to_owned()),
-        license_id: None,
-    })
+    let handle = download::start(
+        DownloadRequest {
+            url: MODEL_URL.to_owned(),
+            dest: model_path.clone(),
+            expected_size: Some(MODEL_BYTES),
+            expected_sha256: Some(MODEL_SHA256.to_owned()),
+            license_id: None,
+        },
+        net,
+    )
     .expect("the model transfer starts");
     match handle.wait().await {
         DownloadState::Done { sha256, size_bytes } => {

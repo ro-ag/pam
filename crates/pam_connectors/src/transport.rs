@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pam_flow::{ArgValue, ConnectorId};
+use pam_net::NetFailure;
 use thiserror::Error;
 use url::Url;
 
@@ -111,9 +112,17 @@ pub enum TransportError {
     /// The deadline passed with no answer.
     #[error("the request timed out")]
     Timeout,
-    /// The TLS certificate could not be verified.
+    /// The TLS certificate could not be verified. Kept for callers and
+    /// fakes that name the failure without a launcher; the launcher itself
+    /// reports certificate problems as [`Self::Net`] with the exact cause.
     #[error("the TLS certificate could not be verified")]
     Certificate,
+    /// The launcher's own account of why the request never became an
+    /// answer: the proxy, the name, the connection, the certificate. The
+    /// sentence is what the human reads; the cause is what the Test action
+    /// and the GUI switch on.
+    #[error("{0}")]
+    Net(NetFailure),
     /// Anything else that stopped the request, excerpted for a human.
     #[error("{0}")]
     Network(String),
@@ -134,6 +143,9 @@ impl From<TransportError> for ConnectorError {
             TransportError::Policy { cause, detail } => Self::Policy { cause, detail },
             TransportError::Timeout => Self::Timeout,
             TransportError::Certificate => Self::Certificate,
+            // One vocabulary with the network test: the refusal a flow
+            // records reads the same as the Test action's row.
+            TransportError::Net(failure) => Self::Network(failure.sentence()),
             TransportError::Network(detail) => Self::Network(detail),
             TransportError::TooLarge { maximum } => Self::TooLarge {
                 bytes: maximum,

@@ -1,5 +1,11 @@
 import { SelectField, TextField, TextArea } from "../components/ui/Fields";
 import { EngineCard } from "./EngineCard";
+import {
+  DownloadConfirm,
+  ImportWeights,
+  PastedConfirm,
+  type ImportRequest,
+} from "./ModelFetch";
 import { ReadinessCard, type RepairTarget } from "./Readiness";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -25,6 +31,7 @@ import {
   modelsDownload,
   modelsDownloadCancel,
   modelsDownloadDiscard,
+  modelsImport,
   modelsList,
   modelsLoad,
   modelsStatus,
@@ -109,16 +116,26 @@ export function latestDownload(jobs: ModelJob[], modelId: string): ModelJob | un
   return jobs.find((job) => job.kind === "download" && job.model_id === modelId);
 }
 
+/** The newest import job, whatever state it reached. */
+export function latestImport(jobs: ModelJob[]): ModelJob | undefined {
+  return jobs.find((job) => job.kind === "import");
+}
+
 /** What a settled download says went wrong, or `null` when it did not fail. */
 export function downloadFailure(job: ModelJob | undefined): BridgeFailure | null {
   if (!job || job.state !== "failed") return null;
+  const word = job.kind === "import" ? "import" : "download";
   // The daemon writes `{cause, detail, recovery}`; a row from an older
   // build, or one truncated somehow, still has to say something rather
   // than render an empty box.
   const fallback: BridgeFailure = {
-    cause: "download_failed",
-    detail: job.detail ?? "the transfer ended without saying why",
-    recovery: "Download again — the partial file is kept, so it resumes.",
+    cause: `${word}_failed`,
+    detail:
+      job.detail ?? `the ${word === "import" ? "copy" : "transfer"} ended without saying why`,
+    recovery:
+      word === "import"
+        ? "Check the path and the file, then import again."
+        : "Download again — the partial file is kept, so it resumes.",
   };
   if (!job.detail) return fallback;
   try {
@@ -634,11 +651,12 @@ function LibraryTable({
 // --- 3. catalog ------------------------------------------------------------
 
 function DownloadProgress({ job, onCancel }: { job: ModelJob; onCancel: () => void }) {
+  const label = job.kind === "import" ? "import progress" : "download progress";
   const pct = percentOf(job.bytes_done, job.bytes_total);
   return (
     <div className="space-y-2">
       <progress
-        aria-label="download progress"
+        aria-label={label}
         className="h-1.5 w-full accent-accent-strong"
         {...(job.bytes_total === null ? {} : { value: job.bytes_done, max: job.bytes_total })}
       />
@@ -662,6 +680,7 @@ function PresetCard({
   preset,
   job,
   busy,
+  savedTo,
   onDownload,
   onCancel,
   onDiscard,
@@ -669,10 +688,12 @@ function PresetCard({
   preset: CatalogPreset;
   job: ModelJob | undefined;
   busy: boolean;
+  savedTo: string | undefined;
   onDownload: () => void;
   onCancel: () => void;
   onDiscard: () => void;
 }) {
+  const [confirming, setConfirming] = useState(false);
   const running = job?.state === "running" ? job : undefined;
   const failure = downloadFailure(job);
   // The catalog reports the part file directly, so a resume is offered on
@@ -695,9 +716,9 @@ function PresetCard({
             <Check aria-hidden="true" className="size-4" />
             installed
           </span>
-        ) : running ? null : (
+        ) : running || confirming ? null : (
           <div className="flex items-center gap-2">
-            <Button size="sm" disabled={busy} onClick={onDownload}>
+            <Button size="sm" disabled={busy} onClick={() => setConfirming(true)}>
               {resumable ? "Resume" : "Download"}
             </Button>
             {resumable && (
@@ -711,6 +732,20 @@ function PresetCard({
           </div>
         )}
       </div>
+
+      {confirming && !running && !preset.installed && (
+        <DownloadConfirm
+          preset={preset}
+          savedTo={savedTo}
+          resuming={resumable}
+          busy={busy}
+          onConfirm={() => {
+            setConfirming(false);
+            onDownload();
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
 
       {running && <DownloadProgress job={running} onCancel={onCancel} />}
 
@@ -739,11 +774,20 @@ function PresetCard({
   );
 }
 
-function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
+function CatalogPanel({
+  jobs,
+  modelsDir,
+  onOpenNetwork,
+}: {
+  jobs: ModelJob[];
+  modelsDir: string | undefined;
+  onOpenNetwork: () => void;
+}) {
   const queryClient = useQueryClient();
   const catalog = useQuery({ queryKey: ["models", "catalog"], queryFn: modelsCatalog });
   const [url, setUrl] = useState("");
   const [vendor, setVendor] = useState("");
+  const [pasted, setPasted] = useState<{ url: string; vendor: string } | null>(null);
   const [actionFailure, setActionFailure] = useState<BridgeFailure | null>(null);
 
   const settle = () => void queryClient.invalidateQueries({ queryKey: ["models"] });
@@ -751,6 +795,13 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
   const download = useMutation({
     mutationFn: (source: { preset_id: string } | { url: string; vendor: string }) =>
       modelsDownload(source),
+    onMutate: () => setActionFailure(null),
+    onError: (error) => setActionFailure(toBridgeFailure(error)),
+    onSettled: settle,
+  });
+
+  const importWeights = useMutation({
+    mutationFn: (request: ImportRequest) => modelsImport(request),
     onMutate: () => setActionFailure(null),
     onError: (error) => setActionFailure(toBridgeFailure(error)),
     onSettled: settle,
@@ -776,6 +827,9 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
   const presets = (catalog.data?.presets ?? []).filter((preset) => preset.fits_host);
 
   const inputClasses = fieldClasses;
+  const importJob = latestImport(jobs);
+  const importRunning = importJob?.state === "running" ? importJob : undefined;
+  const importFailed = downloadFailure(importJob);
 
   return (
     <Panel ground="raised" className="space-y-4 p-5">
@@ -789,6 +843,14 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
       </div>
 
       {listFailure && <FailureNote failure={listFailure} label="catalog" />}
+
+      {catalog.data?.network_issue && (
+        <FailureNote failure={catalog.data.network_issue} label="network settings">
+          <Button size="sm" variant="secondary" onClick={onOpenNetwork}>
+            Open Settings › Network
+          </Button>
+        </FailureNote>
+      )}
 
       {!listFailure && catalog.isPending && (
         <p className="font-data text-xs text-ink-faint">reading the catalog…</p>
@@ -808,6 +870,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
             preset={preset}
             job={latestDownload(jobs, presetModelId(preset))}
             busy={download.isPending || discard.isPending}
+            savedTo={modelsDir}
             onDownload={() => download.mutate({ preset_id: preset.id })}
             onCancel={() => {
               const job = runningDownload(jobs, presetModelId(preset));
@@ -825,7 +888,7 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
           const trimmedUrl = url.trim();
           const trimmedVendor = vendor.trim();
           if (trimmedUrl && trimmedVendor) {
-            download.mutate({ url: trimmedUrl, vendor: trimmedVendor });
+            setPasted({ url: trimmedUrl, vendor: trimmedVendor });
           }
         }}
       >
@@ -864,7 +927,32 @@ function CatalogPanel({ jobs }: { jobs: ModelJob[] }) {
           A pasted file arrives with no expected digest, so it stays unverified until you run
           Verify and its hash is known. {FLOOR_NOTE}
         </p>
+        {pasted && (
+          <PastedConfirm
+            url={pasted.url}
+            busy={download.isPending}
+            onConfirm={() => {
+              download.mutate(pasted);
+              setPasted(null);
+            }}
+            onCancel={() => setPasted(null)}
+          />
+        )}
       </form>
+
+      <ImportWeights
+        savedTo={modelsDir}
+        busy={importWeights.isPending || importRunning !== undefined}
+        result={importWeights.data}
+        onImport={(request) => importWeights.mutate(request)}
+      />
+      {importRunning && (
+        <DownloadProgress
+          job={importRunning}
+          onCancel={() => cancel.mutate(importRunning.id)}
+        />
+      )}
+      {importFailed && <FailureNote failure={importFailed} label="import" />}
 
       {actionFailure && <FailureNote failure={actionFailure} label="catalog" />}
     </Panel>
@@ -1006,6 +1094,7 @@ export function ModelsScreen() {
   const library = useQuery({ queryKey: ["models", "list"], queryFn: modelsList });
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const openNetwork = () => void navigate({ to: "/settings", hash: "network" });
   const repair = (target: RepairTarget) => {
     if (target === "settings") {
       void navigate({ to: "/settings", hash: "models" });
@@ -1076,8 +1165,12 @@ export function ModelsScreen() {
           title="Downloads"
           blurb="The models PAM can fetch and verify — only the ones this machine can hold."
         >
-          <CatalogPanel jobs={jobs} />
-          <EngineCard />
+          <CatalogPanel
+            jobs={jobs}
+            modelsDir={library.data?.models_dir ?? status.data?.models_dir}
+            onOpenNetwork={openNetwork}
+          />
+          <EngineCard onOpenNetwork={openNetwork} />
         </Section>
       </PagePane>
       <PagePane id="models" tab="test" active={tab === "test"}>

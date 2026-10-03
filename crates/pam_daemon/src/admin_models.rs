@@ -8,16 +8,20 @@
 //!
 //! Every refusal carries `{ cause, detail, recovery }`; causes are contract the GUI matches on, and
 //! ones from the runtime are [`pam_model::RuntimeError::cause`] verbatim rather than flattened to
-//! "internal error". `admin.models.download` and `.verify` return only a `job_id` — the work
-//! outlives the op — and its progress and verdict live on `model_job` rows, which
-//! [`OP_MODELS_STATUS`] reports (see [`crate::model_service`]).
+//! "internal error". `admin.models.download`, `.import` and `.verify` return only a `job_id` —
+//! the work outlives the op — and its progress and verdict live on `model_job` rows, which
+//! [`OP_MODELS_STATUS`] reports (see [`crate::model_service`]). A catalog download is fetched
+//! from the models mirror when the human set one (the rewrite is the downloader's own, and
+//! the catalog's `fetch` field shows the same address beforehand); a pasted URL is never
+//! rewritten. An import copies a file from this machine, never moves it, and is recorded as
+//! verified only when its digest is the catalog's or one the human supplied.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pam_model::catalog::{CATALOG, find_preset};
 use pam_model::curator::{AgentId, Detection};
-use pam_model::download::{DownloadError, DownloadRequest, curl_recovery_line};
+use pam_model::download::{DownloadError, DownloadRequest, ImportRequest, curl_recovery_line};
 use pam_model::registry::{ModelEntry, RegistryError};
 use pam_model::runtime::{GenerateRequest, RuntimeState};
 use pam_proto::Outcome;
@@ -40,8 +44,12 @@ pub const OP_MODELS_CATALOG: &str = "admin.models.catalog";
 /// `admin.models.download { preset_id } | { url, vendor }` → `{ job_id }`.
 pub const OP_MODELS_DOWNLOAD: &str = "admin.models.download";
 
-/// `admin.models.download.cancel { job_id }` → stops the transfer, or the
-/// verification, with that job id.
+/// `admin.models.import { path, confirm: true, vendor?, expected_sha256? }`
+/// → `{ job_id, … }`: copies a `.gguf` in from a file on this machine.
+pub const OP_MODELS_IMPORT: &str = "admin.models.import";
+
+/// `admin.models.download.cancel { job_id }` → stops the transfer, the
+/// import, or the verification, with that job id.
 pub const OP_MODELS_DOWNLOAD_CANCEL: &str = "admin.models.download.cancel";
 
 /// `admin.models.download.discard { preset_id } | { url, vendor }` →
@@ -86,6 +94,9 @@ pub const OP_CURATOR_TEST: &str = "admin.curator.test";
 pub const MODEL_ADMIN_OPS: &[&str] = &[
     crate::admin_engine::OP_ENGINE_STATUS,
     crate::admin_engine::OP_ENGINE_INSTALL,
+    crate::admin_engine::OP_ENGINE_IMPORT,
+    crate::admin_engine::OP_ENGINE_REMOVE,
+    OP_MODELS_IMPORT,
     OP_MODELS_LIST,
     OP_MODELS_CATALOG,
     OP_MODELS_DOWNLOAD,
@@ -152,6 +163,27 @@ pub const CAUSE_NOT_DETECTED: &str = "not_detected";
 
 /// Refusal cause: no curator CLI is picked.
 pub const CAUSE_NO_CURATOR: &str = "no_curator";
+
+/// Refusal cause: the file an import names does not exist or cannot be read.
+pub const CAUSE_IMPORT_SOURCE_MISSING: &str = "import_source_missing";
+
+/// Refusal cause: the file an import names breaks a rule (a symbolic link,
+/// not a regular file, not a `.gguf`, already inside the models directory).
+pub const CAUSE_IMPORT_SOURCE_REFUSED: &str = "import_source_refused";
+
+/// Refusal cause: the volume holding the models directory has no room for
+/// the copy an import makes. The detail names the bytes needed.
+pub const CAUSE_NO_SPACE: &str = crate::model_service::CAUSE_NO_SPACE;
+
+/// The vendor directory an imported file lands under when it matches no
+/// catalog preset and the caller named none.
+pub const IMPORT_DEFAULT_VENDOR: &str = "imported";
+
+/// What the reply says when an import will be checked against a digest.
+const IMPORT_NOTE_CHECKED: &str = "PAM copies the file and checks its size and SHA-256 against the value named; the original is not changed. No network is used.";
+
+/// What the reply says when an import has no digest to check against.
+const IMPORT_NOTE_UNVERIFIED: &str = "PAM has no expected SHA-256 for this file: it is copied in as an unverified, test-only model, exactly like a file placed in the models directory by hand. Run Verify on it before it can serve jobs. The original is not changed. No network is used.";
 
 /// Refusal cause: the curator CLI ran and did not answer.
 pub const CAUSE_CURATOR_FAILED: &str = "curator_failed";
@@ -232,6 +264,17 @@ const RECOVERY_CURATOR_PICK: &str =
 const RECOVERY_CURATOR_FAILED: &str =
     "Check that the CLI runs non-interactively (sign in, or update it), then test again.";
 
+/// Recovery line for an import source PAM cannot read.
+const RECOVERY_IMPORT_SOURCE: &str =
+    "Check the path; it must name a .gguf file readable by the user the PAM daemon runs as.";
+
+/// Recovery line for an import source that breaks a rule.
+const RECOVERY_IMPORT_RULE: &str =
+    "Give the path of the .gguf file itself (not a link to it), outside the models directory.";
+
+/// Recovery line for an import the volume cannot hold.
+const RECOVERY_IMPORT_SPACE: &str = "Free the bytes named in the detail on the volume holding the models directory, or move the models directory in Settings, then import again.";
+
 impl AdminService {
     /// Answers one `admin.models.*` / `admin.curator.*` op, or `None` when
     /// the capability belongs to another part of the admin surface.
@@ -241,8 +284,11 @@ impl AdminService {
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
-            crate::admin_engine::OP_ENGINE_STATUS => Ok(self.engine_status()),
+            crate::admin_engine::OP_ENGINE_STATUS => self.engine_status(args).await,
             crate::admin_engine::OP_ENGINE_INSTALL => self.engine_install(args).await,
+            crate::admin_engine::OP_ENGINE_IMPORT => self.engine_import(args).await,
+            crate::admin_engine::OP_ENGINE_REMOVE => self.engine_remove(args).await,
+            OP_MODELS_IMPORT => self.models_import(args).await,
             OP_MODELS_LIST => self.models_list().await,
             OP_MODELS_CATALOG => self.models_catalog().await,
             OP_MODELS_DOWNLOAD => self.models_download(args).await,
@@ -298,13 +344,41 @@ impl AdminService {
             })
             .await
             .map_err(blocking_refusal)?;
+        // What a download of each preset would actually fetch, computed by
+        // the downloader's own rewrite so the confirmation cannot disagree
+        // with the request. Settings that cannot be read show upstream and
+        // say so in `network_issue`; the download itself still refuses.
+        let (models_mirror, network_issue) = match self.mirrors().await {
+            Ok((_, models_mirror)) => (models_mirror, None),
+            Err(issue) => (None, Some(issue)),
+        };
         let presets: Vec<Value> = CATALOG
             .iter()
             .zip(partials)
             .map(|(preset, partial)| {
                 let mut value = serde_json::to_value(preset).unwrap_or_else(|_| json!({}));
                 let model_id = preset.model_id();
+                let fetch = DownloadRequest {
+                    url: preset.url.to_owned(),
+                    dest: PathBuf::new(),
+                    expected_size: None,
+                    expected_sha256: None,
+                    license_id: None,
+                }
+                .via_mirror(models_mirror.as_ref(), pam_model::catalog::UPSTREAM_PREFIX)
+                .url;
+                let mirrored = fetch != preset.url;
                 if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "fetch".to_owned(),
+                        json!({
+                            "host": pam_net::Url::parse(&fetch)
+                                .ok()
+                                .and_then(|url| url.host_str().map(str::to_owned)),
+                            "url": fetch,
+                            "source": if mirrored { "mirror" } else { "upstream" },
+                        }),
+                    );
                     object.insert("fits_host".to_owned(), json!(preset.fits_host(host_ram)));
                     object.insert(
                         "installed".to_owned(),
@@ -318,19 +392,124 @@ impl AdminService {
                 value
             })
             .collect();
+        let mut body = json!({
+            "presets": presets,
+            "host_ram_bytes": host_ram,
+            "models_mirror": models_mirror.as_ref().map(|mirror| mirror.as_str().to_owned()),
+        });
+        if let Some(issue) = network_issue {
+            body["network_issue"] = json!({
+                "cause": issue.cause,
+                "detail": issue.detail,
+                "recovery": issue.recovery,
+            });
+        }
         Ok(AdminOk {
             outcome: Outcome::Verified,
-            body: json!({
-                "presets": presets,
-                "host_ram_bytes": host_ram,
-            }),
+            body,
             audit: json!({ "op": OP_MODELS_CATALOG }),
+        })
+    }
+
+    /// The engine and models mirrors the next transfer would use, as a
+    /// refusal when the network settings cannot be read.
+    async fn mirrors(
+        &self,
+    ) -> Result<(Option<pam_net::MirrorBase>, Option<pam_net::MirrorBase>), AdminRefusal> {
+        self.models.mirrors().await.map_err(|failure| AdminRefusal {
+            cause: failure.cause(),
+            detail: failure.sentence(),
+            recovery: failure.recovery(),
+        })
+    }
+
+    /// Copies a `.gguf` in from a file on this machine, as a job.
+    ///
+    /// The trust decision is made here, before the copy ([`import_target`]):
+    /// a file whose size is a catalog preset's lands under that preset's
+    /// name and must hash to the preset's digest; any other file lands under
+    /// the vendor the caller named (or [`IMPORT_DEFAULT_VENDOR`]) and its own
+    /// name, held to `expected_sha256` when one was given and otherwise
+    /// imported unverified. Nothing a caller sends can make an unknown
+    /// digest count as the catalog's: a supplied digest records a
+    /// verification the way `admin.models.verify` would, and admission for
+    /// jobs still needs a qualification record for that digest.
+    async fn models_import(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+        let wanted = ImportArgs::parse(args)?;
+        // The source's own facts, read off the async threads: the size
+        // picks the catalog preset, if any, and nothing else about the file
+        // is trusted until the copy is hashed.
+        let probe = wanted.source.clone();
+        let size =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                let meta = std::fs::symlink_metadata(&probe).ok()?;
+                (meta.is_file() && !meta.file_type().is_symlink()).then_some(meta.len())
+            })
+            .await
+            .map_err(blocking_refusal)?;
+        let target = import_target(&self.models.registry(), &wanted, size)?;
+        if !target.dest.starts_with(self.models.models_dir()) {
+            return Err(AdminRefusal {
+                cause: CAUSE_OUTSIDE_MODELS_DIR,
+                detail: format!("{} is outside the models directory", target.dest.display()),
+                recovery: RECOVERY_OUTSIDE_DIR,
+            });
+        }
+        let verified_on_completion = target.expected_sha256.is_some();
+        let request = ImportRequest {
+            source: wanted.source.clone(),
+            dest: target.dest.clone(),
+            expected_size: target.expected_size,
+            expected_sha256: target.expected_sha256.clone(),
+        };
+        let job_id = self
+            .models
+            .start_import(request, &target.model_id)
+            .await
+            .map_err(download_refusal)?;
+        Ok(AdminOk {
+            outcome: Outcome::Changed,
+            body: json!({
+                "job_id": job_id,
+                "model_id": target.model_id,
+                "dest": target.dest.display().to_string(),
+                "source": wanted.raw,
+                "size_bytes": size,
+                "catalog": target.catalog.map(|preset| json!({
+                    "preset_id": preset.id,
+                    "label": preset.label,
+                    "sha256": preset.sha256,
+                    "size_bytes": preset.size_bytes,
+                })),
+                "expected_sha256": target.expected_sha256,
+                "verified_on_completion": verified_on_completion,
+                "note": if verified_on_completion { IMPORT_NOTE_CHECKED } else { IMPORT_NOTE_UNVERIFIED },
+            }),
+            audit: json!({
+                "op": OP_MODELS_IMPORT,
+                "job_id": job_id,
+                "model_id": target.model_id,
+                "source": wanted.raw,
+                "catalog_preset": target.catalog.map(|preset| preset.id),
+                "verified_on_completion": verified_on_completion,
+            }),
         })
     }
 
     /// Starts a transfer, from a catalog preset or a pasted URL.
     async fn models_download(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
         let (request, model_id) = self.download_request(args, OP_MODELS_DOWNLOAD)?;
+        // A catalog preset is fetched from the models mirror when the human
+        // set one: only the scheme-and-host prefix changes, the path, size
+        // and digest stay the catalog's. A pasted address is never rewritten
+        // (`via_mirror` leaves a URL outside the upstream prefix alone, and
+        // only the preset arm carries one under it).
+        let request = if args.get("preset_id").is_some() {
+            let (_, models_mirror) = self.mirrors().await?;
+            request.via_mirror(models_mirror.as_ref(), pam_model::catalog::UPSTREAM_PREFIX)
+        } else {
+            request
+        };
 
         let source = request.url.clone();
         let job_id = self
@@ -894,6 +1073,135 @@ impl AdminService {
     }
 }
 
+/// What `admin.models.import` was asked for, checked for shape only.
+pub(crate) struct ImportArgs {
+    /// The path as typed, for the reply and the audit row.
+    raw: String,
+    /// The same, as a path; absolute.
+    source: PathBuf,
+    /// The vendor directory a non-catalog file lands under.
+    vendor: String,
+    /// A digest the human supplied for a non-catalog file.
+    supplied_sha256: Option<String>,
+}
+
+impl ImportArgs {
+    pub(crate) fn parse(args: &Value) -> Result<Self, AdminRefusal> {
+        if let Some(object) = args.as_object()
+            && let Some(stray) = object.keys().find(|key| {
+                !["path", "confirm", "vendor", "expected_sha256"].contains(&key.as_str())
+            })
+        {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!("{OP_MODELS_IMPORT} does not take {stray:?}"),
+                recovery: RECOVERY_FIX_ARGS,
+            });
+        }
+        if args.get("confirm").and_then(Value::as_bool) != Some(true) {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!("{OP_MODELS_IMPORT} needs \"confirm\": true"),
+                recovery: "Import weights through Models; nothing is copied without an explicit request.",
+            });
+        }
+        let raw = required_str(args, "path", OP_MODELS_IMPORT)?.to_owned();
+        let source = PathBuf::from(&raw);
+        if !source.is_absolute() {
+            return Err(AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!("{raw:?} is not an absolute path"),
+                recovery: RECOVERY_FIX_ARGS,
+            });
+        }
+        let supplied_sha256 = match args.get("expected_sha256") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                    .ok_or_else(|| AdminRefusal {
+                        cause: CAUSE_INVALID_ADMIN_ARGS,
+                        detail: "expected_sha256 must be 64 lowercase hex characters".to_owned(),
+                        recovery: RECOVERY_FIX_ARGS,
+                    })?
+                    .to_owned(),
+            ),
+        };
+        let vendor = match args.get("vendor") {
+            None | Some(Value::Null) => IMPORT_DEFAULT_VENDOR.to_owned(),
+            Some(_) => required_str(args, "vendor", OP_MODELS_IMPORT)?.to_owned(),
+        };
+        Ok(Self {
+            raw,
+            source,
+            vendor,
+            supplied_sha256,
+        })
+    }
+}
+
+/// Where an import lands and what it must hash to.
+pub(crate) struct ImportTarget {
+    pub(crate) dest: PathBuf,
+    pub(crate) model_id: String,
+    pub(crate) expected_size: Option<u64>,
+    pub(crate) expected_sha256: Option<String>,
+    /// The catalog preset the file was matched to by size, if any.
+    pub(crate) catalog: Option<&'static pam_model::Preset>,
+}
+
+/// The trust decision for an import, before any byte is copied. A file
+/// whose size is a catalog preset's is that preset: it lands under the
+/// preset's vendor and file name and must hash to the preset's digest,
+/// whatever vendor or digest the caller named. Any other file lands under
+/// the caller's vendor and its own name, held to the supplied digest if any.
+pub(crate) fn import_target(
+    registry: &pam_model::Registry,
+    wanted: &ImportArgs,
+    size: Option<u64>,
+) -> Result<ImportTarget, AdminRefusal> {
+    let catalog = size.and_then(|size| CATALOG.iter().find(|preset| preset.size_bytes == size));
+    if let Some(preset) = catalog {
+        return Ok(ImportTarget {
+            dest: registry.dest_for(preset.vendor, preset.file_name),
+            model_id: preset.model_id(),
+            expected_size: Some(preset.size_bytes),
+            expected_sha256: Some(preset.sha256.to_owned()),
+            catalog: Some(preset),
+        });
+    }
+    let file_name = wanted
+        .source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let dest = registry
+        .checked_dest_for(&wanted.vendor, &file_name)
+        .map_err(|error| match error {
+            RegistryError::InvalidName(_) => AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: error.to_string(),
+                recovery: RECOVERY_FIX_ARGS,
+            },
+            other => registry_refusal(other),
+        })?;
+    let stem = file_name.trim_end_matches(".gguf").to_owned();
+    Ok(ImportTarget {
+        dest,
+        model_id: format!("{}/{stem}", wanted.vendor),
+        expected_size: size,
+        expected_sha256: wanted.supplied_sha256.clone(),
+        catalog: None,
+    })
+}
+
 /// The vendor CLIs in trusted directories (never the daemon's inherited `PATH`, which
 /// may have been shaped by whatever started the daemon), probed off the async threads
 /// (detection stats the filesystem and waits on children). The `PATH` is only looked
@@ -984,6 +1292,35 @@ fn download_refusal(err: ModelServiceError) -> AdminRefusal {
             cause: CAUSE_CHECKPOINT_CONFLICT,
             detail,
             recovery: RECOVERY_CHECKPOINT_CONFLICT,
+        },
+        // The launcher refused before any transfer existed: a corrupt
+        // `net.settings`, a tampered CA copy, a too-old curl. Named, never
+        // an internal error, and never answered by a direct connection.
+        ModelServiceError::Download(DownloadError::Network(failure)) => AdminRefusal {
+            cause: failure.cause(),
+            detail: failure.sentence(),
+            recovery: failure.recovery(),
+        },
+        ModelServiceError::Download(DownloadError::ImportSourceMissing(path)) => AdminRefusal {
+            cause: CAUSE_IMPORT_SOURCE_MISSING,
+            detail: format!("{} does not exist or cannot be read", path.display()),
+            recovery: RECOVERY_IMPORT_SOURCE,
+        },
+        ModelServiceError::Download(DownloadError::ImportSourceRefused { path, reason }) => {
+            AdminRefusal {
+                cause: CAUSE_IMPORT_SOURCE_REFUSED,
+                detail: format!("{} was not imported: {reason}", path.display()),
+                recovery: RECOVERY_IMPORT_RULE,
+            }
+        }
+        ModelServiceError::Download(DownloadError::NoSpace { dir, needed, free }) => AdminRefusal {
+            cause: CAUSE_NO_SPACE,
+            detail: format!(
+                "the copy needs {needed} bytes under {} and {} are free",
+                dir.display(),
+                free.map_or_else(|| "an unknown number".to_owned(), |b| b.to_string())
+            ),
+            recovery: RECOVERY_IMPORT_SPACE,
         },
         ModelServiceError::Download(other) => AdminRefusal {
             cause: CAUSE_INTERNAL_ERROR,

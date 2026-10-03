@@ -163,6 +163,36 @@ fn transport_failures_map_onto_connector_failures() {
     assert!(spawned.detail().contains("curl could not run"));
 }
 
+/// The launcher's own account becomes the connector's network failure,
+/// sentence and all, so a flow's refusal reads like the Test action's row.
+#[test]
+fn launcher_failures_keep_their_sentence_as_a_network_failure() {
+    let failure = pam_net::NetFailure::ProxyAuthRequired {
+        proxy: "proxy.corp.example:3128".to_owned(),
+        offered: vec!["Basic".to_owned(), "NTLM".to_owned()],
+    };
+    let error = ConnectorError::from(TransportError::Net(failure.clone()));
+    assert_eq!(error, ConnectorError::Network(failure.sentence()));
+    assert_eq!(error.cause(), "connector_network");
+    assert!(error.detail().contains("proxy.corp.example:3128"));
+    assert!(error.detail().contains("Basic, NTLM"));
+    assert!(error.retryable());
+    assert!(
+        error
+            .recovery(pam_flow::ConnectorId::Jenkins)
+            .contains("Connectors"),
+        "the connector's own recovery line stays"
+    );
+
+    let tls = pam_net::NetFailure::TlsUntrustedIssuer {
+        host: "jenkins.corp.example".to_owned(),
+        issuer: Some("CN=Corp Inspection CA".to_owned()),
+        backend: "LibreSSL".to_owned(),
+    };
+    let error = ConnectorError::from(TransportError::Net(tls));
+    assert!(error.detail().contains("CN=Corp Inspection CA"), "{error}");
+}
+
 fn variants() -> Vec<ConnectorError> {
     vec![
         ConnectorError::Auth,

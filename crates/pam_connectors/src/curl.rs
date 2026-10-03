@@ -1,83 +1,35 @@
-//! The production transport: the system `curl`, driven as a child process.
+//! The production transport: the system `curl`, driven as a child process
+//! through the one launcher pam has, [`pam_net`].
 //!
 //! pam does not link a TLS stack. It shells out to the `curl` the operating
 //! system already trusts, which keeps the dependency tree free of C and puts
-//! certificate verification in the hands of the platform.
+//! certificate verification in the hands of the platform. Which executable
+//! that is, what its argument vector holds (a constant), what its
+//! environment holds (nothing), and how the proxy and certificate trust the
+//! human configured reach it are all `pam_net`'s; this module only says what
+//! one connector request is and reads the answer back.
 //!
-//! The credential never reaches the argument vector. `curl` is started with
-//! `--config -` and the URL and every header — `Authorization` included —
-//! are written to its standard input, so a secret is invisible to `ps`, to
-//! the audit log, and to anything that samples process arguments.
+//! The credential never reaches the argument vector. The URL and every
+//! header — `Authorization` included — are lines of the config document the
+//! launcher writes to curl's standard input, so a secret is invisible to
+//! `ps`, to the audit log, and to anything that samples process arguments.
+//!
+//! The network profile is asked of a [`NetworkSource`] before every spawn,
+//! never captured at construction: a proxy the human saves applies to the
+//! next request, including the second hop of a redirect.
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::fmt;
 use std::pin::Pin;
-use std::process::Stdio;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use pam_net::{CurlRequest, NetFailure, NetSettings, NetworkSource, TrustedCurl};
 use url::Url;
 
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError, excerpt};
 
-fn untrusted_curl() -> TransportError {
-    TransportError::Policy {
-        cause: "trusted_curl_unavailable",
-        detail: "A trusted operating-system curl is unavailable; no connector process was started."
-            .to_owned(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn trusted_curl_path() -> Result<PathBuf, TransportError> {
-    use std::os::unix::fs::MetadataExt;
-    let path = std::fs::canonicalize("/usr/bin/curl").map_err(|_| untrusted_curl())?;
-    let binary = path.metadata().map_err(|_| untrusted_curl())?;
-    if !binary.is_file() || binary.mode() & 0o111 == 0 {
-        return Err(untrusted_curl());
-    }
-    // Canonical paths remove symlinks; every component must remain outside
-    // an ordinary same-user agent's write authority.
-    for ancestor in path.ancestors() {
-        let metadata = ancestor.symlink_metadata().map_err(|_| untrusted_curl())?;
-        if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
-        {
-            return Err(untrusted_curl());
-        }
-    }
-    Ok(path)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn trusted_curl_path() -> Result<PathBuf, TransportError> {
-    Err(untrusted_curl())
-}
-
-/// Windows has no root-owned file model readable without unsafe or a
-/// platform crate, so trust comes from the one path the operating system
-/// itself owns and services: `%SystemRoot%\System32\curl.exe`. The fixed
-/// location is what rules out a planted lookalike — PATH is never searched
-/// — and the canonicalized file must still resolve inside the
-/// canonicalized System32 directory.
-#[cfg(target_os = "windows")]
-fn trusted_curl_path() -> Result<PathBuf, TransportError> {
-    let system_root = std::env::var_os("SystemRoot").ok_or_else(untrusted_curl)?;
-    let system32 = std::fs::canonicalize(std::path::Path::new(&system_root).join("System32"))
-        .map_err(|_| untrusted_curl())?;
-    let candidate = system32.join("curl.exe");
-    let canonical = std::fs::canonicalize(&candidate).map_err(|_| untrusted_curl())?;
-    if !canonical.is_file() {
-        return Err(untrusted_curl());
-    }
-    Ok(canonical)
-}
-
 /// How much room over `max_bytes` the status line and headers may take.
 const HEADER_HEADROOM: u64 = 64 * 1024;
-
-/// How much of curl's standard error is kept for a failure message.
-const MAX_STDERR_BYTES: u64 = 4 * 1024;
 
 /// How long past the request's own deadline curl is given to exit before it
 /// is killed, so a wedged child cannot outlive the step.
@@ -85,107 +37,44 @@ const GRACE_SECS: u64 = 5;
 
 /// `curl` as an [`HttpTransport`].
 ///
-/// Only the verified operating-system curl may execute: [`Self::trusted`]
-/// resolves it, and a path handed to [`Self::new`] is checked against that
-/// binary before every spawn, so nothing can select a PATH substitute.
-#[derive(Debug, Clone)]
+/// Only the verified operating-system curl ever executes: [`Self::trusted`]
+/// proves it is present, and the launcher resolves it again before every
+/// spawn, so nothing can select a PATH substitute.
+#[derive(Clone)]
 pub struct CurlTransport {
-    curl: PathBuf,
+    source: Arc<dyn NetworkSource>,
+    /// Always `false` in production: only a test build has a way to set it.
     allow_http: bool,
 }
 
+impl fmt::Debug for CurlTransport {
+    /// The source may hold a proxy password, so only the shape is shown.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CurlTransport")
+            .field("allow_http", &self.allow_http)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CurlTransport {
-    /// The transport over the operating-system curl, or the policy refusal
-    /// when this platform has no verifiable one. This is the constructor:
+    /// The transport over the operating-system curl, reading its network
+    /// profile from `source` before every spawn; or the policy refusal
+    /// when this platform has no verifiable curl. This is the constructor:
     /// there is exactly one executable a transport may run, so there is
     /// nothing for a caller to choose.
-    pub fn trusted() -> Result<Self, TransportError> {
+    pub fn trusted(source: Arc<dyn NetworkSource>) -> Result<Self, TransportError> {
+        TrustedCurl::resolve().map_err(refusal_before_spawn)?;
         Ok(Self {
-            curl: trusted_curl_path()?,
+            source,
             allow_http: false,
         })
     }
 
-    /// [`Self::trusted`] with the path spelled out — kept for callers that
-    /// resolved [`Self::trusted_path`] themselves. The path is still checked
-    /// against the trusted binary at spawn; bare `curl` is an explicit system
-    /// selector, never a PATH lookup, and any other executable fails closed
-    /// before spawning. New code calls [`Self::trusted`].
-    #[must_use]
-    pub fn new(curl: PathBuf) -> Self {
-        Self {
-            curl,
-            allow_http: false,
-        }
-    }
-
-    /// The fixed trusted operating-system executable, without searching PATH.
-    /// Platforms without a verifiable operating-system curl, or unsafe
-    /// filesystem ownership, fail closed.
-    pub fn trusted_path() -> Result<PathBuf, TransportError> {
-        trusted_curl_path()
-    }
-
-    pub(crate) fn command(
-        &self,
-        request: &HttpRequest,
-        deadline_secs: u64,
-    ) -> Result<Command, TransportError> {
-        let trusted = Self::trusted_path()?;
-        if self.curl != Path::new("curl")
-            && std::fs::canonicalize(&self.curl).map_err(|_| untrusted_curl())? != trusted
-        {
-            return Err(untrusted_curl());
-        }
-        let mut command = Command::new(trusted);
-        command
-            .arg("-q") // MUST be first: disables all implicit curlrc loading.
-            .arg("--config")
-            .arg("-")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--include")
-            .arg("--max-time")
-            .arg(deadline_secs.to_string())
-            .arg("--max-filesize")
-            .arg(request.max_bytes.to_string())
-            .arg("--proto")
-            .arg(self.proto())
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // The cleared environment keeps nothing the daemon holds, but a
-        // Windows child cannot initialize WinSock or the crypto stack
-        // without the system roots, and `/` is not a working directory
-        // there — the drive root is the neutral equivalent.
-        #[cfg(target_os = "windows")]
-        {
-            for key in [
-                "SystemRoot",
-                "SystemDrive",
-                "windir",
-                "COMSPEC",
-                "TEMP",
-                "TMP",
-            ] {
-                if let Some(value) = std::env::var_os(key) {
-                    command.env(key, value);
-                }
-            }
-            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-            command.current_dir(format!("{drive}\\"));
-        }
-        #[cfg(not(target_os = "windows"))]
-        command.current_dir("/");
-        Ok(command)
-    }
-
     /// Lets this transport speak plain `http` as well as `https`.
     ///
-    /// Only the crate's own origin test uses it, to point real `curl` at a
-    /// throwaway `TcpListener`. Production always keeps `--proto =https`.
+    /// Only the crate's own origin tests use it, to point real `curl` at a
+    /// throwaway `TcpListener`. Production always keeps `https` only.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn allow_http_for_tests(mut self) -> Self {
@@ -193,42 +82,20 @@ impl CurlTransport {
         self
     }
 
-    /// The `--config -` document for one request.
+    /// The `--config -` document for one request under `settings`.
     ///
-    /// Public so a test can prove the secret is here and not in argv. The
-    /// deadline is repeated in the argument vector; curl takes the last
-    /// spelling of an option and the two are identical.
-    #[must_use]
-    pub fn config_for(request: &HttpRequest, deadline_secs: u64) -> String {
-        let mut config = format!(
-            "url = \"{}\"\nmax-time = {deadline_secs}\n",
-            escape(request.url.as_str())
-        );
-        if request.method != Method::Get {
-            writeln!(config, "request = \"{}\"", request.method.as_str()).expect("String writer");
-        }
-        if let Some(body) = &request.body {
-            writeln!(
-                config,
-                "data-binary = \"{}\"",
-                escape(&String::from_utf8_lossy(body))
-            )
-            .expect("String writer");
-        }
-        for (name, value) in &request.headers {
-            writeln!(config, "header = \"{}: {}\"", escape(name), escape(value))
-                .expect("writing into a String cannot fail");
-        }
-        config
-    }
-
-    /// The `--proto` restriction this transport runs under.
-    fn proto(&self) -> &'static str {
-        if self.allow_http {
-            "=https,http"
-        } else {
-            "=https"
-        }
+    /// Public so a test can prove the secret is here and not in argv. Treat
+    /// the result as a secret: it holds the headers and, with a proxy
+    /// credential configured, the proxy password.
+    pub fn config_for(
+        settings: &NetSettings,
+        request: &HttpRequest,
+        deadline_secs: u64,
+    ) -> Result<String, TransportError> {
+        let curl = TrustedCurl::resolve().map_err(refusal_before_spawn)?;
+        build(&curl, settings, request, deadline_secs, false)
+            .config()
+            .map_err(refusal_before_spawn)
     }
 
     /// Runs curl once and turns its exit into a response or a failure.
@@ -237,70 +104,109 @@ impl CurlTransport {
         request: &HttpRequest,
         deadline_secs: u64,
     ) -> Result<HttpResponse, TransportError> {
-        let mut command = self.command(request, deadline_secs)?;
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| TransportError::Spawn(error.to_string()))?;
-
-        let config = Self::config_for(request, deadline_secs);
-        if let Some(mut stdin) = child.stdin.take() {
-            // A closed stdin is not fatal on its own: curl may already have
-            // failed, and its exit code says so more precisely than this
-            // write does.
-            let _ = stdin.write_all(config.as_bytes()).await;
-            let _ = stdin.shutdown().await;
+        let settings = self.source.settings().await.map_err(refusal_before_spawn)?;
+        let curl = TrustedCurl::resolve().map_err(refusal_before_spawn)?;
+        let outcome = build(&curl, &settings, request, deadline_secs, self.allow_http)
+            .run(Duration::from_secs(
+                deadline_secs.saturating_add(GRACE_SECS),
+            ))
+            .await;
+        match outcome {
+            Ok(output) if request.method != Method::Get => {
+                parse_response(&output.stdout).map_err(|_| {
+                    TransportError::Network(
+                        "curl mutation returned an unreadable response; reconcile before retrying"
+                            .to_owned(),
+                    )
+                })
+            }
+            Ok(output) => parse_response(&output.stdout),
+            Err(failure) => Err(failure_refusal(failure, request)),
         }
+    }
+}
 
-        let cap = request.max_bytes.saturating_add(HEADER_HEADROOM);
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        let ((body, truncated), (stderr_bytes, _)) = tokio::join!(
-            read_capped(&mut stdout, cap),
-            read_capped(&mut stderr, MAX_STDERR_BYTES),
-        );
-        if truncated {
-            kill(&mut child).await;
-            return Err(TransportError::TooLarge {
-                maximum: request.max_bytes,
-            });
-        }
+/// One connector request as the launcher is asked for it.
+fn build<'s>(
+    curl: &TrustedCurl,
+    settings: &'s NetSettings,
+    request: &HttpRequest,
+    deadline_secs: u64,
+    allow_http: bool,
+) -> CurlRequest<'s> {
+    let mut curl = curl
+        .request(settings, &request.url)
+        .include_headers()
+        .max_time(deadline_secs)
+        .max_filesize(request.max_bytes)
+        .capture_limit(request.max_bytes.saturating_add(HEADER_HEADROOM));
+    curl = match request.method {
+        Method::Get => curl,
+        Method::Post => curl.method(pam_net::Method::Post),
+        Method::Put => curl.method(pam_net::Method::Put),
+    };
+    if let Some(body) = &request.body {
+        curl = curl.body(body);
+    }
+    for (name, value) in &request.headers {
+        curl = curl.header(name, value);
+    }
+    #[cfg(any(test, feature = "testing"))]
+    if allow_http {
+        curl = curl.allow_http_for_tests();
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = allow_http;
+    curl
+}
 
-        let status =
-            match tokio::time::timeout(std::time::Duration::from_secs(GRACE_SECS), child.wait())
-                .await
-            {
-                Ok(Ok(status)) => status,
-                Ok(Err(error)) => return Err(TransportError::Spawn(error.to_string())),
-                Err(_) => {
-                    kill(&mut child).await;
-                    return Err(TransportError::Timeout);
-                }
-            };
-        match status.code() {
-            Some(0) if request.method != Method::Get => parse_response(&body).map_err(|_| {
-                TransportError::Network(
-                    "curl mutation returned an unreadable response; reconcile before retrying"
-                        .to_owned(),
-                )
-            }),
-            Some(0) => parse_response(&body),
-            Some(28) => Err(TransportError::Timeout),
-            Some(35 | 51 | 58 | 59 | 60) => Err(TransportError::Certificate),
-            Some(63) => Err(TransportError::TooLarge {
-                maximum: request.max_bytes,
-            }),
-            Some(code) if request.method != Method::Get => Err(TransportError::Network(format!(
-                "curl mutation failed with exit {code}; reconcile before retrying"
-            ))),
-            Some(code) => Err(TransportError::Network(format!(
-                "curl exited {code}: {}",
-                excerpt(&stderr_bytes, 512)
-            ))),
-            None => Err(TransportError::Network(
-                "curl was terminated before it answered".to_owned(),
-            )),
-        }
+/// The refusal for a launcher failure that stopped the request before any
+/// process ran: no curl, a profile that cannot be used, a value the config
+/// cannot carry. These are policy, not network, so they keep their own
+/// cause and are never retried as a transient failure.
+fn refusal_before_spawn(failure: NetFailure) -> TransportError {
+    match failure {
+        NetFailure::CurlUnavailable => TransportError::Policy {
+            cause: "trusted_curl_unavailable",
+            detail:
+                "A trusted operating-system curl is unavailable; no connector process was started."
+                    .to_owned(),
+        },
+        NetFailure::Spawn(detail) => TransportError::Spawn(detail),
+        NetFailure::CurlTooOld { .. }
+        | NetFailure::SettingsInvalid(_)
+        | NetFailure::CaBundleTampered
+        | NetFailure::RequestInvalid { .. } => TransportError::Policy {
+            cause: failure.cause(),
+            detail: failure.sentence(),
+        },
+        other => TransportError::Net(other),
+    }
+}
+
+/// The refusal for a launcher failure after curl ran.
+///
+/// Sizes and time keep the shapes the connectors already match on; the
+/// rest is the launcher's own account. A mutation's failure carries the
+/// reconcile hint instead: the request may have had its effect.
+fn failure_refusal(failure: NetFailure, request: &HttpRequest) -> TransportError {
+    match failure {
+        NetFailure::TooLarge { .. } => TransportError::TooLarge {
+            maximum: request.max_bytes,
+        },
+        NetFailure::Timeout | NetFailure::Deadline => TransportError::Timeout,
+        NetFailure::CurlUnavailable
+        | NetFailure::Spawn(_)
+        | NetFailure::CurlTooOld { .. }
+        | NetFailure::SettingsInvalid(_)
+        | NetFailure::CaBundleTampered
+        | NetFailure::RequestInvalid { .. } => refusal_before_spawn(failure),
+        other if request.method != Method::Get => TransportError::Network(format!(
+            "curl mutation failed ({}): {} Reconcile before retrying.",
+            other.cause(),
+            other.sentence()
+        )),
+        other => TransportError::Net(other),
     }
 }
 
@@ -347,7 +253,8 @@ impl CurlTransport {
     /// GitHub answers a job-log request with a redirect to a signed storage
     /// URL; the signature is the credential there, so pam drops its own
     /// `Authorization` header before following, and refuses to follow
-    /// anywhere but `https`.
+    /// anywhere but `https`. Each hop is its own curl process, so the proxy
+    /// and the no-proxy list are evaluated for the hop's own host.
     fn redirect_target(&self, from: &Url, response: &HttpResponse) -> Result<Url, TransportError> {
         let location = response.header("location").ok_or_else(|| {
             TransportError::Network("the service redirected without a Location".to_owned())
@@ -365,51 +272,12 @@ impl CurlTransport {
     }
 }
 
-/// Reads a child stream, stopping once `cap` bytes have arrived.
-///
-/// Answers `(bytes, over_the_cap)`; a read error ends the stream rather than
-/// failing the request, because the child's exit code is the better story.
-pub(crate) async fn read_capped<R>(reader: &mut Option<R>, cap: u64) -> (Vec<u8>, bool)
-where
-    R: AsyncReadExt + Unpin,
-{
-    let mut buffer = Vec::new();
-    let Some(reader) = reader.as_mut() else {
-        return (buffer, false);
-    };
-    let mut chunk = [0_u8; 8192];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => return (buffer, false),
-            Ok(read) => {
-                buffer.extend_from_slice(&chunk[..read]);
-                if buffer.len() as u64 > cap {
-                    return (buffer, true);
-                }
-            }
-        }
-    }
-}
-
-/// Ends a child that is no longer wanted.
-async fn kill(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-/// Escapes a value for a double-quoted curl config field.
-fn escape(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
 /// Turns `--include` output into a response.
 ///
 /// `curl` prints one header block per hop, and a `100 Continue` prelude is a
 /// block of its own, so blocks are consumed until one carries a real status.
+/// A proxy's answer to the `CONNECT` is never in the output: the launcher
+/// suppresses it.
 pub(crate) fn parse_response(raw: &[u8]) -> Result<HttpResponse, TransportError> {
     let mut rest = raw;
     loop {
@@ -475,10 +343,12 @@ fn parse_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), TransportErro
     Ok((status, headers))
 }
 
-/// Refuses a header whose name or value holds a control character. `escape` turns a
-/// line break into the two characters `\n`, which curl's config parser turns back into a
-/// real line break inside the header value: one `Authorization` value with an embedded
-/// newline would send an injected header line. Nothing legitimate needs one.
+/// Refuses a header whose name or value holds a control character. The launcher's
+/// escaping turns a line break into the two characters `\n`, which curl's config
+/// parser turns back into a real line break inside the header value: one
+/// `Authorization` value with an embedded newline would send an injected header line.
+/// Nothing legitimate needs one. The launcher refuses the same thing; this check
+/// runs first so the refusal is the connector's own, before any profile is read.
 pub(crate) fn validate_headers(request: &HttpRequest) -> Result<(), TransportError> {
     if request
         .headers

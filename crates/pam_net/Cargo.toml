@@ -1,0 +1,34 @@
+[package]
+name = "pam_net"
+description = "The one hardened system-curl launcher for pam: network settings (proxy, no-proxy, CA bundle), the stdin config document, and typed network failures."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Exposes `pam_net::testing` — the loopback origin, the fake forward proxy
+# and the `openssl s_server` TLS origin that real curl is driven against.
+# The connector and download suites reuse them instead of copying them.
+# `net` is the listeners, `rt` the tasks that serve them.
+testing = ["tokio/net", "tokio/rt"]
+
+[dependencies]
+# proxy, mirror and target URL parsing; pure Rust.
+url.workspace = true
+# `process` spawns curl, `io-util` bounds what it prints, `time` carries the
+# deadlines, `macros` is `select!` (both pipes are drained while the child
+# runs). No runtime flavor — the daemon owns task placement.
+tokio = { version = "1", default-features = false, features = ["process", "io-util", "time", "macros"] }
+
+[dev-dependencies]
+# The crate's own integration tests need the fixtures: a dev-dependency on
+# itself is how `cargo test -p pam_net` gets the `testing` feature without a
+# flag (path-only, no new package).
+pam_net = { workspace = true, features = ["testing"] }
+# a throwaway directory for the output-file and CA-path tests.
+tempfile.workspace = true
+tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time", "process"] }
+
+[lints]
+workspace = true

@@ -100,6 +100,7 @@ const LONG_ADMIN_OPS: readonly string[] = [
   "admin.models.try",
   "admin.log.compress",
   "admin.models.engine.install",
+  "admin.models.engine.import",
 ];
 const LONG_TIMEOUT_MS = 150_000;
 
@@ -245,6 +246,9 @@ export type AdminOp =
   | "admin.models.settings.set"
   | "admin.models.engine.status"
   | "admin.models.engine.install"
+  | "admin.models.engine.import"
+  | "admin.models.engine.remove"
+  | "admin.models.import"
   | "admin.models.try"
   | "admin.curator.list"
   | "admin.curator.set"
@@ -270,6 +274,9 @@ export type AdminOp =
   | "admin.connectors.keyring"
   | "admin.connectors.sonar_mappings.get"
   | "admin.connectors.sonar_mappings.set"
+  | "admin.network.get"
+  | "admin.network.set"
+  | "admin.network.test"
   | "admin.retention.get"
   | "admin.retention.set"
   | "admin.retention.prune";
@@ -294,6 +301,8 @@ export function adminCall<T>(
  */
 export const CONFIRM_RELAXED = "relaxed";
 export const CONFIRM_GRANT = "grant";
+/** Setting or changing the network proxy, its password or the CA bundle (`CONFIRM_NETWORK`). */
+export const CONFIRM_NETWORK = "network";
 
 export type Profile = "relaxed" | "standard" | "strict";
 
@@ -579,6 +588,20 @@ export interface CatalogPreset {
    * see these — the part file is a dotfile — so the catalog reports them.
    */
   partial_bytes: number | null;
+  /**
+   * What a download of this preset would actually fetch, worked out by the daemon with the
+   * function the downloader uses: the host shown is the host requested. Absent on a daemon that
+   * predates network settings; the screen then falls back to the catalog `url`.
+   */
+  fetch?: PresetFetch;
+}
+
+/** Where a catalog download comes from, resolved against the network settings. */
+export interface PresetFetch {
+  url: string;
+  host: string;
+  /** `mirror` when the configured models mirror replaced the catalog host. */
+  source: "upstream" | "mirror";
 }
 
 /** Where the runtime is; `state` is the discriminant the daemon tags on. */
@@ -601,7 +624,7 @@ export type RuntimeState =
 /** One `model_job` row: a download or a digest run. */
 export interface ModelJob {
   id: string;
-  kind: "download" | "verify";
+  kind: "download" | "verify" | "import";
   model_id: string;
   source: string | null;
   state: "running" | "done" | "failed" | "cancelled";
@@ -634,7 +657,15 @@ export interface EngineManifest {
   bytes: number;
   version_line: string | null;
   installed_at_ms: number;
+  /** Absent in a manifest written by an older build: shown as "source not recorded". */
+  source?: EngineSource | null;
 }
+
+/** Where the installed archive came from (`pam_model::engine::EngineSource`). */
+export type EngineSource =
+  | { kind: "download"; host: string }
+  | { kind: "mirror"; host: string; url?: string }
+  | { kind: "import"; path: string; imported_at_ms?: number };
 
 /**
  * The pinned llama.cpp engine's install state (`admin.models.engine.status`
@@ -649,6 +680,33 @@ export interface EngineStatus {
   server_path: string | null;
   manifest: EngineManifest | null;
   cause: EngineCause;
+  /**
+   * What Install would do, computed by the daemon so the card cannot disagree with the request.
+   * All absent on a daemon that predates engine delivery, and null for an unsupported platform;
+   * the card then says less, never more.
+   */
+  expected_asset?: string | null;
+  expected_size?: number | null;
+  /** The compiled-in SHA-256 the archive is held to. */
+  expected_sha256?: string | null;
+  /** The exact address Install would fetch: upstream, or the mirror's when one is configured. */
+  download_url?: string | null;
+  download_host?: string | null;
+  mirror_in_use?: boolean;
+  mirror_host?: string | null;
+  upstream_host?: string;
+  /** What Remove deletes, and what to delete by hand. */
+  engine_dir?: string;
+  /** The unpacked release inside `engine_dir`. */
+  install_dir?: string;
+  /** Where the installed engine came from; null when not installed or not recorded. */
+  source?: EngineSource | null;
+  /** A model is loaded on the engine right now. */
+  loaded?: boolean;
+  /** `engine_dir` has content and nothing is loaded. */
+  removable?: boolean;
+  /** Present only when the stored network settings cannot be read. */
+  network_issue?: BridgeFailure;
 }
 
 /** Read-only: never installs anything. */
@@ -662,6 +720,31 @@ export function engineStatus(): Promise<EngineStatus> {
  */
 export function engineInstall(): Promise<EngineStatus> {
   return adminCall("admin.models.engine.install", { confirm: true });
+}
+
+/**
+ * Installs the pinned engine from a file already on this computer: the release archive, or a
+ * folder that holds it by its exact name. No network is used; the daemon copies the file, checks
+ * the copy against the SHA-256 built into PAM, and leaves the original untouched.
+ */
+export function engineImport(path: string): Promise<EngineStatus> {
+  return adminCall("admin.models.engine.import", { path, confirm: true });
+}
+
+/** What `admin.models.engine.remove` answers. */
+export interface EngineRemoveReply {
+  removed: boolean;
+  engine_dir: string;
+  entries_removed: number;
+  status: EngineStatus;
+}
+
+/**
+ * Removes everything under the engine directory (not the model files). Only ever called from an
+ * explicit two-tap confirmation; the daemon refuses with `engine_busy` while a model is loaded.
+ */
+export function engineRemove(): Promise<EngineRemoveReply> {
+  return adminCall("admin.models.engine.remove", { confirm: true });
 }
 
 /** The model the engine currently holds, as `admin.models.status` reports it. */
@@ -776,6 +859,8 @@ export function modelsList(): Promise<{ models: ModelEntry[]; models_dir: string
 export function modelsCatalog(): Promise<{
   presets: CatalogPreset[];
   host_ram_bytes: number;
+  /** Present only when the stored network settings cannot be read; `fetch` then shows upstream. */
+  network_issue?: BridgeFailure;
 }> {
   return adminCall("admin.models.catalog");
 }
@@ -802,6 +887,35 @@ export function modelsDownloadDiscard(
   source: { preset_id: string } | { url: string; vendor: string },
 ): Promise<{ model_id: string; discarded_bytes: number }> {
   return adminCall("admin.models.download.discard", { ...source });
+}
+
+/** What `admin.models.import` answers: the job that copies, and what will be trusted. */
+export interface ModelImportReply {
+  job_id: string;
+  model_id: string;
+  dest: string;
+  source: string;
+  size_bytes: number;
+  /** Set when the file's size matched a catalog model, which it is then checked against. */
+  catalog: { preset_id: string; label: string; sha256: string; size_bytes: number } | null;
+  expected_sha256: string | null;
+  verified_on_completion: boolean;
+  /** The daemon's plain sentence on what will be checked and what is left to Verify. */
+  note: string;
+}
+
+/**
+ * Copies a weights file from a path on this computer into the models directory, hashing as it
+ * copies. A file whose size matches a catalog model is checked against that model's digest; any
+ * other `.gguf` lands as an unverified, test-only model unless `expected_sha256` is given and
+ * equal. Answers with the job that does the copy; progress and cancel are the download's.
+ */
+export function modelsImport(source: {
+  path: string;
+  vendor?: string;
+  expected_sha256?: string;
+}): Promise<ModelImportReply> {
+  return adminCall("admin.models.import", { ...source, confirm: true });
 }
 
 export function modelsDelete(modelId: string): Promise<{ deleted: true }> {
@@ -1605,6 +1719,131 @@ export function connectorsTest(
  */
 export function connectorsKeyring(fresh = false): Promise<KeyringHealth> {
   return adminCall("admin.connectors.keyring", { fresh });
+}
+
+// --- network ---------------------------------------------------------------
+
+/**
+ * The network settings surface (`pam_daemon::admin_network`, spec
+ * docs/specs/2026-10-02-enterprise-network-and-engine-delivery.md). The proxy password is
+ * write-only: it goes to the keychain through `credential: { set }` and no reply ever carries it,
+ * only `credential.present`.
+ */
+
+export type ProxyAuth = "none" | "basic" | "anyauth";
+
+export interface NetworkProxy {
+  url: string;
+  auth: ProxyAuth;
+  username?: string | null;
+}
+
+/** The private, digest-checked copy PAM made of an imported CA bundle. */
+export interface NetworkCaBundle {
+  /** Absent on a platform that does not take a bundle file (Windows). */
+  sha256?: string;
+  certificates?: number;
+  /** False on Windows: the OS certificate store is the supported way to trust a CA. */
+  supported?: boolean;
+  /** Why the bundle is unsupported here, in the daemon's words. */
+  reason?: string;
+  /** Where it was imported from; display only. */
+  source_path?: string;
+  imported_ts?: number;
+  /** True when the source file's digest no longer equals the import (display only). */
+  source_changed?: boolean;
+}
+
+export interface NetworkSettings {
+  proxy: NetworkProxy | null;
+  no_proxy: string[];
+  ca_bundle: NetworkCaBundle | null;
+  engine_mirror: string | null;
+  models_mirror: string | null;
+  credential: { present: boolean; store_available: boolean };
+  /** Managed-policy only; absent or empty when no policy sets it. */
+  mirror_allowed_hosts?: string[] | null;
+}
+
+/** Where a field's effective value comes from, and whether policy owns it. */
+export interface NetworkEffective {
+  source: "default" | "user" | "policy";
+  locked: boolean;
+}
+
+export interface NetworkGetReply {
+  settings: NetworkSettings;
+  effective?: Partial<
+    Record<
+      "proxy" | "credential" | "no_proxy" | "ca_bundle" | "engine_mirror" | "models_mirror",
+      NetworkEffective
+    >
+  >;
+  curl?: {
+    version: string;
+    backend: string;
+    supports_proxy: boolean;
+    supports_cidr_no_proxy: boolean;
+  };
+  /** Names (never values) of proxy and CA variables in the daemon's own environment. */
+  ignored_env?: string[];
+}
+
+/**
+ * A patch: an absent key keeps the stored value, `null` clears it, a value sets it. The daemon
+ * validates the whole patch before applying any of it.
+ */
+export interface NetworkPatch {
+  proxy?: { url: string; auth: ProxyAuth; username: string | null } | null;
+  credential?: { set: string } | { clear: true };
+  no_proxy?: string[];
+  ca_bundle?: { path: string } | null;
+  engine_mirror?: string | null;
+  models_mirror?: string | null;
+}
+
+export type NetworkRoute = "direct" | "bypass" | "proxy";
+
+/** One probed target; a failed probe is an answer (`ok: false`), not a refusal. */
+export interface NetworkTestResult {
+  target: string;
+  host: string;
+  route: NetworkRoute;
+  /**
+   * The stage the probe reached or failed at. `connect` is the first connection itself, the one
+   * word that is not about a proxy; a daemon that still sends `proxy` for a route with no proxy
+   * is read as `connect` by the screen.
+   */
+  stage: "connect" | "proxy" | "tunnel" | "tls" | "http";
+  ok: boolean;
+  http_status: number | null;
+  cause?: string | null;
+  detail?: string | null;
+  recovery?: string | null;
+}
+
+export function networkGet(): Promise<NetworkGetReply> {
+  return adminCall("admin.network.get");
+}
+
+/**
+ * Saves a patch. A proxy URL, password or CA bundle that is set or changed needs the typed
+ * phrase (`CONFIRM_NETWORK`); the bridge checks it in Rust before the op reaches the daemon.
+ */
+/** A save can carry a `warning` (macOS: a bundle replaces system trust); nothing else is read. */
+export function networkSet(
+  patch: NetworkPatch,
+  confirmation?: string,
+): Promise<{ warning?: string } | null> {
+  return adminCall("admin.network.set", { ...patch }, confirmation);
+}
+
+/**
+ * Probes a configured target with the saved settings: no credentials, no free-form URL. The
+ * bridge gives this op 25 s.
+ */
+export function networkTest(target?: string): Promise<{ results: NetworkTestResult[] }> {
+  return adminCall("admin.network.test", target === undefined ? {} : { target });
 }
 
 // --- daemon log ------------------------------------------------------------

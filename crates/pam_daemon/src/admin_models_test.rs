@@ -12,10 +12,12 @@ use crate::admin::{
     ADMIN_CALLER_AGENT, ADMIN_REPO, AdminService, CAUSE_INVALID_ADMIN_ARGS, CAUSE_UNKNOWN_ADMIN_OP,
 };
 use crate::admin_models::{
-    CAUSE_ALREADY_INSTALLED, CAUSE_MODELS_DIR_OVERLAPS_BASE, CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED,
-    CAUSE_UNKNOWN_MODEL, CAUSE_UNQUALIFIED, CAUSE_UNVERIFIED, MODEL_ADMIN_OPS, OP_CURATOR_LIST,
-    OP_CURATOR_SET, OP_CURATOR_TEST, OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE,
-    OP_MODELS_DOWNLOAD, OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_LIST,
+    CAUSE_ALREADY_DOWNLOADING, CAUSE_ALREADY_INSTALLED, CAUSE_CHECKPOINT_CONFLICT,
+    CAUSE_IMPORT_SOURCE_MISSING, CAUSE_IMPORT_SOURCE_REFUSED, CAUSE_MODELS_DIR_OVERLAPS_BASE,
+    CAUSE_NO_CURATOR, CAUSE_NOT_DETECTED, CAUSE_UNKNOWN_MODEL, CAUSE_UNQUALIFIED, CAUSE_UNVERIFIED,
+    IMPORT_DEFAULT_VENDOR, MODEL_ADMIN_OPS, OP_CURATOR_LIST, OP_CURATOR_SET, OP_CURATOR_TEST,
+    OP_MODELS_CATALOG, OP_MODELS_DEFAULTS_SET, OP_MODELS_DELETE, OP_MODELS_DOWNLOAD,
+    OP_MODELS_DOWNLOAD_CANCEL, OP_MODELS_DOWNLOAD_DISCARD, OP_MODELS_IMPORT, OP_MODELS_LIST,
     OP_MODELS_LOAD, OP_MODELS_SETTINGS_SET, OP_MODELS_STATUS, OP_MODELS_TRY, OP_MODELS_UNLOAD,
     OP_MODELS_VERIFY,
 };
@@ -35,15 +37,15 @@ const LONG_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// An admin service over an in-memory store, pointed at a temp models
 /// directory that lives as long as the fixture.
-struct Fixture {
-    store: Arc<Store>,
-    models: Arc<ModelService>,
-    admin: AdminService,
-    dir: tempfile::TempDir,
+pub(crate) struct Fixture {
+    pub(crate) store: Arc<Store>,
+    pub(crate) models: Arc<ModelService>,
+    pub(crate) admin: AdminService,
+    pub(crate) dir: tempfile::TempDir,
     next: std::sync::atomic::AtomicU32,
 }
 
-async fn fixture() -> Fixture {
+pub(crate) async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let (events, _rx) = EventPublisher::for_tests();
@@ -54,6 +56,9 @@ async fn fixture() -> Fixture {
     ));
     let models = ModelService::new(Arc::clone(&store)).await.unwrap();
     models.set_models_dir(dir.path()).await.unwrap();
+    // The origin these tests download from is a plain-http loopback
+    // listener; production refuses `http://`.
+    models.allow_plain_http_downloads_for_tests();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
     let flows = crate::flow_service_test::flows_for_tests(
@@ -83,14 +88,14 @@ async fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    fn models_dir(&self) -> &Path {
+    pub(crate) fn models_dir(&self) -> &Path {
         self.dir.path()
     }
 
     /// Runs one admin op through the whole service (row, tripwire,
     /// deadline, audit) and asserts the invariant every admin op owes:
     /// exactly one terminal audit row.
-    async fn run(&self, op: &str, args: Value) -> Response {
+    pub(crate) async fn run(&self, op: &str, args: Value) -> Response {
         let index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("req_model_{index:03}");
         let envelope = Envelope {
@@ -146,7 +151,7 @@ impl Fixture {
     }
 
     /// Writes a synthetic GGUF under `<models dir>/<vendor>/<file_name>`.
-    fn install_gguf(&self, vendor: &str, file_name: &str) -> PathBuf {
+    pub(crate) fn install_gguf(&self, vendor: &str, file_name: &str) -> PathBuf {
         let vendor_dir = self.models_dir().join(vendor);
         std::fs::create_dir_all(&vendor_dir).unwrap();
         let path = vendor_dir.join(file_name);
@@ -156,7 +161,7 @@ impl Fixture {
 }
 
 /// Unwraps a result body, asserting the outcome.
-fn expect_result(response: Response, outcome: Outcome) -> Value {
+pub(crate) fn expect_result(response: Response, outcome: Outcome) -> Value {
     match response {
         Response::Result {
             outcome: got, body, ..
@@ -170,7 +175,7 @@ fn expect_result(response: Response, outcome: Outcome) -> Value {
 
 /// Unwraps a refusal, asserting the cause and that a recovery came with
 /// it — a cause with no way forward is not a legible refusal.
-fn expect_refusal(response: Response, cause: &str) -> String {
+pub(crate) fn expect_refusal(response: Response, cause: &str) -> String {
     match response {
         Response::Refusal {
             cause: got,
@@ -239,7 +244,7 @@ impl GgufWriter {
 /// A minimal valid `qwen3` GGUF header — unverified until a test hashes it,
 /// so the registry classes it `test_only`, which is exactly what the
 /// admission refusals need to be provable without real weights.
-fn tiny_gguf() -> Vec<u8> {
+pub(crate) fn tiny_gguf() -> Vec<u8> {
     let mut w = GgufWriter::default();
     w.buf.extend_from_slice(b"GGUF");
     w.u32(3);
@@ -262,7 +267,7 @@ fn tiny_gguf() -> Vec<u8> {
 async fn every_model_op_is_dispatched_and_none_is_unknown() {
     timeout(DEADLINE, async {
         let fx = fixture().await;
-        assert_eq!(MODEL_ADMIN_OPS.len(), 18, "model and engine ops");
+        assert_eq!(MODEL_ADMIN_OPS.len(), 21, "model and engine ops");
         for op in MODEL_ADMIN_OPS {
             assert!(op.starts_with("admin."), "{op} is under the admin prefix");
             // Called with no arguments: whatever comes back, it must not
@@ -1133,4 +1138,306 @@ async fn engine_status_reads_files_only_and_install_needs_an_explicit_confirm() 
     })
     .await
     .expect("test within deadline");
+}
+
+// ------------------------------------------------- importing from a file
+
+impl Fixture {
+    /// Polls a job row to its verdict.
+    async fn settled_job(&self, job_id: &str) -> pam_store::ModelJobRow {
+        loop {
+            let jobs = self.store.list_model_jobs(20).await.unwrap();
+            let job = jobs.into_iter().find(|job| job.id == job_id).expect("row");
+            if job.state != "running" {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A file with no known digest is copied in as an unverified, test-only
+/// model under the default vendor; the reply says so, the row carries the
+/// digest the copy hashed to, and the original is untouched. The same file
+/// with its digest supplied is recorded verified on completion, under the
+/// vendor named. A wrong supplied digest fails the job and leaves nothing.
+#[tokio::test]
+async fn an_import_is_unverified_without_a_digest_and_verified_with_the_right_one() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let body = tiny_gguf();
+        let share = tempfile::tempdir().unwrap();
+        let source = share.path().join("tiny.gguf");
+        std::fs::write(&source, &body).unwrap();
+        let digest = sha256_hex(&body);
+
+        // 1. No digest: unverified, default vendor.
+        let started = expect_result(
+            fx.run(
+                OP_MODELS_IMPORT,
+                json!({ "confirm": true, "path": source.display().to_string() }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(started["model_id"], format!("{IMPORT_DEFAULT_VENDOR}/tiny"));
+        assert_eq!(started["catalog"], Value::Null);
+        assert_eq!(started["expected_sha256"], Value::Null);
+        assert_eq!(started["verified_on_completion"], false);
+        assert_eq!(started["size_bytes"], body.len());
+        assert!(started["note"].as_str().unwrap().contains("Run Verify"), "{started}");
+        let job = fx.settled_job(started["job_id"].as_str().unwrap()).await;
+        assert_eq!(job.state, "done", "{:?}", job.detail);
+        assert_eq!(job.model_id, format!("{IMPORT_DEFAULT_VENDOR}/tiny"));
+        assert_eq!(job.source.as_deref(), Some(source.display().to_string().as_str()));
+        let detail: Value = serde_json::from_str(&job.detail.unwrap()).unwrap();
+        assert_eq!(detail["sha256"], digest.as_str());
+        assert!(detail.get("verified").is_none(), "nothing claimed: {detail}");
+        let listed = expect_result(fx.run(OP_MODELS_LIST, json!({})).await, Outcome::Verified);
+        assert_eq!(listed["models"][0]["id"], format!("{IMPORT_DEFAULT_VENDOR}/tiny"));
+        assert_eq!(listed["models"][0]["class"], "test_only");
+        assert_eq!(std::fs::read(&source).unwrap(), body, "the original is untouched");
+
+        // Importing it again under the same name is refused: never overwritten.
+        expect_refusal(
+            fx.run(
+                OP_MODELS_IMPORT,
+                json!({ "confirm": true, "path": source.display().to_string() }),
+            )
+            .await,
+            CAUSE_ALREADY_INSTALLED,
+        );
+
+        // 2. The right digest, another vendor: verified on completion.
+        let started = expect_result(
+            fx.run(
+                OP_MODELS_IMPORT,
+                json!({ "confirm": true, "path": source.display().to_string(), "vendor": "qwen", "expected_sha256": digest }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(started["model_id"], "qwen/tiny");
+        assert_eq!(started["expected_sha256"], digest.as_str());
+        assert_eq!(started["verified_on_completion"], true);
+        assert!(started["note"].as_str().unwrap().contains("No network"), "{started}");
+        let job = fx.settled_job(started["job_id"].as_str().unwrap()).await;
+        assert_eq!(job.state, "done", "{:?}", job.detail);
+        let detail: Value = serde_json::from_str(&job.detail.unwrap()).unwrap();
+        assert_eq!(detail["verified"], true, "{detail}");
+        let listed = expect_result(fx.run(OP_MODELS_LIST, json!({})).await, Outcome::Verified);
+        let qwen = listed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "qwen/tiny")
+            .expect("imported under qwen");
+        assert_eq!(qwen["class"], "engine");
+        assert_eq!(qwen["verified"]["sha256"], digest.as_str());
+
+        // 3. A wrong digest: the job fails and the copy is gone.
+        let started = expect_result(
+            fx.run(
+                OP_MODELS_IMPORT,
+                json!({ "confirm": true, "path": source.display().to_string(), "vendor": "other", "expected_sha256": "f".repeat(64) }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        let job = fx.settled_job(started["job_id"].as_str().unwrap()).await;
+        assert_eq!(job.state, "failed");
+        let detail: Value = serde_json::from_str(&job.detail.unwrap()).unwrap();
+        assert_eq!(detail["cause"], "digest_mismatch");
+        assert!(!fx.models_dir().join("other").join("tiny.gguf").exists());
+        assert!(
+            std::fs::read_dir(fx.models_dir().join("other"))
+                .map_or(true, |mut d| d.next().is_none()),
+            "no part or lock left"
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// What the import op refuses before any copy: missing confirmation, a
+/// stray key, a relative path, a bad digest shape, a vendor that is not one
+/// plain segment, a missing file, a symbolic link, a non-gguf, a file
+/// already inside the models directory, and a destination a transfer holds.
+#[tokio::test]
+async fn an_import_refuses_bad_arguments_and_sources_by_name() {
+    timeout(DEADLINE, async {
+        let fx = fixture().await;
+        let share = tempfile::tempdir().unwrap();
+        let source = share.path().join("tiny.gguf");
+        std::fs::write(&source, tiny_gguf()).unwrap();
+        let path = source.display().to_string();
+
+        for (args, cause, needle) in [
+            (json!({ "path": path }), CAUSE_INVALID_ADMIN_ARGS, "confirm"),
+            (json!({ "confirm": true, "path": path, "sha256": "x" }), CAUSE_INVALID_ADMIN_ARGS, "sha256"),
+            (json!({ "confirm": true, "path": "relative/tiny.gguf" }), CAUSE_INVALID_ADMIN_ARGS, "absolute"),
+            (json!({ "confirm": true, "path": path, "expected_sha256": "ABC" }), CAUSE_INVALID_ADMIN_ARGS, "64 lowercase hex"),
+            (json!({ "confirm": true, "path": path, "vendor": "../up" }), CAUSE_INVALID_ADMIN_ARGS, "up"),
+            (json!({ "confirm": true, "path": share.path().join("absent.gguf").display().to_string() }), CAUSE_IMPORT_SOURCE_MISSING, "absent.gguf"),
+        ] {
+            let detail = expect_refusal(fx.run(OP_MODELS_IMPORT, args.clone()).await, cause);
+            assert!(detail.contains(needle), "{args}: {detail}");
+        }
+
+        #[cfg(unix)]
+        {
+            let link = share.path().join("link.gguf");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let detail = expect_refusal(
+                fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": link.display().to_string() })).await,
+                CAUSE_IMPORT_SOURCE_REFUSED,
+            );
+            assert!(detail.contains("symbolic link"), "{detail}");
+        }
+
+        let text = share.path().join("notes.txt");
+        std::fs::write(&text, b"x").unwrap();
+        let detail = expect_refusal(
+            fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": text.display().to_string() })).await,
+            CAUSE_IMPORT_SOURCE_REFUSED,
+        );
+        assert!(detail.contains(".gguf"), "{detail}");
+
+        let inside = fx.install_gguf("qwen", "placed.gguf");
+        let detail = expect_refusal(
+            fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": inside.display().to_string() })).await,
+            CAUSE_IMPORT_SOURCE_REFUSED,
+        );
+        assert!(detail.contains("models directory"), "{detail}");
+
+        // A partial download of the destination: discard it first.
+        let dest = fx.models_dir().join(IMPORT_DEFAULT_VENDOR).join("tiny.gguf");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let sidecars = pam_model::download::sidecar_paths(&dest);
+        std::fs::write(&sidecars.part, b"half").unwrap();
+        expect_refusal(
+            fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": path })).await,
+            CAUSE_CHECKPOINT_CONFLICT,
+        );
+        assert!(sidecars.part.exists(), "the partial download is not touched");
+        std::fs::remove_file(&sidecars.part).unwrap();
+
+        // A running import of the same destination: already downloading.
+        let big = share.path().join("big.gguf");
+        std::fs::write(&big, vec![0_u8; 48 * 1024 * 1024]).unwrap();
+        let started = expect_result(
+            fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": big.display().to_string() })).await,
+            Outcome::Changed,
+        );
+        let second = fx
+            .run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": big.display().to_string() }))
+            .await;
+        match second {
+            Response::Refusal { cause, .. } => assert!(
+                cause == CAUSE_ALREADY_DOWNLOADING || cause == CAUSE_ALREADY_INSTALLED,
+                "{cause}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // Cancelling it through the download cancel op leaves nothing behind.
+        let job_id = started["job_id"].as_str().unwrap().to_owned();
+        let cancel = fx
+            .run(OP_MODELS_DOWNLOAD_CANCEL, json!({ "job_id": job_id }))
+            .await;
+        let job = fx.settled_job(&job_id).await;
+        if matches!(cancel, Response::Result { .. }) {
+            assert!(job.state == "cancelled" || job.state == "done", "{job:?}");
+        } else {
+            assert_eq!(job.state, "done", "{:?}", job.detail);
+        }
+        let big_dest = fx.models_dir().join(IMPORT_DEFAULT_VENDOR).join("big.gguf");
+        let sidecars = pam_model::download::sidecar_paths(&big_dest);
+        assert!(!sidecars.part.exists());
+        assert!(!sidecars.lock.exists());
+        assert!(big.is_file(), "the original is untouched");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The three new ops are dispatched (not `unknown_admin_op`) and sit in
+/// the list the bridge whitelists.
+#[tokio::test]
+async fn the_import_and_engine_ops_are_dispatched_and_listed() {
+    for op in [
+        OP_MODELS_IMPORT,
+        crate::admin_engine::OP_ENGINE_IMPORT,
+        crate::admin_engine::OP_ENGINE_REMOVE,
+    ] {
+        assert!(MODEL_ADMIN_OPS.contains(&op), "{op}");
+    }
+    let fx = fixture().await;
+    for op in [
+        OP_MODELS_IMPORT,
+        crate::admin_engine::OP_ENGINE_IMPORT,
+        crate::admin_engine::OP_ENGINE_REMOVE,
+    ] {
+        match fx.run(op, json!({})).await {
+            Response::Refusal { cause, .. } => {
+                assert_ne!(cause, CAUSE_UNKNOWN_ADMIN_OP, "{op}");
+                assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS, "{op}");
+            }
+            other => panic!("{op}: expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The trust decision before a copy: a file of a catalog preset's size is
+/// that preset — its vendor, its name, its digest — whatever vendor or
+/// digest the caller offered; any other size is the caller's vendor and the
+/// file's own name, with the supplied digest or none.
+#[test]
+fn an_import_of_a_catalog_sized_file_is_held_to_the_catalog_not_the_caller() {
+    let registry = pam_model::Registry::new("/models");
+    let preset = &CATALOG[0];
+    // Absolute on every platform: a bare `/share/…` has no drive on Windows.
+    let share = std::env::temp_dir().join("anything.gguf");
+    let args = json!({
+        "confirm": true,
+        "path": share.to_str().unwrap(),
+        "vendor": "mine",
+        "expected_sha256": "f".repeat(64),
+    });
+    let Ok(wanted) = crate::admin_models::ImportArgs::parse(&args) else {
+        panic!("the arguments parse");
+    };
+    let Ok(target) =
+        crate::admin_models::import_target(&registry, &wanted, Some(preset.size_bytes))
+    else {
+        panic!("a catalog-sized file has a target");
+    };
+    assert_eq!(
+        target.dest,
+        Path::new("/models")
+            .join(preset.vendor)
+            .join(preset.file_name)
+    );
+    assert_eq!(target.model_id, preset.model_id());
+    assert_eq!(target.expected_size, Some(preset.size_bytes));
+    assert_eq!(target.expected_sha256.as_deref(), Some(preset.sha256));
+    assert_eq!(target.catalog.map(|p| p.id), Some(preset.id));
+
+    let Ok(other) =
+        crate::admin_models::import_target(&registry, &wanted, Some(preset.size_bytes + 1))
+    else {
+        panic!("a plain file has a target");
+    };
+    assert_eq!(other.dest, Path::new("/models/mine/anything.gguf"));
+    assert_eq!(other.model_id, "mine/anything");
+    assert_eq!(other.expected_size, Some(preset.size_bytes + 1));
+    assert_eq!(
+        other.expected_sha256.as_deref(),
+        Some("f".repeat(64).as_str())
+    );
+    assert!(other.catalog.is_none());
 }

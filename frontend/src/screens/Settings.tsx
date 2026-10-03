@@ -48,6 +48,7 @@ import { exactTime, formatDuration, relativeTime } from "../lib/time";
 import { SettingsConnectorsSection } from "./SettingsConnectors";
 import { SettingsFlowsSection } from "./SettingsFlows";
 import { SettingsModelsSection } from "./SettingsModels";
+import { SettingsNetworkSection } from "./SettingsNetwork";
 
 /**
  * Settings — hash-addressed desktop tabs. Visited panes retain form drafts;
@@ -954,6 +955,13 @@ const SETTINGS_CATEGORIES = [
     blurb: "Service connections and credentials, stored in this machine's keychain.",
   },
   {
+    id: "network",
+    label: "Network",
+    eyebrow: "Daemon setting",
+    blurb:
+      "How PAM reaches connector services and download hosts. Nothing is read from environment variables.",
+  },
+  {
     id: "daemon",
     label: "Daemon",
     eyebrow: "Daemon control",
@@ -1029,6 +1037,7 @@ export function SettingsScreen() {
     models: <SettingsModelsSection />,
     flows: <SettingsFlowsSection />,
     connectors: <SettingsConnectorsSection targetId={hash.replace(/^#/, "").split("/")[1]} />,
+    network: <SettingsNetworkSection />,
     daemon: <DaemonPanel active={selected === "daemon"} />,
     retention: <RetentionPanel />,
     logs: <LogsPanel active={selected === "logs"} />,

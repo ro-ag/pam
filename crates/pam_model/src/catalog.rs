@@ -16,6 +16,11 @@
 //! and the rest of the working set), not the file size; the GUI hides
 //! entries that do not fit rather than greying them out.
 
+/// The scheme and host every catalog entry is fetched from. A models mirror
+/// replaces exactly this prefix and keeps the rest of the path
+/// (`DownloadRequest::via_mirror`); a pasted URL is never rewritten.
+pub const UPSTREAM_PREFIX: &str = "https://huggingface.co/";
+
 /// A model PAM knows how to fetch, down to the byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Preset {

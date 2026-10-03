@@ -40,9 +40,27 @@ engine is a visible commit that changes the tag and all six digests together.
 
 ## Acquisition
 
-1. The archive is fetched with the same resumable curl transfer models use
-   (`pam_model::download`), which refuses a digest or size mismatch before the
-   file lands. Cancellation keeps the part file for a resume.
+The pinned asset name, size, SHA-256 and build are the same whichever way the
+archive arrives (updated 2026-10-02, [enterprise network and engine
+delivery](2026-10-02-enterprise-network-and-engine-delivery.md)):
+
+1. The archive comes from one of three places.
+   - **Upstream**: `ENGINE_RELEASE_BASE` plus the asset name, fetched with the
+     same resumable transfer models use (`pam_model::download`) through the
+     `pam_net` launcher under the GUI network settings (proxy, no-proxy list,
+     CA bundle). A digest or size mismatch is refused before the file lands;
+     cancellation keeps the part file for a resume.
+   - **Mirror**: the engine mirror set in Settings › Network, a directory URL
+     to which the asset name is appended unchanged; the same transfer and the
+     same checks. A mirror serving other bytes is `engine_digest_mismatch`.
+   - **A local file**, `admin.models.engine.import { path, confirm }`: the
+     pinned archive by its exact name, or a folder that holds it by that
+     name. The file is opened once, its size checked on that handle, and it
+     is copied into `<base>/engine/<asset>` while the same bytes are hashed;
+     the original is never changed, moved or deleted. A symbolic link, an
+     unpacked tree, a source inside `<base>/engine`, a wrong size or a wrong
+     digest is refused by name and the private copy deleted. No network is
+     used and curl is never started.
 2. The archive is unpacked into a private scratch directory by the operating
    system's own `tar` (`/usr/bin/tar`; `%SystemRoot%\System32\tar.exe` on
    Windows, which reads the zip assets too), never by a compression crate.
@@ -50,7 +68,22 @@ engine is a visible commit that changes the tag and all six digests together.
    must print `(build <ENGINE_BUILD>,`; anything else is discarded.
 4. The release directory moves to `<base>/engine/llama-<tag>/` and
    `<base>/engine/.pam-engine.json` records tag, build, target, asset, digest,
-   size, the version line and the install time. The archive is removed.
+   size, the version line, the install time and, since 2026-10-02, `source`:
+   `{ "kind": "download", "host" }`, `{ "kind": "mirror", "host", "url" }` or
+   `{ "kind": "import", "path", "imported_at_ms" }`. A manifest without
+   `source` still reads as installed and shows "source not recorded". The
+   archive is removed.
+5. `engine::remove(base)`, behind `admin.models.engine.remove { confirm }`,
+   deletes everything under `<base>/engine` (the manifest first, so a failure
+   part-way reads as not installed): the release, any archive, the private
+   verified weights copies and the engine's key file. It is refused with
+   `engine_busy` while a model is loaded.
+
+The production entry points, `engine::install(base, cancel, net, mirror)` and
+`engine::import(base, path, cancel)`, build `EngineRelease::pinned` themselves;
+`install_release` and `import_release`, which take a release, exist only under
+`cfg(any(test, feature = "testing"))`, so no setting, argument or file can
+install a release with another digest.
 
 `status()` reads files only and reports `not_installed`, `manifest_invalid`,
 `stale_release`, `server_missing` or `installed`; it never runs a process.
@@ -60,9 +93,20 @@ engine is a visible commit that changes the tag and all six digests together.
 - `admin.models.engine.status` → the status above plus the pinned tag and
   target name. Read-only.
 - `admin.models.engine.install { confirm: true }` → installs the pinned
-  release and answers with the status. Without `confirm` it refuses
-  (`invalid_admin_args`), so no listing or probe ever starts a download. The
-  GUI bridge gives it the long (120 s) deadline.
+  release, from the configured mirror when one is set, and answers with the
+  status. Without `confirm` it refuses (`invalid_admin_args`), so no listing
+  or probe ever starts a download; any other key is refused the same way, so
+  no digest, tag or URL can be passed in. Refused `engine_busy` while a model
+  is loaded. The GUI bridge gives it the long (120 s) deadline.
+- `admin.models.engine.status` additionally discloses what Install would do:
+  `expected_asset`, `expected_size`, `expected_sha256`, `download_url`,
+  `download_host`, `mirror_in_use`, `mirror_host`, `upstream_host`,
+  `engine_dir`, `install_dir`, the installed `source`, `loaded`, `removable`
+  and, when the stored network settings cannot be read, `network_issue`.
+- `admin.models.engine.import { path, confirm: true }` → installs from a
+  local file (above); 120 s deadline, same strict arguments.
+- `admin.models.engine.remove { confirm: true }` → removes the engine
+  directory and answers `{ removed, engine_dir, entries_removed, status }`.
 - The engine root is the daemon's base directory (`~/.pam` by default), set
   on the model service at start; tests fall back to a private directory
   beside their models.

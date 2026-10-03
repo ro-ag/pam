@@ -9,7 +9,8 @@
 //! reads that file) before touching the socket, so a typo or smuggled op is refused client-side
 //! with the same shape the daemon would give. The webview is a full-admin root, so the ops that
 //! **expand what agents may do** ([`required_confirmation`]: switching to the relaxed profile, adding
-//! a grant, approving with "remember") additionally need a typed confirmation that the bridge
+//! a grant, approving with "remember", routing connector traffic through a proxy or a CA bundle)
+//! additionally need a typed confirmation that the bridge
 //! checks in Rust before the op reaches the socket. Tauri's dialog plugin is not part of this
 //! binary and no dependency may be added, so the prompt itself is drawn by the frontend; a webview
 //! that is already compromised could supply the phrase itself, which is why this is a second wall
@@ -34,10 +35,11 @@ use pam_daemon::admin::{
     OP_PROFILE_SET, OP_REQUESTS_CANCEL,
 };
 use pam_daemon::admin_connectors::{CONNECTOR_ADMIN_OPS, OP_CONNECTORS_TEST};
-use pam_daemon::admin_engine::OP_ENGINE_INSTALL;
+use pam_daemon::admin_engine::{OP_ENGINE_IMPORT, OP_ENGINE_INSTALL};
 use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
+use pam_daemon::admin_network::{NETWORK_ADMIN_OPS, OP_NETWORK_SET, OP_NETWORK_TEST};
 use pam_daemon::admin_retention::RETENTION_ADMIN_OPS;
 use pam_daemon::lifecycle::{LOG_DIR, LOG_FILE};
 use pam_proto::Response;
@@ -54,10 +56,11 @@ const STATUS_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Deadline for admin operations (synchronous request/reply).
 const ADMIN_DEADLINE_MS: u64 = 30_000;
 
-/// Deadline for the three admin ops that do real work rather than a read:
+/// Deadline for the admin ops that do real work rather than a read:
 /// `admin.models.try` runs a generation, `admin.log.compress` runs a
 /// 64 MiB compaction plus a generation, and `admin.models.engine.install`
-/// downloads and verifies the pinned inference engine. A cold prompt on a
+/// and `.import` download or copy, unpack and verify the pinned inference
+/// engine. A cold prompt on a
 /// large model decodes for minutes, not seconds, so the shared 30 s
 /// ceiling would time out a working model.
 const LONG_DEADLINE_MS: u64 = 120_000;
@@ -66,6 +69,11 @@ const LONG_DEADLINE_MS: u64 = 120_000;
 /// service ten seconds (`CONNECTOR_TEST_DEADLINE`), so the bridge waits
 /// just long enough to hear the verdict rather than time out over it.
 const CONNECTOR_TEST_DEADLINE_MS: u64 = 15_000;
+
+/// Deadline for `admin.network.test`: the daemon bounds the whole probe
+/// run at twenty seconds (`NETWORK_TEST_DEADLINE`), so the bridge waits
+/// just past that for the table of results.
+const NETWORK_TEST_DEADLINE_MS: u64 = 25_000;
 
 /// How long [`daemon_stop`] waits for the daemon's drain to finish.
 const STOP_WAIT: Duration = Duration::from_secs(10);
@@ -87,16 +95,17 @@ const CORE_ADMIN_OPS: [&str; 11] = [
 ];
 
 /// How many ops the whitelist carries: the core surface plus the model,
-/// log, flow, connector and retention surfaces, counted from the
+/// log, flow, connector, retention and network surfaces, counted from the
 /// daemon's own lists.
 const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len()
     + MODEL_ADMIN_OPS.len()
     + LOG_ADMIN_OPS.len()
     + FLOW_ADMIN_OPS.len()
     + CONNECTOR_ADMIN_OPS.len()
-    + RETENTION_ADMIN_OPS.len();
+    + RETENTION_ADMIN_OPS.len()
+    + NETWORK_ADMIN_OPS.len();
 
-/// Splices the six daemon-owned lists into one array at compile time —
+/// Splices the seven daemon-owned lists into one array at compile time —
 /// no op name is retyped here, so the whitelist cannot drift from the
 /// daemon's dispatch.
 const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
@@ -135,15 +144,22 @@ const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
         ops[index + retention] = RETENTION_ADMIN_OPS[retention];
         retention += 1;
     }
+    index += RETENTION_ADMIN_OPS.len();
+    let mut network = 0;
+    while network < NETWORK_ADMIN_OPS.len() {
+        ops[index + network] = NETWORK_ADMIN_OPS[network];
+        network += 1;
+    }
     ops
 }
 
 /// Every admin op the bridge forwards; anything else is refused before
 /// touching the socket. Composed from `pam_daemon::admin`,
 /// `pam_daemon::admin_models`, `pam_daemon::admin_logs`,
-/// `pam_daemon::admin_flows`, `pam_daemon::admin_connectors` and
-/// `pam_daemon::admin_retention` — the daemon would refuse an unknown op
-/// too, this just fails faster and keeps the GUI surface explicit.
+/// `pam_daemon::admin_flows`, `pam_daemon::admin_connectors`,
+/// `pam_daemon::admin_retention` and `pam_daemon::admin_network` — the
+/// daemon would refuse an unknown op too, this just fails faster and keeps
+/// the GUI surface explicit.
 pub const ADMIN_OPS: [&str; ADMIN_OPS_LEN] = compose_admin_ops();
 
 /// True when `op` is an admin operation the bridge forwards.
@@ -160,15 +176,17 @@ pub fn is_known_admin_op(op: &str) -> bool {
 /// (`admin.log.compress`), or an engine download and verification
 /// (`admin.models.engine.install`). `admin.connectors.test` gets its own
 /// `CONNECTOR_TEST_DEADLINE_MS`: it reaches a remote service the daemon
-/// already bounds at ten seconds.
+/// already bounds at ten seconds; `admin.network.test` likewise gets
+/// `NETWORK_TEST_DEADLINE_MS` over the daemon's twenty.
 ///
 /// `admin.flows.run` is *not* long: it answers with a ticket the moment
 /// the pipeline admits the run, and the GUI follows that ticket's events.
 #[must_use]
 pub fn deadline_for(op: &str) -> u64 {
     match op {
-        OP_MODELS_TRY | OP_LOG_COMPRESS | OP_ENGINE_INSTALL => LONG_DEADLINE_MS,
+        OP_MODELS_TRY | OP_LOG_COMPRESS | OP_ENGINE_INSTALL | OP_ENGINE_IMPORT => LONG_DEADLINE_MS,
         OP_CONNECTORS_TEST => CONNECTOR_TEST_DEADLINE_MS,
+        OP_NETWORK_TEST => NETWORK_TEST_DEADLINE_MS,
         _ => ADMIN_DEADLINE_MS,
     }
 }
@@ -411,9 +429,21 @@ pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
 /// - `admin.grants.add` ([`CONFIRM_GRANT`]): a grant is global, not per repository.
 /// - `admin.approvals.resolve` with `remember` on anything but a denial ([`CONFIRM_GRANT`]):
 ///   remembering an approval persists the same global grant.
+/// - `admin.network.set` that sets a proxy, stores a proxy password or imports a CA bundle
+///   ([`CONFIRM_NETWORK`]): a proxy plus a CA bundle is the one configuration that lets a third
+///   party read the credentials PAM sends to connectors. Clearing any of them, editing the
+///   no-proxy list or setting a mirror is one click. The frontend sends a proxy object only when
+///   it differs from the stored one, so every non-null `proxy` counts as a change here.
 #[must_use]
 pub fn required_confirmation(op: &str, args: &serde_json::Value) -> Option<&'static str> {
     match op {
+        OP_NETWORK_SET => {
+            let sets = |key: &str| {
+                args.get(key)
+                    .is_some_and(|value| !value.is_null() && value.get("clear").is_none())
+            };
+            (sets("proxy") || sets("credential") || sets("ca_bundle")).then_some(CONFIRM_NETWORK)
+        }
         OP_PROFILE_SET => match args.get("profile").and_then(serde_json::Value::as_str) {
             Some("standard" | "strict") => None,
             _ => Some(CONFIRM_RELAXED),
@@ -437,6 +467,9 @@ pub const CONFIRM_RELAXED: &str = "relaxed";
 
 /// The phrase for adding a global grant, directly or by approving with "remember".
 pub const CONFIRM_GRANT: &str = "grant";
+
+/// The phrase for setting a proxy, storing its password or importing a CA bundle.
+pub const CONFIRM_NETWORK: &str = "network";
 
 /// Checks `confirmation` against [`required_confirmation`] for this op.
 ///

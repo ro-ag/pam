@@ -492,22 +492,22 @@ pub struct AuditRow {
     pub ts: i64,
 }
 
-/// One row of the `model_job` table: a download or a verification, with
-/// where it got to.
+/// One row of the `model_job` table: a download, a verification or an
+/// import from a local file, with where it got to.
 ///
-/// `kind` is `download` or `verify`; `state` is `running`, `done`,
-/// `failed` or `cancelled` — both are CHECK-constrained in the schema and
-/// kept as strings here because the model layer, not the store, owns their
-/// vocabulary.
+/// `kind` is `download`, `verify` or `import`; `state` is `running`,
+/// `done`, `failed` or `cancelled` — both are CHECK-constrained in the
+/// schema and kept as strings here because the model layer, not the store,
+/// owns their vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelJobRow {
     /// Job id, `job_<ulid>`.
     pub id: String,
-    /// `download` or `verify`.
+    /// `download`, `verify` or `import`.
     pub kind: String,
     /// Registry id the job is about (`<vendor>/<file stem>`).
     pub model_id: String,
-    /// Source URL, for a download.
+    /// Source URL, for a download; the source file's path, for an import.
     pub source: Option<String>,
     /// `running`, `done`, `failed` or `cancelled`.
     pub state: String,

@@ -3,6 +3,7 @@ use super::{
     Action, Arc, ArgValue, Attempt, BTreeMap, CallResult, CapabilityFailure, ConnectorId, Duration,
     Instant, RunState, Step, StepReport, StepStatus, Value, cancelled, json, rate_limit_wait,
 };
+use crate::flow_intent::EffectIntent;
 use crate::flow_recovery::{Prepare, WatchState, failure};
 use crate::flow_watch::{self, State, WatchError};
 
@@ -239,8 +240,7 @@ impl RunState<'_> {
                 .prepare(
                     &self.service.store,
                     &self.ctx.request_id,
-                    step,
-                    Prepare::Run,
+                    &EffectIntent::attempt(step, Prepare::Run),
                 )
                 .await?;
             return Ok(None);
@@ -251,8 +251,7 @@ impl RunState<'_> {
                 .prepare(
                     &self.service.store,
                     &self.ctx.request_id,
-                    step,
-                    Prepare::Run,
+                    &EffectIntent::attempt(step, Prepare::Run),
                 )
                 .await?;
             return Ok(Some(self.watch_blocked(step, &error)));
@@ -391,8 +390,7 @@ impl RunState<'_> {
             .prepare(
                 &self.service.store,
                 &self.ctx.request_id,
-                step,
-                Prepare::Run,
+                &EffectIntent::attempt(step, Prepare::Run),
             )
             .await?;
         self.retained_watch_conflict(step).ok_or_else(failure)

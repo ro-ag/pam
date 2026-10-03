@@ -30,9 +30,12 @@
 //!   `remember_refused`). A plain approval always works.
 //! - **State/audit split**: the service owns the `approval` row and resolution audit rows; the
 //!   pipeline owns every `request` state transition around the wait (single writer per path) — the
-//!   service moves the row into `waiting_approval` when the wait begins, the pipeline moves it out
-//!   on outcome (back to `queued` before lane placement on approval, or terminal `refused` with its
-//!   own refusal audit row on denial/timeout/cancellation).
+//!   service moves the row into `waiting_approval` when the wait begins
+//!   ([`RequestEvent::AwaitApproval`](crate::request_state::RequestEvent::AwaitApproval)), the
+//!   pipeline moves it out on outcome (back to `queued` before lane placement on approval,
+//!   `Place`; a flow step's run carries on `running`, `Resume`; or terminal `refused` with its own
+//!   refusal audit row on denial/timeout/cancellation, `Finish`). The legal moves are the table in
+//!   [`crate::request_state`].
 //! - Every resolution writes an [`ACTION_APPROVAL`] row: approve → `approve`/`human`; deny →
 //!   `deny`/`human`; timeout → `timeout`/`system`; cancelled-while-waiting → `deny`/`system`
 //!   (approval row resolved `denied`, note `cancelled`).

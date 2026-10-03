@@ -206,8 +206,13 @@ fn inspection_reports_an_undeclared_input_apart_from_a_missing_one() {
 
 #[test]
 fn inspection_distinguishes_admission_auto_grants_and_manual_approvals() {
-    use crate::flow_contract::inspect_gate;
     use crate::policy::{CapabilityClass as Class, Profile};
+    // The labels inspection reports for the gate's own decision, with no
+    // managed policy in force.
+    let unmanaged = crate::managed_policy::PolicyView::unmanaged();
+    let inspect_gate = |profile, granted, class| {
+        crate::flow_service::inspect_admission(&unmanaged, profile, "echo", granted, class)
+    };
     for profile in [Profile::Relaxed, Profile::Standard, Profile::Strict] {
         for granted in [false, true] {
             assert_eq!(inspect_gate(profile, granted, Class::ReadOnly), "allowed");

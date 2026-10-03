@@ -96,6 +96,9 @@ pub mod public_transport;
 mod public_transport_test;
 pub mod queue;
 pub mod refusal_log;
+pub mod request_state;
+#[cfg(test)]
+mod request_state_test;
 pub mod retention;
 pub mod runtime_dir;
 pub mod secrets;
@@ -180,6 +183,9 @@ pub(crate) mod sonar_mapping;
 #[cfg(test)]
 mod sonar_mapping_test;
 
+mod flow_intent;
+#[cfg(test)]
+mod flow_intent_test;
 mod flow_recovery;
 #[cfg(test)]
 mod flow_recovery_test;

@@ -44,6 +44,19 @@ mod landing_runtime;
 mod landing_runtime_test;
 pub(crate) use landing_runtime::{landing_workspace, release_workspace};
 
+#[path = "flow_step.rs"]
+mod step;
+#[path = "flow_step_command.rs"]
+mod step_command;
+#[path = "flow_step_connector.rs"]
+mod step_connector;
+#[path = "flow_step_landing.rs"]
+mod step_landing;
+use step::{Attempt, InspectScope, StepExecutor, step_kind};
+#[cfg(test)]
+pub(crate) use step_connector::apply_connector_assertion;
+use step_connector::rate_limit_wait;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,6 +81,7 @@ use crate::flow_exec::{
     cancelled, effects_for, effects_note, outcome_for, resolve_program, run_command_budgeted,
     scrub_env, sleep_or_cancel, summary_for,
 };
+use crate::flow_intent::EffectIntent;
 use crate::flow_recovery::Prepare;
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
 use crate::managed_policy::{
@@ -76,7 +90,7 @@ use crate::managed_policy::{
 use crate::managed_policy_service::PolicyHandle;
 use crate::model_readiness::Stage;
 use crate::model_service::Tier;
-use crate::policy::{CapabilityClass, GateDecision, PolicyGate};
+use crate::policy::{CapabilityClass, GateDecision, GrantStanding, PolicyGate, StepGrant};
 use crate::scope_policy::{RECOVERY_SCOPE, ScopeError, ScopePolicy};
 
 /// `setting` key holding the programs a command step may run.
@@ -265,11 +279,7 @@ pub fn step_capability(flow: &str, step: &str) -> String {
 /// (`External`); every other gated step is `Destructive`.
 #[must_use]
 pub fn step_class(step: &Step) -> CapabilityClass {
-    if matches!(step.action, Action::Connector { .. }) {
-        CapabilityClass::External
-    } else {
-        CapabilityClass::Destructive
-    }
+    step_kind(step).class()
 }
 
 /// The effect digest of `step`: SHA-256 over what the step does, read off
@@ -283,24 +293,7 @@ pub fn step_class(step: &Step) -> CapabilityClass {
 /// digest, and a grant bound to the old one no longer covers the step.
 #[must_use]
 pub fn step_effect_digest(step: &Step) -> String {
-    let action = match &step.action {
-        Action::Command { argv } => json!(["command", argv]),
-        Action::Connector {
-            connector,
-            call,
-            with,
-        } => {
-            let with: Vec<Value> = with
-                .iter()
-                .map(|(name, value)| match value {
-                    ArgValue::Text(text) => json!([name, "text", text]),
-                    ArgValue::Int(number) => json!([name, "int", number]),
-                })
-                .collect();
-            json!(["connector", connector.as_str(), call, with])
-        }
-        Action::Landing { operation } => json!(["landing", operation]),
-    };
+    let action = step_kind(step).effect();
     let env: Vec<Value> = step
         .env
         .iter()
@@ -632,6 +625,14 @@ impl RunArgs {
 }
 
 /// Whether `text` has the shape of [`pam_flow::digest`]'s output.
+/// The state an approved step's run carries on in: the state table's
+/// [`RequestEvent::Resume`](crate::request_state::RequestEvent::Resume)
+/// target (never refused; the fallback is the same state).
+fn resume_state() -> RequestState {
+    crate::request_state::target(crate::request_state::RequestEvent::Resume)
+        .unwrap_or(RequestState::Running)
+}
+
 fn is_flow_digest(text: &str) -> bool {
     text.len() == 64
         && text
@@ -1115,7 +1116,7 @@ impl FlowService {
     }
 
     /// The admission inspection reports for one gated step, in the gate's
-    /// own order (see [`inspect_admission`]), with its blocker.
+    /// own decision (see [`inspect_gate`]), with its blocker.
     async fn inspect_step_gate(
         &self,
         view: &PolicyView,
@@ -1131,29 +1132,13 @@ impl FlowService {
             .active_grants(&capability)
             .await
             .map_err(|error| store_note(&error))?;
-        let class = step_class(step);
-        // Inspection binds nothing: a legacy grant reads as present (the
-        // run binds it), a bound one that no longer covers the step as it
-        // is now — or this repository — reads as changed.
-        let binding = step_binding(
-            flow,
-            step,
-            repo.map(|path| path.to_string_lossy().into_owned()),
-        );
-        let state = crate::policy::match_step_grant(&rows, &binding);
-        let granted = matches!(
-            state,
-            crate::policy::StepGrant::Bound | crate::policy::StepGrant::Legacy(_)
-        );
-        let mut admission =
-            inspect_admission(view, self.gate.profile(), &capability, granted, class);
-        if let crate::policy::StepGrant::Changed(changed) = &state {
-            if admission != CAUSE_POLICY_DENIED {
-                admission = "approval_required";
-            }
+        let (decision, state) = inspect_gate(flow, step, repo, view, self.gate.profile(), &rows);
+        let admission = admission_label(&decision);
+        if let StepGrant::Changed(changed) = &state {
             item["grant"] = json!("changed");
             item["grant_changed"] = json!(changed);
         } else {
+            let granted = matches!(state, StepGrant::Bound | StepGrant::Legacy(_));
             item["grant"] = json!(if granted { "present" } else { "missing" });
         }
         item["admission"] = json!(admission);
@@ -1179,108 +1164,25 @@ impl FlowService {
     ) -> Result<(Vec<Value>, Vec<Value>), FlowRefusal> {
         let mut blockers = Vec::new();
         let mut steps = Vec::new();
+        let scope = InspectScope {
+            vars,
+            repo,
+            allowed,
+            artifacts_root,
+            view,
+        };
         for step in &flow.steps {
             let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "watch": step.watch, "live": "unknown"});
             if step.gated() {
                 self.inspect_step_gate(view, flow, step, canonical, &mut item, &mut blockers)
                     .await?;
             }
-            match &step.action {
-                Action::Landing { operation } => {
-                    self.inspect_landing_step(
-                        view,
-                        repo,
-                        step,
-                        *operation,
-                        &mut item,
-                        &mut blockers,
-                    )
-                    .await;
-                }
-                Action::Command { argv } => {
-                    inspect_command_step(
-                        step,
-                        argv,
-                        vars,
-                        allowed,
-                        artifacts_root,
-                        &mut item,
-                        &mut blockers,
-                    );
-                    // A run refuses this before spawn with the policy's
-                    // cause; inspection says so first.
-                    if item["program"]
-                        .as_str()
-                        .is_some_and(|program| policy_forbids_program(view, program))
-                    {
-                        blockers.push(json!({"step": step.id, "cause": CAUSE_POLICY_DENIED, "recovery": RECOVERY_MANAGED}));
-                    }
-                }
-                Action::Connector {
-                    connector,
-                    call,
-                    with,
-                } => {
-                    item["product"] = json!(connector.as_str());
-                    item["operation"] = json!(call);
-                    // Named to stay off the redactor's sensitive-key list: a
-                    // `credential`-shaped key would mask the sentinel itself,
-                    // and "never probed" must survive redaction to reach agents.
-                    item["auth_probe"] = json!("unknown_not_probed");
-                    let row = self
-                        .store
-                        .get_connector(connector.as_str())
-                        .await
-                        .map_err(|error| store_note(&error))?;
-                    item["configured"] = json!(row.as_ref().is_some_and(|row| row.enabled));
-                    let resolved = with
-                        .iter()
-                        .map(|(name, value)| {
-                            let value = match value {
-                                ArgValue::Text(text) => ArgValue::Text(substitute(text, vars)?),
-                                ArgValue::Int(number) => ArgValue::Int(*number),
-                            };
-                            Ok((name.clone(), value))
-                        })
-                        .collect::<Result<BTreeMap<_, _>, pam_flow::VarError>>();
-                    match resolved {
-                        Ok(resolved) => if let Err(error) = self.connectors.authorize_scope(repo, *connector, call, &resolved).await {
-                            blockers.push(json!({"step": step.id, "cause": error.cause(), "recovery": error.recovery(*connector)}));
-                        },
-                        Err(_) => blockers.push(json!({"step": step.id, "cause": "target_unresolved", "recovery": "supply declared inputs; prior-step targets are checked during execution"})),
-                    }
-                    let shape = pam_connectors::descriptor(*connector);
-                    if shape.username_label.is_some()
-                        && row
-                            .as_ref()
-                            .and_then(|row| row.username.as_deref())
-                            .is_none_or(|value| value.trim().is_empty())
-                    {
-                        blockers.push(json!({"step": step.id, "cause": "connector_username_missing", "recovery": "configure the connector in GUI Connectors"}));
-                    }
-                }
-            }
+            step_kind(step)
+                .inspect(self, &scope, step, &mut item, &mut blockers)
+                .await?;
             steps.push(item);
         }
         Ok((steps, blockers))
-    }
-
-    async fn inspect_landing_step(
-        &self,
-        view: &PolicyView,
-        repo: &Path,
-        step: &Step,
-        operation: pam_flow::LandingOperation,
-        item: &mut Value,
-        blockers: &mut Vec<Value>,
-    ) {
-        item["landing"] = json!(operation);
-        item["live_state"] = json!("unknown_until_frozen_and_verified");
-        if let Err(error) =
-            landing_runtime::inspect_policy(&self.store, view, repo, operation).await
-        {
-            blockers.push(json!({"step":step.id,"cause":error.cause,"recovery":error.recovery}));
-        }
     }
 
     /// `flow.show`: one flow's text, its canonical rendering, and its
@@ -1652,49 +1554,6 @@ pub(crate) fn check_allowed_program(program: &str) -> Result<(), FlowRefusal> {
         ));
     }
     Ok(())
-}
-
-/// What `flow.inspect` says about one command step: containment, the
-/// program's allowlist status, and whether its build outputs have a home.
-fn inspect_command_step(
-    step: &Step,
-    argv: &[String],
-    vars: &Vars,
-    allowed: &[String],
-    artifacts_root: bool,
-    item: &mut Value,
-    blockers: &mut Vec<Value>,
-) {
-    item["containment"] = json!(if cfg!(target_os = "macos") {
-        "checked_before_execution"
-    } else {
-        "unavailable"
-    });
-    if !cfg!(target_os = "macos") {
-        blockers.push(json!({"step": step.id, "cause": crate::command_containment::CAUSE_UNAVAILABLE, "recovery": "command workloads require qualified OS containment; this platform is unsupported"}));
-    }
-    // The values known now are the caller's inputs: one that would become an
-    // option is refused at run time, so inspection says so before anything runs.
-    if let Err(error @ ArgvError::Option { .. }) = substitute_argv(argv, vars) {
-        blockers.push(json!({"step": step.id, "cause": CAUSE_ARGUMENT_OPTION, "detail": error.to_string(), "recovery": RECOVERY_ARGUMENT_OPTION}));
-    }
-    let program = argv.first().and_then(|value| substitute(value, vars).ok());
-    item["program"] = json!(program);
-    if !program
-        .as_ref()
-        .is_some_and(|program| check_allowed_program(program).is_ok() && allowed.contains(program))
-    {
-        blockers.push(json!({"step": step.id, "cause": "program_not_allowed_or_unresolved", "recovery": RECOVERY_ALLOWED_PROGRAMS}));
-    }
-    let needs_artifacts = program.as_deref().is_some_and(artifacts::needs_artifacts);
-    item["artifacts"] = json!(match (needs_artifacts, artifacts_root) {
-        (false, _) => "not_needed",
-        (true, true) => "configured",
-        (true, false) => "unset",
-    });
-    if needs_artifacts && !artifacts_root {
-        blockers.push(json!({"step": step.id, "cause": CAUSE_ARTIFACTS_ROOT_UNSET, "recovery": RECOVERY_ARTIFACTS_ROOT}));
-    }
 }
 
 /// Refuses a build output directory that is empty or not absolute once
@@ -2092,7 +1951,11 @@ impl RunState<'_> {
                 Prepare::Run
             };
             self.recovery
-                .prepare(&self.service.store, &self.ctx.request_id, step, prepare)
+                .prepare(
+                    &self.service.store,
+                    &self.ctx.request_id,
+                    &EffectIntent::attempt(step, prepare),
+                )
                 .await?;
             if prepare == Prepare::Skip {
                 self.reports
@@ -2259,72 +2122,21 @@ impl RunState<'_> {
         }
         // The gate has passed: from here on the step may change something.
         self.recovery
-            .arm_effect(&self.service.store, &self.ctx.request_id, step)
+            .arm_effect(
+                &self.service.store,
+                &self.ctx.request_id,
+                &EffectIntent::armed(step),
+            )
             .await?;
         let started = Instant::now();
-        match &step.action {
-            Action::Landing { operation } => {
-                self.run_landing_step(step, *operation, &mut report).await?;
-            }
-            Action::Command { argv } => self.run_command_step(step, argv, &mut report).await?,
-            Action::Connector {
-                connector,
-                call,
-                with,
-            } => {
-                self.run_connector_step(step, *connector, call, with, &mut report)
-                    .await?;
-            }
-        }
+        step_kind(step).execute(self, step, &mut report).await?;
         report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(report)
     }
 
     async fn check_step_scope(&self, step: &Step) -> Result<(), FlowRefusal> {
         self.service.approved_repo(&self.repo).await?;
-        // A program the managed policy forbids never reaches the gate, so no
-        // human is asked to approve a step that cannot run. The program is
-        // checked again right before spawn, after substitution.
-        if let Action::Command { argv } = &step.action
-            && let Some(program) = argv
-                .first()
-                .and_then(|program| substitute(program, &self.vars).ok())
-            && policy_forbids_program(&self.service.policy.view(), &program)
-        {
-            return Err(FlowRefusal::new(
-                CAUSE_POLICY_DENIED,
-                format!(
-                    "step {:?} runs {program:?}, which your organization's policy does not \
-                     allow on this machine ({})",
-                    step.id,
-                    Key::FlowsPrograms
-                ),
-                RECOVERY_MANAGED,
-            ));
-        }
-        if let Action::Landing { operation } = step.action {
-            let view = self.service.policy.view();
-            landing_runtime::inspect_policy(&self.service.store, &view, &self.repo, operation)
-                .await?;
-        }
-        if let Action::Connector {
-            connector,
-            call,
-            with,
-        } = &step.action
-        {
-            let args = self.substitute_args(with).map_err(|detail| {
-                FlowRefusal::new(CAUSE_VARIABLE_UNAVAILABLE, detail, RECOVERY_FLOW_EDIT)
-            })?;
-            self.service
-                .connectors
-                .authorize_scope(&self.repo, *connector, call, &args)
-                .await
-                .map_err(|error| {
-                    FlowRefusal::new(error.cause(), error.detail(), &error.recovery(*connector))
-                })?;
-        }
-        Ok(())
+        step_kind(step).check_scope(self, step).await
     }
 
     /// What a gated step will run, as this run resolved it: the hand-off to
@@ -2338,60 +2150,7 @@ impl RunState<'_> {
     fn approval_snapshot(&self, step: &Step, capability: &str) -> StepSnapshot {
         let flow_digest = digest(self.flow);
         let cwd = Some(self.repo.display().to_string());
-        match &step.action {
-            Action::Command { argv } => {
-                let mut scratch = StepReport::new(&step.id, step.kind(), StepStatus::Failed);
-                let argv = self
-                    .command_line(step, argv, &mut scratch)
-                    .map_or_else(|| argv.clone(), |(argv, _env)| argv);
-                let program = argv.first().cloned().unwrap_or_default();
-                let path = std::env::var_os("PATH").unwrap_or_default();
-                let resolved = resolve_program(&program, &self.settings.extra_path_dirs(), &path)
-                    .map_or(program, |found| found.display().to_string());
-                StepSnapshot::new(
-                    &flow_digest,
-                    capability,
-                    resolved,
-                    argv.get(1..).unwrap_or_default().to_vec(),
-                    cwd,
-                    step.env.keys().cloned().collect(),
-                )
-            }
-            Action::Connector {
-                connector,
-                call,
-                with,
-            } => {
-                let filled = self.substitute_args(with).unwrap_or_else(|_| with.clone());
-                let mut argv = vec![call.clone()];
-                argv.extend(filled.iter().map(|(name, value)| match value {
-                    ArgValue::Text(text) => format!("{name}={text}"),
-                    ArgValue::Int(number) => format!("{name}={number}"),
-                }));
-                StepSnapshot::new(
-                    &flow_digest,
-                    capability,
-                    format!("connector:{}", connector.as_str()),
-                    argv,
-                    None,
-                    Vec::new(),
-                )
-            }
-            Action::Landing { operation } => {
-                let operation = serde_json::to_value(operation)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                StepSnapshot::new(
-                    &flow_digest,
-                    capability,
-                    format!("landing:{operation}"),
-                    Vec::new(),
-                    cwd,
-                    Vec::new(),
-                )
-            }
-        }
+        step_kind(step).approval_snapshot(self, step, capability, &flow_digest, cwd)
     }
 
     /// The step gate (see the module docs). `Some(report)` means the step
@@ -2457,7 +2216,7 @@ impl RunState<'_> {
                         // is this run.
                         self.service
                             .store
-                            .update_request_state(&self.ctx.request_id, RequestState::Running, None)
+                            .update_request_state(&self.ctx.request_id, resume_state(), None)
                             .await
                             .map_err(failed)?;
                         Ok(None)
@@ -2490,1005 +2249,9 @@ impl RunState<'_> {
     }
 }
 
-/// Retrieval and verification are distinct: preserve the successful response as
-/// evidence even when its status fails the flow's explicit assertion.
-pub(crate) fn apply_connector_assertion(
-    step: &Step,
-    result: Option<&Value>,
-    report: &mut StepReport,
-) {
-    if report.status != StepStatus::Succeeded || !matches!(step.action, Action::Connector { .. }) {
-        return;
-    }
-    let Some(expected) = &step.expect_status else {
-        if step.role == Role::Verify {
-            report.fail(StepStatus::Failed, CAUSE_STATUS_ASSERTION_REQUIRED,
-                format!("connector verification step {:?} has no passing-status assertion", step.id),
-                "edit the flow to declare `expect_status` for verification, or use `role: observe` for retrieval".to_owned());
-        }
-        return;
-    };
-    let actual = result
-        .and_then(|value| {
-            if step.watch.is_some()
-                && matches!(
-                    step.action,
-                    Action::Connector {
-                        connector: ConnectorId::Github,
-                        ..
-                    }
-                )
-            {
-                value.pointer("/run/conclusion")
-            } else {
-                value.get("status")
-            }
-        })
-        .and_then(Value::as_str);
-    if actual != Some(expected.as_str()) {
-        report.fail(StepStatus::Failed, CAUSE_STATUS_ASSERTION,
-            format!("step {:?} expected status {expected:?}; inspect its retained connector evidence", step.id),
-            "resolve the reported gate conditions and re-run the flow; missing or unknown status never establishes a pass".to_owned());
-    }
-}
+impl RunState<'_> {}
 
-fn assert_connector_attempt(step: &Step, attempt: Attempt) -> Attempt {
-    let Attempt::Succeeded {
-        exit_status,
-        output,
-        result,
-    } = attempt
-    else {
-        return attempt;
-    };
-    let mut report = StepReport::new(&step.id, "connector", StepStatus::Succeeded);
-    apply_connector_assertion(step, result.as_ref(), &mut report);
-    if let Some(error) = report.error {
-        Attempt::Failed {
-            exit_status,
-            output,
-            result,
-            status: StepStatus::Failed,
-            cause: if step.expect_status.is_some() {
-                CAUSE_STATUS_ASSERTION
-            } else {
-                CAUSE_STATUS_ASSERTION_REQUIRED
-            },
-            detail: error.detail,
-            recovery: error.recovery,
-            retry_after: None,
-        }
-    } else {
-        Attempt::Succeeded {
-            exit_status,
-            output,
-            result,
-        }
-    }
-}
-
-/// A command step's argument vector and its environment additions, every
-/// `${…}` filled in.
-type CommandLine = (Vec<String>, Vec<(String, String)>);
-
-/// What one attempt of a step produced.
-enum Attempt {
-    /// It ran and reported success.
-    Succeeded {
-        /// The process (or job) status, when there was one.
-        exit_status: Option<i32>,
-        /// Bytes to file as evidence, when the step produced any.
-        output: Vec<u8>,
-        /// A connector's JSON answer, when the step was a connector call.
-        result: Option<Value>,
-    },
-    /// It ran and reported failure; another attempt may still follow.
-    Failed {
-        /// The process (or job) status, when there was one.
-        exit_status: Option<i32>,
-        /// Whatever it wrote before failing.
-        output: Vec<u8>,
-        /// Retrieved JSON retained even when its status assertion failed.
-        result: Option<Value>,
-        /// `Failed`, or `Blocked` when only a human can clear it.
-        status: StepStatus,
-        /// Machine-readable cause.
-        cause: &'static str,
-        /// What happened.
-        detail: String,
-        /// The concrete fix.
-        recovery: String,
-        /// Honour this wait before retrying instead of the backoff (a
-        /// service that named a `Retry-After` knows better than pam).
-        retry_after: Option<Duration>,
-    },
-}
-
-impl RunState<'_> {
-    /// Runs one command step, retries included.
-    async fn run_command_step(
-        &mut self,
-        step: &Step,
-        argv: &[String],
-        report: &mut StepReport,
-    ) -> Result<(), CapabilityFailure> {
-        let Some((argv, step_env)) = self.command_line(step, argv, report) else {
-            return Ok(());
-        };
-        // Validation guarantees a command step has at least its program.
-        let program = argv.first().cloned().unwrap_or_default();
-        // The live policy, not only the settings this run started with: a
-        // program the organization's policy removes is never spawned, and
-        // the refusal names the policy rather than the human's allowlist.
-        if policy_forbids_program(&self.service.policy.view(), &program) {
-            report.fail(
-                StepStatus::Blocked,
-                CAUSE_POLICY_DENIED,
-                format!(
-                    "step {:?} runs {program:?}, which your organization's policy does not \
-                     allow on this machine ({})",
-                    step.id,
-                    Key::FlowsPrograms
-                ),
-                RECOVERY_MANAGED.to_owned(),
-            );
-            return Ok(());
-        }
-        if !self.settings.allows(&program) {
-            report.fail(
-                StepStatus::Blocked,
-                CAUSE_PROGRAM_NOT_ALLOWED,
-                format!(
-                    "step {:?} runs {program:?}, which is not in the flow allowlist",
-                    step.id
-                ),
-                RECOVERY_ALLOWED_PROGRAMS.to_owned(),
-            );
-            return Ok(());
-        }
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let Some(resolved) = resolve_program(&program, &self.settings.extra_path_dirs(), &path)
-        else {
-            report.fail(
-                StepStatus::Failed,
-                CAUSE_PROGRAM_MISSING,
-                format!("{program:?} is allowed but is not installed on this machine"),
-                RECOVERY_EXTRA_PATH.to_owned(),
-            );
-            return Ok(());
-        };
-
-        let (containment, mut env) = match self.contain_step(step, &program, &resolved).await {
-            Ok(prepared) => prepared,
-            Err(refusal) => {
-                report.fail(
-                    StepStatus::Blocked,
-                    refusal.cause,
-                    refusal.detail,
-                    refusal.recovery,
-                );
-                return Ok(());
-            }
-        };
-        env.extend(step_env);
-        env.push(("PAM_FLOW".to_owned(), self.flow.id.clone()));
-        env.push(("PAM_STEP".to_owned(), step.id.clone()));
-        let spec = CommandSpec {
-            containment,
-            program: resolved,
-            argv: argv[1..].to_vec(),
-            cwd: self.repo.clone(),
-            env,
-            timeout: step.timeout,
-        };
-
-        let mut attempt = None;
-        for number in 1..=step.retry.attempts {
-            report.attempts = number;
-            let Some(outcome) = self.attempt_command(&spec, step).await else {
-                return Err(CapabilityFailure::Cancelled);
-            };
-            let done = matches!(
-                outcome,
-                Attempt::Succeeded { .. }
-                    | Attempt::Failed {
-                        status: StepStatus::Blocked,
-                        ..
-                    }
-            ) || step.effect == pam_flow::Effect::Stateful
-                || number == step.retry.attempts;
-            if done {
-                attempt = Some(outcome);
-                break;
-            }
-            self.preserve_attempt(step, outcome, report).await;
-            if self.wait_before_retry(step.retry, number, None).await {
-                return Err(CapabilityFailure::Cancelled);
-            }
-        }
-        self.settle(step, attempt, report).await;
-        Ok(())
-    }
-
-    /// The step's argument vector and environment additions with every
-    /// `${…}` filled in; `None` when the step cannot run, with `report`
-    /// already saying why.
-    fn command_line(
-        &self,
-        step: &Step,
-        argv: &[String],
-        report: &mut StepReport,
-    ) -> Option<CommandLine> {
-        let unavailable = |report: &mut StepReport, detail: String| {
-            report.fail(
-                StepStatus::Failed,
-                CAUSE_VARIABLE_UNAVAILABLE,
-                detail,
-                "supply the input the step references, or edit the flow's YAML".to_owned(),
-            );
-        };
-        let argv = match substitute_argv(argv, &self.vars) {
-            Ok(argv) => argv,
-            Err(error @ ArgvError::Unresolved { .. }) => {
-                unavailable(report, error.to_string());
-                return None;
-            }
-            // A value that would change what the program is asked to do is a
-            // refusal, not a failed attempt: the run stops here.
-            Err(error @ ArgvError::Option { .. }) => {
-                report.fail(
-                    StepStatus::Blocked,
-                    CAUSE_ARGUMENT_OPTION,
-                    format!("step {:?}: {error}", step.id),
-                    RECOVERY_ARGUMENT_OPTION.to_owned(),
-                );
-                return None;
-            }
-        };
-        // Environment values take the same variables as arguments; validation
-        // already counted an input one of them names as read.
-        match self.substitute_env(&step.env) {
-            Ok(env) => Some((argv, env)),
-            Err(error) => {
-                unavailable(report, error);
-                None
-            }
-        }
-    }
-
-    /// The boundary and environment one command step runs under: the
-    /// repository boundary, plus the private artifacts tree and the
-    /// read-only caches when a build output directory is configured.
-    async fn contain_step(
-        &self,
-        step: &Step,
-        program: &str,
-        resolved: &Path,
-    ) -> Result<
-        (
-            crate::command_containment::CommandContainment,
-            Vec<(String, String)>,
-        ),
-        FlowRefusal,
-    > {
-        let mut containment = command_boundary(
-            &self.service.protected_base,
-            &self.repo,
-            resolved,
-            step.effect,
-        );
-        let Some(artifacts) = self.prepare_artifacts(program).await? else {
-            return Ok((containment, base_env(self.settings)));
-        };
-        containment
-            .read_only_roots
-            .extend(self.settings.read_cache_dirs());
-        containment.read_only_roots.sort();
-        containment.read_only_roots.dedup();
-        containment.artifact_roots.push(artifacts.clone());
-        let env = artifacts::build_env(self.settings, &artifacts);
-        Ok((containment, env))
-    }
-
-    /// The private artifacts tree this step writes to: `None` when no root
-    /// is configured and the program does not need one, a refusal when the
-    /// program does (`artifacts_root_unset`) or the root is unusable.
-    async fn prepare_artifacts(&self, program: &str) -> Result<Option<PathBuf>, FlowRefusal> {
-        let Some(root) = self.settings.artifacts_root_dir() else {
-            if artifacts::needs_artifacts(program) {
-                return Err(FlowRefusal::new(
-                    CAUSE_ARTIFACTS_ROOT_UNSET,
-                    format!(
-                        "{program:?} keeps its caches and build outputs in a home directory, \
-                         and no private build output directory is configured"
-                    ),
-                    RECOVERY_ARTIFACTS_ROOT,
-                ));
-            }
-            return Ok(None);
-        };
-        let repo = self.repo.clone();
-        let protected = self.service.protected_base.clone();
-        let caches = self.settings.read_cache_dirs();
-        crate::blocking_jobs::run(crate::blocking_jobs::Kind::RepositoryIdentity, move || {
-            artifacts::prepare(&root, &repo, &protected, &caches)
-        })
-        .await
-        .map_err(|error| {
-            FlowRefusal::new(
-                CAUSE_ARTIFACTS_ROOT_INVALID,
-                error.to_string(),
-                RECOVERY_ARTIFACTS_ROOT,
-            )
-        })?
-        .map(Some)
-    }
-
-    /// One child-process attempt, as an [`Attempt`]. `None` means the
-    /// request was cancelled.
-    async fn attempt_command(&mut self, spec: &CommandSpec, step: &Step) -> Option<Attempt> {
-        if let Err(refusal) = self.service.approved_repo(&self.repo).await {
-            return Some(Attempt::Failed {
-                result: None,
-                exit_status: None,
-                output: Vec::new(),
-                status: StepStatus::Blocked,
-                cause: refusal.cause,
-                detail: refusal.detail,
-                recovery: refusal.recovery,
-                retry_after: None,
-            });
-        }
-        let outcome =
-            match run_command_budgeted(spec.clone(), &mut self.cancel, &self.ctx.budget).await {
-                Ok(outcome) => outcome,
-                Err(error) => return Some(budget_attempt(error)),
-            };
-        command_attempt(step, outcome)
-    }
-}
-
-/// How one child-process ending reads as an [`Attempt`]; `None` is the
-/// cancel signal.
-fn command_attempt(step: &Step, outcome: CommandOutcome) -> Option<Attempt> {
-    match outcome {
-            CommandOutcome::Exited { status: 0, output }
-                if step.expect_empty_output && !output.is_empty() => Some(Attempt::Failed {
-                result: None,                    exit_status: Some(0),
-                    output,
-                    status: StepStatus::Failed,
-                    cause: CAUSE_OUTPUT_ASSERTION,
-                    detail: format!("step {:?} expected empty output but the command emitted bytes", step.id),
-                    recovery: "read the step's evidence, resolve the reported changes or warnings, and re-run the flow".to_owned(),
-                    retry_after: None,
-                }),
-            CommandOutcome::Exited { status: 0, output } => Some(Attempt::Succeeded {
-                exit_status: Some(0),
-                output,
-                result: None,
-            }),
-            CommandOutcome::Exited { status, output } => Some(Attempt::Failed {
-                result: None,                exit_status: Some(status),
-                output,
-                status: StepStatus::Failed,
-                cause: CAUSE_EXIT_STATUS,
-                detail: format!("step {:?} exited {status}", step.id),
-                recovery: "read the step's evidence, fix what it reports, and re-run the flow"
-                    .to_owned(),
-                retry_after: None,
-            }),
-            CommandOutcome::TimedOut { output } => Some(Attempt::Failed {
-                result: None,                exit_status: None,
-                output,
-                status: StepStatus::Failed,
-                cause: CAUSE_TIMEOUT,
-                detail: format!(
-                    "step {:?} was still running after its {} second timeout and was killed",
-                    step.id,
-                    step.timeout.as_secs()
-                ),
-                recovery:
-                    "raise the step's `timeout:` in the flow's YAML, or make the step do less"
-                        .to_owned(),
-                retry_after: None,
-            }),
-            CommandOutcome::OutputLimit { output } => Some(Attempt::Failed {
-                result: None,                exit_status: None,
-                output,
-                status: StepStatus::Failed,
-                cause: CAUSE_OUTPUT_LIMIT,
-                detail: format!(
-                    "step {:?} wrote more than {} bytes and was killed",
-                    step.id,
-                    pam_compact::MAX_SOURCE_BYTES
-                ),
-                recovery: "make the step quieter, or send its output to a file the flow reads back"
-                    .to_owned(),
-                retry_after: None,
-            }),
-            CommandOutcome::ContainmentUnavailable { detail } => Some(Attempt::Failed {
-                result: None,
-                exit_status: None,
-                output: Vec::new(),
-                status: StepStatus::Blocked,
-                cause: crate::command_containment::CAUSE_UNAVAILABLE,
-                detail,
-                recovery: "Use a qualified command-containment platform and a repository outside PAM's protected files; no uncontained fallback is available.".to_owned(),
-                retry_after: None,
-            }),
-            CommandOutcome::SpawnFailed(detail) => Some(Attempt::Failed {
-                result: None,                exit_status: None,
-                output: Vec::new(),
-                status: StepStatus::Failed,
-                cause: CAUSE_SPAWN_FAILED,
-                detail: format!("step {:?} could not be started: {detail}", step.id),
-                recovery: RECOVERY_EXTRA_PATH.to_owned(),
-                retry_after: None,
-            }),
-            CommandOutcome::WaitFailed { detail, output } => Some(Attempt::Failed {
-                result: None,
-                exit_status: None,
-                output,
-                status: StepStatus::Failed,
-                cause: CAUSE_WAIT_FAILED,
-                detail: format!(
-                    "step {:?} ran but its exit status could not be collected: {detail}",
-                    step.id
-                ),
-                recovery: "read the step's evidence; the outcome of the command itself is unknown, so re-run the flow"
-                    .to_owned(),
-                retry_after: None,
-            }),
-            CommandOutcome::Cancelled => None,
-    }
-}
-
-impl RunState<'_> {
-    /// Runs one connector step, retries included.
-    async fn run_connector_step(
-        &mut self,
-        step: &Step,
-        connector: ConnectorId,
-        call: &str,
-        with: &BTreeMap<String, ArgValue>,
-        report: &mut StepReport,
-    ) -> Result<(), CapabilityFailure> {
-        let args = match self.substitute_args(with) {
-            Ok(args) => args,
-            Err(error) => {
-                report.fail(
-                    StepStatus::Failed,
-                    CAUSE_VARIABLE_UNAVAILABLE,
-                    error,
-                    "supply the input the step references, or edit the flow's YAML".to_owned(),
-                );
-                return Ok(());
-            }
-        };
-
-        let mut attempt = None;
-        for number in 1..=step.retry.attempts {
-            report.attempts = number;
-            let Some(outcome) = self.attempt_connector(step, connector, call, &args).await else {
-                return Err(CapabilityFailure::Cancelled);
-            };
-            let retry_after = match &outcome {
-                Attempt::Failed { retry_after, .. } => *retry_after,
-                Attempt::Succeeded { .. } => None,
-            };
-            // A blocked connector will still be blocked next attempt.
-            let done = matches!(
-                outcome,
-                Attempt::Succeeded { .. }
-                    | Attempt::Failed {
-                        status: StepStatus::Blocked,
-                        ..
-                    }
-            ) || number == step.retry.attempts;
-            if done {
-                attempt = Some(outcome);
-                break;
-            }
-            self.preserve_attempt(step, outcome, report).await;
-            if self
-                .wait_before_retry(step.retry, number, retry_after)
-                .await
-            {
-                return Err(CapabilityFailure::Cancelled);
-            }
-        }
-        self.settle(step, attempt, report).await;
-        Ok(())
-    }
-
-    /// One connector call, bounded by the step's timeout and the cancel
-    /// signal. `None` means the request was cancelled.
-    async fn attempt_connector(
-        &mut self,
-        step: &Step,
-        connector: ConnectorId,
-        call: &str,
-        args: &BTreeMap<String, ArgValue>,
-    ) -> Option<Attempt> {
-        let deadline = Instant::now() + step.timeout;
-        let called = tokio::select! {
-            biased;
-            () = cancelled(&mut self.cancel) => return None,
-            called = tokio::time::timeout(
-                step.timeout,
-                self.service.connectors.invoke_captured(&self.repo, connector, call, args, deadline.min(self.ctx.budget.deadline()), Arc::clone(&self.ctx.budget)),
-            ) => called,
-        };
-        let called = called.map(|result| {
-            result.and_then(|(result, origin)| {
-                if !self.all_origins.contains(&origin) {
-                    self.all_origins.push(origin.clone());
-                }
-                self.origins.insert(step.id.clone(), origin);
-                result
-            })
-        });
-        let attempt = match called {
-            Err(_elapsed) => Attempt::Failed {
-                result: None,
-                exit_status: None,
-                output: Vec::new(),
-                status: StepStatus::Failed,
-                cause: CAUSE_TIMEOUT,
-                detail: format!(
-                    "the {connector} call did not answer within step {:?}'s {} second timeout",
-                    step.id,
-                    step.timeout.as_secs()
-                ),
-                recovery: format!("open Pam → Settings → Connectors → {connector} → Test"),
-                retry_after: None,
-            },
-            Ok(Ok(CallResult::Json(value))) => Attempt::Succeeded {
-                exit_status: None,
-                output: Vec::new(),
-                result: Some(value),
-            },
-            Ok(Ok(CallResult::Log {
-                bytes, exit_status, ..
-            })) => Attempt::Succeeded {
-                exit_status,
-                output: bytes,
-                result: None,
-            },
-            Ok(Err(error)) => Attempt::Failed {
-                result: None,
-                exit_status: None,
-                output: Vec::new(),
-                // A connector a human has not finished setting up is a
-                // block (somebody must open Settings); a service that
-                // answered badly is a failure — the step did run.
-                status: if blocks_the_run(&error) {
-                    StepStatus::Blocked
-                } else {
-                    StepStatus::Failed
-                },
-                cause: error.cause(),
-                detail: format!("the {connector} call failed: {}", error.detail()),
-                recovery: error.recovery(connector),
-                retry_after: rate_limit_wait(&error),
-            },
-        };
-        let attempt = self.check_watch_pins(step, connector, attempt);
-        let attempt = self.correlate_attempt(step, attempt).await;
-        Some(assert_connector_attempt(step, attempt))
-    }
-
-    async fn correlate_attempt(&mut self, step: &Step, attempt: Attempt) -> Attempt {
-        let Attempt::Succeeded {
-            exit_status,
-            output,
-            mut result,
-        } = attempt
-        else {
-            return attempt;
-        };
-        let correlated = if let Some(origin) = self.origins.get(&step.id) {
-            match self
-                .correlation
-                .enrich(&self.service.store, origin, result.as_mut())
-                .await
-            {
-                Err(error) => Err(error),
-                Ok(()) => {
-                    self.correlation
-                        .associate(
-                            &self.service.store,
-                            &self.ctx.request_id,
-                            step,
-                            origin,
-                            result.as_ref(),
-                        )
-                        .await
-                }
-            }
-        } else {
-            Err(crate::correlation::Failure {
-                cause: crate::correlation::MISSING,
-                detail: "connector origin unavailable for association".to_owned(),
-            })
-        };
-        match correlated {
-            Ok(()) => Attempt::Succeeded {
-                exit_status,
-                output,
-                result,
-            },
-            Err(error) => Attempt::Failed {
-                exit_status,
-                output,
-                result,
-                status: StepStatus::Blocked,
-                cause: error.cause,
-                detail: error.detail,
-                recovery: crate::correlation::RECOVERY.to_owned(),
-                retry_after: None,
-            },
-        }
-    }
-
-    /// Persist a completed failed attempt before waiting or starting another.
-    async fn preserve_attempt(&mut self, step: &Step, attempt: Attempt, report: &mut StepReport) {
-        let (output, result, exit_status) = match attempt {
-            Attempt::Succeeded {
-                output,
-                result,
-                exit_status,
-            }
-            | Attempt::Failed {
-                output,
-                result,
-                exit_status,
-                ..
-            } => (output, result, exit_status),
-        };
-        if let Some(result) = result {
-            self.file_connector_result(step, &result, report).await;
-        } else {
-            self.file_output(step, output, exit_status, report).await;
-        }
-    }
-
-    /// Files the last attempt's output and writes the step's verdict.
-    async fn settle(&mut self, step: &Step, attempt: Option<Attempt>, report: &mut StepReport) {
-        let Some(attempt) = attempt else {
-            // Unreachable: validation keeps `retry.attempts` at one or
-            // more, so the attempt loop always runs at least once.
-            report.fail(
-                StepStatus::Failed,
-                CAUSE_INTERNAL,
-                format!("step {:?} made no attempt", step.id),
-                "re-run the flow".to_owned(),
-            );
-            return;
-        };
-        let (exit_status, output, result) = match attempt {
-            Attempt::Succeeded {
-                exit_status,
-                output,
-                result,
-            } => {
-                report.status = StepStatus::Succeeded;
-                report.exit_status = exit_status;
-                (exit_status, output, result)
-            }
-            Attempt::Failed {
-                exit_status,
-                output,
-                result,
-                status,
-                cause,
-                detail,
-                recovery,
-                ..
-            } => {
-                report.exit_status = exit_status;
-                report.fail(status, cause, detail, recovery);
-                (exit_status, output, result)
-            }
-        };
-
-        if let Some(result) = &result {
-            self.file_connector_result(step, result, report).await;
-        } else {
-            self.file_output(step, output, exit_status, report).await;
-        }
-        self.observed.set_step(
-            &step.id,
-            json!({ "exit_status": exit_status, "result": result }),
-        );
-        let correlated = report
-            .error
-            .as_ref()
-            .is_none_or(|error| !error.cause.starts_with("correlation_"));
-        self.vars.set_step(
-            &step.id,
-            json!({ "exit_status": if correlated { exit_status } else { None }, "result": if correlated { result } else { None } }),
-        );
-    }
-
-    /// Files a connector's JSON answer as `connector.result` evidence.
-    fn capture_scope(&self, step: &Step) -> Result<crate::evidence_service::CaptureScope, String> {
-        use crate::evidence_service::{CaptureScope, EvidenceOrigin};
-        if matches!(step.action, Action::Connector { .. }) {
-            self.origins
-                .get(&step.id)
-                .ok_or("connector capture identity unavailable")?;
-        }
-        // Later local steps can consume earlier connector values. Conservatively
-        // retain every preceding target rather than downgrade derived evidence.
-        let origin = EvidenceOrigin {
-            targets: self.all_origins.clone(),
-        };
-        Ok(CaptureScope {
-            repository: self.repo.to_string_lossy().into_owned(),
-            origin,
-        })
-    }
-
-    /// Keep raw connector answers protected and publish their redacted views.
-    async fn file_connector_result(
-        &mut self,
-        step: &Step,
-        result: &Value,
-        report: &mut StepReport,
-    ) {
-        let Action::Connector {
-            connector,
-            call,
-            with: _,
-        } = &step.action
-        else {
-            return;
-        };
-        if let Some(summary) = crate::context_summary::summarize(*connector, call, result) {
-            report.summary = crate::evidence_view::redact(summary.as_bytes())
-                .ok()
-                .and_then(|view| String::from_utf8(view.bytes).ok());
-        }
-        if (*connector == ConnectorId::Jenkins
-            && matches!(call.as_str(), "investigate" | "node_evidence"))
-            || (*connector == ConnectorId::Sonarqube && call == "analysis")
-        {
-            report.summary = result
-                .get("summary")
-                .and_then(Value::as_str)
-                .filter(|text| text.len() <= 6000)
-                .and_then(|text| crate::evidence_view::redact(text.as_bytes()).ok())
-                .and_then(|view| String::from_utf8(view.bytes).ok());
-        }
-        let meta = json!({
-            "connector": connector.as_str(),
-            "attempt": report.attempts,
-            "call": call,
-            "args": self.origins.get(&step.id).map(|origin| &origin.args),
-        });
-        let content = match serde_json::to_vec(result) {
-            Ok(content) => content,
-            Err(error) => {
-                tracing::warn!(step = %step.id, %error, "a connector result did not serialize");
-                return;
-            }
-        };
-        let id = new_evidence_id();
-        match self
-            .service
-            .store
-            .insert_evidence(
-                &id,
-                &self.ctx.request_id,
-                EVIDENCE_KIND_CONNECTOR_RESULT,
-                &content,
-                Some(&meta.to_string()),
-            )
-            .await
-        {
-            Ok(()) => {
-                let capture = self.capture_scope(step);
-                let view = crate::evidence_service::prepare(content).await;
-                if let (Ok(capture), Ok(view)) = (capture, view) {
-                    if let Err(error) = crate::evidence_service::publish(
-                        &self.service.store,
-                        &capture,
-                        &self.ctx.request_id,
-                        &id,
-                        view,
-                        json!({"kind": "protected_connector_result"}),
-                    )
-                    .await
-                    {
-                        tracing::warn!(step = %step.id, %error, "connector evidence view unavailable");
-                        report
-                            .evidence_unavailable
-                            .push(format!("{id}: view_unavailable"));
-                    }
-                } else {
-                    tracing::warn!(step = %step.id, "connector evidence view could not be prepared");
-                    report
-                        .evidence_unavailable
-                        .push(format!("{id}: view_unavailable"));
-                }
-                report.evidence.push(id.clone());
-                self.evidence.push(id);
-            }
-            Err(error) => {
-                tracing::warn!(step = %step.id, %error, "a connector result could not be filed");
-                report
-                    .evidence_unavailable
-                    .push("connector_source_unavailable".to_owned());
-            }
-        }
-    }
-
-    /// Compresses a step's output per its `output:` policy.
-    ///
-    /// A compression that fails costs the run its evidence, not its
-    /// verdict: the step already did (or did not do) its work, and losing
-    /// the log is worth a warning in the daemon log, not a changed answer.
-    async fn file_output(
-        &mut self,
-        step: &Step,
-        output: Vec<u8>,
-        exit_status: Option<i32>,
-        report: &mut StepReport,
-    ) {
-        if output.is_empty() || step.output == OutputPolicy::Discard {
-            return;
-        }
-        let summarize = step.output == OutputPolicy::Summarize;
-        let capture = match self.capture_scope(step) {
-            Ok(capture) => capture,
-            Err(error) => {
-                tracing::warn!(step = %step.id, %error, "evidence scope could not be captured");
-                report
-                    .evidence_unavailable
-                    .push("capture_scope_unavailable".to_owned());
-                return;
-            }
-        };
-        let compressed = self
-            .service
-            .logs
-            .compress_scoped(
-                &self.ctx.request_id,
-                CompressInput {
-                    name: format!("{}/{}/attempt-{}", self.flow.id, step.id, report.attempts),
-                    bytes: output,
-                    exit_status,
-                    use_model: summarize,
-                },
-                Some(&capture),
-                // The step's own cancel: a cancelled run stops its summary too.
-                self.cancel.clone(),
-            )
-            .await;
-        let compressed = match compressed {
-            Ok(compressed) => compressed,
-            Err(error) => {
-                tracing::warn!(step = %step.id, %error, "a step's output could not be compressed");
-                report
-                    .evidence_unavailable
-                    .push(format!("log_view_unavailable: {}", error.cause()));
-                return;
-            }
-        };
-        for skipped in &compressed.view_skipped {
-            report
-                .evidence_unavailable
-                .push(format!("{}: {}", skipped.detail, skipped.cause));
-        }
-        for id in [
-            Some(compressed.source.id.clone()),
-            Some(compressed.compact.id.clone()),
-            compressed.summary.as_ref().map(|row| row.id.clone()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            report.evidence.push(id.clone());
-            self.evidence.push(id);
-        }
-        if summarize {
-            report.summary_model = compressed.model.as_ref().map(|used| SummaryModel {
-                id: used.id.clone(),
-                qualification: used.qualification.clone(),
-            });
-            report.summary = compressed.summary_text.clone().or_else(|| {
-                compressed
-                    .model_skipped
-                    .as_ref()
-                    .map(|skipped| format!("model_skipped: {} — {}", skipped.cause, skipped.detail))
-            });
-        }
-    }
-
-    /// Sleeps the doubling backoff (or a service's own `Retry-After`);
-    /// `true` means the request was cancelled while waiting.
-    async fn wait_before_retry(
-        &mut self,
-        retry: Retry,
-        attempt: u8,
-        retry_after: Option<Duration>,
-    ) -> bool {
-        let delay = retry_after
-            .filter(|wait| *wait <= MAX_BACKOFF)
-            .unwrap_or_else(|| backoff_for(retry, attempt));
-        sleep_or_cancel(delay, &mut self.cancel).await
-    }
-
-    /// Substitutes `${…}` in every environment value of a command step,
-    /// naming the first variable that fails.
-    fn substitute_env(
-        &self,
-        env: &BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, String> {
-        env.iter()
-            .map(|(name, value)| {
-                substitute(value, &self.vars)
-                    .map(|value| (name.clone(), value))
-                    .map_err(|error| format!("env.{name}: {error}"))
-            })
-            .collect()
-    }
-
-    /// Substitutes `${…}` in every text connector argument; integers pass
-    /// through untouched.
-    fn substitute_args(
-        &self,
-        with: &BTreeMap<String, ArgValue>,
-    ) -> Result<BTreeMap<String, ArgValue>, String> {
-        with.iter()
-            .map(|(name, value)| match value {
-                ArgValue::Text(text) => substitute(text, &self.vars)
-                    .map(|text| (name.clone(), ArgValue::Text(text)))
-                    .map_err(|error| format!("`{name}`: {error}")),
-                ArgValue::Int(number) => Ok((name.clone(), ArgValue::Int(*number))),
-            })
-            .collect()
-    }
-}
-
-/// The backoff before the next attempt: the step's own backoff doubled
-/// once per failure, capped at [`MAX_BACKOFF`].
-#[must_use]
-fn backoff_for(retry: Retry, attempt: u8) -> Duration {
-    let doublings = u32::from(attempt.saturating_sub(1)).min(16);
-    retry
-        .backoff
-        .saturating_mul(1_u32 << doublings)
-        .min(MAX_BACKOFF)
-}
-
-/// Whether this connector failure is something only a human at the
-/// Connectors screen can clear, which makes the step `blocked`.
-fn blocks_the_run(error: &InvokeError) -> bool {
-    matches!(
-        error,
-        InvokeError::Disabled
-            | InvokeError::Scope(_)
-            | InvokeError::Connector(pam_connectors::ConnectorError::Policy { .. })
-            | InvokeError::CredentialMissing
-            | InvokeError::BaseUrlMissing
-            | InvokeError::BadUrl(_)
-            | InvokeError::NotConfigured(_)
-            | InvokeError::Secret(_)
-            | InvokeError::CurlMissing
-    )
-}
-
-/// The wait a rate-limited service asked for, when it named one.
-fn rate_limit_wait(error: &InvokeError) -> Option<Duration> {
-    match error {
-        InvokeError::Connector(pam_connectors::ConnectorError::RateLimited { retry_after }) => {
-            *retry_after
-        }
-        _ => None,
-    }
-}
+impl RunState<'_> {}
 
 fn budget_refusal(error: crate::request_budget::BudgetError) -> FlowRefusal {
     FlowRefusal::new(
@@ -3496,19 +2259,6 @@ fn budget_refusal(error: crate::request_budget::BudgetError) -> FlowRefusal {
         error.to_string(),
         crate::request_budget::RECOVERY_BUDGET,
     )
-}
-
-fn budget_attempt(error: crate::request_budget::BudgetError) -> Attempt {
-    Attempt::Failed {
-        result: None,
-        exit_status: None,
-        output: Vec::new(),
-        status: StepStatus::Blocked,
-        cause: error.cause,
-        detail: error.to_string(),
-        recovery: crate::request_budget::RECOVERY_BUDGET.to_owned(),
-        retry_after: None,
-    }
 }
 
 fn contract_refusal(error: crate::flow_contract::ContractError) -> FlowRefusal {
@@ -3714,11 +2464,12 @@ pub(crate) fn boundary_read_roots(
     roots
 }
 
-/// The admission inspection reports for `capability`: the gate's own order,
-/// so inspection never shows a step admissible that the gate refuses. A
-/// managed never-grant rule refuses first, on every profile and whether or
-/// not a grant exists (`policy_denied`, with no rule text); otherwise the
-/// profile and grant decide (`flow_contract::inspect_gate`).
+/// The admission inspection reports for `capability`: the run's own gate
+/// decision ([`crate::policy::decide`]) for a grant that is present or
+/// missing, as a label ([`admission_label`]). A managed never-grant rule
+/// refuses first, on every profile and whether or not a grant exists
+/// (`policy_denied`, with no rule text); otherwise the profile and grant
+/// decide.
 pub(crate) fn inspect_admission(
     view: &PolicyView,
     profile: crate::policy::Profile,
@@ -3726,8 +2477,64 @@ pub(crate) fn inspect_admission(
     granted: bool,
     class: CapabilityClass,
 ) -> &'static str {
-    if class != CapabilityClass::Control && view.never_match(capability, Some(class)).is_some() {
-        return CAUSE_POLICY_DENIED;
+    let grant = if granted {
+        GrantStanding::Granted
+    } else {
+        GrantStanding::Missing
+    };
+    admission_label(
+        &crate::policy::decide(view, profile, capability, class, &grant).decision(capability),
+    )
+}
+
+/// The gate decision for the gated `step` of `flow` in `repository` (the
+/// canonical one the run binds grants to, when the scope admits it), from
+/// `grants` — the step capability's active grants as they are now — under
+/// the policy `view` and the effective `profile`. It is the run's own
+/// decision ([`crate::policy::decide`], whose two halves
+/// [`PolicyGate::evaluate_step`] calls around its grant read) with none of
+/// its side effects: no `policy.denied` audit row, no legacy binding. The
+/// flow settings play no part in it (the program allowlist is a separate
+/// blocker). Also returns how the grants stand against the step as it is
+/// now, which inspection reports beside the decision.
+pub(crate) fn inspect_gate(
+    flow: &Flow,
+    step: &Step,
+    repository: Option<&Path>,
+    view: &PolicyView,
+    profile: crate::policy::Profile,
+    grants: &[pam_store::GrantRow],
+) -> (GateDecision, StepGrant) {
+    let capability = step_capability(&flow.id, &step.id);
+    // Inspection binds nothing: a legacy grant reads as present (the run
+    // binds it), a bound one that no longer covers the step as it is now —
+    // or this repository — reads as changed.
+    let binding = step_binding(
+        flow,
+        step,
+        repository.map(|path| path.to_string_lossy().into_owned()),
+    );
+    let grant = crate::policy::match_step_grant(grants, &binding);
+    let verdict = crate::policy::decide(
+        view,
+        profile,
+        &capability,
+        step_class(step),
+        &GrantStanding::from(&grant),
+    );
+    (verdict.decision(&capability), grant)
+}
+
+/// The admission label `flow.inspect` reports for a gate decision: an
+/// allow that would grant on execution is `auto_grant_on_execution`.
+pub(crate) fn admission_label(decision: &GateDecision) -> &'static str {
+    match decision {
+        GateDecision::Allow {
+            auto_granted: false,
+        } => "allowed",
+        GateDecision::Allow { auto_granted: true } => "auto_grant_on_execution",
+        GateDecision::RequireApproval { .. } => "approval_required",
+        GateDecision::Refuse { cause, .. } if cause == CAUSE_POLICY_DENIED => CAUSE_POLICY_DENIED,
+        GateDecision::Refuse { .. } => crate::policy::CAUSE_NOT_GRANTED,
     }
-    crate::flow_contract::inspect_gate(profile, granted, class)
 }

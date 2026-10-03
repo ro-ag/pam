@@ -33,6 +33,8 @@ use pam_store::{Actor, ApprovalResolution, AuditEntry, Decision, RequestState, S
 use thiserror::Error;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
+use crate::request_state::{self, RequestEvent};
+
 /// Name of the single-instance lock file inside the run directory.
 pub const LOCK_FILE: &str = "daemon.lock";
 
@@ -209,6 +211,15 @@ pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> 
         };
         after = Some((last.created_ts, last.id.clone()));
         for row in stuck {
+            // The stuck page holds in-flight rows only; the state table says
+            // what recovery may do with each, and the store's guard has the
+            // last word on a row that finished since the page was read.
+            let Ok(restart_state) = request_state::transition(
+                Some(row.state),
+                RequestEvent::Finish(RequestState::Failed),
+            ) else {
+                continue;
+            };
             let was_waiting = row.state == RequestState::WaitingApproval;
             let recovery = recover_journal(store, &row).await?;
             if recovery == JournalRecovery::Requeued {
@@ -232,7 +243,7 @@ pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> 
             let finished = store
                 .finish_request(
                     &row.id,
-                    RequestState::Failed,
+                    restart_state,
                     Some(cause),
                     AuditEntry {
                         action: ACTION_DAEMON_RESTART,
@@ -289,7 +300,9 @@ async fn recover_journal(
     row: &pam_store::RequestRow,
 ) -> Result<JournalRecovery, StoreError> {
     use pam_store::FlowJournalState;
-    if row.capability != "flow.run" {
+    if row.capability != "flow.run"
+        || request_state::transition(Some(row.state), RequestEvent::Requeue).is_err()
+    {
         return Ok(JournalRecovery::Legacy);
     }
     let Some(journal) = store.read_flow_journal(&row.id).await? else {

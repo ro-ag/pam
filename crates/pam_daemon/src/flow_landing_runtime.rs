@@ -5,6 +5,7 @@ use super::{
     digest, failed, json, new_evidence_id,
 };
 use crate::connector_service::{InvokeError, LandingGithubOp};
+use crate::flow_intent::EffectIntent;
 use crate::flow_recovery::{KIND, MAX_INLINE_BYTES, failure};
 use crate::landing_checkout::{self, CANCELLED, CheckoutReceipt, CheckoutRequest, valid_oid};
 use crate::landing_git::{
@@ -45,7 +46,7 @@ struct Session {
     checktree: PathBuf,
     target: pam_flow::CorrelationTarget,
     receipts: BTreeMap<String, Value>,
-    intent: Option<Intent>,
+    intent: Option<EffectIntent<Op>>,
     poll: Option<Poll>,
     /// The broker Git frozen with this landing; every later stage must
     /// resolve to the same executable. Absent on sessions frozen before it
@@ -61,14 +62,6 @@ pub(super) struct GitRecord {
     pub path: PathBuf,
     pub source: GitSource,
     pub version: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Intent {
-    step_id: String,
-    operation: Op,
-    state: String,
-    expected: Value,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,7 +282,7 @@ impl RunState<'_> {
         Ok(self.landing_session().await?.is_some_and(|(_, session)| {
             session
                 .intent
-                .is_some_and(|intent| intent.step_id == step.id && intent.state == "prepared")
+                .is_some_and(|intent| intent.is_prepared_for(&step.id))
         }))
     }
     pub(super) async fn landing_approval_valid(
@@ -545,7 +538,7 @@ impl RunState<'_> {
                 if self.landing_session().await?.is_some_and(|(_, s)| {
                     s.intent
                         .as_ref()
-                        .is_some_and(|i| i.step_id == step.id && i.state == "prepared")
+                        .is_some_and(|i| i.is_prepared_for(&step.id))
                 }) {
                     return Err(error);
                 }
@@ -879,12 +872,7 @@ impl RunState<'_> {
         }) {
             return Err(failure());
         }
-        loaded.session.intent = Some(Intent {
-            step_id: step.id.clone(),
-            operation,
-            state: "prepared".into(),
-            expected,
-        });
+        loaded.session.intent = Some(EffectIntent::prepared(&step.id, operation, expected));
         self.landing_save(loaded).await
     }
     /// Journals what the mutating process itself reported, before the exact
@@ -968,8 +956,7 @@ impl RunState<'_> {
             Ok(value) => Ok(value),
             Err(error) if error.cause() != CANCELLED && mutation_refused(&error) => {
                 let intent = loaded.session.intent.as_mut().ok_or_else(failure)?;
-                intent.state = "rejected".into();
-                intent.expected["rejection"] = json!(error.cause());
+                intent.reject(error.cause());
                 self.landing_save(loaded).await?;
                 Err(refused_with(
                     error.cause(),
@@ -1522,7 +1509,7 @@ fn require_predecessor(session: &Session, operation: Op) -> Result<(), Capabilit
 fn has_intent(loaded: &Loaded, step: &Step, operation: Op) -> Result<bool, CapabilityFailure> {
     match &loaded.session.intent {
         Some(intent) if intent.step_id == step.id => {
-            if intent.operation != operation || intent.state != "prepared" {
+            if !intent.is_prepared(&step.id, &operation) {
                 return Err(failure());
             }
             Ok(true)

@@ -42,7 +42,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 5 | Medium | `cancel` has no authorization, and a `pam-gui` label forges a human actor in the audit | `executor.rs:396-413`, `queue.rs:620-660` | fixed: a public cancel is `system`, bound to the caller's repository, and `admin.requests.cancel` is the human's cancel |
 | 6 | Medium | Attached duplicate callers are never released when the original is gate-refused or fails internally | `daemon.rs:978-1740` | fixed |
 | 7 | Medium | The completion router retains every terminal response for 60 s with no entry or byte bound | `daemon.rs:259-330` | fixed: at most 256 entries and 8 MiB, oldest evicted; a late attacher reads the durable result |
-| 8 | Medium | One global async mutex over the queue is held across store I/O on every path | `queue.rs:267-750` | deferred |
+| 8 | Medium | One global async mutex over the queue is held across store I/O on every path | `queue.rs:267-750` | fixed (plan 55, task 227): the lock guards only in-memory lane state; store calls run outside it with a per-request in-progress mark; the lock order is in the `queue.rs` module docs |
 | 9 | Medium | A failed terminal write after a successful execution strands the lane and discards the real result | `queue.rs:605-613`, `daemon.rs:1437-1583` | fixed: the lane is released at once, the verdict parked and retried, waiters still get the real result |
 | 10 | Medium (plausible) | Reply path has head-of-line blocking behind one peer and drops final replies at shutdown | `transport.rs:360-389` | superseded by the transport replacement |
 | 11 | Medium | The `echo` test hook is a production lane-hog primitive reachable by any caller | `executor.rs:368-378` | fixed: delay over 60 s or arguments over 64 KiB refused (`echo_limit_exceeded`) |
@@ -70,7 +70,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 11 | Medium-low | `${...}` in `env:` is validated but never substituted; env can override isolation variables | `validate.rs:786-799`, `flow_service.rs:2137` | partly fixed: substituted at run time; reserving `PATH`, `HOME` and `GIT_CONFIG_*` is an owner decision |
 | 12 | Low (plausible) | The daemon writes into an agent-writable `.git` after a stale layout check (symlink swap) | `landing_git.rs:565-650`, `1113-1251` | partly fixed: each directory is walked and checked immediately before each write; a swap in the instants between walk and write remains |
 | 13 | Low | Required PR and main checks are matched by name only | `github_landing.rs:385-465` | fixed (task 224): checks can be pinned as `{ name, app_id }`; a same-named check from another app or a commit status never satisfies a pinned one; name-only checks show "Unpinned app" |
-| 14 | Low | Stringly-typed, duplicated state machines | `flow_landing_runtime.rs:39-44`, `landing_session.rs:97-108`, `flow_contract.rs:391-409` | deferred |
+| 14 | Low | Stringly-typed, duplicated state machines | `flow_landing_runtime.rs:39-44`, `landing_session.rs:97-108`, `flow_contract.rs:391-409` | fixed (plan 55, task 227): one `request_state` transition table used by every writer, one `EffectIntent` type, and a pure gate function shared by `flow.inspect` and the run; `flow_service.rs` split into a `StepExecutor` per step kind |
 | 15 | Low | The compact result drops the last steps first | `flow_contract.rs:292-304` | fixed: succeeded and skipped observations are dropped first |
 | c1 | Carry-over | `github_owner_name` matches the first `github.com` anywhere in the origin URL (reported in the 2026-09-16 flow review) | `flow_service.rs:1413` | fixed: the host must be exactly `github.com` |
 
@@ -264,14 +264,8 @@ From the fix reports:
 
 Not done, with the reason.
 
-- **Queue lock held across store I/O** (daemon core 8): structural. The hard
-  handler deadline and the separate pools bound its effect.
 - **Windows pending-handshake slots** (daemon core 12): the Windows listener is
   replaced by the new transport.
-- **One shared effect-intent type and a pure `inspect_gate`** (flows 14), and a
-  `StepExecutor` split of `flow_service.rs`: structural; the `match step.action`
-  repetition is unchanged. The same holds for the single request state machine
-  spread across four daemon modules.
 - **`watch_target_changed` raw results readable through `${steps.*}`** and builtin
   descriptions that over-promise `git fetch`: unreachable from shipped recipes, and
   description text only.

@@ -36,7 +36,11 @@ async fn landing_poll_commits_progress_without_copying_or_advancing_protected_sn
     let original_cursor: Value = serde_json::from_str(&original.checkpoint_json).unwrap();
     for id in ["poll1", "poll1", "poll2"] {
         recovery
-            .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+            .prepare(
+                &store,
+                "r",
+                &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+            )
             .await
             .unwrap();
         recovery

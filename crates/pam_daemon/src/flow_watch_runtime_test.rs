@@ -85,7 +85,11 @@ async fn polls_reuse_snapshot_and_completed_cursor_preserves_committed_progress(
     };
     for poll in 1..=2 {
         recovery
-            .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+            .prepare(
+                &store,
+                "r",
+                &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+            )
             .await
             .unwrap();
         state.polls = poll;
@@ -106,7 +110,11 @@ async fn polls_reuse_snapshot_and_completed_cursor_preserves_committed_progress(
             .is_err()
     );
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     recovery.settle(&store, "r", &snapshot, true).await.unwrap();
@@ -198,7 +206,11 @@ async fn substituted_run_is_committed_as_conflict_without_replacing_valid_pins()
         last_evidence: "ev_conflict".into(),
     };
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     recovery
@@ -533,7 +545,11 @@ impl Fixture {
         let (profile_stamp, authorization_revision) = state.watch_stamp().await.unwrap();
         state
             .recovery
-            .prepare(&self.store, "watch", step, Prepare::Run)
+            .prepare(
+                &self.store,
+                "watch",
+                &crate::flow_intent::EffectIntent::attempt(step, Prepare::Run),
+            )
             .await
             .unwrap();
         state
@@ -591,7 +607,11 @@ impl Fixture {
         let step = &self.flow.steps[0];
         state
             .recovery
-            .prepare(&self.store, "watch", step, Prepare::Run)
+            .prepare(
+                &self.store,
+                "watch",
+                &crate::flow_intent::EffectIntent::attempt(step, Prepare::Run),
+            )
             .await
             .unwrap();
         state.advance_watch(step).await

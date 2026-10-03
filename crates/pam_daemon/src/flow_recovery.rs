@@ -1,4 +1,5 @@
 //! Protected bounded runtime snapshots. Public evidence readers never receive these blobs.
+use crate::flow_intent::{EffectIntent, StepAttempt};
 use crate::{
     evidence_service::{ConnectorTarget, EvidenceOrigin, authorize_origin},
     executor::CapabilityFailure,
@@ -336,25 +337,24 @@ impl Recovery {
             snapshot,
         ))
     }
-    /// Commits the intent to attempt `step` before any I/O. A
-    /// [`Prepare::Run`] of a stateful step is journaled as effectful; a
-    /// [`Prepare::Gate`] is not until [`Self::arm_effect`], and a
-    /// [`Prepare::Skip`] never is, whatever the step declares.
+    /// Commits the intent to attempt a step before any I/O
+    /// ([`EffectIntent::attempt`] says when it is effectful: a
+    /// [`Prepare::Run`] of a stateful step is; a [`Prepare::Gate`] is not
+    /// until [`Self::arm_effect`], and a [`Prepare::Skip`] never is,
+    /// whatever the step declares).
     pub async fn prepare(
         &mut self,
         store: &Store,
         ticket: &str,
-        step: &pam_flow::Step,
-        prepare: Prepare,
+        intent: &EffectIntent<StepAttempt>,
     ) -> Result<(), CapabilityFailure> {
-        let stateful = step.effect == pam_flow::Effect::Stateful;
         if !store
             .prepare_flow_attempt(
                 ticket,
                 self.revision,
-                &step.id,
+                &intent.step_id,
                 1,
-                prepare == Prepare::Run && stateful,
+                intent.operation.effectful,
             )
             .await
             .map_err(|_| failure())?
@@ -362,7 +362,7 @@ impl Recovery {
             return Err(failure());
         }
         self.revision += 1;
-        self.gating = (prepare == Prepare::Gate && stateful).then(|| step.id.clone());
+        self.gating = intent.operation.gating.then(|| intent.step_id.clone());
         Ok(())
     }
     /// Journals the effect of a step that was prepared with [`Prepare::Gate`]
@@ -376,9 +376,9 @@ impl Recovery {
         &mut self,
         store: &Store,
         ticket: &str,
-        step: &pam_flow::Step,
+        intent: &EffectIntent<StepAttempt>,
     ) -> Result<(), CapabilityFailure> {
-        if self.gating.as_deref() != Some(step.id.as_str()) {
+        if self.gating.as_deref() != Some(intent.step_id.as_str()) {
             return Ok(());
         }
         if !store
@@ -390,7 +390,13 @@ impl Recovery {
         }
         self.revision += 1;
         if !store
-            .prepare_flow_attempt(ticket, self.revision, &step.id, 1, true)
+            .prepare_flow_attempt(
+                ticket,
+                self.revision,
+                &intent.step_id,
+                1,
+                intent.operation.effectful,
+            )
             .await
             .map_err(|_| failure())?
         {

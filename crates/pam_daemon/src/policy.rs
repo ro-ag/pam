@@ -46,6 +46,15 @@
 //!   rule; the rule goes into a `policy.denied` audit row on the request, which the gate writes
 //!   itself like the auto-grant row. Control capabilities (`status`, `query`, `cancel`, the
 //!   doctor report) are the daemon's own bookkeeping, not work, and are never denied.
+//! - **One decision, two callers**: what the gate decides is a pure function of the policy view,
+//!   the effective profile, the capability, its class and how its grant stands
+//!   ([`decide_before_grant`] then [`decide_with_grant`], or [`decide`] for both). The run's gate
+//!   ([`PolicyGate::evaluate`], [`PolicyGate::evaluate_step`]) calls the two halves around the
+//!   grant read, so a denied or read-only capability never touches the grant table, and then
+//!   performs the decision's side effects (the `policy.denied` audit row, the auto-grant, the
+//!   legacy binding); `flow.inspect` calls [`decide`] on the grants as they are now and performs
+//!   none. Both turn the [`Verdict`] into a [`GateDecision`] with [`Verdict::decision`], so they
+//!   cannot disagree.
 //! - **Classes and admission pools**: [`classify`] is the one registry. [`CapabilityClass::Control`]
 //!   names the daemon's own bookkeeping requests (`status`, `query`, `cancel`); [`admission_pool`]
 //!   derives the dispatcher pool from the class, so no other module matches capability names to
@@ -131,6 +140,170 @@ pub fn match_step_grant(rows: &[GrantRow], binding: &GrantBinding) -> StepGrant 
         )),
         None => StepGrant::Missing,
     }
+}
+
+/// How a capability's grant stands when the gate decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantStanding {
+    /// An active grant covers it (for a flow step: a bound grant, or a
+    /// legacy one the run binds).
+    Granted,
+    /// No active grant.
+    Missing,
+    /// A flow step's grants exist and none covers what runs now; the reason
+    /// says what changed.
+    Changed(String),
+}
+
+impl From<&StepGrant> for GrantStanding {
+    /// How inspection reads a step's grants: a legacy grant counts as
+    /// granted (the run binds it), a changed one as changed.
+    fn from(grant: &StepGrant) -> Self {
+        match grant {
+            StepGrant::Bound | StepGrant::Legacy(_) => Self::Granted,
+            StepGrant::Missing => Self::Missing,
+            StepGrant::Changed(reason) => Self::Changed(reason.clone()),
+        }
+    }
+}
+
+/// What the gate decided, before any of its side effects (see the module
+/// docs on one decision, two callers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// A managed never-grant rule matches; the rule is for the audit row only.
+    PolicyDenied {
+        /// The matching rule.
+        rule: String,
+    },
+    /// Go: read-only or control, or granted where the profile lets a grant
+    /// alone admit it.
+    Allow,
+    /// Go, granting it first (relaxed profile, non-destructive, first use).
+    AutoGrant,
+    /// A human must approve this operation.
+    RequireApproval {
+        /// Why, for the approval prompt.
+        reason: String,
+        /// For a flow step whose grant no longer covers what runs: what changed.
+        changed: Option<String>,
+    },
+    /// Refused: no active grant under a manual profile.
+    NotGranted,
+}
+
+impl Verdict {
+    /// The [`GateDecision`] this verdict is, for `capability`. The run's gate
+    /// returns it once the side effects are done; inspection returns it as it
+    /// is (an [`Self::AutoGrant`] is an allow that would grant on execution).
+    #[must_use]
+    pub fn decision(&self, capability: &str) -> GateDecision {
+        match self {
+            Self::PolicyDenied { .. } => GateDecision::Refuse {
+                cause: CAUSE_POLICY_DENIED.to_owned(),
+                detail: format!("capability {capability:?} is not available on this machine"),
+                recovery: RECOVERY_POLICY_DENIED.to_owned(),
+            },
+            Self::Allow => GateDecision::Allow {
+                auto_granted: false,
+            },
+            Self::AutoGrant => GateDecision::Allow { auto_granted: true },
+            Self::RequireApproval { reason, .. } => GateDecision::RequireApproval {
+                reason: reason.clone(),
+            },
+            Self::NotGranted => GateDecision::Refuse {
+                cause: CAUSE_NOT_GRANTED.to_owned(),
+                detail: format!("capability {capability:?} has no active grant"),
+                recovery: RECOVERY_NOT_GRANTED.to_owned(),
+            },
+        }
+    }
+}
+
+/// The first half of the gate's decision, taken before any grant is read:
+/// a never-grant rule refuses first, on every profile, grant or not
+/// (control requests are the daemon's own bookkeeping, never work); a
+/// read-only or control capability bypasses grants on every profile. `None`:
+/// the grant decides ([`decide_with_grant`]).
+#[must_use]
+pub fn decide_before_grant(
+    view: &PolicyView,
+    capability: &str,
+    class: CapabilityClass,
+) -> Option<Verdict> {
+    if class != CapabilityClass::Control
+        && let Some(rule) = view.never_match(capability, Some(class))
+    {
+        return Some(Verdict::PolicyDenied { rule });
+    }
+    class.bypasses_lanes().then_some(Verdict::Allow)
+}
+
+/// The second half of the gate's decision: the profile and how the grant
+/// stands. A grant that no longer covers what runs is never a pass and
+/// never a plain refusal: the human sees the step as it is now and decides
+/// again.
+#[must_use]
+pub fn decide_with_grant(
+    profile: Profile,
+    capability: &str,
+    class: CapabilityClass,
+    grant: &GrantStanding,
+) -> Verdict {
+    let granted = match grant {
+        GrantStanding::Granted => true,
+        GrantStanding::Missing => false,
+        GrantStanding::Changed(changed) => {
+            return Verdict::RequireApproval {
+                reason: format!("{capability:?}: {changed}"),
+                changed: Some(changed.clone()),
+            };
+        }
+    };
+    match (profile, granted, class) {
+        // An active grant on relaxed means go; on standard it means go for
+        // non-destructive work.
+        (Profile::Relaxed, true, _)
+        | (Profile::Standard, true, CapabilityClass::NonDestructive) => Verdict::Allow,
+        // Relaxed auto-grants non-destructive capabilities on first use.
+        (Profile::Relaxed, false, CapabilityClass::NonDestructive) => Verdict::AutoGrant,
+        // Relaxed asks once per destructive/external capability; the
+        // approval service records the grant on approval, so the next
+        // evaluation takes the granted arm above.
+        (Profile::Relaxed, false, _) => Verdict::RequireApproval {
+            reason: format!(
+                "capability {capability:?} needs a one-time approval \
+                 under the relaxed profile"
+            ),
+            changed: None,
+        },
+        // Manual profiles refuse anything ungranted outright.
+        (Profile::Standard | Profile::Strict, false, _) => Verdict::NotGranted,
+        // Granted destructive/external work on standard — and any granted
+        // non-read-only work on strict — needs a per-operation approval.
+        (Profile::Standard | Profile::Strict, true, _) => Verdict::RequireApproval {
+            reason: format!(
+                "capability {capability:?} requires per-operation approval \
+                 under the {} profile",
+                profile.as_str()
+            ),
+            changed: None,
+        },
+    }
+}
+
+/// The whole decision for a caller that has the grant up front and
+/// performs no side effects (`flow.inspect`).
+#[must_use]
+pub fn decide(
+    view: &PolicyView,
+    profile: Profile,
+    capability: &str,
+    class: CapabilityClass,
+    grant: &GrantStanding,
+) -> Verdict {
+    decide_before_grant(view, capability, class)
+        .unwrap_or_else(|| decide_with_grant(profile, capability, class, grant))
 }
 
 /// The lower-case name a [`CapabilityClass`] is recorded under in a grant's
@@ -622,93 +795,48 @@ impl PolicyGate {
     ) -> Result<(GateDecision, Option<String>), StoreError> {
         // One snapshot of the managed policy for the whole decision.
         let view = self.policy.view();
-        // A never-grant rule refuses first: every profile, grant or not.
-        // Control requests are the daemon's own bookkeeping, never work.
-        if class != CapabilityClass::Control
-            && let Some(rule) = view.never_match(capability, Some(class))
-        {
-            return Ok((
-                self.deny_by_policy(request_id, capability, &rule, &view)
-                    .await?,
-                None,
-            ));
-        }
-        // Read-only and control capabilities bypass grants on every
-        // profile (the queue exempts them from lanes for the same reason).
-        if class.bypasses_lanes() {
-            return Ok((
-                GateDecision::Allow {
-                    auto_granted: false,
-                },
-                None,
-            ));
+        match decide_before_grant(&view, capability, class) {
+            Some(Verdict::PolicyDenied { rule }) => {
+                return Ok((
+                    self.deny_by_policy(request_id, capability, &rule, &view)
+                        .await?,
+                    None,
+                ));
+            }
+            Some(verdict) => return Ok((verdict.decision(capability), None)),
+            None => {}
         }
         // One read: the whole decision is made under the profile that was
         // live when it started.
         let profile = view.effective_profile(Some(self.stored_profile())).0;
-        let granted = match binding {
-            None => self.store.active_grant(capability).await?,
-            Some(binding) => {
-                match self
-                    .step_granted(request_id, capability, binding, profile)
-                    .await?
-                {
-                    Ok(granted) => granted,
-                    // A grant that no longer covers what runs is never a
-                    // pass and never a plain refusal: the human sees the
-                    // step as it is now and decides again.
-                    Err(changed) => {
-                        return Ok((
-                            GateDecision::RequireApproval {
-                                reason: format!("{capability:?}: {changed}"),
-                            },
-                            Some(changed),
-                        ));
-                    }
+        let grant = match binding {
+            None => {
+                if self.store.active_grant(capability).await? {
+                    GrantStanding::Granted
+                } else {
+                    GrantStanding::Missing
                 }
             }
-        };
-        let decision = match (profile, granted, class) {
-            // An active grant on relaxed means go; on standard it means
-            // go for non-destructive work.
-            (Profile::Relaxed, true, _)
-            | (Profile::Standard, true, CapabilityClass::NonDestructive) => GateDecision::Allow {
-                auto_granted: false,
-            },
-            // Relaxed auto-grants non-destructive capabilities on first
-            // use; the grant mutation is audited right here (see the
-            // module docs for the audit split).
-            (Profile::Relaxed, false, CapabilityClass::NonDestructive) => {
-                self.auto_grant(request_id, capability, profile).await?;
-                GateDecision::Allow { auto_granted: true }
-            }
-            // Relaxed asks once per destructive/external capability; the
-            // approval service records the grant on approval, so the next
-            // evaluation takes the granted arm above.
-            (Profile::Relaxed, false, _) => GateDecision::RequireApproval {
-                reason: format!(
-                    "capability {capability:?} needs a one-time approval \
-                     under the relaxed profile"
-                ),
-            },
-            // Manual profiles refuse anything ungranted outright.
-            (Profile::Standard | Profile::Strict, false, _) => GateDecision::Refuse {
-                cause: CAUSE_NOT_GRANTED.to_owned(),
-                detail: format!("capability {capability:?} has no active grant"),
-                recovery: RECOVERY_NOT_GRANTED.to_owned(),
-            },
-            // Granted destructive/external work on standard — and any
-            // granted non-read-only work on strict — needs a
-            // per-operation approval.
-            (Profile::Standard | Profile::Strict, true, _) => GateDecision::RequireApproval {
-                reason: format!(
-                    "capability {capability:?} requires per-operation approval \
-                     under the {} profile",
-                    profile.as_str()
-                ),
+            Some(binding) => match self
+                .step_granted(request_id, capability, binding, profile)
+                .await?
+            {
+                Ok(true) => GrantStanding::Granted,
+                Ok(false) => GrantStanding::Missing,
+                Err(changed) => GrantStanding::Changed(changed),
             },
         };
-        Ok((decision, None))
+        let verdict = decide_with_grant(profile, capability, class, &grant);
+        // The auto-grant mutation is audited right here (see the module
+        // docs for the audit split).
+        if verdict == Verdict::AutoGrant {
+            self.auto_grant(request_id, capability, profile).await?;
+        }
+        let changed = match &verdict {
+            Verdict::RequireApproval { changed, .. } => changed.clone(),
+            _ => None,
+        };
+        Ok((verdict.decision(capability), changed))
     }
 
     /// The refusal for a capability a never-grant `rule` matches. The
@@ -731,11 +859,10 @@ impl PolicyGate {
                 Some(&detail),
             )
             .await?;
-        Ok(GateDecision::Refuse {
-            cause: CAUSE_POLICY_DENIED.to_owned(),
-            detail: format!("capability {capability:?} is not available on this machine"),
-            recovery: RECOVERY_POLICY_DENIED.to_owned(),
-        })
+        Ok(Verdict::PolicyDenied {
+            rule: rule.to_owned(),
+        }
+        .decision(capability))
     }
 
     /// Inserts the grant row and its audit row for a relaxed-profile

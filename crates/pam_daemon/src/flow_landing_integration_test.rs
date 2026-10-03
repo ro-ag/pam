@@ -542,7 +542,11 @@ impl Fixture {
             }
             state
                 .recovery
-                .prepare(&self.ctx.store, &self.ctx.request_id, step, Prepare::Run)
+                .prepare(
+                    &self.ctx.store,
+                    &self.ctx.request_id,
+                    &crate::flow_intent::EffectIntent::attempt(step, Prepare::Run),
+                )
                 .await
                 .unwrap();
             let report = state.run_step(step).await.unwrap();

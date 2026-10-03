@@ -613,3 +613,106 @@ describe("a network failure", () => {
     );
   });
 });
+
+describe("managed policy", () => {
+  const entry = {
+    source: "policy" as const,
+    locked: false,
+    mode: "forbid" as const,
+    constraint: { engine_source: "import_only" },
+    state: "applied" as const,
+  };
+
+  it("closes Install and says why when only import is allowed", async () => {
+    mockBridge({
+      "admin.models.engine.status": () =>
+        status({
+          ...plan(),
+          source_policy: {
+            engine_source: "import_only",
+            install_allowed: false,
+            install_blocked: "import_only",
+            import_allowed: true,
+            effective: entry,
+          },
+        }),
+    });
+    mount();
+    const install = await screen.findByRole("button", { name: "Install engine" });
+    await waitFor(() => expect(install).toBeDisabled());
+    expect(
+      screen.getByText(/only allows installing the engine from a file you already have/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Limited by your organization")).toBeInTheDocument();
+    // Import is the way in, and stays open.
+    expect(screen.getByRole("button", { name: "Install from a file…" })).toBeEnabled();
+  });
+
+  it("closes Install when a mirror is required and none is set", async () => {
+    mockBridge({
+      "admin.models.engine.status": () =>
+        status({
+          ...plan(),
+          source_policy: {
+            engine_source: "mirror_only",
+            install_allowed: false,
+            install_blocked: "mirror_missing",
+            import_allowed: true,
+          },
+        }),
+    });
+    mount();
+    const install = await screen.findByRole("button", { name: "Install engine" });
+    await waitFor(() => expect(install).toBeDisabled());
+    expect(
+      screen.getByText(/from a mirror, and none is set in Settings › Network/),
+    ).toBeInTheDocument();
+  });
+
+  it("closes the file import when the policy does not allow importing", async () => {
+    mockBridge({
+      "admin.models.engine.status": () =>
+        status({
+          ...plan(),
+          source_policy: {
+            engine_source: "download",
+            install_allowed: true,
+            install_blocked: null,
+            import_allowed: false,
+          },
+        }),
+    });
+    mount();
+    const file = await screen.findByRole("button", { name: "Install from a file…" });
+    await waitFor(() => expect(file).toBeDisabled());
+    expect(screen.getByText(/does not allow importing files/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install engine" })).toBeEnabled();
+  });
+
+  it("renders a refused install with the policy's cause, detail and recovery", async () => {
+    mockBridge({
+      "admin.models.engine.status": () => status(plan()),
+      "admin.models.engine.install": () => {
+        throw {
+          cause: "policy_not_allowed",
+          detail: "installing the engine from the network is not allowed on this machine",
+          recovery: "Managed by your organization's policy; ask your administrator.",
+        };
+      },
+    });
+    mount();
+    await screen.findByText("Not installed");
+    const button = screen.getByRole("button", { name: "Install engine" });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(await screen.findByText(/engine · policy_not_allowed/)).toBeInTheDocument();
+    expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+  });
+
+  it("says nothing about policy when none is in play", async () => {
+    mockBridge({ "admin.models.engine.status": () => status(plan()) });
+    mount();
+    await screen.findByRole("button", { name: "Install engine" });
+    expect(screen.queryByText(/organization/)).toBeNull();
+  });
+});

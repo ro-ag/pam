@@ -33,10 +33,21 @@ async fn service() -> (Arc<Store>, AdminService, mpsc::Receiver<(String, Event)>
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
         &store,
@@ -53,6 +64,7 @@ async fn service() -> (Arc<Store>, AdminService, mpsc::Receiver<(String, Event)>
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     (store, admin, rx)
 }
@@ -71,10 +83,21 @@ async fn service_with_approvals() -> (
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
         &store,
@@ -91,6 +114,7 @@ async fn service_with_approvals() -> (
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     (store, admin, approvals, rx)
 }
@@ -1318,6 +1342,582 @@ async fn approvals_pending_does_not_describe_a_flow_edited_after_the_request_sta
             .await
             .unwrap();
         wait.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+// --- The managed policy over profile, grants and approvals -------------------
+
+/// Profile floor, grants `remember: deny`, and both kinds of never rule.
+const SECURITY_POLICY: &str = r#"{
+  "version": 1,
+  "revision": "r1",
+  "contact": "it@example.com",
+  "security": {
+    "profile": { "floor": "standard", "reason": "SEC-114" },
+    "grants": {
+      "manual": "allow",
+      "remember": "deny",
+      "never": ["flow.step:*/merge"],
+      "never_classes": ["external"]
+    }
+  }
+}"#;
+
+/// No grants by hand.
+const MANUAL_DENY_POLICY: &str =
+    r#"{"version":1,"revision":"r2","security":{"grants":{"manual":"deny"}}}"#;
+
+/// The profile locked strict.
+const LOCKED_POLICY: &str = r#"{
+  "version": 1,
+  "revision": "r3",
+  "contact": "it@example.com",
+  "security": { "profile": { "locked": "strict", "reason": "SEC-1" } }
+}"#;
+
+/// A file that cannot be used, with no last good copy: Tier A is held.
+const TRUNCATED_POLICY: &str = r#"{"version":"#;
+
+pub(crate) struct Managed {
+    pub(crate) store: Arc<Store>,
+    pub(crate) admin: AdminService,
+    approvals: Arc<ApprovalService>,
+    events: mpsc::Receiver<(String, Event)>,
+    pub(crate) source: Arc<crate::policy_test::SwitchablePolicy>,
+    pub(crate) handle: Arc<crate::managed_policy_service::PolicyHandle>,
+}
+
+impl Managed {
+    /// Replaces the policy file and reloads it, as `admin.policy.reload`
+    /// would.
+    pub(crate) async fn replace(&self, text: Option<&str>) {
+        self.source.set(text);
+        self.handle
+            .reload(crate::managed_policy_service::Trigger::Reload { request_id: None })
+            .await;
+    }
+
+    pub(crate) async fn op(&self, id: &str, op: &str, args: serde_json::Value) -> Response {
+        self.admin.handle(&admin_envelope(id, op, args)).await
+    }
+}
+
+/// An admin service whose every component (the gate included, on the same
+/// store) reads the policy `text`, over a stored `profile`.
+pub(crate) async fn managed(text: Option<&str>, profile: Profile) -> Managed {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    store
+        .set_setting(
+            crate::policy::PROFILE_SETTING_KEY,
+            &serde_json::to_string(&profile).unwrap(),
+        )
+        .await
+        .unwrap();
+    let source = crate::policy_test::SwitchablePolicy::new(text);
+    let handle = crate::policy_test::managed_handle(&store, &source).await;
+    let (events_tx, events) = EventPublisher::for_tests();
+    let approvals = Arc::new(ApprovalService::new(
+        Arc::clone(&store),
+        events_tx,
+        LONG_TIMEOUT,
+        Arc::clone(&handle),
+    ));
+    let models = ModelService::new(Arc::clone(&store), Arc::clone(&handle))
+        .await
+        .unwrap();
+    let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        Arc::clone(&handle),
+    ));
+    let gate = Arc::new(
+        crate::policy::PolicyGate::new(Arc::clone(&store), Arc::clone(&handle))
+            .await
+            .unwrap(),
+    );
+    let flows = Arc::new(crate::flow_service::FlowService::new(
+        std::path::Path::new("pam-tests-have-no-flow-library"),
+        Arc::clone(&store),
+        Arc::clone(&approvals),
+        Arc::clone(&connectors),
+        Arc::clone(&logs),
+        gate,
+        Arc::clone(&handle),
+    ));
+    let admin = AdminService::new(
+        Arc::clone(&store),
+        Arc::clone(&approvals),
+        models,
+        logs,
+        connectors,
+        flows,
+        crate::flow_service_test::closed_submit(),
+        Arc::clone(&handle),
+    );
+    Managed {
+        store,
+        admin,
+        approvals,
+        events,
+        source,
+        handle,
+    }
+}
+
+/// Every audit row of `id` as `(action, decision, actor, detail)`, oldest
+/// first.
+async fn audit_trail(store: &Store, id: &str) -> Vec<(String, Decision, Actor, serde_json::Value)> {
+    store
+        .audit_for_request(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let detail = row
+                .detail
+                .as_deref()
+                .map_or(serde_json::Value::Null, |raw| {
+                    serde_json::from_str(raw).unwrap()
+                });
+            (row.action, row.decision, row.actor, detail)
+        })
+        .collect()
+}
+
+/// Asserts `id` was refused by the policy: a `policy.locked_write` row
+/// naming `key`, `cause` and the full digest of `text`, then the terminal
+/// `admin`/`refuse` row.
+async fn assert_locked_write(
+    store: &Store,
+    id: &str,
+    op: &str,
+    key: &str,
+    cause: &str,
+    text: &str,
+) {
+    let row = store.get_request(id).await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Refused);
+    let trail = audit_trail(store, id).await;
+    assert_eq!(trail.len(), 2, "{trail:?}");
+    let (action, decision, actor, detail) = &trail[0];
+    assert_eq!(
+        action,
+        crate::managed_policy_service::ACTION_POLICY_LOCKED_WRITE
+    );
+    assert_eq!(*decision, Decision::Refuse);
+    assert_eq!(*actor, Actor::Policy);
+    assert_eq!(detail["op"], op);
+    assert_eq!(detail["keys"], serde_json::json!([key]));
+    assert_eq!(detail["cause"], cause);
+    assert_eq!(
+        detail["digest"],
+        crate::network_service::sha256_hex(text.as_bytes())
+    );
+    let (action, decision, actor, _) = &trail[1];
+    assert_eq!(action, ACTION_ADMIN);
+    assert_eq!(*decision, Decision::Refuse);
+    assert_eq!(*actor, Actor::System);
+}
+
+fn digest12(text: &str) -> String {
+    crate::network_service::sha256_hex(text.as_bytes())[..12].to_owned()
+}
+
+#[tokio::test]
+async fn profile_get_reports_the_effective_profile_and_its_floor() {
+    timeout(DEADLINE, async {
+        let fx = managed(Some(SECURITY_POLICY), Profile::Relaxed).await;
+        let body = expect_result(
+            fx.op("req_pg", OP_PROFILE_GET, serde_json::json!({})).await,
+            Outcome::Verified,
+        );
+        assert_eq!(body["profile"], "standard");
+        assert_eq!(
+            body["effective"]["profile"],
+            serde_json::json!({
+                "source": "policy", "locked": false, "mode": "floor",
+                "constraint": { "floor": "standard" }, "reason": "SEC-114",
+                "state": "applied", "clamped": true,
+            })
+        );
+
+        // With no policy the entry is exactly the unmanaged shape.
+        let fx = managed(None, Profile::Strict).await;
+        let body = expect_result(
+            fx.op("req_pg", OP_PROFILE_GET, serde_json::json!({})).await,
+            Outcome::Verified,
+        );
+        assert_eq!(body["profile"], "strict");
+        assert_eq!(
+            body["effective"]["profile"],
+            serde_json::json!({ "source": "user", "locked": false })
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn profile_set_refuses_below_the_floor_and_under_a_lock_and_audits_it() {
+    timeout(DEADLINE, async {
+        let fx = managed(Some(SECURITY_POLICY), Profile::Strict).await;
+        let before = fx
+            .store
+            .get_setting(crate::policy::PROFILE_SETTING_KEY)
+            .await
+            .unwrap();
+
+        let detail = expect_refusal(
+            fx.op(
+                "req_ps1",
+                OP_PROFILE_SET,
+                serde_json::json!({ "profile": "relaxed" }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED,
+        );
+        assert!(detail.contains("security.profile"), "{detail}");
+        assert!(detail.contains("SEC-114"), "{detail}");
+        assert!(detail.contains("it@example.com"), "{detail}");
+        assert!(
+            detail.contains(&format!("(policy {}, rev r1)", digest12(SECURITY_POLICY))),
+            "{detail}"
+        );
+        assert_locked_write(
+            &fx.store,
+            "req_ps1",
+            OP_PROFILE_SET,
+            "security.profile",
+            crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED,
+            SECURITY_POLICY,
+        )
+        .await;
+        assert_eq!(
+            fx.store
+                .get_setting(crate::policy::PROFILE_SETTING_KEY)
+                .await
+                .unwrap(),
+            before,
+            "the stored row is untouched"
+        );
+
+        // Inside the bounds the change goes through.
+        let body = expect_result(
+            fx.op(
+                "req_ps2",
+                OP_PROFILE_SET,
+                serde_json::json!({ "profile": "standard" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(body["profile"], "standard");
+        assert_eq!(body["effective"]["profile"]["source"], "user");
+
+        fx.replace(Some(LOCKED_POLICY)).await;
+        let detail = expect_refusal(
+            fx.op(
+                "req_ps3",
+                OP_PROFILE_SET,
+                serde_json::json!({ "profile": "strict" }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+        );
+        assert!(detail.contains("SEC-1"), "{detail}");
+        assert_locked_write(
+            &fx.store,
+            "req_ps3",
+            OP_PROFILE_SET,
+            "security.profile",
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+            LOCKED_POLICY,
+        )
+        .await;
+        assert_eq!(fx.admin.flows.gate().profile(), Profile::Strict);
+        assert_eq!(fx.admin.flows.gate().stored_profile(), Profile::Standard);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn profile_set_while_frozen_tightens_but_never_loosens() {
+    timeout(DEADLINE, async {
+        let fx = managed(Some(TRUNCATED_POLICY), Profile::Relaxed).await;
+        expect_result(
+            fx.op(
+                "req_pf1",
+                OP_PROFILE_SET,
+                serde_json::json!({ "profile": "strict" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        expect_refusal(
+            fx.op(
+                "req_pf2",
+                OP_PROFILE_SET,
+                serde_json::json!({ "profile": "relaxed" }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_POLICY_FROZEN,
+        );
+        assert_locked_write(
+            &fx.store,
+            "req_pf2",
+            OP_PROFILE_SET,
+            "security.profile",
+            crate::managed_policy::CAUSE_POLICY_FROZEN,
+            TRUNCATED_POLICY,
+        )
+        .await;
+        assert_eq!(fx.admin.flows.gate().profile(), Profile::Strict);
+
+        // Revoking a grant is never frozen: removing authority is the human's.
+        fx.store.insert_grant("deploy").await.unwrap();
+        expect_result(
+            fx.op(
+                "req_pf3",
+                OP_GRANTS_REVOKE,
+                serde_json::json!({ "capability": "deploy" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn grants_add_refuses_never_rules_and_manual_deny_but_revoke_stays_open() {
+    timeout(DEADLINE, async {
+        let fx = managed(Some(SECURITY_POLICY), Profile::Standard).await;
+        let detail = expect_refusal(
+            fx.op(
+                "req_ga1",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "flow.step:ship/merge" }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED,
+        );
+        assert!(detail.contains("security.grants.never"), "{detail}");
+        assert!(!fx.store.active_grant("flow.step:ship/merge").await.unwrap());
+        assert_locked_write(
+            &fx.store,
+            "req_ga1",
+            OP_GRANTS_ADD,
+            "security.grants.never",
+            crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED,
+            SECURITY_POLICY,
+        )
+        .await;
+
+        // A capability no rule matches is granted as before.
+        expect_result(
+            fx.op(
+                "req_ga2",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "flow.step:ship/push" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+
+        fx.replace(Some(MANUAL_DENY_POLICY)).await;
+        expect_refusal(
+            fx.op(
+                "req_ga3",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "deploy" }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+        );
+        assert_locked_write(
+            &fx.store,
+            "req_ga3",
+            OP_GRANTS_ADD,
+            "security.grants.manual",
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+            MANUAL_DENY_POLICY,
+        )
+        .await;
+        assert!(!fx.store.active_grant("deploy").await.unwrap());
+        expect_result(
+            fx.op(
+                "req_ga4",
+                OP_GRANTS_REVOKE,
+                serde_json::json!({ "capability": "flow.step:ship/push" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+
+        // A held never rule freezes additions.
+        fx.replace(Some(
+            r#"{"version":1,"revision":"bad","security":{"grants":{"never":"flow.step:*/merge"}}}"#,
+        ))
+        .await;
+        expect_refusal(
+            fx.op(
+                "req_ga5",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "deploy" }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_POLICY_FROZEN,
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn grants_list_marks_blocked_rows_and_reports_the_grants_policy() {
+    timeout(DEADLINE, async {
+        let fx = managed(Some(SECURITY_POLICY), Profile::Standard).await;
+        // Grants that predate the policy stay the human's.
+        fx.store.insert_grant("flow.step:ship/merge").await.unwrap();
+        fx.store.insert_grant("deploy").await.unwrap();
+
+        let body = expect_result(
+            fx.op("req_gl1", OP_GRANTS_LIST, serde_json::json!({}))
+                .await,
+            Outcome::Verified,
+        );
+        let blocked = |body: &serde_json::Value, capability: &str| {
+            body["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["capability"] == capability)
+                .unwrap_or_else(|| panic!("{capability} is listed: {body}"))["blocked_by_policy"]
+                .clone()
+        };
+        assert_eq!(blocked(&body, "flow.step:ship/merge"), true);
+        assert_eq!(blocked(&body, "deploy"), false);
+        assert_eq!(
+            body["policy"],
+            serde_json::json!({
+                "manual": "allow",
+                "remember": "deny",
+                "never": ["flow.step:*/merge"],
+                "never_classes": ["external"],
+            })
+        );
+        assert_eq!(
+            body["effective"]["remember"],
+            serde_json::json!({
+                "source": "policy", "locked": true, "mode": "forbid",
+                "constraint": { "remember": "deny" }, "state": "applied",
+            })
+        );
+        assert_eq!(body["effective"]["manual"]["locked"], false);
+        assert_eq!(
+            body["effective"]["never"]["constraint"]["never"],
+            serde_json::json!(["flow.step:*/merge"])
+        );
+
+        // Without the rule the same row is not blocked, and nothing was
+        // deleted in between.
+        fx.replace(Some(MANUAL_DENY_POLICY)).await;
+        let body = expect_result(
+            fx.op("req_gl2", OP_GRANTS_LIST, serde_json::json!({}))
+                .await,
+            Outcome::Verified,
+        );
+        assert_eq!(blocked(&body, "flow.step:ship/merge"), false);
+        assert_eq!(body["policy"]["never"], serde_json::Value::Null);
+        assert_eq!(
+            body["effective"]["never"],
+            serde_json::json!({ "source": "default", "locked": false })
+        );
+        assert_eq!(body["effective"]["manual"]["locked"], true);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn approvals_resolve_refuses_remember_under_the_policy_and_a_plain_approval_works() {
+    timeout(DEADLINE, async {
+        let mut fx = managed(Some(SECURITY_POLICY), Profile::Relaxed).await;
+        let (_cancel, wait) =
+            spawn_approval_wait(&fx.store, &fx.approvals, &mut fx.events, "req_wr").await;
+
+        let detail = expect_refusal(
+            fx.op(
+                "req_rr1",
+                OP_APPROVALS_RESOLVE,
+                serde_json::json!({
+                    "request_id": "req_wr",
+                    "resolution": "approved",
+                    "remember": true,
+                }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+        );
+        assert!(detail.contains("security.grants.remember"), "{detail}");
+        assert_locked_write(
+            &fx.store,
+            "req_rr1",
+            OP_APPROVALS_RESOLVE,
+            "security.grants.remember",
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+            SECURITY_POLICY,
+        )
+        .await;
+        assert!(!wait.is_finished(), "the approval stays pending");
+
+        // Under manual: deny a remembered approval would be a grant by hand.
+        fx.replace(Some(MANUAL_DENY_POLICY)).await;
+        expect_refusal(
+            fx.op(
+                "req_rr2",
+                OP_APPROVALS_RESOLVE,
+                serde_json::json!({
+                    "request_id": "req_wr",
+                    "resolution": "approved",
+                    "remember": true,
+                }),
+            )
+            .await,
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+        );
+        assert_locked_write(
+            &fx.store,
+            "req_rr2",
+            OP_APPROVALS_RESOLVE,
+            "security.grants.manual",
+            crate::managed_policy::CAUSE_SETTING_LOCKED,
+            MANUAL_DENY_POLICY,
+        )
+        .await;
+        assert!(!wait.is_finished());
+
+        // A plain approval still works, and adds no grant.
+        expect_result(
+            fx.op(
+                "req_rr3",
+                OP_APPROVALS_RESOLVE,
+                serde_json::json!({ "request_id": "req_wr", "resolution": "approved" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(
+            wait.await.unwrap().unwrap(),
+            ApprovalOutcome::Approved { remember: false }
+        );
+        assert!(!fx.store.active_grant("release").await.unwrap());
     })
     .await
     .unwrap();

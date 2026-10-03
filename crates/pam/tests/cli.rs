@@ -1,4 +1,4 @@
-//! CLI-flow integration tests: a real daemon ([`run_daemon`]) on a temp
+//! CLI-flow integration tests: a real daemon ([`run_daemon_with`]) on a temp
 //! base dir, driven through the library functions the `pam` binary
 //! dispatches to — [`client::send_request`], [`client::follow_ticket`],
 //! and the renderers. The binary itself stays a thin clap shell, so
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use pam::client;
 use pam::render;
-use pam_daemon::daemon::{DaemonHandle, run_daemon};
+use pam_daemon::daemon::{DaemonConfig, DaemonHandle, run_daemon_with};
 use pam_daemon::flow_service::{SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_proto::{Event, Outcome, Response};
@@ -68,9 +68,22 @@ impl TestDaemon {
             seed_toolchain_path(&tmp).await;
         }
         let (shutdown, shutdown_rx) = watch::channel(false);
-        let handle = run_daemon(Some(base_of(&tmp)), shutdown_rx)
-            .await
-            .expect("daemon starts");
+        // A scripted "no policy file": a policy installed on the machine
+        // running the tests is never read.
+        let handle = run_daemon_with(
+            DaemonConfig {
+                base_dir: Some(base_of(&tmp)),
+                policy_source: Some(pam_testkit::ScriptedPolicy::absent()),
+                // An in-memory keychain: tests never touch the real one.
+                secret_backend: Some(std::sync::Arc::new(
+                    pam_testkit::FakeSecretBackend::default(),
+                )),
+                ..DaemonConfig::default()
+            },
+            shutdown_rx,
+        )
+        .await
+        .expect("daemon starts");
         Self {
             tmp,
             handle,

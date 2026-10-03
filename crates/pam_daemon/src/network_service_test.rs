@@ -1,14 +1,16 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pam_net::{NetFailure, NetworkSource, ProxyAuth};
 use pam_store::Store;
 use serde_json::json;
 
+use crate::managed_policy_service::{Fingerprint, PolicyHandle, PolicySource, SourceRead};
 use crate::network_service::{
-    CaBundleEntry, CaImportError, DOCUMENT_VERSION, Field, FixedManagedNetwork, IGNORED_ENV,
-    ManagedNetwork, NetworkDocument, NetworkService, PROXY_CREDENTIAL_ID, ProxyEntry, SETTING_KEY,
-    Source, ignored_env, resolve, sha256_hex,
+    CaBundleEntry, CaImportError, DOCUMENT_VERSION, Field, FixedManagedNetwork, IGNORED_ENV, Lock,
+    ManagedDefaults, ManagedNetwork, NetworkDocument, NetworkService, PROXY_CREDENTIAL_ID,
+    PolicyClosed, ProxyEntry, SETTING_KEY, Source, ignored_env, resolve, resolve_layers,
+    sha256_hex,
 };
 use crate::secrets::{FakeSecretBackend, SecretBackend, SecretError, SecretStore, account_for};
 
@@ -274,6 +276,98 @@ fn the_policy_overlay_pins_fields_and_names_their_source() {
     assert_eq!(pinned.mirror_allowed_hosts, ["artifacts.corp.example"]);
     assert_eq!(Source::Policy.as_str(), "policy");
     assert!(Source::Policy.locked() && !Source::User.locked());
+    // Every field carries its lock next to its source.
+    assert_eq!(pinned.entry(Field::Proxy), (Source::Policy, Lock::Locked));
+    assert_eq!(pinned.entry(Field::NoProxy), (Source::User, Lock::Open));
+    assert_eq!(pinned.entry(Field::CaBundle), (Source::Default, Lock::Open));
+    assert!(pinned.is_locked(Field::EngineMirror) && !pinned.is_locked(Field::ModelsMirror));
+}
+
+/// A policy default is the value while the human has stored none: it is
+/// the policy's (`source: policy`) and the field stays open. A value the
+/// human stored wins, and a lock wins over both.
+#[test]
+fn a_policy_default_applies_only_while_the_user_has_no_value_and_stays_open() {
+    let defaults = ManagedDefaults {
+        no_proxy: Some(vec!["corp.example".to_owned()]),
+        engine_mirror: Some(Some("https://artifacts.corp.example/llama/".to_owned())),
+        models_mirror: Some(None),
+    };
+    assert!(!defaults.is_empty() && ManagedDefaults::default().is_empty());
+
+    let nothing = resolve_layers(&NetworkDocument::default(), None, &defaults);
+    assert_eq!(nothing.document.no_proxy, ["corp.example"]);
+    assert_eq!(nothing.entry(Field::NoProxy), (Source::Policy, Lock::Open));
+    assert_eq!(
+        nothing.document.engine_mirror.as_deref(),
+        Some("https://artifacts.corp.example/llama/")
+    );
+    assert_eq!(
+        nothing.entry(Field::EngineMirror),
+        (Source::Policy, Lock::Open)
+    );
+    // A default of "upstream" is still the policy's answer, and still open.
+    assert_eq!(nothing.document.models_mirror, None);
+    assert_eq!(
+        nothing.entry(Field::ModelsMirror),
+        (Source::Policy, Lock::Open)
+    );
+    // The proxy and the CA bundle take no default.
+    assert_eq!(nothing.entry(Field::Proxy), (Source::Default, Lock::Open));
+    assert_eq!(
+        nothing.entry(Field::CaBundle),
+        (Source::Default, Lock::Open)
+    );
+    assert!(nothing.locked_fields().is_empty());
+
+    let user = NetworkDocument {
+        no_proxy: vec!["mine.example".to_owned()],
+        engine_mirror: Some("https://mine.example/llama/".to_owned()),
+        ..NetworkDocument::default()
+    };
+    let own = resolve_layers(&user, None, &defaults);
+    assert_eq!(own.document.no_proxy, ["mine.example"]);
+    assert_eq!(own.entry(Field::NoProxy), (Source::User, Lock::Open));
+    assert_eq!(
+        own.document.engine_mirror.as_deref(),
+        Some("https://mine.example/llama/")
+    );
+    assert_eq!(own.entry(Field::EngineMirror), (Source::User, Lock::Open));
+
+    let locked = ManagedNetwork {
+        no_proxy: Some(vec!["pinned.example".to_owned()]),
+        ..ManagedNetwork::default()
+    };
+    let over = resolve_layers(&user, Some(&locked), &defaults);
+    assert_eq!(over.document.no_proxy, ["pinned.example"]);
+    assert_eq!(over.entry(Field::NoProxy), (Source::Policy, Lock::Locked));
+}
+
+/// Decision D6: the policy never carries a secret, so the password is the
+/// policy's only when the policy pins a proxy that needs none.
+#[test]
+fn the_credential_is_locked_only_with_a_pinned_proxy_that_needs_none() {
+    let user = NetworkDocument::default();
+    let locked = |entry: Option<ProxyEntry>| {
+        let managed = ManagedNetwork {
+            proxy: Some(entry),
+            ..ManagedNetwork::default()
+        };
+        resolve(&user, Some(&managed)).credential_locked()
+    };
+    assert!(locked(Some(proxy("none", None))), "no sign-in: locked");
+    assert!(locked(None), "a pinned direct connection needs no password");
+    assert!(
+        !locked(Some(proxy("basic", Some("svc")))),
+        "the human types it"
+    );
+    assert!(!locked(Some(proxy("anyauth", Some("svc")))));
+    // An unlocked proxy never locks the password.
+    let own = NetworkDocument {
+        proxy: Some(proxy("none", None)),
+        ..NetworkDocument::default()
+    };
+    assert!(!resolve(&own, None).credential_locked());
 }
 
 #[tokio::test]
@@ -731,4 +825,391 @@ fn ignored_environment_names_are_names_from_the_fixed_list_only() {
         assert!(IGNORED_ENV.contains(&name.as_str()), "{name}");
         assert!(!name.contains('='), "names only, never values: {name}");
     }
+}
+
+// --- The managed overlay: defaults, closure, the policy handle ---------------
+
+fn service_over(fixture: &Fixture, layer: Arc<FixedManagedNetwork>) -> NetworkService {
+    NetworkService::new(
+        Arc::clone(&fixture.store),
+        Some(Arc::new(SecretStore::new(
+            Arc::clone(&fixture.backend) as Arc<_>
+        ))),
+        fixture.base.path().to_path_buf(),
+    )
+    .with_managed(layer)
+}
+
+#[tokio::test]
+async fn unlocked_defaults_reach_the_profile_and_the_mirrors_until_the_human_saves() {
+    let fixture = fixture().await;
+    let layer = Arc::new(
+        FixedManagedNetwork::new(None).with_defaults(ManagedDefaults {
+            no_proxy: Some(vec!["corp.example".to_owned()]),
+            engine_mirror: Some(Some("https://artifacts.corp.example/llama/".to_owned())),
+            models_mirror: None,
+        }),
+    );
+    let service = service_over(&fixture, layer);
+
+    assert_eq!(service.settings().await.unwrap().no_proxy().len(), 1);
+    let (engine, models) = service.mirrors().await.unwrap();
+    assert_eq!(
+        engine.as_ref().map(pam_net::MirrorBase::as_str),
+        Some("https://artifacts.corp.example/llama/")
+    );
+    assert!(models.is_none());
+    let loaded = service.load().await.unwrap().expect("valid");
+    assert_eq!(
+        loaded.resolved.entry(Field::NoProxy),
+        (Source::Policy, Lock::Open)
+    );
+    assert_eq!(
+        loaded.user,
+        NetworkDocument::default(),
+        "the default is never stored"
+    );
+
+    // The human's own list replaces the default; the other default stands.
+    let saved = NetworkDocument {
+        no_proxy: vec!["mine.example".to_owned(), "10.0.0.0/8".to_owned()],
+        ..NetworkDocument::default()
+    };
+    assert!(service.save(None, &saved).await.unwrap());
+    assert_eq!(service.settings().await.unwrap().no_proxy().len(), 2);
+    assert!(service.mirrors().await.unwrap().0.is_some());
+}
+
+/// A closed overlay refuses every consumer, whatever the cache holds, and
+/// never answers with a direct connection. The Network screen can still
+/// read the settings.
+#[tokio::test]
+async fn a_closed_overlay_refuses_the_profile_and_the_mirrors_and_names_the_key_and_the_cause() {
+    let fixture = fixture().await;
+    let layer = Arc::new(FixedManagedNetwork::new(None));
+    let service = service_over(&fixture, Arc::clone(&layer));
+    service.settings().await.expect("open, and now cached");
+    assert!(service.policy_closed().is_none());
+
+    *layer.closed.lock().unwrap() = Some(PolicyClosed {
+        key: "network.ca_bundle".to_owned(),
+        code: "writable_by_user".to_owned(),
+        detail: "the bundle can be modified by this user".to_owned(),
+    });
+    // Within the cache window: the closure still applies at once.
+    let failure = service.settings().await.expect_err("closed");
+    assert_eq!(failure.cause(), "network_policy_invalid");
+    let sentence = failure.sentence();
+    for needle in [
+        "organization's policy",
+        "network.ca_bundle",
+        "writable_by_user",
+        "can be modified by this user",
+        "administrator",
+    ] {
+        assert!(sentence.contains(needle), "{needle}: {sentence}");
+    }
+    let mirrors = service.mirrors().await.expect_err("closed");
+    assert_eq!(mirrors.cause(), "network_policy_invalid");
+    assert!(mirrors.sentence().contains("network.ca_bundle"));
+    assert!(
+        service.load().await.unwrap().is_ok(),
+        "the screen can still read"
+    );
+    assert_eq!(
+        service.policy_closed().map(|closed| closed.code),
+        Some("writable_by_user".to_owned())
+    );
+
+    *layer.closed.lock().unwrap() = None;
+    service.settings().await.expect("open again");
+}
+
+// --- A real policy handle behind the overlay ----------------------------------
+
+/// A policy source the test scripts: the file's bytes and the answer for
+/// the referenced CA bundle.
+pub(crate) struct Scripted {
+    policy: Mutex<Vec<u8>>,
+    referenced: Mutex<SourceRead>,
+}
+
+impl PolicySource for Scripted {
+    fn origin(&self) -> String {
+        "/fake/policy.json".to_owned()
+    }
+
+    fn read(&self) -> SourceRead {
+        SourceRead::Trusted(self.policy.lock().unwrap().clone())
+    }
+
+    fn fingerprint(&self) -> Option<Fingerprint> {
+        None
+    }
+
+    fn read_referenced(&self, _path: &Path, _max_bytes: u64) -> SourceRead {
+        self.referenced.lock().unwrap().clone()
+    }
+}
+
+/// Where a policy pins its bundle: an absolute path on this platform.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn ca_pin_path() -> &'static str {
+    if cfg!(windows) {
+        r"C:\ProgramData\PAM\ca\corp-root.pem"
+    } else {
+        "/Library/Application Support/PAM/ca/corp-root.pem"
+    }
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn test_ca_pem() -> Vec<u8> {
+    std::fs::read(pam_net::testing::test_ca()).expect("the fixture CA")
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn normalized_digest(pem: &[u8]) -> String {
+    sha256_hex(
+        pam_net::normalize_pem(pem)
+            .expect("a bundle")
+            .pem
+            .as_bytes(),
+    )
+}
+
+/// A policy handle over a scripted trusted file holding `policy`, with
+/// `referenced` as the answer for the pinned CA bundle's file, loaded on
+/// `base`.
+pub(crate) async fn load_policy(
+    store: &Arc<Store>,
+    base: &Path,
+    policy: &serde_json::Value,
+    referenced: SourceRead,
+) -> Arc<PolicyHandle> {
+    let source = Arc::new(Scripted {
+        policy: Mutex::new(policy.to_string().into_bytes()),
+        referenced: Mutex::new(referenced),
+    });
+    PolicyHandle::load(Arc::clone(store), source as Arc<dyn PolicySource>, base).await
+}
+
+/// A handle over `policy` loaded on the fixture's base, and the network
+/// service under it.
+async fn under_policy(
+    fixture: &Fixture,
+    policy: &serde_json::Value,
+    referenced: SourceRead,
+) -> (Arc<PolicyHandle>, NetworkService) {
+    let handle = load_policy(&fixture.store, fixture.base.path(), policy, referenced).await;
+    let service = NetworkService::new(
+        Arc::clone(&fixture.store),
+        Some(Arc::new(SecretStore::new(
+            Arc::clone(&fixture.backend) as Arc<_>
+        ))),
+        fixture.base.path().to_path_buf(),
+    )
+    .with_policy(Arc::clone(&handle));
+    (handle, service)
+}
+
+#[tokio::test]
+async fn a_policy_locked_proxy_is_the_one_the_profile_uses_and_the_users_is_kept() {
+    let fixture = fixture().await;
+    let own = NetworkDocument {
+        proxy: Some(proxy("none", None)),
+        ..NetworkDocument::default()
+    };
+    fixture
+        .store
+        .set_setting(SETTING_KEY, &own.to_json())
+        .await
+        .unwrap();
+    let (_, service) = under_policy(
+        &fixture,
+        &json!({
+            "version": 1,
+            "network": { "proxy": { "locked": {
+                "url": "http://managed.example.com:8080", "auth": "none" } } },
+        }),
+        SourceRead::Absent,
+    )
+    .await;
+
+    let settings = service.settings().await.unwrap();
+    assert_eq!(settings.proxy().unwrap().host(), "managed.example.com");
+    let loaded = service.load().await.unwrap().expect("valid");
+    assert_eq!(
+        loaded.resolved.entry(Field::Proxy),
+        (Source::Policy, Lock::Locked)
+    );
+    assert!(loaded.resolved.credential_locked());
+    assert_eq!(loaded.user, own, "the user's proxy is untouched");
+}
+
+#[tokio::test]
+async fn a_policy_default_is_used_until_the_human_saves_a_value() {
+    let fixture = fixture().await;
+    let (_, service) = under_policy(
+        &fixture,
+        &json!({
+            "version": 1,
+            "network": {
+                "no_proxy": { "default": ["corp.example"] },
+                "models_mirror": { "default": "https://artifacts.example.com/hf" },
+                "mirror_allowed_hosts": ["artifacts.example.com"],
+            },
+        }),
+        SourceRead::Absent,
+    )
+    .await;
+
+    assert_eq!(service.settings().await.unwrap().no_proxy().len(), 1);
+    let (_, models) = service.mirrors().await.unwrap();
+    assert_eq!(
+        models.as_ref().map(pam_net::MirrorBase::as_str),
+        Some("https://artifacts.example.com/hf/")
+    );
+    let loaded = service.load().await.unwrap().expect("valid");
+    assert_eq!(
+        loaded.resolved.entry(Field::NoProxy),
+        (Source::Policy, Lock::Open)
+    );
+    assert_eq!(
+        loaded.resolved.entry(Field::ModelsMirror),
+        (Source::Policy, Lock::Open)
+    );
+    assert!(loaded.resolved.locked_fields().is_empty());
+
+    // The human saves a list: it is theirs, and the policy's is not merged.
+    let saved = NetworkDocument {
+        no_proxy: vec!["mine.example".to_owned(), "10.0.0.0/8".to_owned()],
+        ..NetworkDocument::default()
+    };
+    assert!(service.save(None, &saved).await.unwrap());
+    assert_eq!(service.settings().await.unwrap().no_proxy().len(), 2);
+    let loaded = service.load().await.unwrap().expect("valid");
+    assert_eq!(
+        loaded.resolved.entry(Field::NoProxy),
+        (Source::User, Lock::Open)
+    );
+    assert_eq!(
+        loaded.resolved.entry(Field::ModelsMirror),
+        (Source::Policy, Lock::Open)
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_failed_ca_import_closes_connector_calls_and_downloads_with_the_cause() {
+    let fixture = fixture().await;
+    let pem = test_ca_pem();
+    let (handle, service) = under_policy(
+        &fixture,
+        &json!({
+            "version": 1,
+            "network": { "ca_bundle": { "locked": {
+                "path": ca_pin_path(), "sha256": normalized_digest(&pem) } } },
+        }),
+        SourceRead::Untrusted {
+            code: "writable_by_user",
+            detail: "the bundle can be modified by this user".to_owned(),
+        },
+    )
+    .await;
+    // The handle, not the view, knows the import failed.
+    assert!(handle.view().network_closed().is_none());
+    assert_eq!(
+        handle.network_closed().unwrap().key.path(),
+        "network.ca_bundle"
+    );
+
+    let failure = service.settings().await.expect_err("closed");
+    assert_eq!(failure.cause(), "network_policy_invalid");
+    let sentence = failure.sentence();
+    assert!(sentence.contains("network.ca_bundle"), "{sentence}");
+    assert!(sentence.contains("writable_by_user"), "{sentence}");
+    let mirrors = service.mirrors().await.expect_err("closed");
+    assert!(mirrors.sentence().contains("writable_by_user"), "{mirrors}");
+    assert!(
+        service.load().await.unwrap().is_ok(),
+        "the screen can still read"
+    );
+    assert_eq!(service.policy_closed().unwrap().key, "network.ca_bundle");
+}
+
+#[tokio::test]
+async fn a_rejected_proxy_with_no_last_good_value_closes_the_network() {
+    let fixture = fixture().await;
+    // No port: the leaf is rejected, and nothing last-good holds the proxy.
+    let (_, service) = under_policy(
+        &fixture,
+        &json!({
+            "version": 1,
+            "network": { "proxy": { "locked": { "url": "http://p.example.com", "auth": "none" } } },
+        }),
+        SourceRead::Absent,
+    )
+    .await;
+    let failure = service.settings().await.expect_err("closed");
+    assert_eq!(failure.cause(), "network_policy_invalid");
+    assert!(failure.sentence().contains("network.proxy"), "{failure}");
+    assert_eq!(
+        service.mirrors().await.unwrap_err().cause(),
+        "network_policy_invalid"
+    );
+}
+
+/// The loader imported the pinned bundle; the service re-hashes that private
+/// copy on every spawn and never imports a second time.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_managed_ca_bundle_is_the_loaders_private_copy_checked_on_every_spawn() {
+    let fixture = fixture().await;
+    let pem = test_ca_pem();
+    let digest = normalized_digest(&pem);
+    let (handle, service) = under_policy(
+        &fixture,
+        &json!({
+            "version": 1,
+            "network": { "ca_bundle": { "locked": { "path": ca_pin_path(), "sha256": digest } } },
+        }),
+        SourceRead::Trusted(pem),
+    )
+    .await;
+    assert!(handle.network_closed().is_none());
+
+    let settings = service.settings().await.expect("a pinned bundle is usable");
+    let copy = service.copy_path(&digest);
+    assert_eq!(settings.ca_bundle(), Some(copy.as_path()));
+    assert_eq!(
+        sha256_hex(&std::fs::read(&copy).unwrap()),
+        digest,
+        "the copy is the loader's"
+    );
+    let loaded = service.load().await.unwrap().expect("valid");
+    assert_eq!(
+        loaded.resolved.entry(Field::CaBundle),
+        (Source::Policy, Lock::Locked)
+    );
+    assert_eq!(
+        loaded
+            .resolved
+            .document
+            .ca_bundle
+            .as_ref()
+            .map(|bundle| bundle.sha256.as_str()),
+        Some(digest.as_str())
+    );
+
+    // A save by the human prunes unreferenced copies, never the managed one.
+    service.prune_ca_copies(None);
+    assert!(copy.exists(), "the managed copy outlives a prune");
+
+    // Tampering with the copy is caught at the next spawn.
+    std::fs::write(&copy, b"not the bundle").unwrap();
+    service.invalidate();
+    assert_eq!(
+        service.settings().await.expect_err("tampered").cause(),
+        "network_ca_tampered"
+    );
 }

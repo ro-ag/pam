@@ -180,3 +180,84 @@ it("refuses more than eight cache roots before an admin save", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
   expect(mocks.landingSet).not.toHaveBeenCalled();
 });
+
+it("disables a permission the policy ceiling forbids and says so", async () => {
+  mocks.landingGet.mockResolvedValue({
+    ...saved,
+    effective: {
+      max_permissions: {
+        source: "policy",
+        locked: false,
+        mode: "forbid",
+        constraint: { "landing.max_permissions": { create_pr: false } },
+        clamped: true,
+        value: { push: true, create_pr: false, merge: true, sync: true },
+      },
+    },
+  });
+  await setup();
+  expect(screen.getByLabelText(/Landing repository 1: Create pull request/)).toBeDisabled();
+  expect(screen.getByLabelText(/Landing repository 1: Push branch/)).toBeEnabled();
+  expect(screen.getByText("not allowed by your organization")).toBeInTheDocument();
+  expect(screen.getByText("Limited by your organization")).toBeInTheDocument();
+});
+
+it("lists the allowed GitHub servers", async () => {
+  mocks.landingGet.mockResolvedValue({
+    ...saved,
+    effective: {
+      allowed_github_servers: {
+        source: "policy",
+        locked: false,
+        mode: "forbid",
+        constraint: { "landing.allowed_github_servers": ["https://ghe.corp.example/api/v3/"] },
+        value: ["https://ghe.corp.example/api/v3/"],
+      },
+    },
+  });
+  await setup();
+  expect(screen.getByLabelText("allowed GitHub servers")).toHaveTextContent(
+    "https://ghe.corp.example/api/v3/",
+  );
+});
+
+it("reports the landing recipes the policy is not using", async () => {
+  mocks.landingGet.mockResolvedValue({
+    ...saved,
+    landing_policy_dropped: [
+      {
+        root: "/repo",
+        key: "landing.allowed_github_servers",
+        reason: "this repository's GitHub server is not one your organization allows",
+      },
+    ],
+  });
+  await setup();
+  const note = screen.getByRole("note", { name: "landing recipes the policy is not using" });
+  expect(note).toHaveTextContent("/repo");
+  expect(note).toHaveTextContent("not one your organization allows");
+});
+
+it("freezes the whole editor when the policy holds a landing key", async () => {
+  mocks.landingGet.mockResolvedValue({
+    ...saved,
+    effective: { max_permissions: { source: "default", locked: true, state: "held" } },
+  });
+  await setup();
+  expect(screen.getByLabelText("Landing repository 1: Push branch")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Add landing repository" })).toBeDisabled();
+  expect(screen.getByText(/paused until the policy file is fixed/)).toBeInTheDocument();
+});
+
+it("renders a refused save with the daemon's cause, detail and recovery", async () => {
+  mocks.landingSet.mockRejectedValue({
+    cause: "policy_not_allowed",
+    detail: "landing.max_permissions does not allow create_pr",
+    recovery: "Managed by your organization's policy; ask your administrator.",
+  });
+  await setup();
+  fireEvent.click(screen.getByLabelText("Landing repository 1: Push branch"));
+  fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
+  expect(await screen.findByText(/landing policy · policy_not_allowed/)).toBeInTheDocument();
+  expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+});

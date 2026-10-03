@@ -42,6 +42,7 @@ import {
   type BoundaryStatus,
   type BridgeFailure,
   type DaemonStopReply,
+  type EffectiveEntry,
   type HarnessProfile,
   type GrantRow,
   type Profile,
@@ -50,6 +51,8 @@ import {
   type ServiceReport,
 } from "../lib/ipc";
 import { AppearancePanel } from "./AppearancePanel";
+import { ManagedField, ManagedNote, isLocked } from "./ManagedField";
+import { PolicyPanel, PolicyStatusLine } from "./SettingsPolicy";
 import { exactTime, formatDuration, relativeTime } from "../lib/time";
 import { SettingsConnectorsSection } from "./SettingsConnectors";
 import { SettingsFlowsSection } from "./SettingsFlows";
@@ -80,6 +83,22 @@ export const PROFILE_SENTENCES: Record<Profile, string> = {
 };
 
 const PROFILE_ORDER: readonly Profile[] = ["relaxed", "standard", "strict"];
+
+/** Why a profile cannot be picked under the managed policy, or undefined when it can. */
+export function profileBlocker(
+  entry: EffectiveEntry | undefined,
+  candidate: Profile,
+): string | undefined {
+  if (isLocked(entry)) return "Managed by your organization";
+  const floor = entry?.constraint?.floor;
+  if (typeof floor === "string") {
+    const lowest = PROFILE_ORDER.indexOf(floor as Profile);
+    if (lowest > PROFILE_ORDER.indexOf(candidate)) {
+      return `Your organization does not allow a profile below ${floor}`;
+    }
+  }
+  return undefined;
+}
 
 function ProfilePanel() {
   const queryClient = useQueryClient();
@@ -112,6 +131,7 @@ function ProfilePanel() {
   });
 
   const current = profile.data?.profile;
+  const entry = profile.data?.effective?.profile;
   const failure = profile.isError
     ? toBridgeFailure(profile.error)
     : setProfile.isError
@@ -121,16 +141,20 @@ function ProfilePanel() {
   return (
     <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">Policy profile</p>
+      <ManagedNote entry={entry} />
       <div role="radiogroup" aria-label="policy profile" className="space-y-2">
         {PROFILE_ORDER.map((candidate) => {
           const selected = current === candidate;
+          const blocker = profileBlocker(entry, candidate);
           return (
             <label
               key={candidate}
+              title={blocker}
               className={cn(
                 "flex cursor-pointer items-start gap-3 rounded-card border p-3 transition-colors duration-150",
                 selected ? "border-accent-strong bg-accent-soft/40" : "border-line",
-                current === undefined && "cursor-default opacity-50",
+                (current === undefined || blocker !== undefined) &&
+                  "cursor-default opacity-50",
               )}
             >
               <input
@@ -138,7 +162,9 @@ function ProfilePanel() {
                 name="policy-profile"
                 value={candidate}
                 checked={selected}
-                disabled={current === undefined || setProfile.isPending}
+                disabled={
+                  current === undefined || setProfile.isPending || blocker !== undefined
+                }
                 onChange={() => {
                   if (candidate === "relaxed") setConfirmingRelaxed(true);
                   else {
@@ -202,6 +228,11 @@ export const KNOWN_CAPABILITIES = [
   "evidence.read",
 ] as const;
 
+export const GRANT_BLOCKED_NOTE =
+  "your organization's policy does not allow this capability; the grant is kept but does not authorize";
+export const GRANT_MANUAL_BLOCKED_NOTE =
+  "Your organization's policy does not allow adding grants by hand.";
+
 function GrantRowView({
   grant,
   busy,
@@ -212,9 +243,17 @@ function GrantRowView({
   onRevoke: () => void;
 }) {
   const revoked = grant.revoked_ts !== null;
+  const blocked = grant.blocked_by_policy === true && !revoked;
   return (
     <tr className="border-t border-line">
-      <td className="py-2.5 pr-3 font-data text-sm text-ink">{grant.capability}</td>
+      <td className="py-2.5 pr-3 font-data text-sm text-ink">
+        {grant.capability}
+        {blocked && (
+          <span className="mt-1 block max-w-content font-sans text-xs text-warning">
+            {GRANT_BLOCKED_NOTE}
+          </span>
+        )}
+      </td>
       <td className="py-2.5 pr-3 font-data text-xs text-ink-muted">{grant.scope}</td>
       <td
         className="py-2.5 pr-3 font-data text-xs text-ink-faint"
@@ -223,7 +262,13 @@ function GrantRowView({
         {relativeTime(grant.granted_ts)}
       </td>
       <td className="py-2.5 pr-3">
-        {revoked ? <Badge tone="neutral">revoked</Badge> : <Badge tone="success">active</Badge>}
+        {revoked ? (
+          <Badge tone="neutral">revoked</Badge>
+        ) : blocked ? (
+          <Badge tone="warning">blocked by policy</Badge>
+        ) : (
+          <Badge tone="success">active</Badge>
+        )}
       </td>
       <td className="py-2.5 text-right">
         {!revoked && (
@@ -275,10 +320,36 @@ function GrantsPanel() {
 
   const rows = grants.data?.grants ?? [];
   const listFailure = grants.isError ? toBridgeFailure(grants.error) : null;
+  const manual = grants.data?.effective?.manual;
+  const manualBlocked = isLocked(manual);
+  const never = grants.data?.policy?.never ?? [];
+  const neverClasses = grants.data?.policy?.never_classes ?? [];
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
       <p className="font-data text-xs text-ink-faint">Capability grants</p>
+
+      {(never.length > 0 || neverClasses.length > 0) && (
+        <p
+          aria-label="capabilities the policy never allows"
+          className="select-text font-sans text-sm text-ink-muted"
+        >
+          Your organization&apos;s policy never allows
+          {never.length > 0 && (
+            <>
+              {" "}
+              <SafeText value={never.join(", ")} />
+            </>
+          )}
+          {neverClasses.length > 0 && (
+            <>
+              {never.length > 0 ? " and the classes " : " the classes "}
+              <SafeText value={neverClasses.join(", ")} />
+            </>
+          )}
+          . A grant for one of them is kept but does not authorize.
+        </p>
+      )}
 
       {listFailure && <FailureNote failure={listFailure} label="grants" />}
 
@@ -315,12 +386,19 @@ function GrantsPanel() {
         </div>
       )}
 
+      {manualBlocked && (
+        <div className="space-y-1 border-t border-line pt-4">
+          <ManagedNote entry={manual} />
+          <p className="font-sans text-sm text-ink-muted">{GRANT_MANUAL_BLOCKED_NOTE}</p>
+        </div>
+      )}
+
       <form
         className="flex flex-wrap items-end gap-2 border-t border-line pt-4"
         onSubmit={(event) => {
           event.preventDefault();
           const capability = draft.trim();
-          if (capability) setConfirming(capability);
+          if (capability && !manualBlocked) setConfirming(capability);
         }}
       >
         <label className="min-w-48 flex-1 space-y-1">
@@ -329,6 +407,7 @@ function GrantsPanel() {
             aria-label="capability to grant"
             list="known-capabilities"
             value={draft}
+            disabled={manualBlocked}
             onChange={(event) => setDraft(event.target.value)}
             placeholder="e.g. flow.run"
           />
@@ -341,8 +420,14 @@ function GrantsPanel() {
         <Button
           size="sm"
           type="submit"
-          disabled={add.isPending || !draft.trim()}
-          title={!draft.trim() ? "Name a capability first" : undefined}
+          disabled={add.isPending || !draft.trim() || manualBlocked}
+          title={
+            manualBlocked
+              ? GRANT_MANUAL_BLOCKED_NOTE
+              : !draft.trim()
+                ? "Name a capability first"
+                : undefined
+          }
         >
           {add.isPending && (
             <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
@@ -884,27 +969,32 @@ function RetentionPanel() {
     label: string,
     choices: ReadonlyArray<number | null>,
     days: number | null,
+    entry: EffectiveEntry | undefined,
     onPick: (next: number | null) => void,
   ) => (
-    <label className="space-y-1">
-      <span className={fieldLabelClasses}>{caption}</span>
-      <SelectField
-        appearance="plain"
-        aria-label={label}
-        value={windowValue(days)}
-        disabled={busy}
-        onChange={(event) =>
-          onPick(event.target.value === "forever" ? null : Number(event.target.value))
-        }
-        className={selectClasses}
-      >
-        {choices.map((choice) => (
-          <option key={windowValue(choice)} value={windowValue(choice)}>
-            {windowLabel(choice)}
-          </option>
-        ))}
-      </SelectField>
-    </label>
+    <ManagedField entry={entry}>
+      {(locked) => (
+        <label className="block space-y-1">
+          <span className={fieldLabelClasses}>{caption}</span>
+          <SelectField
+            appearance="plain"
+            aria-label={label}
+            value={windowValue(days)}
+            disabled={busy || locked}
+            onChange={(event) =>
+              onPick(event.target.value === "forever" ? null : Number(event.target.value))
+            }
+            className={selectClasses}
+          >
+            {choices.map((choice) => (
+              <option key={windowValue(choice)} value={windowValue(choice)}>
+                {windowLabel(choice)}
+              </option>
+            ))}
+          </SelectField>
+        </label>
+      )}
+    </ManagedField>
   );
 
   return (
@@ -929,6 +1019,7 @@ function RetentionPanel() {
           "evidence age",
           EVIDENCE_CHOICES,
           state.data?.evidence_days ?? null,
+          state.data?.effective?.evidence_days,
           (next) => save.mutate({ evidence_days: next }),
         )}
         {windowField(
@@ -936,6 +1027,7 @@ function RetentionPanel() {
           "audit age",
           AUDIT_CHOICES,
           state.data?.audit_days ?? null,
+          state.data?.effective?.audit_days,
           (next) => save.mutate({ audit_days: next }),
         )}
       </div>
@@ -1213,6 +1305,7 @@ export function SettingsScreen() {
     appearance: <AppearancePanel />,
     security: (
       <div className="settings-grid settings-security">
+        <PolicyPanel />
         <ProfilePanel />
         <GrantsPanel />
       </div>
@@ -1232,6 +1325,7 @@ export function SettingsScreen() {
         <div>
           <h1 className="font-sans text-title font-semibold text-ink">Settings</h1>
           <p className="text-sm text-ink-muted">Your machine. Your defaults.</p>
+          <PolicyStatusLine onOpen={() => select("security")} />
         </div>
       </header>
       <LayoutGroup id={motionGroup}>

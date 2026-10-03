@@ -314,3 +314,77 @@ it("names a blocked keychain and carries its recovery", async () => {
   expect(banner.getByText("Keychain · denied")).toBeInTheDocument();
   expect(banner.getByText("Allow the access prompt when Pam asks.")).toBeInTheDocument();
 });
+
+it("disables every control of a connector the policy disables, and says who owns it", async () => {
+  current = current.map((row) =>
+    row.id === "github"
+      ? {
+          ...row,
+          enabled: false,
+          effective: {
+            enabled: { source: "policy", locked: true, mode: "forbid", state: "applied" },
+          },
+        }
+      : row,
+  );
+  const client = createAppQueryClient();
+  render(
+    <QueryClientProvider client={client}>
+      <SettingsConnectorsSection />
+    </QueryClientProvider>,
+  );
+  await screen.findByLabelText("connector GitHub");
+  await waitFor(() =>
+    expect(row().getByText("Managed by your organization")).toBeInTheDocument(),
+  );
+  expect(row().getByLabelText("enable GitHub")).toBeDisabled();
+  expect(row().getByLabelText("GitHub base URL")).toBeDisabled();
+  expect(row().getByLabelText("GitHub credential")).toBeDisabled();
+  expect(row().getByRole("button", { name: "Save and test" })).toBeDisabled();
+  // Another connector is untouched.
+  expect(
+    within(screen.getByLabelText("connector Confluence")).queryByText(/Managed by/),
+  ).toBeNull();
+});
+
+it("prints the hosts the policy allows beside the base URL, which stays editable", async () => {
+  current = current.map((row) =>
+    row.id === "github"
+      ? {
+          ...row,
+          effective: {
+            base_url: {
+              source: "policy",
+              locked: false,
+              mode: "forbid",
+              constraint: { allow: ["api.github.com"] },
+              clamped: true,
+              state: "applied",
+            },
+          },
+        }
+      : row,
+  );
+  await setup();
+  expect(row().getByText("Limited by your organization")).toBeInTheDocument();
+  expect(row().getByText("allowed: api.github.com")).toBeInTheDocument();
+  expect(row().getByLabelText("GitHub base URL")).toBeEnabled();
+});
+
+it.each([
+  ["connector_disabled", "GitHub is disabled by your organization's policy"],
+  ["policy_not_allowed", "api.example.test is not a host your organization allows"],
+  ["setting_locked", "this setting is managed by your organization's policy"],
+])("renders a %s refusal's detail and recovery", async (cause, detail) => {
+  mocks.connectorsConfigure.mockRejectedValue({
+    cause,
+    detail,
+    recovery: "Managed by your organization's policy; ask your administrator.",
+  });
+  await setup();
+  fireEvent.change(row().getByLabelText("GitHub credential"), { target: { value: "token" } });
+  fireEvent.click(row().getByRole("button", { name: "Save and test" }));
+  expect(await screen.findByText(new RegExp(`github · ${cause}`))).toBeInTheDocument();
+  expect(screen.getByText(`${detail}.`)).toBeInTheDocument();
+  expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+});

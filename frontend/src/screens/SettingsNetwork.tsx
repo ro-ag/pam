@@ -27,6 +27,7 @@ import {
 } from "../lib/ipc";
 import { escapeInvisible } from "../lib/safeText";
 import { exactTime, relativeTime } from "../lib/time";
+import { ManagedNote, isLocked } from "./ManagedField";
 
 /**
  * Settings → Network: how PAM reaches connector services and download hosts
@@ -168,7 +169,7 @@ export function checkMirrorUrl(raw: string): Checked<string | null> {
   if (refusedMirrorHost(parts.host)) {
     return {
       error:
-        "A mirror cannot be on this computer or a link-local address; use your organisation's mirror host.",
+        "A mirror cannot be on this computer or a link-local address; use your organization's mirror host.",
     };
   }
   if (tail.split("/").some((segment) => segment === "." || segment === "..")) {
@@ -436,8 +437,6 @@ function Field({
   );
 }
 
-const LOCKED_NOTE = "Set by your organisation";
-
 // --- the test panel ---------------------------------------------------------------
 
 function ResultRow({
@@ -665,12 +664,12 @@ export function SettingsNetworkSection() {
   }
 
   const effective = reply?.effective ?? {};
-  const proxyLocked = effective.proxy?.locked === true;
-  const passwordLocked = (effective.credential ?? effective.proxy)?.locked === true;
-  const noProxyLocked = effective.no_proxy?.locked === true;
-  const caLocked = effective.ca_bundle?.locked === true;
-  const engineLocked = effective.engine_mirror?.locked === true;
-  const modelsLocked = effective.models_mirror?.locked === true;
+  const proxyLocked = isLocked(effective.proxy);
+  const passwordLocked = isLocked(effective.credential ?? effective.proxy);
+  const noProxyLocked = isLocked(effective.no_proxy);
+  const caLocked = isLocked(effective.ca_bundle);
+  const engineLocked = isLocked(effective.engine_mirror);
+  const modelsLocked = isLocked(effective.models_mirror);
 
   const loading = !network.isSuccess;
   const busy = loading || network.isFetching || apply.isPending;
@@ -719,6 +718,16 @@ export function SettingsNetworkSection() {
       </Panel>
 
       {failure && <FailureNote failure={failure} label="network" />}
+      {reply?.closed_by_policy && (
+        <FailureNote
+          failure={{
+            cause: reply.closed_by_policy.code,
+            detail: reply.closed_by_policy.detail.replace(/\.+$/, ""),
+            recovery: reply.closed_by_policy.recovery,
+          }}
+          label="network closed by policy"
+        />
+      )}
       {loading && !failure && (
         <p className="font-data text-xs text-ink-faint">reading the network settings…</p>
       )}
@@ -736,7 +745,7 @@ export function SettingsNetworkSection() {
             The curl on this computer ({reply.curl.version}) is too old to use a proxy.
           </p>
         )}
-        {proxyLocked && <Badge tone="warning">{LOCKED_NOTE}</Badge>}
+        <ManagedNote entry={effective.proxy} />
         <div className="grid grid-cols-1 gap-3">
           <Field label="Proxy address" error={check.errors.proxyUrl}>
             <TextField
@@ -830,13 +839,13 @@ export function SettingsNetworkSection() {
             onChange={(event) => edit({ noProxy: event.target.value })}
           />
         </Field>
-        {noProxyLocked && <Badge tone="warning">{LOCKED_NOTE}</Badge>}
+        <ManagedNote entry={effective.no_proxy} />
       </Panel>
 
       <Panel ground="raised" className="space-y-4 p-4">
         <p className="font-data text-xs text-ink-faint">Certificate authority</p>
         <p className="font-sans text-sm text-ink-muted">
-          If your organisation inspects TLS and this computer's keychain or certificate store
+          If your organization inspects TLS and this computer's keychain or certificate store
           already trusts its root, leave this empty. Otherwise import a PEM file of the
           certificates PAM should trust. It replaces the system's trust for PAM's requests, so
           include every root those services need. A proxy that inspects TLS can read the
@@ -847,7 +856,7 @@ export function SettingsNetworkSection() {
             curl {reply.curl.version} · {reply.curl.backend}
           </p>
         )}
-        {caLocked && <Badge tone="warning">{LOCKED_NOTE}</Badge>}
+        <ManagedNote entry={effective.ca_bundle} />
         {bundle ? (
           <div
             aria-label="imported CA bundle"
@@ -953,7 +962,8 @@ export function SettingsNetworkSection() {
           Hugging Face (models). The size and SHA-256 checks built into PAM still apply to
           whatever the mirror serves. Leave empty to use the original hosts.
         </p>
-        {(engineLocked || modelsLocked) && <Badge tone="warning">{LOCKED_NOTE}</Badge>}
+        <ManagedNote entry={effective.engine_mirror} />
+        <ManagedNote entry={effective.models_mirror} />
         <div className="grid grid-cols-1 gap-3">
           <Field label="Engine mirror" error={check.errors.engineMirror}>
             <TextField
@@ -983,7 +993,7 @@ export function SettingsNetworkSection() {
             aria-label="allowed mirror hosts"
             className="select-text font-sans text-sm text-ink-muted"
           >
-            Your organisation allows mirrors only on: {allowedHosts.join(", ")}. This list is
+            Your organization allows mirrors only on: {allowedHosts.join(", ")}. This list is
             set by policy and cannot be edited here.
           </p>
         )}
@@ -1019,7 +1029,7 @@ export function SettingsNetworkSection() {
             <p>
               A proxy sits between PAM and your connector services. If it inspects TLS it can
               read the credentials PAM sends. Only continue with a proxy and password your
-              organisation gave you.
+              organization gave you.
             </p>
           </TypedConfirm>
         )}

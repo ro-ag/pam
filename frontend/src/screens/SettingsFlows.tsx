@@ -2,6 +2,7 @@ import { TextField, SelectField, TextArea } from "../components/ui/Fields";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { LandingSettings } from "./LandingSettings";
+import { ManagedField, PolicyDropNotice, entryList } from "./ManagedField";
 import { useRef, useState } from "react";
 import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
@@ -264,10 +265,25 @@ export function SettingsFlowsSection() {
   }
 
   const listFailure = settings.isError ? toBridgeFailure(settings.error) : null;
-  const programs = settings.data?.allowed_programs ?? [];
-  const extraPath = settings.data?.extra_path ?? [];
-  const artifactsRoot = settings.data?.artifacts_root ?? null;
-  const readCaches = settings.data?.read_cache_roots ?? [];
+  const effective = settings.data?.effective;
+  // A locked field shows what the policy put in force, not what the human last saved.
+  const programs = entryList(
+    effective?.allowed_programs?.locked ? effective.allowed_programs : undefined,
+    settings.data?.allowed_programs ?? [],
+  );
+  const extraPath = entryList(
+    effective?.extra_path?.locked ? effective.extra_path : undefined,
+    settings.data?.extra_path ?? [],
+  );
+  const rootEntry = effective?.artifacts_root;
+  const artifactsRoot =
+    rootEntry?.locked && (typeof rootEntry.value === "string" || rootEntry.value === null)
+      ? rootEntry.value
+      : (settings.data?.artifacts_root ?? null);
+  const readCaches = entryList(
+    effective?.read_cache_roots?.locked ? effective.read_cache_roots : undefined,
+    settings.data?.read_cache_roots ?? [],
+  );
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
@@ -285,58 +301,77 @@ export function SettingsFlowsSection() {
         </>
       )}
 
-      <ListEditor
-        title="Allowed programs"
-        values={programs}
-        addLabel="Program to allow"
-        removeLabel="remove program"
-        placeholder="e.g. cargo"
-        empty="No program is allowed yet, so every command step would refuse."
-        busy={busy}
-        onChange={(next) => change({ allowed_programs: next })}
-      />
+      <ManagedField entry={effective?.allowed_programs}>
+        {(locked) => (
+          <ListEditor
+            title="Allowed programs"
+            values={programs}
+            addLabel="Program to allow"
+            removeLabel="remove program"
+            placeholder="e.g. cargo"
+            empty="No program is allowed yet, so every command step would refuse."
+            busy={busy || locked}
+            onChange={(next) => change({ allowed_programs: next })}
+          />
+        )}
+      </ManagedField>
 
-      <div className="border-t border-line pt-4">
-        <ListEditor
-          title="Extra PATH"
-          values={extraPath}
-          addLabel="Directory to add to PATH"
-          removeLabel="remove directory"
-          placeholder="e.g. /opt/homebrew/bin"
-          empty="Nothing added — steps see only the daemon's own PATH."
-          busy={busy}
-          onChange={(next) => change({ extra_path: next })}
-        />
-      </div>
+      <ManagedField entry={effective?.extra_path} className="border-t border-line pt-4">
+        {(locked) => (
+          <ListEditor
+            title="Extra PATH"
+            values={extraPath}
+            addLabel="Directory to add to PATH"
+            removeLabel="remove directory"
+            placeholder="e.g. /opt/homebrew/bin"
+            empty="Nothing added — steps see only the daemon's own PATH."
+            busy={busy || locked}
+            onChange={(next) => change({ extra_path: next })}
+          />
+        )}
+      </ManagedField>
 
-      <div className="border-t border-line pt-4">
-        <DirectoryEditor
-          value={artifactsRoot}
-          busy={busy}
-          onSave={(next) => change({ artifacts_root: next })}
-        />
-      </div>
+      <ManagedField entry={effective?.artifacts_root} className="border-t border-line pt-4">
+        {(locked) => (
+          <DirectoryEditor
+            value={artifactsRoot}
+            busy={busy || locked}
+            onSave={(next) => change({ artifacts_root: next })}
+          />
+        )}
+      </ManagedField>
 
-      <div className="border-t border-line pt-4">
-        <ListEditor
-          title="Read-only caches"
-          values={readCaches}
-          addLabel="Cache directory to add"
-          removeLabel="remove cache directory"
-          placeholder="e.g. ~/.cargo/registry"
-          empty="No cache is shared — every build fetches nothing, since steps have no network."
-          busy={busy}
-          onChange={(next) => change({ read_cache_roots: next })}
-        />
-      </div>
+      <ManagedField entry={effective?.read_cache_roots} className="border-t border-line pt-4">
+        {(locked) => (
+          <ListEditor
+            title="Read-only caches"
+            values={readCaches}
+            addLabel="Cache directory to add"
+            removeLabel="remove cache directory"
+            placeholder="e.g. ~/.cargo/registry"
+            empty="No cache is shared — every build fetches nothing, since steps have no network."
+            busy={busy || locked}
+            onChange={(next) => change({ read_cache_roots: next })}
+          />
+        )}
+      </ManagedField>
 
       {failure && <FailureNote failure={failure} label="flow settings" />}
 
-      <ScopeEditor
-        policy={settings.data?.scope_policy ?? EMPTY_SCOPES}
-        busy={busy}
-        onSave={(scope_policy, onSaved) => change({ scope_policy }, onSaved)}
+      <PolicyDropNotice
+        drops={settings.data?.scope_policy_dropped}
+        label="scope entries the policy is not using"
       />
+
+      <ManagedField entry={effective?.scope_policy}>
+        {(locked) => (
+          <ScopeEditor
+            policy={settings.data?.scope_policy ?? EMPTY_SCOPES}
+            busy={busy || locked}
+            onSave={(scope_policy, onSaved) => change({ scope_policy }, onSaved)}
+          />
+        )}
+      </ManagedField>
 
       <LandingSettings />
 

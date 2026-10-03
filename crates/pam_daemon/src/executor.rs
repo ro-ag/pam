@@ -8,8 +8,9 @@
 //! never touch the `request` row or audit trail themselves — terminal bookkeeping is the daemon
 //! pipeline's ([`crate::daemon`]), which owns exactly one audit write per terminal path.
 //! - `status` (control): daemon version, protocol version, uptime, in-flight request count, and
-//!   the model and keyring blocks, served from [`crate::status_cache::StatusCache`] so a poll never
-//!   waits behind a slow lane. Outcome `verified`.
+//!   the model, keyring, boundary and managed-policy blocks (the policy block names its state,
+//!   revision and digest only, never a rule), served from [`crate::status_cache::StatusCache`] so a
+//!   poll never waits behind a slow lane. Outcome `verified`.
 //! - `query` (control): the lifecycle state of `args.ticket`'s request, straight from the store —
 //!   the authoritative answer, and the authorisation a follow (`pam wait`/`pam subscribe`) opens
 //!   with: a follower of an already-finished ticket gets this answer at once instead of waiting

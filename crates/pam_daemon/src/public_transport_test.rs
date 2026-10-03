@@ -55,11 +55,26 @@ struct Rig {
     repo: tempfile::TempDir,
     /// Bytes the in-memory connection buffers in each direction.
     buffer: usize,
+    /// The managed policy the follow path reads.
+    managed: Arc<crate::managed_policy_service::PolicyHandle>,
 }
 
 impl Rig {
     async fn new(follow: FollowTimes) -> Self {
+        Self::under(follow, None).await
+    }
+
+    /// [`Self::new`] whose follow path reads the managed policy from
+    /// `source`; `None` is no policy.
+    async fn under(
+        follow: FollowTimes,
+        source: Option<Arc<crate::policy_test::SwitchablePolicy>>,
+    ) -> Self {
         let store = Arc::new(Store::open_in_memory().await.expect("a store"));
+        let managed = match &source {
+            Some(source) => crate::policy_test::managed_handle(&store, source).await,
+            None => crate::managed_policy_service::PolicyHandle::none(),
+        };
         let repo = tempfile::tempdir().expect("a repository directory");
         let root = repo.path().canonicalize().expect("the repository exists");
         store
@@ -85,7 +100,9 @@ impl Rig {
             ImageWatch::capture(Arc::new(FsProbe)),
             Limits::PUBLIC,
             follow,
+            Arc::clone(&managed),
         );
+        let managed_for_rig = managed;
         Self {
             policy,
             core,
@@ -95,7 +112,15 @@ impl Rig {
             stop,
             repo,
             buffer: 64 * 1024,
+            managed: managed_for_rig,
         }
+    }
+
+    /// Re-reads the managed policy now, as `admin.policy.reload` does.
+    async fn policy_reload(&self) {
+        self.managed
+            .reload(crate::managed_policy_service::Trigger::Reload { request_id: None })
+            .await;
     }
 
     fn repo(&self) -> String {
@@ -547,6 +572,56 @@ async fn a_follow_ends_when_its_authorisation_no_longer_holds() {
     assert_eq!(rig.hub.usage().followers, 0);
 }
 
+/// The follow path authorizes under the managed policy too: a policy that
+/// drops the follower's repository from the effective scopes ends the follow
+/// with the refusal a `query` would get, while the human's stored scopes
+/// still name the repository.
+#[tokio::test]
+async fn a_follow_ends_when_the_managed_policy_drops_its_repository() {
+    let source = crate::policy_test::SwitchablePolicy::new(None);
+    let mut rig = Rig::under(
+        FollowTimes {
+            lifetime: Duration::from_hours(1),
+            reconcile: Duration::from_millis(80),
+        },
+        Some(Arc::clone(&source)),
+    )
+    .await;
+    rig.admit("req_managed").await;
+
+    let (mut client, serving) = rig.follow("req_managed", async |_: &Rig| {}).await;
+    following(&mut client).await;
+    let elsewhere = if cfg!(windows) {
+        r"C:\pam-policy-allows-only-this"
+    } else {
+        "/pam-policy-allows-only-this"
+    };
+    source.set(Some(
+        &serde_json::json!({
+            "version": 1,
+            "scopes": { "allowed_repository_roots": [elsewhere] },
+        })
+        .to_string(),
+    ));
+    rig.policy_reload().await;
+
+    let end = end(&mut client).await;
+    assert_eq!(end.event, None);
+    assert_eq!(refusal(&end.response), ("result_unavailable", false));
+    serving.await.unwrap();
+    assert_eq!(rig.hub.usage().followers, 0);
+    let stored = rig
+        .store
+        .get_setting(crate::scope_policy::SETTING_SCOPE_POLICY)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.contains(&rig.repo().replace('\\', "\\\\")),
+        "the human's scopes are untouched: {stored}"
+    );
+}
+
 #[tokio::test]
 async fn a_follow_expires_at_its_lifetime_and_frees_its_slot() {
     let mut rig = Rig::new(FollowTimes {
@@ -678,6 +753,7 @@ async fn a_connection_over_the_cap_is_told_and_a_freed_slot_is_reusable() {
         ImageWatch::capture(Arc::new(FsProbe)),
         limits,
         FollowTimes::DEFAULT,
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     let dir = pam_testkit::short_tempdir();
     let path = dir.path().join("pam.sock");
@@ -799,6 +875,7 @@ mod live {
                 base_dir: Some(pam_testkit::base_of(tmp)),
                 secret_backend: Some(Arc::new(FakeSecretBackend::default())),
                 handler_grace: Duration::from_millis(300),
+                policy_source: Some(crate::daemon_test::no_policy_file()),
                 ..DaemonConfig::default()
             },
             shutdown_rx,

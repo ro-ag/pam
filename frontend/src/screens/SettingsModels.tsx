@@ -22,6 +22,7 @@ import {
   type ModelEntry,
   type TierReadiness,
 } from "../lib/ipc";
+import { ManagedNote, isLocked } from "./ManagedField";
 import { admissionBlocker } from "./Models";
 import { ReadinessLine } from "./Readiness";
 
@@ -227,6 +228,18 @@ function CuratorPanel() {
 
   const detected = curator.data?.detected ?? [];
   const selected = curator.data?.selected ?? null;
+  const curatorEntry = curator.data?.effective?.curator;
+  // `allow` lists the agents the policy permits; an empty list disables all of them.
+  const allowedAgents = Array.isArray(curatorEntry?.constraint?.allow)
+    ? (curatorEntry.constraint.allow as string[])
+    : null;
+  const curatorLocked = isLocked(curatorEntry);
+  const agentBlocker = (id: AgentId): string | undefined =>
+    curatorLocked
+      ? "Managed by your organization"
+      : allowedAgents !== null && !allowedAgents.includes(id)
+        ? "Your organization's policy does not allow this agent"
+        : undefined;
   const listFailure = curator.isError ? toBridgeFailure(curator.error) : null;
 
   return (
@@ -237,6 +250,7 @@ function CuratorPanel() {
         it rides your own subscription, or nothing.
       </p>
 
+      <ManagedNote entry={curatorEntry} />
       {listFailure && <FailureNote failure={listFailure} label="curator" />}
 
       {!listFailure && detected.length === 0 && !curator.isPending && (
@@ -249,12 +263,15 @@ function CuratorPanel() {
         <div role="radiogroup" aria-label="curator agent" className="space-y-2">
           {detected.map((cli) => {
             const active = selected === cli.id;
+            const blocker = agentBlocker(cli.id);
             return (
               <label
                 key={cli.id}
+                title={blocker}
                 className={cn(
                   "flex cursor-pointer items-start gap-3 rounded-card border p-3 transition-colors duration-150",
                   active ? "border-accent-strong bg-accent-soft/40" : "border-line",
+                  blocker !== undefined && "cursor-default opacity-50",
                 )}
               >
                 <input
@@ -262,7 +279,7 @@ function CuratorPanel() {
                   name="curator-agent"
                   value={cli.id}
                   checked={active}
-                  disabled={pick.isPending}
+                  disabled={pick.isPending || blocker !== undefined}
                   onChange={() => pick.mutate(cli.id)}
                   className="mt-0.5 size-4.5 shrink-0 accent-accent-strong"
                 />
@@ -396,6 +413,10 @@ function StoragePanel() {
   }
 
   const inputClasses = fieldClasses;
+  const dirEntry = status.data?.effective?.models_dir;
+  const idleEntry = status.data?.effective?.idle_unload_min;
+  const dirLocked = isLocked(dirEntry);
+  const idleLocked = isLocked(idleEntry);
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
@@ -404,12 +425,13 @@ function StoragePanel() {
         <FailureNote failure={toBridgeFailure(status.error)} label="model settings" />
       )}
 
+      <ManagedNote entry={dirEntry} />
       <form
         className="flex flex-wrap items-end gap-2"
         onSubmit={(event) => {
           event.preventDefault();
           const next = dir.trim();
-          if (next) change({ models_dir: next });
+          if (next && !dirLocked) change({ models_dir: next });
         }}
       >
         <label className="min-w-0 flex-1 space-y-1">
@@ -417,7 +439,7 @@ function StoragePanel() {
           <TextField
             aria-label="models directory"
             value={dir}
-            disabled={busy}
+            disabled={busy || dirLocked}
             onChange={(event) => {
               if (busy || saving.current) return;
               dirtyDir.current = true;
@@ -431,18 +453,21 @@ function StoragePanel() {
           size="sm"
           type="submit"
           variant="secondary"
-          disabled={busy || !dir.trim()}
+          disabled={busy || dirLocked || !dir.trim()}
           title={!dir.trim() ? "Name a directory first" : undefined}
         >
           Apply
         </Button>
       </form>
 
+      <div className="border-t border-line pt-4">
+        <ManagedNote entry={idleEntry} />
+      </div>
       <form
-        className="flex flex-wrap items-end gap-2 border-t border-line pt-4"
+        className="flex flex-wrap items-end gap-2"
         onSubmit={(event) => {
           event.preventDefault();
-          if (validMinutes) change({ idle_unload_min: Number(minutes) });
+          if (validMinutes && !idleLocked) change({ idle_unload_min: Number(minutes) });
         }}
       >
         <label className="w-40 space-y-1">
@@ -452,7 +477,7 @@ function StoragePanel() {
             min={0}
             aria-label="idle unload minutes"
             value={minutes}
-            disabled={busy}
+            disabled={busy || idleLocked}
             onChange={(event) => {
               if (busy || saving.current) return;
               dirtyMinutes.current = true;
@@ -465,7 +490,7 @@ function StoragePanel() {
           size="sm"
           type="submit"
           variant="secondary"
-          disabled={busy || !validMinutes}
+          disabled={busy || idleLocked || !validMinutes}
           title={!validMinutes ? "Whole minutes, 0 or more" : undefined}
         >
           Apply

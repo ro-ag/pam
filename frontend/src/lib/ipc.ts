@@ -129,6 +129,73 @@ function bridged<T>(
   return withTimeout(invoke<T>(command, args), timeoutMs, command);
 }
 
+// --- managed policy ----------------------------------------------------------
+
+/**
+ * The managed policy file's state (`pam_daemon::managed_policy`): `none` (no file), `active`,
+ * `degraded` (some leaves rejected, the rest applied), `last_good` (the file cannot be read or
+ * trusted and the last good copy governs) or `frozen` (nothing usable: widening changes pause).
+ */
+export type PolicyState = "none" | "active" | "degraded" | "last_good" | "frozen";
+
+/** One setting the file names: how it stands. */
+export interface PolicyKeyRow {
+  key: string;
+  tier: string;
+  mode: string[];
+  state: "applied" | "held" | "rejected";
+  code?: string;
+  detail?: string;
+}
+
+/** One problem found while reading the file. */
+export interface PolicyDiagnostic {
+  code: string;
+  key: string;
+  detail: string;
+}
+
+/** The trust verdict on the file's origin. */
+export interface PolicyTrust {
+  verdict: "trusted" | "untrusted" | "busy" | "absent";
+  code: string | null;
+  recovery: string | null;
+  owner?: string | null;
+  writable_by_user?: boolean | null;
+  symlink?: boolean | null;
+  parents?: "ok" | "failed" | "unknown";
+}
+
+/** `admin.policy.get` and `admin.policy.reload` answer this body. Timestamps are unix seconds. */
+export interface PolicyBody {
+  state: PolicyState;
+  reason_code: string | null;
+  reason_detail: string | null;
+  origin: { path: string | null; platform: string; trust: PolicyTrust };
+  /** 64 hex digits; the screen shows a prefix. */
+  digest: string | null;
+  file_digest: string | null;
+  revision: string | null;
+  organization: string | null;
+  contact: string | null;
+  loaded_ts: number | null;
+  checked_ts: number | null;
+  last_good: { digest: string; loaded_ts: number } | null;
+  rejected_leaves: number;
+  keys: PolicyKeyRow[];
+  diagnostics: PolicyDiagnostic[];
+  compliance: { login_unit: { required: boolean; present: boolean | null } };
+}
+
+export function policyGet(): Promise<PolicyBody> {
+  return adminCall("admin.policy.get");
+}
+
+/** Re-reads the policy file now; no confirmation, because it cannot loosen what the file says. */
+export function policyReload(): Promise<PolicyBody> {
+  return adminCall("admin.policy.reload");
+}
+
 // --- daemon status ---------------------------------------------------------
 
 /** What the `status` capability reports (loosely typed on purpose). */
@@ -486,7 +553,9 @@ export type AdminOp =
   | "admin.network.test"
   | "admin.retention.get"
   | "admin.retention.set"
-  | "admin.retention.prune";
+  | "admin.retention.prune"
+  | "admin.policy.get"
+  | "admin.policy.reload";
 
 /**
  * One generic admin call; prefer the typed wrappers below. `confirmation` is the phrase the
@@ -513,6 +582,27 @@ export const CONFIRM_NETWORK = "network";
 
 export type Profile = "relaxed" | "standard" | "strict";
 
+/**
+ * One field of an `effective` block (`pam_daemon::managed_policy::EffectiveEntry`): where the
+ * value in force came from, and whether the human can edit it at all. `source: "policy"` with
+ * `locked: false` is a policy default or a clamp; `source: "default"` means no policy is in play.
+ * `mode`, `constraint` and `reason` appear only when a managed policy names the key; `value` only
+ * on the ops that echo the effective value.
+ */
+export interface EffectiveEntry {
+  source: "policy" | "user" | "default";
+  locked: boolean;
+  mode?: "locked" | "default" | "floor" | "min" | "max" | "allow" | "forbid";
+  constraint?: Record<string, unknown>;
+  reason?: string;
+  state?: "applied" | "held" | "rejected";
+  clamped?: boolean;
+  value?: unknown;
+}
+
+/** An `effective` block: one entry per field the op reports. */
+export type EffectiveBlock<K extends string> = Partial<Record<K, EffectiveEntry>>;
+
 /** One grant row; timestamps are unix seconds (`pam_store` integers). */
 export interface GrantRow {
   id: number;
@@ -520,6 +610,22 @@ export interface GrantRow {
   scope: string;
   granted_ts: number;
   revoked_ts: number | null;
+  /** The managed policy's `never` rules cover it: kept, but it does not authorize. */
+  blocked_by_policy?: boolean;
+}
+
+/** What the managed policy says about grants; each is null unless that key is in force. */
+export interface GrantsPolicy {
+  manual: "allow" | "deny" | null;
+  remember: "allow" | "deny" | null;
+  never: string[] | null;
+  never_classes: string[] | null;
+}
+
+export interface GrantsListReply {
+  grants: GrantRow[];
+  policy?: GrantsPolicy;
+  effective?: EffectiveBlock<"manual" | "remember" | "never" | "never_classes">;
 }
 
 /** One unresolved raised hand; `requested_ts` is unix seconds. */
@@ -595,18 +701,27 @@ export interface CallerRow {
   last_seen: number;
 }
 
-export function profileGet(): Promise<{ profile: Profile }> {
+export interface ProfileGetReply {
+  profile: Profile;
+  effective?: EffectiveBlock<"profile">;
+}
+
+export function profileGet(): Promise<ProfileGetReply> {
   return adminCall("admin.profile.get");
 }
 
 export function profileSet(
   profile: Profile,
   confirmation?: string,
-): Promise<{ profile: Profile; applies: "now" | "next_daemon_start" }> {
+): Promise<{
+  profile: Profile;
+  applies: "now" | "next_daemon_start";
+  effective?: EffectiveBlock<"profile">;
+}> {
   return adminCall("admin.profile.set", { profile }, confirmation);
 }
 
-export function grantsList(): Promise<{ grants: GrantRow[] }> {
+export function grantsList(): Promise<GrantsListReply> {
   return adminCall("admin.grants.list");
 }
 
@@ -914,6 +1029,17 @@ export interface EngineStatus {
   removable?: boolean;
   /** Present only when the stored network settings cannot be read. */
   network_issue?: BridgeFailure;
+  /** What `models.engine_source` allows right now; absent on a daemon without the policy layer. */
+  source_policy?: EngineSourcePolicy;
+}
+
+/** The `source_policy` block of the engine status. */
+export interface EngineSourcePolicy {
+  engine_source: "download" | "mirror_only" | "import_only";
+  install_allowed: boolean;
+  install_blocked: "import_only" | "mirror_missing" | null;
+  import_allowed: boolean;
+  effective?: EffectiveEntry;
 }
 
 /** Read-only: never installs anything. */
@@ -1022,6 +1148,7 @@ export interface ModelsStatus {
   idle_unload_min: number;
   models_dir: string;
   host_ram_bytes: number;
+  effective?: EffectiveBlock<"models_dir" | "idle_unload_min">;
   /** Absent on an older daemon that predates the engine — never invented. */
   engine?: ModelsEngineSummary;
   /** Absent on an older daemon that predates readiness — never invented. */
@@ -1068,6 +1195,7 @@ export function modelsCatalog(): Promise<{
   host_ram_bytes: number;
   /** Present only when the stored network settings cannot be read; `fetch` then shows upstream. */
   network_issue?: BridgeFailure;
+  effective?: EffectiveBlock<"allowed_sources">;
 }> {
   return adminCall("admin.models.catalog");
 }
@@ -1156,7 +1284,11 @@ export function modelsDefaultsSet(
 export function modelsSettingsSet(patch: {
   models_dir?: string;
   idle_unload_min?: number;
-}): Promise<{ models_dir: string; idle_unload_min: number }> {
+}): Promise<{
+  models_dir: string;
+  idle_unload_min: number;
+  effective?: EffectiveBlock<"models_dir" | "idle_unload_min">;
+}> {
   return adminCall("admin.models.settings.set", { ...patch });
 }
 
@@ -1179,7 +1311,11 @@ export function modelsTry(
   });
 }
 
-export function curatorList(): Promise<{ detected: AgentCli[]; selected: AgentId | null }> {
+export function curatorList(): Promise<{
+  detected: AgentCli[];
+  selected: AgentId | null;
+  effective?: EffectiveBlock<"curator">;
+}> {
   return adminCall("admin.curator.list");
 }
 
@@ -1621,6 +1757,20 @@ export interface FlowSettings {
   /** Toolchain caches a step may read but never write. */
   read_cache_roots?: string[];
   scope_policy?: FlowScopePolicy;
+  /** What every consumer reads under the managed policy, per field. */
+  effective?: EffectiveBlock<
+    "allowed_programs" | "extra_path" | "artifacts_root" | "read_cache_roots" | "scope_policy"
+  >;
+  /** Stored scope entries the managed policy forbids: kept, reported, never used. */
+  scope_policy_dropped?: PolicyDrop[];
+}
+
+/** One stored entry the managed policy stops using, and why. */
+export interface PolicyDrop {
+  root: string;
+  connector?: string | null;
+  key?: string;
+  reason: string;
 }
 
 /** How one step of a run ended (`pam_daemon::flow_exec::StepStatus`). */
@@ -1832,6 +1982,7 @@ export interface PruneReport {
 /** The settings plus the last pass — what `get` and `set` both answer. */
 export interface RetentionState extends RetentionSettings {
   last_run: PruneReport | null;
+  effective?: EffectiveBlock<"evidence_days" | "audit_days">;
 }
 
 export function retentionGet(): Promise<RetentionState> {
@@ -1883,6 +2034,8 @@ export interface ConnectorSummary {
   /** Whether the OS credential store answered at all. */
   store_available: boolean;
   last_test?: { status: "passed" | "failed"; detail: string; ts: number };
+  /** Whether the managed policy disables it or narrows its service host. */
+  effective?: EffectiveBlock<"enabled" | "base_url">;
 }
 
 /** What a configure asks of the stored credential. */
@@ -1973,10 +2126,7 @@ export interface NetworkSettings {
 }
 
 /** Where a field's effective value comes from, and whether policy owns it. */
-export interface NetworkEffective {
-  source: "default" | "user" | "policy";
-  locked: boolean;
-}
+export type NetworkEffective = EffectiveEntry;
 
 export interface NetworkGetReply {
   settings: NetworkSettings;
@@ -1994,6 +2144,8 @@ export interface NetworkGetReply {
   };
   /** Names (never values) of proxy and CA variables in the daemon's own environment. */
   ignored_env?: string[];
+  /** Present when the managed policy closes the network: nothing leaves the machine. */
+  closed_by_policy?: { key: string; code: string; detail: string; recovery: string };
 }
 
 /**

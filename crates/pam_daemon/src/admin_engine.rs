@@ -11,6 +11,12 @@
 //! explicitly (`confirm: true`), so no probe or listing ever starts a
 //! download or deletes a file. [`OP_ENGINE_STATUS`] discloses, before any
 //! click, exactly what Install would fetch and check.
+//!
+//! The managed policy's `models.engine_source` decides whether Install is open at all: `import_only`
+//! refuses it, and `mirror_only` refuses it unless an engine mirror is in force, in both cases before
+//! any network profile is resolved, so upstream is never contacted. Import stays open (it needs
+//! `import` among `models.allowed_sources`). [`OP_ENGINE_STATUS`] carries a `source_policy` block
+//! saying which of the two is open and why.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +28,8 @@ use serde_json::{Value, json};
 use crate::admin::{
     AdminOk, AdminRefusal, AdminService, CAUSE_INVALID_ADMIN_ARGS, RECOVERY_FIX_ARGS,
 };
+use crate::managed_policy::{CAUSE_POLICY_NOT_ALLOWED, EngineSource, Key, ModelSource};
+use crate::network_service::Source;
 
 /// GUI-only query: pinned tag, target, whether a verified server is present,
 /// and what an install would fetch.
@@ -210,6 +218,66 @@ fn confirmed(args: &Value, op: &str, would: &str) -> Result<(), AdminRefusal> {
 }
 
 impl AdminService {
+    /// The managed policy's verdict on an install. `import_only` refuses
+    /// it; `mirror_only` refuses it unless an engine mirror is in force
+    /// (so upstream is never contacted); `download` leaves the choice to
+    /// the settings. A refusal is audited on this request.
+    async fn gate_engine_install(&self, envelope_id: &str) -> Result<(), AdminRefusal> {
+        let view = self.policy.view();
+        let key = Key::ModelsEngineSource;
+        let what = match view.engine_source() {
+            EngineSource::Download => return Ok(()),
+            EngineSource::ImportOnly => {
+                "this machine installs the engine only from a file you import, not from the network"
+            }
+            EngineSource::MirrorOnly => {
+                if self.engine_mirror().await?.is_some() {
+                    return Ok(());
+                }
+                "this machine installs the engine only through an engine mirror, and none is configured"
+            }
+        };
+        let refusal = view.refusal(key, CAUSE_POLICY_NOT_ALLOWED, what);
+        Err(self
+            .policy_refusal(envelope_id, OP_ENGINE_INSTALL, refusal, &view)
+            .await)
+    }
+
+    /// The `source_policy` block of the engine status: what
+    /// `models.engine_source` allows right now, and why an install would
+    /// be refused.
+    fn engine_source_policy(&self, mirror_in_force: bool) -> Value {
+        let view = self.policy.view();
+        let source = view.engine_source();
+        let install_blocked = match source {
+            EngineSource::Download => None,
+            EngineSource::ImportOnly => Some("import_only"),
+            EngineSource::MirrorOnly if mirror_in_force => None,
+            EngineSource::MirrorOnly => Some("mirror_missing"),
+        };
+        let entry = crate::connector_service::plain_entry(
+            &view,
+            Key::ModelsEngineSource,
+            if view
+                .status(Key::ModelsEngineSource)
+                .is_some_and(crate::managed_policy::LeafStatus::in_force)
+            {
+                Source::Policy
+            } else {
+                Source::Default
+            },
+            false,
+            Some(serde_json::json!({ "engine_source": source.as_str() })),
+        );
+        json!({
+            "engine_source": source.as_str(),
+            "install_allowed": install_blocked.is_none(),
+            "install_blocked": install_blocked,
+            "import_allowed": view.model_source_allowed(ModelSource::Import),
+            "effective": entry.to_json(),
+        })
+    }
+
     /// The engine mirror the next install would fetch from, when the
     /// human set one; settings that cannot be used are reported, not used.
     async fn engine_mirror(&self) -> Result<Option<MirrorBase>, AdminRefusal> {
@@ -253,14 +321,17 @@ impl AdminService {
             Ok(mirror) => (mirror, None),
             Err(issue) => (None, Some(issue)),
         };
-        body(
+        let source_policy = self.engine_source_policy(mirror.is_some());
+        let mut value = body(
             status,
             self.models.engine_release().as_ref(),
             mirror.as_ref(),
             &self.models.engine_base().join("engine"),
             self.engine_loaded(),
             network_issue,
-        )
+        );
+        value["source_policy"] = source_policy;
+        value
     }
 
     pub(crate) async fn engine_status(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
@@ -273,9 +344,17 @@ impl AdminService {
         })
     }
 
-    pub(crate) async fn engine_install(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    pub(crate) async fn engine_install(
+        &self,
+        envelope_id: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         only_keys(args, &["confirm"], OP_ENGINE_INSTALL)?;
         confirmed(args, OP_ENGINE_INSTALL, "install")?;
+        // The managed policy's `models.engine_source` is decided before
+        // anything else happens: a refused install resolves no network
+        // profile and opens no socket.
+        self.gate_engine_install(envelope_id).await?;
         let base = self.models.engine_base();
         if !engine::status(&base).installed {
             self.refuse_if_loaded("replace")?;
@@ -295,9 +374,9 @@ impl AdminService {
                 detail: failure.sentence(),
                 recovery: failure.recovery(),
             })?;
-        // The mirror, when the human set one, changes only where the pinned
-        // archive is fetched from; the digest, size and build it is held to
-        // are this build's constants.
+        // The mirror, when the human or the policy set one, changes only
+        // where the pinned archive is fetched from; the digest, size and
+        // build it is held to are this build's constants.
         let engine_mirror = self.engine_mirror().await?;
         let status = self
             .run_install(&base, cancel, net, engine_mirror.as_ref())
@@ -361,9 +440,17 @@ impl AdminService {
     /// profile is resolved and no curl runs: the archive is copied, hashed
     /// and held to the compiled-in size and digest, then unpacked and
     /// checked like a downloaded one.
-    pub(crate) async fn engine_import(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    pub(crate) async fn engine_import(
+        &self,
+        envelope_id: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         only_keys(args, &["confirm", "path"], OP_ENGINE_IMPORT)?;
         confirmed(args, OP_ENGINE_IMPORT, "import")?;
+        // `engine_source: import_only` leaves this op open; the sources the
+        // organization allows decide whether a local file may come in.
+        self.gate_model_source(envelope_id, OP_ENGINE_IMPORT, ModelSource::Import)
+            .await?;
         let raw = crate::admin::required_str(args, "path", OP_ENGINE_IMPORT)?;
         let path = PathBuf::from(raw);
         if !path.is_absolute() {

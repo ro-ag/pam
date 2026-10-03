@@ -13,6 +13,12 @@
 //! [`ModelService::generate_bounded`], returns [`ModelUnavailable::NoDefault`] with nothing
 //! configured so the caller falls back deterministically. An [`IDLE_TICK`] ticker unloads the engine once idle past
 //! [`SETTING_IDLE_UNLOAD_MIN`] (`0` = never), via the pure `should_unload`.
+//! The managed policy bounds two of the settings at read time and never rewrites what the human
+//! saved: `models.dir` ([`ModelService::models_dir`]: locked, or the policy's default until the human
+//! chooses one) and `models.idle_unload_min` (locked, or clamped into `min`/`max`, so a ceiling also
+//! turns "never" into the ceiling). The ops that bring weights or the engine in (`allowed_sources`,
+//! `engine_source`) and the curator pick (`allowed_curators`) are gated in [`crate::admin_models`]
+//! and [`crate::admin_engine`].
 //! The model layer never becomes a hard dependency: with nothing configured every caller falls back
 //! deterministically. `last_used_at` (which drives idle unload) is updated after every load and
 //! every *successful* generation: a caller retrying against a failing engine must not keep it
@@ -60,6 +66,10 @@ use pam_net::{NetFailure, NetSettings, NetworkSource};
 use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
+
+use crate::managed_policy::{EffectiveEntry, Key, PolicyView};
+use crate::managed_policy_service::PolicyHandle;
+use crate::network_service::Source;
 
 /// Setting key: the directory PAM scans for weights (`~/llm` by default).
 pub const SETTING_MODELS_DIR: &str = "model.models_dir";
@@ -381,11 +391,14 @@ type Verifies = Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// The daemon's model layer (see the module docs).
 pub struct ModelService {
     store: Arc<Store>,
-    /// The models directory. Behind a lock because
-    /// `admin.models.settings.set` moves it while the daemon serves; a
-    /// [`Registry`] is rebuilt from it on every read, so no caller can
-    /// hold a stale one.
-    models_dir: RwLock<PathBuf>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
+    /// The models directory the human saved (`None`: never set). Behind a
+    /// lock because `admin.models.settings.set` moves it while the daemon
+    /// serves; a [`Registry`] is rebuilt from the effective directory
+    /// ([`Self::models_dir`]: this value under the managed policy's
+    /// `models.dir`) on every read, so no caller can hold a stale one.
+    stored_models_dir: RwLock<Option<PathBuf>>,
     /// The qualification table every registry read matches against: the
     /// compiled-in one, or a fixture table an in-crate test installed.
     qualifications: RwLock<&'static [Qualification]>,
@@ -467,9 +480,12 @@ impl ModelService {
     /// Reads the models directory setting, measures host RAM once, fails
     /// the jobs a previous daemon left `running`
     /// ([`CAUSE_DAEMON_RESTART`]), and spawns the idle-unload ticker.
-    /// Needs a tokio runtime.
-    pub async fn new(store: Arc<Store>) -> Result<Arc<Self>, StoreError> {
-        let models_dir = read_models_dir(&store).await?;
+    /// Needs a tokio runtime. Holds `policy`, the managed policy handle.
+    pub async fn new(
+        store: Arc<Store>,
+        policy: Arc<PolicyHandle>,
+    ) -> Result<Arc<Self>, StoreError> {
+        let stored_models_dir = read_stored_models_dir(&store).await?;
         let recovered = store
             .fail_running_model_jobs(&job_failure_detail(
                 CAUSE_DAEMON_RESTART,
@@ -484,7 +500,8 @@ impl ModelService {
         }
         let service = Arc::new(Self {
             store,
-            models_dir: RwLock::new(models_dir),
+            policy,
+            stored_models_dir: RwLock::new(stored_models_dir),
             qualifications: RwLock::new(QUALIFIED),
             engine_base: RwLock::new(None),
             network: RwLock::new(Arc::new(Arc::new(NetSettings::direct()))),
@@ -513,6 +530,13 @@ impl ModelService {
             service.stopping.subscribe(),
         ));
         Ok(service)
+    }
+
+    /// The managed policy handle this layer reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// Spawns one of the service's own tasks where [`Self::shutdown`] can
@@ -617,6 +641,56 @@ impl ModelService {
         let built = Arc::new(built);
         *slot = Some(Arc::clone(&built));
         Some(built)
+    }
+
+    /// Registers the managed-policy change hook that unloads a model a
+    /// reload strands: when a policy change moves the effective
+    /// `models.dir` (a lock or default added, changed or removed), the
+    /// model loaded from the previous directory is unloaded, as the human's
+    /// own `set_models_dir` does, because registry ids repeat across
+    /// directories. The old and the new directory are both computed over
+    /// the human's stored directory as it is at the change, so a human edit
+    /// in between is never mistaken for a policy move. Called once, after
+    /// boot; the hook holds the service weakly.
+    pub fn unload_when_the_policy_moves_the_models_dir(self: &Arc<Self>) {
+        let service = Arc::downgrade(self);
+        let previous = std::sync::Mutex::new(self.policy.view());
+        self.policy.on_change(move |_| {
+            let Some(service) = service.upgrade() else {
+                return;
+            };
+            let current = service.policy.view();
+            let before = std::mem::replace(
+                &mut *previous
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Arc::clone(&current),
+            );
+            if service.models_dir_entry_under(&before).0
+                == service.models_dir_entry_under(&current).0
+            {
+                return;
+            }
+            // Hooks run on the reloading task and must not block it; the
+            // unload takes the model lane's operation lock like any other
+            // directory switch.
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            runtime.spawn(async move {
+                let _operation = service.operation.lock().await;
+                if let Err(error) = service.unload_all().await {
+                    tracing::warn!(
+                        %error,
+                        "the model loaded from the previous models directory did not unload"
+                    );
+                } else {
+                    tracing::info!(
+                        "the managed policy moved the models directory; the loaded model was unloaded"
+                    );
+                }
+            });
+        });
     }
 
     /// Unloads whatever holds weights: the engine process. The private copies stay (a
@@ -1095,13 +1169,38 @@ impl ModelService {
             .unwrap_or_else(|| self.models_dir().join(".pam"))
     }
 
-    /// The configured models directory.
+    /// The models directory in force: the managed policy's `models.dir`
+    /// (locked, or its default while the human has not chosen one), else
+    /// what the human saved, else the platform default.
     #[must_use]
     pub fn models_dir(&self) -> PathBuf {
-        self.models_dir
+        self.models_dir_entry().0
+    }
+
+    /// [`Self::models_dir`] with where it came from, for the `effective`
+    /// block of the status and settings replies.
+    #[must_use]
+    pub fn models_dir_entry(&self) -> (PathBuf, EffectiveEntry) {
+        self.models_dir_entry_under(&self.policy.view())
+    }
+
+    /// [`Self::models_dir_entry`] under `view`, over the human's stored
+    /// directory as it is now.
+    fn models_dir_entry_under(&self, view: &PolicyView) -> (PathBuf, EffectiveEntry) {
+        let stored = self
+            .stored_models_dir
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        let (value, entry) =
+            view.effective_string(Key::ModelsDir, stored.map(|dir| dir.display().to_string()));
+        // A machine with no home directory has nowhere canonical to keep
+        // weights; the relative path scans empty, which is the honest answer.
+        let dir = value.map_or_else(
+            || default_models_dir().unwrap_or_else(|| PathBuf::from("llm")),
+            PathBuf::from,
+        );
+        (dir, entry)
     }
 
     /// The `(light, heavy)` tier defaults as configured, unresolved.
@@ -1621,6 +1720,8 @@ impl ModelService {
             .as_ref()
             .and_then(|engine| engine.last_exit());
         let resident = engine_loaded.as_ref().map(|loaded| loaded.id.clone());
+        let (idle_unload_min, idle_entry) = self.idle_unload_min_entry().await?;
+        let (models_dir, models_dir_entry) = self.models_dir_entry();
         let readiness = json!({
             "light": self
                 .readiness(Tier::Light, &engine_status, resident.as_deref())
@@ -1643,8 +1744,14 @@ impl ModelService {
             "jobs": jobs,
             "defaults": { "light": light, "heavy": heavy },
             "readiness": readiness,
-            "idle_unload_min": self.idle_unload_min().await?,
-            "models_dir": self.models_dir().display().to_string(),
+            "idle_unload_min": idle_unload_min,
+            "models_dir": models_dir.display().to_string(),
+            // Where each of the two settings above came from: the human, the
+            // built-in default, or the managed policy (and whether it is locked).
+            "effective": {
+                "models_dir": models_dir_entry.to_json(),
+                "idle_unload_min": idle_entry.to_json(),
+            },
             // Where PAM keeps its own copy of every verified model (what the engine loads).
             "weights_dir": self.weights_dir().display().to_string(),
             // A disclosure, not a gate: the fingerprint of the prompt a summary is sent
@@ -1685,12 +1792,22 @@ impl ModelService {
             .any(|(path, _)| path == dest)
     }
 
-    /// The configured idle-unload window in minutes.
+    /// The idle-unload window in minutes in force (`0` = never): what the
+    /// human saved (else the built-in default) under the managed policy's
+    /// `models.idle_unload_min`.
     pub(crate) async fn idle_unload_min(&self) -> Result<u64, StoreError> {
+        Ok(self.idle_unload_min_entry().await?.0)
+    }
+
+    /// [`Self::idle_unload_min`] with where it came from.
+    pub(crate) async fn idle_unload_min_entry(&self) -> Result<(u64, EffectiveEntry), StoreError> {
         let raw = self.store.get_setting(SETTING_IDLE_UNLOAD_MIN).await?;
-        Ok(raw
-            .and_then(|value| serde_json::from_str::<u64>(&value).ok())
-            .unwrap_or(DEFAULT_IDLE_UNLOAD_MIN))
+        // A stored value that does not read is the same as none stored.
+        let stored = raw.and_then(|value| serde_json::from_str::<u64>(&value).ok());
+        Ok(self
+            .policy
+            .view()
+            .effective_idle_unload_min(stored, DEFAULT_IDLE_UNLOAD_MIN))
     }
 
     /// Persists the idle-unload window.
@@ -1703,18 +1820,31 @@ impl ModelService {
     /// Persists a new models directory and rebuilds the registry over it.
     pub(crate) async fn set_models_dir(&self, dir: &Path) -> Result<(), ModelUnavailable> {
         let _operation = self.operation.lock().await;
-        if self.models_dir().as_path() == dir {
+        let stored = self
+            .stored_models_dir
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (current, entry) = self.models_dir_entry();
+        // Nothing to do when the human already has this directory, or has
+        // none and this is what is in force (but a directory the policy
+        // supplied as a default is not the human's until they choose it).
+        if stored.as_deref() == Some(dir)
+            || (stored.is_none() && current.as_path() == dir && entry.source != Source::Policy)
+        {
             return Ok(());
         }
         // Registry IDs repeat across directories. Never leave the previous root's
         // loaded snapshot available under an ID now resolved in a different root.
-        self.unload_all().await?;
+        if current.as_path() != dir {
+            self.unload_all().await?;
+        }
         let encoded = json!(dir.display().to_string()).to_string();
         self.store.set_setting(SETTING_MODELS_DIR, &encoded).await?;
         *self
-            .models_dir
+            .stored_models_dir
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = dir.to_path_buf();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.to_path_buf());
         Ok(())
     }
 
@@ -2035,16 +2165,11 @@ fn job_json(job: &ModelJobRow) -> serde_json::Value {
     })
 }
 
-/// The models directory from the settings, or the platform default.
-async fn read_models_dir(store: &Store) -> Result<PathBuf, StoreError> {
-    if let Some(configured) = read_setting_string(store, SETTING_MODELS_DIR).await?
-        && !configured.is_empty()
-    {
-        return Ok(PathBuf::from(configured));
-    }
-    // A machine with no home directory has nowhere canonical to keep
-    // weights; the relative path scans empty, which is the honest answer.
-    Ok(default_models_dir().unwrap_or_else(|| PathBuf::from("llm")))
+/// The models directory the human saved, or `None` when they never set one.
+async fn read_stored_models_dir(store: &Store) -> Result<Option<PathBuf>, StoreError> {
+    Ok(read_setting_string(store, SETTING_MODELS_DIR)
+        .await?
+        .map(PathBuf::from))
 }
 
 /// A setting stored as a JSON string, or `None` when unset or null.

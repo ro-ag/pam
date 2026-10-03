@@ -713,6 +713,118 @@ async fn a_program_that_is_not_allowed_blocks_the_run() {
 }
 
 #[tokio::test]
+async fn a_program_the_managed_policy_removed_is_refused_before_spawn_with_the_policy_cause() {
+    Box::pin(with_deadline(async {
+        // `git` is on the human's allowlist (the harness seeds it); the
+        // organization's policy allows only the helper. The step is refused
+        // before the gate and before anything is spawned, naming the policy.
+        let yaml = "schema: 1\nid: managed\nname: Managed\n\
+                    steps:\n\
+                    \x20 - id: look\n    run: [git, --version]\n";
+        let policy = serde_json::json!({
+            "version": 1,
+            "revision": "flows-it",
+            "flows": { "programs": { "allow": ["pam-flow-helper"] } }
+        })
+        .to_string();
+        let flows = FlowDaemon::spawn_with(&[("managed", yaml)], |config| {
+            config.policy_source = Some(pam_testkit::ScriptedPolicy::trusted(&policy));
+        })
+        .await;
+        let mut client = flows.daemon.client().await;
+
+        let body = flows.run(&mut client, "req_run", "managed").await;
+        assert_eq!(body["outcome"], "blocked");
+        let look = step(&body, "look");
+        assert_eq!(look["status"], "blocked");
+        assert_eq!(look["error"]["cause"], "policy_denied");
+        assert_eq!(
+            look["error"]["recovery"],
+            "Managed by your organization's policy; ask your administrator."
+        );
+        assert!(
+            look["error"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("flows.programs")),
+            "{look}"
+        );
+        // Nothing ran: no attempt was recorded for the step.
+        assert_eq!(look["attempts"].as_u64().unwrap_or(0), 0, "{look}");
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+/// Inspection and the gate agree on a managed never-grant rule: the step
+/// inspection reports as `policy_denied` (no rule text) is the step the run
+/// refuses with `policy_denied`, even with a grant for it.
+#[tokio::test]
+async fn inspection_reports_a_step_the_never_rule_denies_as_the_gate_refuses_it() {
+    Box::pin(with_deadline(async {
+        // Stateful, so the gate is asked about it (a read-only local
+        // command never reaches the gate).
+        let yaml = "schema: 1\nid: managed\nname: Managed\n\
+                    steps:\n\
+                    \x20 - id: look\n    run: [git, --version]\n    effect: stateful\n";
+        let policy = serde_json::json!({
+            "version": 1,
+            "revision": "never-it",
+            "security": { "grants": { "never": ["flow.step:managed/*"] } }
+        })
+        .to_string();
+        let flows = FlowDaemon::spawn_with(&[("managed", yaml)], |config| {
+            config.policy_source = Some(pam_testkit::ScriptedPolicy::trusted(&policy));
+        })
+        .await;
+        flows
+            .daemon
+            .store()
+            .insert_grant("flow.step:managed/look")
+            .await
+            .expect("a grant the rule makes inert");
+        let mut client = flows.daemon.client().await;
+
+        let inspection = result_body(
+            client
+                .request(&envelope_for_repo(
+                    &flows.repo(),
+                    "req_inspect",
+                    CAP_FLOW_INSPECT,
+                    serde_json::json!({ "id": "managed" }),
+                    true,
+                ))
+                .await,
+        );
+        assert_eq!(inspection["readiness"], "blocked", "{inspection}");
+        assert_eq!(
+            inspection["steps"][0]["admission"], "policy_denied",
+            "{inspection}"
+        );
+        let blocker = inspection["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .find(|blocker| blocker["cause"] == "policy_denied")
+            .unwrap_or_else(|| panic!("no policy blocker in {inspection}"));
+        assert_eq!(blocker["step"], "look");
+        assert!(
+            !inspection.to_string().contains("flow.step:managed/*"),
+            "inspection names no rule: {inspection}"
+        );
+
+        let body = flows.run(&mut client, "req_run", "managed").await;
+        let look = step(&body, "look");
+        assert_eq!(look["error"]["cause"], "policy_denied", "{look}");
+        assert_eq!(look["attempts"].as_u64().unwrap_or(0), 0, "{look}");
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
+#[tokio::test]
 async fn a_build_tool_step_is_blocked_until_a_private_artifacts_root_is_configured() {
     Box::pin(with_deadline(async {
         let yaml = "schema: 1\nid: build\nname: Build\n\

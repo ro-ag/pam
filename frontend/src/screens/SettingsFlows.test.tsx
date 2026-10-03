@@ -411,3 +411,128 @@ it("blocks a failed background refresh even when cached chips remain", async () 
   fireEvent.submit(screen.getByLabelText("Program to allow").closest("form")!);
   expect(mocks.flowsSettingsSet).not.toHaveBeenCalled();
 });
+
+describe("managed policy", () => {
+  function managed(extra: Partial<FlowSettings>) {
+    mocks.flowsSettingsGet.mockResolvedValue({ ...SETTINGS, ...extra });
+  }
+
+  it("disables a locked list and shows the policy's list in force, not the saved one", async () => {
+    managed({
+      allowed_programs: ["git", "cargo"],
+      effective: {
+        allowed_programs: {
+          source: "policy",
+          locked: true,
+          mode: "locked",
+          reason: "SEC-114",
+          value: ["git"],
+        },
+      },
+    });
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <SettingsFlowsSection />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("SEC-114");
+    expect(screen.getByText("Managed by your organization")).toBeInTheDocument();
+    expect(screen.getByLabelText("Program to allow")).toBeDisabled();
+    expect(screen.getByLabelText("remove program git")).toBeDisabled();
+    expect(screen.queryByLabelText("remove program cargo")).toBeNull();
+    // The other lists stay editable.
+    expect(screen.getByLabelText("Directory to add to PATH")).toBeEnabled();
+  });
+
+  it("locks the build output directory and the read-only caches too", async () => {
+    managed({
+      artifacts_root: "/home/me/saved",
+      read_cache_roots: ["/home/me/cache"],
+      effective: {
+        artifacts_root: { source: "policy", locked: true, value: "/managed/builds" },
+        read_cache_roots: { source: "policy", locked: true, value: ["/managed/cache"] },
+      },
+    });
+    await renderSection();
+    const directory = await screen.findByLabelText("build output directory");
+    expect(directory).toHaveValue("/managed/builds");
+    expect(directory).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Clear directory" })).toBeDisabled();
+    expect(screen.getByLabelText("Cache directory to add")).toBeDisabled();
+    expect(screen.getByLabelText("remove cache directory /managed/cache")).toBeDisabled();
+    expect(screen.queryByLabelText("remove cache directory /home/me/cache")).toBeNull();
+  });
+
+  it("prints an allowlist beside a list that stays editable", async () => {
+    managed({
+      effective: {
+        extra_path: {
+          source: "policy",
+          locked: false,
+          mode: "allow",
+          constraint: { allow: ["/opt/homebrew"] },
+          clamped: true,
+        },
+      },
+    });
+    await renderSection();
+    expect(await screen.findByText("allowed: /opt/homebrew")).toBeInTheDocument();
+    expect(screen.getByLabelText("Directory to add to PATH")).toBeEnabled();
+  });
+
+  it("lists the scope entries the policy is not using, with the reason", async () => {
+    managed({
+      scope_policy: {
+        version: 1,
+        repositories: [{ root: "/work/app", connectors: [] }],
+      },
+      scope_policy_dropped: [
+        {
+          root: "/work/app",
+          connector: "jenkins",
+          key: "connectors.disabled",
+          reason: "your organization's policy disables this connector",
+        },
+      ],
+    });
+    await renderSection();
+    const note = await screen.findByRole("note", {
+      name: "scope entries the policy is not using",
+    });
+    expect(note).toHaveTextContent("/work/app · jenkins");
+    expect(note).toHaveTextContent("your organization's policy disables this connector");
+    expect(note).toHaveTextContent("kept, and nothing is deleted");
+  });
+
+  it("freezes the scope editor when the policy holds the scope keys", async () => {
+    managed({
+      effective: {
+        scope_policy: { source: "default", locked: true, state: "held" },
+      },
+    });
+    await renderSection();
+    expect(
+      await screen.findByText(/paused until the policy file is fixed/),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("repository root")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Add repository" })).toBeDisabled();
+  });
+
+  it.each([
+    ["setting_locked", "allowed_programs is managed by your organization's policy"],
+    ["policy_not_allowed", '"make" is not on the list your organization allows'],
+    ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
+  ])("renders a %s refusal's detail and recovery", async (cause, detail) => {
+    mocks.flowsSettingsSet.mockRejectedValue({
+      cause,
+      detail,
+      recovery: "Managed by your organization's policy; ask your administrator.",
+    });
+    await renderSection();
+    fireEvent.change(screen.getByLabelText("Program to allow"), { target: { value: "make" } });
+    fireEvent.submit(screen.getByLabelText("Program to allow").closest("form")!);
+    expect(await screen.findByText(new RegExp(`flow settings · ${cause}`))).toBeInTheDocument();
+    expect(screen.getByText(`${detail}.`)).toBeInTheDocument();
+    expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+  });
+});

@@ -110,18 +110,33 @@ async fn symlink_retarget_cannot_change_admitted_lane_or_ticket_owner() {
     let executor_row = store.get_request(&work.request_id).await.unwrap().unwrap();
     assert_eq!(executor_row.repo, a.to_string_lossy());
     assert!(
-        crate::flow_result_service::authorized_metadata(&store, &b.to_string_lossy(), "old")
-            .await
-            .is_err()
+        crate::flow_result_service::authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &b.to_string_lossy(),
+            "old"
+        )
+        .await
+        .is_err()
     );
     assert!(
-        crate::flow_result_service::authorized_metadata(&store, &b.to_string_lossy(), "request")
-            .await
-            .is_err()
+        crate::flow_result_service::authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &b.to_string_lossy(),
+            "request"
+        )
+        .await
+        .is_err()
     );
     assert!(
-        crate::flow_result_service::authorized_metadata(&store, &a.to_string_lossy(), "request")
-            .await
-            .is_ok()
+        crate::flow_result_service::authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &a.to_string_lossy(),
+            "request"
+        )
+        .await
+        .is_ok()
     );
 }

@@ -173,8 +173,14 @@ impl Harness {
             store.clone(),
             events.clone(),
             Duration::from_secs(10),
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
-        let models = ModelService::new(store.clone()).await.unwrap();
+        let models = ModelService::new(
+            store.clone(),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap();
         let logs = LogService::new(store.clone(), models.clone());
         let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
         let reads = Arc::new(Reads::default());
@@ -182,6 +188,7 @@ impl Harness {
             store.clone(),
             secrets.clone(),
             reads.clone(),
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
         connectors
             .configure(
@@ -197,7 +204,14 @@ impl Harness {
             )
             .await
             .unwrap();
-        let gate = Arc::new(PolicyGate::new(store.clone()).await.unwrap());
+        let gate = Arc::new(
+            PolicyGate::new(
+                store.clone(),
+                crate::managed_policy_service::PolicyHandle::none(),
+            )
+            .await
+            .unwrap(),
+        );
         let flows = Arc::new(FlowService::new(
             base.path(),
             store.clone(),
@@ -205,6 +219,7 @@ impl Harness {
             connectors,
             logs,
             gate,
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
         let queue = Arc::new(QueueManager::new(store.clone()));
         store

@@ -15,6 +15,14 @@
 //! copies are removed. The password crosses the socket once into the keychain and appears in no
 //! row, reply or log line; the audit row says only `set`, `cleared` or `unchanged`.
 //!
+//! A field the managed policy owns is refused as `setting_locked` (or `policy_frozen` while the
+//! policy cannot be read), with the detail naming the key and the policy, and one
+//! `policy.locked_write` audit row on the op's request. The proxy password follows the proxy only
+//! when the policy pins a proxy that needs none (`auth: none`); with `basic` or `anyauth` the
+//! password stays the human's to type, since the policy never carries a secret. `get` answers an
+//! `effective` entry per field (`source`, `locked`, and with a policy in play `mode`, `reason`,
+//! `state`) and, when the policy closes the network, a `closed_by_policy` notice.
+//!
 //! [`OP_NETWORK_TEST`] probes configured targets only — the base URL of a connector, the pinned
 //! engine asset, the models host — with a bare `HEAD`, no credentials and no custom headers, so
 //! it cannot be used to reach an address the human did not already configure. A probe that
@@ -38,8 +46,11 @@ use crate::admin::{
 };
 use crate::connector_service::CredentialAction;
 use crate::daemon::CAUSE_INTERNAL_ERROR;
+use crate::managed_policy::{EffectiveEntry, Key, Mode, PolicyView, WriteRefusal};
+use crate::managed_policy_service::{ACTION_POLICY_LOCKED_WRITE, locked_write_detail};
 use crate::network_service::{
-    CaBundleEntry, CaImportError, Field, Loaded, NetworkDocument, ProxyEntry, Source, ignored_env,
+    CaBundleEntry, CaImportError, Field, Loaded, Lock, NetworkDocument, ProxyEntry, Resolved,
+    Source, ignored_env,
 };
 
 /// `admin.network.get {}` → the settings, where each came from, the curl
@@ -112,7 +123,7 @@ const PROBE_PARALLELISM: usize = 4;
 const TARGET_ENGINE: &str = "engine";
 const TARGET_MODELS: &str = "models";
 
-const RECOVERY_LOCKED: &str = "Managed by your organisation's policy; ask your administrator.";
+const RECOVERY_CLOSED: &str = "Managed by your organization's policy; ask your administrator to correct the policy file. Connector calls and downloads are refused until then.";
 const RECOVERY_CONFLICT: &str = "The network settings changed since this screen loaded; reload Settings › Network and apply the change again.";
 const RECOVERY_RELOAD: &str = "Open Settings › Network, correct the value and save again.";
 const RECOVERY_CA: &str = "Give the path of a PEM file of certificates that you or root own and that other users cannot write, then import again.";
@@ -179,7 +190,11 @@ impl AdminService {
             None => Value::Null,
             Some(bundle) => {
                 let mut value = bundle_json(bundle);
-                if let Some(changed) = self.network.source_changed(bundle).await {
+                // A managed bundle's source is the policy's file, re-verified
+                // by the policy loader; only a human's import can drift.
+                if !loaded.resolved.is_locked(Field::CaBundle)
+                    && let Some(changed) = self.network.source_changed(bundle).await
+                {
                     value["source_changed"] = json!(changed);
                 }
                 value
@@ -195,16 +210,21 @@ impl AdminService {
             ca_bundle["reason"] = json!(WINDOWS_CA_REASON);
         }
         let allowed = &loaded.resolved.mirror_allowed_hosts;
+        let view = self.policy.view();
         let mut effective = serde_json::Map::new();
         for field in Field::ALL {
-            let source = loaded.resolved.source(field);
-            effective.insert(field.as_str().to_owned(), source_json(source));
+            effective.insert(
+                field.as_str().to_owned(),
+                effective_entry(&view, &loaded.resolved, field).to_json(),
+            );
         }
-        // The password has no field of its own in the document; it is
-        // locked exactly when the proxy is.
+        // The password has no field of its own in the document. It is the
+        // policy's only when the policy pins a proxy that needs none; the
+        // policy never carries a secret, so with `basic` or `anyauth` it is
+        // the human's to type.
         effective.insert(
             "credential".to_owned(),
-            source_json(loaded.resolved.source(Field::Proxy)),
+            credential_entry(&view, &loaded.resolved, present).to_json(),
         );
         let curl = curl_probe().await;
         let mut body = json!({
@@ -221,6 +241,14 @@ impl AdminService {
             "curl": curl,
             "ignored_env": ignored_env(),
         });
+        if let Some(closed) = self.network.policy_closed() {
+            body["closed_by_policy"] = json!({
+                "key": closed.key,
+                "code": closed.code,
+                "detail": closed.detail,
+                "recovery": RECOVERY_CLOSED,
+            });
+        }
         if let Some(detail) = notice {
             body["document"] = json!({
                 "valid": false,
@@ -259,24 +287,11 @@ impl AdminService {
                 (invalid.raw, NetworkDocument::default(), defaults.resolved)
             }
         };
+        // The policy first: a locked field is refused as managed even where
+        // the platform would refuse the same change for its own reason.
+        self.refuse_policy_owned(envelope_id, &patch, &resolved)
+            .await?;
         patch.refuse_ca_import_on_windows()?;
-        let locked: Vec<&str> = patch
-            .fields()
-            .into_iter()
-            .filter(|field| resolved.source(*field).locked())
-            .map(Field::as_str)
-            .collect();
-        if !locked.is_empty() {
-            return Err(AdminRefusal {
-                cause: CAUSE_SETTING_LOCKED,
-                detail: format!(
-                    "{} {} set by your organisation's policy; nothing was changed",
-                    locked.join(", "),
-                    if locked.len() == 1 { "is" } else { "are" }
-                ),
-                recovery: RECOVERY_LOCKED,
-            });
-        }
         let changed = patch.changed_names();
         let credential_word = CredentialAction::audit_word(patch.credential.as_ref());
 
@@ -343,6 +358,84 @@ impl AdminService {
             body,
             audit: json!({ "op": OP_NETWORK_SET, "changed": changed }),
         })
+    }
+
+    /// Refuses a patch that touches a field the policy owns: `policy_frozen`
+    /// while the policy cannot be read, `setting_locked` for a locked field
+    /// (and for the password when the policy pins a proxy that needs none).
+    /// Nothing is applied, and one `policy.locked_write` row names the keys.
+    async fn refuse_policy_owned(
+        &self,
+        envelope_id: &str,
+        patch: &Patch,
+        resolved: &Resolved,
+    ) -> Result<(), AdminRefusal> {
+        let view = self.policy.view();
+        let touched = patch.fields();
+        for field in &touched {
+            if let Err(refusal) = view.guard_held(field.policy_key()) {
+                return Err(self
+                    .network_policy_refusal(envelope_id, &[refusal.key], refusal, &view)
+                    .await);
+            }
+        }
+        let mut names: Vec<&'static str> = Vec::new();
+        let mut keys: Vec<Key> = Vec::new();
+        for field in &touched {
+            let key = field.policy_key();
+            if resolved.is_locked(*field) || view.is_locked(key) {
+                names.push(field.as_str());
+                keys.push(key);
+            }
+        }
+        if patch.credential.is_some() && resolved.credential_locked() {
+            names.push("credential");
+            if !keys.contains(&Key::NetworkProxy) {
+                keys.push(Key::NetworkProxy);
+            }
+        }
+        let Some(first) = keys.first().copied() else {
+            return Ok(());
+        };
+        let what = format!(
+            "{} {} set by your organization's policy; nothing was changed",
+            names.join(", "),
+            if names.len() == 1 { "is" } else { "are" }
+        );
+        let refusal = view.refusal(first, CAUSE_SETTING_LOCKED, &what);
+        Err(self
+            .network_policy_refusal(envelope_id, &keys, refusal, &view)
+            .await)
+    }
+
+    /// The refusal as the admin surface answers it, after the
+    /// `policy.locked_write` row for `keys` on this op's request.
+    async fn network_policy_refusal(
+        &self,
+        envelope_id: &str,
+        keys: &[Key],
+        refusal: WriteRefusal,
+        view: &PolicyView,
+    ) -> AdminRefusal {
+        let detail = locked_write_detail(OP_NETWORK_SET, keys, refusal.cause, view).to_string();
+        if let Err(error) = self
+            .store
+            .append_audit(
+                envelope_id,
+                ACTION_POLICY_LOCKED_WRITE,
+                Decision::Refuse,
+                Actor::Policy,
+                Some(&detail),
+            )
+            .await
+        {
+            tracing::warn!(%error, "the policy.locked_write row was not recorded");
+        }
+        AdminRefusal {
+            cause: refusal.cause,
+            detail: refusal.detail,
+            recovery: refusal.recovery,
+        }
     }
 
     /// The user's document with the patch applied; a CA import happens
@@ -793,9 +886,65 @@ fn ca_refusal(error: &CaImportError) -> AdminRefusal {
     }
 }
 
-/// `{ source, locked }` for one field.
-fn source_json(source: Source) -> Value {
-    json!({ "source": source.as_str(), "locked": source.locked() })
+/// The `effective` entry of one field. With no policy in play for the key
+/// it is exactly `{ source, locked }`; with one, the policy's `mode`,
+/// `reason` and `state` come along. A held key reads as locked: its writes
+/// refuse `policy_frozen`.
+fn effective_entry(view: &PolicyView, resolved: &Resolved, field: Field) -> EffectiveEntry {
+    let key = field.policy_key();
+    let (source, lock) = resolved.entry(field);
+    let mut entry = EffectiveEntry::unmanaged(source);
+    entry.locked = lock.is_locked() || view.is_locked(key) || view.is_held(key);
+    if let Some(status) = view.status(key) {
+        entry.state = Some(status.as_str());
+        entry.reason = policy_reason(view, key);
+        if source == Source::Policy {
+            entry.mode = Some(match lock {
+                Lock::Locked => Mode::Locked,
+                Lock::Open => Mode::Default,
+            });
+        }
+    }
+    entry
+}
+
+/// The `effective` entry of the proxy password: the proxy's when the policy
+/// owns it (a pinned proxy that needs none), otherwise the human's.
+fn credential_entry(view: &PolicyView, resolved: &Resolved, present: bool) -> EffectiveEntry {
+    if resolved.credential_locked() {
+        return effective_entry(view, resolved, Field::Proxy);
+    }
+    let source = match resolved.source(Field::Proxy) {
+        Source::Policy if present => Source::User,
+        Source::Policy => Source::Default,
+        other => other,
+    };
+    EffectiveEntry::unmanaged(source)
+}
+
+/// The administrator's reason on a network key's leaf.
+fn policy_reason(view: &PolicyView, key: Key) -> Option<String> {
+    let policy = view.policy();
+    match key {
+        Key::NetworkProxy => policy.proxy.as_ref().and_then(|leaf| leaf.reason.clone()),
+        Key::NetworkNoProxy => policy
+            .no_proxy
+            .as_ref()
+            .and_then(|leaf| leaf.reason.clone()),
+        Key::NetworkCaBundle => policy
+            .ca_bundle
+            .as_ref()
+            .and_then(|leaf| leaf.reason.clone()),
+        Key::NetworkEngineMirror => policy
+            .engine_mirror
+            .as_ref()
+            .and_then(|leaf| leaf.reason.clone()),
+        Key::NetworkModelsMirror => policy
+            .models_mirror
+            .as_ref()
+            .and_then(|leaf| leaf.reason.clone()),
+        _ => None,
+    }
 }
 
 fn proxy_json(proxy: &ProxyEntry) -> Value {
@@ -987,11 +1136,12 @@ impl Patch {
             && self.models_mirror.is_keep()
     }
 
-    /// The document fields this patch touches. The credential counts as
-    /// the proxy's: it is locked with it.
+    /// The document fields this patch touches. The password is not one: it
+    /// is locked only with a pinned proxy that needs none
+    /// ([`Resolved::credential_locked`]).
     fn fields(&self) -> Vec<Field> {
         let mut fields = Vec::new();
-        if !self.proxy.is_keep() || self.credential.is_some() {
+        if !self.proxy.is_keep() {
             fields.push(Field::Proxy);
         }
         if self.no_proxy.is_some() {

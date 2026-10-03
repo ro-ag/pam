@@ -2,7 +2,7 @@ import { createMemoryHistory } from "@tanstack/react-router";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
-import type { GrantRow } from "../lib/ipc";
+import type { GrantRow, PolicyBody } from "../lib/ipc";
 import {
   applyTheme,
   applyMaterial,
@@ -23,8 +23,11 @@ import {
   KNOWN_CAPABILITIES,
   LOG_LINE_CHOICES,
   PROFILE_SENTENCES,
+  GRANT_BLOCKED_NOTE,
+  GRANT_MANUAL_BLOCKED_NOTE,
   boundaryVerdictLine,
   logTone,
+  profileBlocker,
 } from "./Settings";
 
 /**
@@ -67,6 +70,9 @@ const mocks = vi.hoisted(() => ({
   serviceStatus: vi.fn(),
   serviceInstall: vi.fn(),
   serviceUninstall: vi.fn(),
+  // The Security tab mounts the managed-policy panel; the header reads it on every tab.
+  policyGet: vi.fn(),
+  policyReload: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -83,6 +89,29 @@ function grant(overrides: Partial<GrantRow>): GrantRow {
     scope: "global",
     granted_ts: nowSec - 3_600,
     revoked_ts: null,
+    ...overrides,
+  };
+}
+
+/** What `admin.policy.get` answers on a machine with no managed policy. */
+function unmanagedPolicy(overrides: Partial<PolicyBody> = {}): PolicyBody {
+  return {
+    state: "none",
+    reason_code: null,
+    reason_detail: null,
+    origin: { path: null, platform: "macos", trust: { verdict: "absent", code: null, recovery: null } },
+    digest: null,
+    file_digest: null,
+    revision: null,
+    organization: null,
+    contact: null,
+    loaded_ts: null,
+    checked_ts: null,
+    last_good: null,
+    rejected_leaves: 0,
+    keys: [],
+    diagnostics: [],
+    compliance: { login_unit: { required: false, present: null } },
     ...overrides,
   };
 }
@@ -131,6 +160,8 @@ beforeEach(() => {
     },
     note: "the manager stopped the managed daemon along with its unit; the next pam command starts one lazily",
   });
+  mocks.policyGet.mockResolvedValue(unmanagedPolicy());
+  mocks.policyReload.mockResolvedValue(unmanagedPolicy());
   mocks.approvalsPending.mockResolvedValue({ pending: [] });
   mocks.activityList.mockResolvedValue({ requests: [] });
   mocks.callersList.mockResolvedValue({ callers: [] });
@@ -1160,4 +1191,251 @@ it("opens and focuses an exact connector from a recovery link", async () => {
     "true",
   );
   await waitFor(() => expect(target).toHaveFocus());
+});
+
+describe("managed policy in Settings", () => {
+  const managed = (overrides: Partial<PolicyBody> = {}) =>
+    unmanagedPolicy({
+      state: "active",
+      organization: "Example Corp",
+      digest: "ab12cd34ef56".padEnd(64, "0"),
+      revision: "r1",
+      ...overrides,
+    });
+
+  it("shows the policy panel in Security and the status line on every tab", async () => {
+    mocks.policyGet.mockResolvedValue(managed());
+    renderSettings("security");
+    expect(await screen.findByRole("region", { name: "managed policy" })).toBeInTheDocument();
+    const line = await screen.findByRole("status", { name: "managed policy status" });
+    expect(line).toHaveTextContent("Managed by your organization's policy.");
+    fireEvent.click(screen.getByRole("tab", { name: "Daemon" }));
+    expect(screen.getByRole("status", { name: "managed policy status" })).toBeInTheDocument();
+  });
+
+  it("the status line opens the Security tab", async () => {
+    mocks.policyGet.mockResolvedValue(managed({ state: "frozen" }));
+    renderSettings("daemon");
+    const line = await screen.findByRole("status", { name: "managed policy status" });
+    expect(line).toHaveTextContent(/paused until it is fixed/);
+    fireEvent.click(within(line).getByRole("button", { name: "View policy" }));
+    await waitFor(() => expectActiveCategory("Security"));
+  });
+
+  it("shows no status line when there is no policy", async () => {
+    renderSettings("security");
+    expect(
+      await screen.findByText("No managed policy is installed on this computer."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "managed policy status" })).toBeNull();
+  });
+
+  it("Check now re-reads the policy and refreshes what the other panels show", async () => {
+    mocks.policyGet.mockResolvedValue(managed());
+    renderSettings("security");
+    await screen.findByText("Managed by Example Corp.");
+    const profileReads = mocks.profileGet.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /Check now/ }));
+    await waitFor(() => expect(mocks.policyReload).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mocks.profileGet.mock.calls.length).toBeGreaterThan(profileReads));
+  });
+
+  describe("profile", () => {
+    it("disables every profile and says who owns it when the policy locks it", async () => {
+      mocks.profileGet.mockResolvedValue({
+        profile: "strict",
+        effective: { profile: { source: "policy", locked: true, mode: "locked", reason: "SEC-114" } },
+      });
+      renderSettings("security");
+      await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeChecked());
+      for (const name of [/relaxed/, /standard/, /strict/]) {
+        expect(screen.getByRole("radio", { name })).toBeDisabled();
+      }
+      expect(screen.getAllByText("Managed by your organization").length).toBeGreaterThan(0);
+      expect(screen.getByText("SEC-114")).toBeInTheDocument();
+    });
+
+    it("disables only the profiles below a floor and prints the floor", async () => {
+      mocks.profileGet.mockResolvedValue({
+        profile: "standard",
+        effective: {
+          profile: {
+            source: "policy",
+            locked: false,
+            mode: "floor",
+            constraint: { floor: "standard" },
+            clamped: true,
+          },
+        },
+      });
+      renderSettings("security");
+      await waitFor(() => expect(screen.getByRole("radio", { name: /standard/ })).toBeChecked());
+      expect(screen.getByRole("radio", { name: /relaxed/ })).toBeDisabled();
+      expect(screen.getByRole("radio", { name: /standard/ })).toBeEnabled();
+      expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled();
+      expect(screen.getByText("lowest allowed: standard")).toBeInTheDocument();
+    });
+
+    it("names why a profile is blocked", () => {
+      expect(profileBlocker(undefined, "relaxed")).toBeUndefined();
+      expect(profileBlocker({ source: "policy", locked: true }, "strict")).toBe(
+        "Managed by your organization",
+      );
+      expect(
+        profileBlocker(
+          { source: "policy", locked: false, mode: "floor", constraint: { floor: "strict" } },
+          "standard",
+        ),
+      ).toBe("Your organization does not allow a profile below strict");
+    });
+
+    it.each([
+      ["setting_locked", "the profile is managed by your organization's policy"],
+      ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
+      ["policy_not_allowed", "relaxed is below the floor your organization set"],
+    ])("renders a %s refusal's detail and recovery through the failure note", async (cause, detail) => {
+      mocks.profileSet.mockRejectedValue({
+        cause,
+        detail,
+        recovery: "Managed by your organization's policy; ask your administrator.",
+      });
+      renderSettings("security");
+      await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled());
+      fireEvent.click(screen.getByRole("radio", { name: /strict/ }));
+      expect(await screen.findByText(new RegExp(`profile · ${cause}`))).toBeInTheDocument();
+      expect(screen.getByText(`${detail}.`)).toBeInTheDocument();
+      expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+    });
+  });
+
+  describe("grants", () => {
+    it("badges a row the policy blocks and explains that the grant is kept", async () => {
+      mocks.grantsList.mockResolvedValue({
+        grants: [grant({ id: 1, capability: "echo", blocked_by_policy: true })],
+      });
+      renderSettings("security");
+      expect(await screen.findByText("blocked by policy")).toBeInTheDocument();
+      expect(screen.getByText(GRANT_BLOCKED_NOTE)).toBeInTheDocument();
+      expect(screen.queryByText("active")).toBeNull();
+      // Revoke stays: the row is the human's, and revoking is never refused.
+      expect(screen.getByRole("button", { name: "Revoke" })).toBeInTheDocument();
+    });
+
+    it("lists what the policy never allows", async () => {
+      mocks.grantsList.mockResolvedValue({
+        grants: [],
+        policy: { manual: null, remember: null, never: ["flow.step:prod/*"], never_classes: ["destructive"] },
+      });
+      renderSettings("security");
+      const note = await screen.findByLabelText("capabilities the policy never allows");
+      expect(note).toHaveTextContent("never allows flow.step:prod/* and the classes destructive");
+    });
+
+    it("disables Add with the reason when the policy forbids manual grants", async () => {
+      mocks.grantsList.mockResolvedValue({
+        grants: [],
+        policy: { manual: "deny", remember: null, never: null, never_classes: null },
+        effective: { manual: { source: "policy", locked: true, mode: "forbid" } },
+      });
+      renderSettings("security");
+      expect(await screen.findByText(GRANT_MANUAL_BLOCKED_NOTE)).toBeInTheDocument();
+      expect(screen.getByLabelText("capability to grant")).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Grant" })).toHaveAttribute(
+        "title",
+        GRANT_MANUAL_BLOCKED_NOTE,
+      );
+    });
+
+    it("renders a refused add through the failure note", async () => {
+      mocks.grantsAdd.mockRejectedValue({
+        cause: "policy_not_allowed",
+        detail: "capability \"echo\" is not allowed by your organization",
+        recovery: "Managed by your organization's policy; ask your administrator.",
+      });
+      renderSettings("security");
+      const input = await screen.findByLabelText("capability to grant");
+      fireEvent.change(input, { target: { value: "echo" } });
+      fireEvent.click(screen.getByRole("button", { name: "Grant" }));
+      const prompt = within(
+        screen.getByRole("group", { name: "Grant echo to every repository?" }),
+      );
+      fireEvent.change(prompt.getByRole("textbox", { name: "type grant to confirm" }), {
+        target: { value: "grant" },
+      });
+      fireEvent.click(prompt.getByRole("button", { name: "Grant" }));
+      expect(await screen.findByText(/grants · policy_not_allowed/)).toBeInTheDocument();
+      expect(screen.getByText(/is not allowed by your organization/)).toBeInTheDocument();
+    });
+  });
+
+  describe("retention", () => {
+    it("disables a window the policy locks and keeps the other editable", async () => {
+      mocks.retentionGet.mockResolvedValue({
+        evidence_days: 90,
+        audit_days: 365,
+        last_run: null,
+        effective: {
+          evidence_days: { source: "policy", locked: true, mode: "locked" },
+          audit_days: { source: "user", locked: false },
+        },
+      });
+      renderSettings("retention");
+      const evidence = (await screen.findByLabelText("evidence age")) as HTMLSelectElement;
+      await waitFor(() => expect(evidence.value).toBe("90"));
+      expect(evidence).toBeDisabled();
+      expect(screen.getByLabelText("audit age")).toBeEnabled();
+      expect(screen.getAllByText("Managed by your organization")).toHaveLength(1);
+    });
+
+    it("hints a policy default and leaves the window editable", async () => {
+      mocks.retentionGet.mockResolvedValue({
+        evidence_days: 90,
+        audit_days: 365,
+        last_run: null,
+        effective: {
+          evidence_days: { source: "policy", locked: false, mode: "default" },
+          audit_days: { source: "user", locked: false },
+        },
+      });
+      renderSettings("retention");
+      expect(await screen.findByText("organization default")).toBeInTheDocument();
+      expect(screen.getByLabelText("evidence age")).toBeEnabled();
+    });
+
+    it("renders a window the policy clamps with its limit", async () => {
+      mocks.retentionGet.mockResolvedValue({
+        evidence_days: 30,
+        audit_days: 90,
+        last_run: null,
+        effective: {
+          evidence_days: {
+            source: "policy",
+            locked: false,
+            mode: "max",
+            constraint: { max: 30 },
+            clamped: true,
+          },
+          audit_days: { source: "user", locked: false },
+        },
+      });
+      renderSettings("retention");
+      expect(await screen.findByText("at most: 30")).toBeInTheDocument();
+      expect(screen.getByText("Limited by your organization")).toBeInTheDocument();
+    });
+
+    it("renders a refused window through the failure note", async () => {
+      mocks.retentionSet.mockRejectedValue({
+        cause: "setting_locked",
+        detail: "evidence_days is managed by your organization's policy",
+        recovery: "Managed by your organization's policy; ask your administrator.",
+      });
+      renderSettings("retention");
+      const evidence = (await screen.findByLabelText("evidence age")) as HTMLSelectElement;
+      await waitFor(() => expect(evidence.value).toBe("90"));
+      fireEvent.change(evidence, { target: { value: "365" } });
+      expect(await screen.findByText(/retention · setting_locked/)).toBeInTheDocument();
+      expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+    });
+  });
 });

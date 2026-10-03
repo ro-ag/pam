@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "revision": "2026-10-02.1",
+  "organization": "Example Corp",
+  "contact": "it-help@example.com",
+  "comment": "Strict fleet baseline (macOS paths): strict profile, no remembered approvals, allowlisted repositories, hosts and mirrors.",
+  "security": {
+    "profile": { "locked": "strict", "reason": "SEC-114: every managed laptop runs the strict profile" },
+    "grants": {
+      "manual": "allow",
+      "remember": "deny",
+      "never": ["flow.step:*/deploy", "flow.step:*/release"]
+    }
+  },
+  "scopes": {
+    "allowed_repository_roots": ["/Users", "/Volumes/Work"],
+    "connector_wide": "deny"
+  },
+  "connectors": {
+    "allowed_base_hosts": ["github.example.com", "jira.example.com", "sonar.example.com"]
+  },
+  "flows": {
+    "programs": { "allow": ["git", "cargo", "npm", "node", "make"] },
+    "extra_path": { "allow": ["/opt/homebrew/bin", "/usr/local/bin"] }
+  },
+  "landing": {
+    "max_permissions": { "merge": false },
+    "allowed_github_servers": ["github.example.com"]
+  },
+  "models": {
+    "engine_source": "mirror_only",
+    "allowed_sources": ["catalog"],
+    "allowed_curators": []
+  },
+  "retention": {
+    "evidence_days": { "min": 30, "reason": "SEC-201: keep evidence at least 30 days" },
+    "audit_days": { "min": 365, "reason": "SEC-201: keep the audit trail at least a year" }
+  },
+  "network": {
+    "proxy": { "locked": { "url": "http://proxy.example.com:8080", "auth": "none" }, "reason": "NET-7" },
+    "no_proxy": { "default": ["git.example.com", "artifacts.example.com", "10.0.0.0/8"] },
+    "mirror_allowed_hosts": ["artifacts.example.com"],
+    "engine_mirror": { "locked": "https://artifacts.example.com/llama.cpp" },
+    "models_mirror": { "locked": "https://artifacts.example.com/hf" }
+  },
+  "service": { "require_login_unit": true }
+}

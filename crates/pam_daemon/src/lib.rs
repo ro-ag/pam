@@ -13,6 +13,9 @@ pub mod admin_models;
 pub mod admin_network;
 #[cfg(test)]
 mod admin_network_test;
+pub mod admin_policy;
+#[cfg(test)]
+mod admin_policy_test;
 pub mod admin_retention;
 pub mod admin_transport;
 pub mod approval;
@@ -73,6 +76,15 @@ pub mod ingress;
 mod ingress_test;
 pub mod lifecycle;
 pub mod log_service;
+pub mod managed_policy;
+pub mod managed_policy_service;
+#[cfg(test)]
+mod managed_policy_service_test;
+#[cfg(test)]
+mod managed_policy_test;
+pub mod managed_policy_trust;
+#[cfg(test)]
+mod managed_policy_trust_test;
 pub mod model_readiness;
 pub mod model_service;
 pub mod network_service;

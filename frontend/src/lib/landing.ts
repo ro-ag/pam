@@ -1,4 +1,4 @@
-import { adminCall } from "./ipc";
+import { adminCall, type EffectiveBlock, type PolicyDrop } from "./ipc";
 
 export interface LandingCheck {
   name: string;
@@ -21,7 +21,16 @@ export interface LandingRepository {
 }
 export interface LandingPolicy {
   revision: string;
+  /** What the human saved; the editor shows and sends these. */
   repositories: LandingRepository[];
+  /**
+   * What landing checks read under the managed policy: `max_permissions` carries the ceiling as
+   * its `value`, `allowed_github_servers` the allowed servers (or null), `repositories` the
+   * recipes in force.
+   */
+  effective?: EffectiveBlock<"max_permissions" | "allowed_github_servers" | "repositories">;
+  /** Recipes the managed policy stops using: kept, reported, never used. */
+  landing_policy_dropped?: PolicyDrop[];
 }
 export function landingGet(): Promise<LandingPolicy> {
   return adminCall("admin.flows.landing.get");

@@ -32,21 +32,53 @@ async fn fixture() -> (tempfile::TempDir, Store, String) {
 #[tokio::test]
 async fn status_authorization_denies_cross_repo_legacy_and_revoked_tickets() {
     let (_dir, store, repo) = fixture().await;
-    assert!(authorized_metadata(&store, &repo, "r").await.is_ok());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_ok()
+    );
     let other = tempfile::tempdir().unwrap();
     assert!(
-        authorized_metadata(&store, &other.path().to_string_lossy(), "r")
-            .await
-            .is_err()
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &other.path().to_string_lossy(),
+            "r"
+        )
+        .await
+        .is_err()
     );
     store
         .insert_request("legacy", "echo", &repo, "test", "{}", None)
         .await
         .unwrap();
-    assert!(authorized_metadata(&store, &repo, "legacy").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "legacy"
+        )
+        .await
+        .is_err()
+    );
     store.insert_grant("echo").await.unwrap();
     store.revoke_grant("echo").await.unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -58,16 +90,41 @@ async fn an_unrelated_revocation_does_not_void_a_tickets_status() {
         store.insert_grant(unrelated).await.unwrap();
         store.revoke_grant(unrelated).await.unwrap();
         assert!(
-            authorized_metadata(&store, &repo, "r").await.is_ok(),
+            authorized_metadata(
+                &store,
+                &crate::managed_policy::PolicyView::unmanaged(),
+                &repo,
+                "r"
+            )
+            .await
+            .is_ok(),
             "revoking {unrelated} must not void an echo ticket"
         );
     }
     // Re-granting the revoked capability never restores a voided ticket.
     store.insert_grant("echo").await.unwrap();
     store.revoke_grant("echo").await.unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_err()
+    );
     store.insert_grant("echo").await.unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -122,9 +179,27 @@ async fn captured_product_scope_is_required_even_for_persisted_status() {
         .await
         .unwrap();
     store.insert_evidence_view(&pam_store::EvidenceViewInsert {evidence_id:"verdict".into(),request_id:"r".into(),repository:repo.clone(),origin_json:json!({"targets":[{"connector":"jenkins","base_url":base,"call":"builds","args":{"job":pam_connectors::ArgValue::Text("team/build".into())}}]}).to_string(),identity_json:"{}".into(),map_json:"[]".into(),view_id:"v".into(),view_bytes:vec![]}).await.unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_err()
+    );
     store.set_setting("flows.scope_policy",&json!({"version":1,"repositories":[{"root":repo,"connectors":[{"connector":"jenkins","base_url":base,"access":"connector_wide","targets":[]}]}]}).to_string()).await.unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_ok());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_ok()
+    );
     store
         .upsert_connector(
             "jenkins",
@@ -135,7 +210,16 @@ async fn captured_product_scope_is_required_even_for_persisted_status() {
         )
         .await
         .unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -147,9 +231,14 @@ async fn a_running_request_with_an_unpublished_view_reads_as_pending_not_unavail
         .insert_evidence("src", "r", "log.source", b"captured", None)
         .await
         .unwrap();
-    let (status, result) = authorized_metadata(&store, &repo, "r")
-        .await
-        .expect("a running request is readable while its view catches up");
+    let (status, result) = authorized_metadata(
+        &store,
+        &crate::managed_policy::PolicyView::unmanaged(),
+        &repo,
+        "r",
+    )
+    .await
+    .expect("a running request is readable while its view catches up");
     assert!(!status.state.is_terminal());
     assert!(result.is_none());
 
@@ -169,7 +258,16 @@ async fn a_running_request_with_an_unpublished_view_reads_as_pending_not_unavail
         )
         .await
         .unwrap();
-    assert!(authorized_metadata(&store, &repo, "r").await.is_err());
+    assert!(
+        authorized_metadata(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            &repo,
+            "r"
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -179,7 +277,14 @@ async fn admitted_flow_lifecycle_survives_missing_final_projection() {
         .insert_admitted_request("flow", "flow.run", &repo, "test", "{}", None, i64::MAX)
         .await
         .unwrap();
-    let (status, result) = authorized_metadata(&store, &repo, "flow").await.unwrap();
+    let (status, result) = authorized_metadata(
+        &store,
+        &crate::managed_policy::PolicyView::unmanaged(),
+        &repo,
+        "flow",
+    )
+    .await
+    .unwrap();
     let output =
         crate::flow_result_service::result_output("read", "flow", &status, result.as_ref())
             .unwrap();
@@ -201,7 +306,14 @@ async fn admitted_flow_lifecycle_survives_missing_final_projection() {
         )
         .await
         .unwrap();
-    let (status, result) = authorized_metadata(&store, &repo, "flow").await.unwrap();
+    let (status, result) = authorized_metadata(
+        &store,
+        &crate::managed_policy::PolicyView::unmanaged(),
+        &repo,
+        "flow",
+    )
+    .await
+    .unwrap();
     let output =
         crate::flow_result_service::result_output("read", "flow", &status, result.as_ref())
             .unwrap();

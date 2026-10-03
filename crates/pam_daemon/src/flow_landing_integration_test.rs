@@ -320,8 +320,13 @@ fn recipe(sha: &str, sync: bool) -> String {
     yaml
 }
 impl Fixture {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture wires every service a flow run reaches, in boot order"
+    )]
     async fn new(failing_check: bool, sync: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
+        let policy = crate::managed_policy_service::PolicyHandle::none();
         let dirs = tempfile::tempdir().unwrap();
         let root = dirs.path().canonicalize().unwrap();
         let repo = root.join("repo");
@@ -344,8 +349,11 @@ impl Fixture {
             store.clone(),
             events.clone(),
             Duration::from_secs(10),
+            policy.clone(),
         ));
-        let models = ModelService::new(store.clone()).await.unwrap();
+        let models = ModelService::new(store.clone(), policy.clone())
+            .await
+            .unwrap();
         let logs = LogService::new(store.clone(), models.clone());
         let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
         let github = Arc::new(Github::new(&root, &repo, &base_sha, &sha));
@@ -353,6 +361,7 @@ impl Fixture {
             store.clone(),
             secrets.clone(),
             github.clone(),
+            policy.clone(),
         ));
         connectors
             .configure(
@@ -368,7 +377,11 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let gate = Arc::new(PolicyGate::new(store.clone()).await.unwrap());
+        let gate = Arc::new(
+            PolicyGate::new(store.clone(), policy.clone())
+                .await
+                .unwrap(),
+        );
         let flows = Arc::new(FlowService::new(
             &base,
             store.clone(),
@@ -376,6 +389,7 @@ impl Fixture {
             connectors,
             logs,
             gate,
+            policy.clone(),
         ));
         let budget = admitted_budget(&store, &repo, &flow).await;
         let (cancel, rx) = watch::channel(false);

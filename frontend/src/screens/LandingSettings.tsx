@@ -6,6 +6,7 @@ import { FailureNote } from "../components/ui/FailureNote";
 import { fieldClasses } from "../components/ui/field";
 import { cn } from "../lib/cn";
 import { toBridgeFailure, type BridgeFailure } from "../lib/ipc";
+import { ManagedNote, PolicyDropNotice, entryList, isLocked } from "./ManagedField";
 import {
   emptyLandingRepository,
   landingGet,
@@ -136,14 +137,27 @@ function CheckEditor({
     </div>
   );
 }
+type Permission = keyof LandingRepository["permissions"];
+
+/** Which permissions the managed policy's ceiling forbids; none when no ceiling is in force. */
+function forbiddenPermissions(value: unknown): Permission[] {
+  if (typeof value !== "object" || value === null) return [];
+  const ceiling = value as Partial<Record<Permission, unknown>>;
+  return (["push", "create_pr", "merge", "sync"] as const).filter(
+    (permission) => ceiling[permission] === false,
+  );
+}
+
 function RepositoryEditor({
   repository,
   index,
+  forbidden,
   onChange,
   onRemove,
 }: {
   repository: LandingRepository;
   index: number;
+  forbidden: Permission[];
   onChange: (repository: LandingRepository) => void;
   onRemove: () => void;
 }) {
@@ -249,6 +263,12 @@ function RepositoryEditor({
               type="checkbox"
               className="size-4.5 accent-accent-strong"
               checked={repository.permissions[permission]}
+              disabled={forbidden.includes(permission)}
+              title={
+                forbidden.includes(permission)
+                  ? "Your organization's policy does not allow this"
+                  : undefined
+              }
               onChange={(e) =>
                 onChange({
                   ...repository,
@@ -257,6 +277,11 @@ function RepositoryEditor({
               }
             />
             {prefix}: {label}
+            {forbidden.includes(permission) && (
+              <span className="font-data text-xs text-ink-faint">
+                not allowed by your organization
+              </span>
+            )}
           </label>
         ))}
       </div>
@@ -280,6 +305,11 @@ export function LandingSettings() {
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const current = draft?.repositories ?? query.data?.repositories ?? [];
+  const ceilingEntry = query.data?.effective?.max_permissions;
+  const serversEntry = query.data?.effective?.allowed_github_servers;
+  const forbidden = forbiddenPermissions(ceilingEntry?.value);
+  const policyLocked = isLocked(ceilingEntry) || isLocked(serversEntry);
+  const allowedServers = entryList(serversEntry, []);
   const stale = conflicted || (draft !== null && draft.revision !== query.data?.revision);
   const cacheOverflow = current.some(
     (repo) => (repo.read_cache_roots ?? []).filter((path) => path.trim()).length > 8,
@@ -350,6 +380,20 @@ export function LandingSettings() {
           {draft ? "Unsaved landing changes" : "Showing saved policy"}
         </p>
       )}
+      <ManagedNote entry={ceilingEntry} />
+      <ManagedNote entry={serversEntry} />
+      {allowedServers.length > 0 && (
+        <p
+          aria-label="allowed GitHub servers"
+          className="select-text font-sans text-xs text-ink-muted"
+        >
+          Your organization allows GitHub servers only at: {allowedServers.join(", ")}.
+        </p>
+      )}
+      <PolicyDropNotice
+        drops={query.data?.landing_policy_dropped}
+        label="landing recipes the policy is not using"
+      />
       {(failure || query.error) && (
         <FailureNote label="landing policy" failure={failure ?? toBridgeFailure(query.error)} />
       )}
@@ -364,12 +408,16 @@ export function LandingSettings() {
           Limit each landing recipe to eight read-only cache directories.
         </p>
       )}
-      <fieldset disabled={pending || !query.data || stale} className="space-y-3">
+      <fieldset
+        disabled={pending || !query.data || stale || policyLocked}
+        className="space-y-3"
+      >
         {current.map((repo, index) => (
           <RepositoryEditor
             key={index}
             repository={repo}
             index={index}
+            forbidden={forbidden}
             onChange={(next) => edit(current.map((old, i) => (i === index ? next : old)))}
             onRemove={() => edit(current.filter((_, i) => i !== index))}
           />

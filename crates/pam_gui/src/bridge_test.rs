@@ -25,8 +25,32 @@ fn every_daemon_admin_op_is_whitelisted() {
             + pam_daemon::admin_flows::FLOW_ADMIN_OPS.len()
             + pam_daemon::admin_connectors::CONNECTOR_ADMIN_OPS.len()
             + pam_daemon::admin_retention::RETENTION_ADMIN_OPS.len()
-            + pam_daemon::admin_network::NETWORK_ADMIN_OPS.len(),
+            + pam_daemon::admin_network::NETWORK_ADMIN_OPS.len()
+            + pam_daemon::admin_policy::POLICY_ADMIN_OPS.len(),
         "new admin ops need explicit wiring"
+    );
+}
+
+#[test]
+fn every_policy_admin_op_is_whitelisted() {
+    // The managed-policy surface behind Settings › Policy: `get` and
+    // `reload` ("Check now"), spliced in from the daemon's own list. Neither
+    // expands what agents may do, so neither needs a typed confirmation.
+    for op in pam_daemon::admin_policy::POLICY_ADMIN_OPS {
+        assert!(is_known_admin_op(op), "{op} must be forwarded");
+        assert_eq!(required_confirmation(op, &json!({})), None, "{op}");
+        assert_eq!(deadline_for(op), 30_000, "{op} is a synchronous read");
+    }
+    assert_eq!(pam_daemon::admin_policy::POLICY_ADMIN_OPS.len(), 2);
+}
+
+#[test]
+fn the_daemon_looks_for_the_login_unit_install_writes() {
+    // The daemon reports `compliance.login_unit.present` without depending
+    // on the client crate, so it names the label itself; the two must agree.
+    assert_eq!(
+        pam_daemon::admin_policy::LOGIN_UNIT_LABEL,
+        pam_client::service::LAUNCHD_LABEL
     );
 }
 

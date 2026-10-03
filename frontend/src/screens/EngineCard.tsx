@@ -7,6 +7,7 @@ import { TextField } from "../components/ui/Fields";
 import { fieldLabelClasses } from "../components/ui/field";
 import { FailureNote } from "../components/ui/FailureNote";
 import { Panel } from "../components/ui/Panel";
+import { ManagedNote } from "./ManagedField";
 import { SafeText } from "../components/ui/SafeText";
 import { formatBytes } from "../lib/bytes";
 import { backoffRefetchInterval } from "../lib/polling";
@@ -381,6 +382,20 @@ function EngineFailure({
   );
 }
 
+/** Why an install or import is closed under `models.engine_source`, in the human's words. */
+export function installBlockedReason(
+  source: EngineStatus["source_policy"],
+): string | undefined {
+  switch (source?.install_blocked) {
+    case "import_only":
+      return "Your organization's policy only allows installing the engine from a file you already have.";
+    case "mirror_missing":
+      return "Your organization's policy only allows installing the engine from a mirror, and none is set in Settings › Network.";
+    default:
+      return undefined;
+  }
+}
+
 export function EngineCard({ onOpenNetwork }: { onOpenNetwork?: () => void } = {}) {
   const client = useQueryClient();
   const status = useQuery({
@@ -436,6 +451,12 @@ export function EngineCard({ onOpenNetwork }: { onOpenNetwork?: () => void } = {
   const working = install.isPending || importLocal.isPending;
   const removable = data?.removable !== false;
   const from = data ? fromHost(data) : null;
+  const sourcePolicy = data?.source_policy;
+  const installBlocked = installBlockedReason(sourcePolicy);
+  const importBlocked =
+    sourcePolicy?.import_allowed === false
+      ? "Your organization's policy does not allow importing files."
+      : undefined;
 
   return (
     <Panel className="space-y-3 p-4">
@@ -445,6 +466,17 @@ export function EngineCard({ onOpenNetwork }: { onOpenNetwork?: () => void } = {
       </div>
 
       {statusFailure && <FailureNote failure={statusFailure} label="engine" />}
+
+      {!statusFailure && sourcePolicy && (
+        <div className="space-y-1">
+          <ManagedNote entry={sourcePolicy.effective} />
+          {(installBlocked ?? importBlocked) && (
+            <p className="select-text font-sans text-sm text-ink-muted">
+              {[installBlocked, importBlocked].filter(Boolean).join(" ")}
+            </p>
+          )}
+        </div>
+      )}
 
       {!statusFailure && data && (
         <div className="space-y-1">
@@ -511,7 +543,12 @@ export function EngineCard({ onOpenNetwork }: { onOpenNetwork?: () => void } = {
 
       {!hideButton && (
         <div className="flex flex-wrap items-center gap-3">
-          <Button size="sm" disabled={!data || working} onClick={() => install.mutate()}>
+          <Button
+            size="sm"
+            disabled={!data || working || installBlocked !== undefined}
+            title={installBlocked}
+            onClick={() => install.mutate()}
+          >
             {install.isPending && (
               <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
             )}
@@ -520,7 +557,8 @@ export function EngineCard({ onOpenNetwork }: { onOpenNetwork?: () => void } = {
           <Button
             size="sm"
             variant="secondary"
-            disabled={!data || working}
+            disabled={!data || working || importBlocked !== undefined}
+            title={importBlocked}
             aria-expanded={importing}
             onClick={() => setImporting((open) => !open)}
           >

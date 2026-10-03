@@ -66,6 +66,10 @@ use crate::flow_exec::{
 };
 use crate::flow_recovery::Prepare;
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
+use crate::managed_policy::{
+    CAUSE_POLICY_DENIED, EffectiveEntry, Key, PolicyView, RECOVERY_MANAGED, WriteRefusal,
+};
+use crate::managed_policy_service::PolicyHandle;
 use crate::model_readiness::Stage;
 use crate::model_service::Tier;
 use crate::policy::{CapabilityClass, GateDecision, PolicyGate};
@@ -333,6 +337,98 @@ impl FlowSettings {
                 .iter()
                 .any(|allowed| allowed == program)
     }
+
+    /// These (stored) settings under the managed policy `view`: the
+    /// effective settings and one `effective` entry per field, in
+    /// [`SETTINGS_FIELDS`] order. `flows.programs` is an exact-name
+    /// allowlist (or a locked list), `flows.extra_path` and
+    /// `flows.read_cache_roots` are path-prefix allowlists compared by
+    /// component after `~` expansion, and `flows.artifacts_root` is locked
+    /// or a default. Nothing here is persisted: the human's rows stay as
+    /// they were saved.
+    #[must_use]
+    pub fn managed(&self, view: &PolicyView) -> (Self, [EffectiveEntry; 4]) {
+        let home = std::env::home_dir();
+        let home = home.as_deref();
+        let (allowed_programs, programs) = view.effective_programs(&self.allowed_programs);
+        let (extra_path, path) =
+            view.effective_path_list(Key::FlowsExtraPath, &self.extra_path, home);
+        let (artifacts_root, artifacts) =
+            view.effective_string(Key::FlowsArtifactsRoot, self.artifacts_root.clone());
+        let (read_cache_roots, caches) =
+            view.effective_path_list(Key::FlowsReadCacheRoots, &self.read_cache_roots, home);
+        (
+            Self {
+                allowed_programs,
+                extra_path,
+                artifacts_root,
+                read_cache_roots,
+            },
+            [programs, path, artifacts, caches],
+        )
+    }
+
+    /// The `effective` block of a settings reply: `{ value, source, locked,
+    /// mode?, constraint?, reason?, state?, clamped? }` per field, from
+    /// [`Self::managed`].
+    #[must_use]
+    pub fn effective_json(&self, entries: &[EffectiveEntry; 4]) -> Value {
+        let values = [
+            json!(self.allowed_programs),
+            json!(self.extra_path),
+            json!(self.artifacts_root),
+            json!(self.read_cache_roots),
+        ];
+        let mut block = serde_json::Map::new();
+        for ((field, entry), value) in SETTINGS_FIELDS.iter().zip(entries).zip(values) {
+            let mut item = entry.to_json();
+            item["value"] = value;
+            block.insert((*field).to_owned(), item);
+        }
+        Value::Object(block)
+    }
+}
+
+/// The settings fields, in the order [`FlowSettings::managed`] reports them.
+pub const SETTINGS_FIELDS: [&str; 4] = [
+    "allowed_programs",
+    "extra_path",
+    "artifacts_root",
+    "read_cache_roots",
+];
+
+/// Whether the managed policy forbids a command step from running
+/// `program` (a name its exact-name allowlist or locked list leaves out).
+#[must_use]
+pub fn policy_forbids_program(view: &PolicyView, program: &str) -> bool {
+    let (kept, _) = view.effective_programs(&[program.to_owned()]);
+    !kept.iter().any(|allowed| allowed == program)
+}
+
+/// Whether the managed policy lets the human save `patch`: one snapshot,
+/// checked before any write. A field the patch leaves out is not checked.
+///
+/// # Errors
+///
+/// `policy_frozen` for a held key, `setting_locked` for a locked one and
+/// `policy_not_allowed` for an entry outside an allowlist (see
+/// [`PolicyView::check_list`]).
+pub fn check_settings_patch(view: &PolicyView, patch: &SettingsPatch) -> Result<(), WriteRefusal> {
+    let home = std::env::home_dir();
+    let home = home.as_deref();
+    for (key, list) in [
+        (Key::FlowsPrograms, patch.allowed_programs.as_deref()),
+        (Key::FlowsExtraPath, patch.extra_path.as_deref()),
+        (Key::FlowsReadCacheRoots, patch.read_cache_roots.as_deref()),
+    ] {
+        if let Some(list) = list {
+            view.check_list(key, &clean_list(list), home)?;
+        }
+    }
+    if !matches!(patch.artifacts_root, ArtifactsRootPatch::Keep) {
+        view.guard_locked(Key::FlowsArtifactsRoot)?;
+    }
+    Ok(())
 }
 
 /// Expands a leading `~` or `%USERPROFILE%` in a stored path.
@@ -488,6 +584,8 @@ pub struct FlowService {
     connectors: Arc<ConnectorService>,
     logs: Arc<LogService>,
     gate: Arc<PolicyGate>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
 }
 
 impl FlowService {
@@ -510,6 +608,7 @@ impl FlowService {
         connectors: Arc<ConnectorService>,
         logs: Arc<LogService>,
         gate: Arc<PolicyGate>,
+        policy: Arc<PolicyHandle>,
     ) -> Self {
         Self {
             protected_base: base_dir.to_path_buf(),
@@ -519,7 +618,15 @@ impl FlowService {
             connectors,
             logs,
             gate,
+            policy,
         }
+    }
+
+    /// The managed policy handle this engine reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// The flow library this engine reads and writes.
@@ -528,9 +635,19 @@ impl FlowService {
         &self.library
     }
 
-    /// The flow settings, persisting the platform default the first time
-    /// they are read so the GUI always has something concrete to edit.
+    /// The effective flow settings: what the human saved under the managed
+    /// policy in force (see [`FlowSettings::managed`]). Every consumer reads
+    /// these; only the admin edit path reads `user_settings`.
     pub async fn settings(&self) -> Result<FlowSettings, StoreError> {
+        let view = self.policy.view();
+        Ok(self.user_settings().await?.managed(&view).0)
+    }
+
+    /// The flow settings as the human saved them, persisting the platform
+    /// default the first time they are read so the GUI always has
+    /// something concrete to edit. No policy applied: for the admin edit
+    /// path, which shows and edits what the human saved.
+    pub(crate) async fn user_settings(&self) -> Result<FlowSettings, StoreError> {
         let defaults = FlowSettings::platform_default();
         Ok(FlowSettings {
             allowed_programs: self
@@ -565,9 +682,10 @@ impl FlowService {
         }
     }
 
-    /// Current GUI-approved scopes, independently of capability grants.
+    /// The effective GUI-approved scopes (under the managed policy in
+    /// force), independently of capability grants.
     pub async fn scope_policy(&self) -> Result<ScopePolicy, FlowRefusal> {
-        ScopePolicy::load(&self.store)
+        ScopePolicy::load_effective(&self.store, &self.policy.view())
             .await
             .map_err(|error| scope_refusal(&error))
     }
@@ -611,7 +729,9 @@ impl FlowService {
         Ok(default.to_vec())
     }
 
-    /// Replaces the named settings.
+    /// Replaces the named settings and returns them as the human saved
+    /// them. The managed policy is checked by the admin op before this
+    /// ([`check_settings_patch`]), on the snapshot it audits with.
     ///
     /// # Errors
     ///
@@ -655,7 +775,9 @@ impl FlowService {
                 .await
                 .map_err(|error| store_note(&error))?;
         }
-        self.settings().await.map_err(|error| store_note(&error))
+        self.user_settings()
+            .await
+            .map_err(|error| store_note(&error))
     }
 
     /// Every flow, builtins merged with the library, sorted by id.
@@ -740,18 +862,25 @@ impl FlowService {
             )
         })?;
         let mut blockers = Vec::new();
+        // The effective values, on one snapshot: inspection reports what a
+        // run would be held to, the managed policy included.
+        let view = self.policy.view();
         let run_granted = self
             .store
             .active_grant(CAP_FLOW_RUN)
             .await
             .map_err(|error| store_note(&error))?;
-        let run_admission = crate::flow_contract::inspect_gate(
+        let run_admission = inspect_admission(
+            &view,
             self.gate.profile(),
+            CAP_FLOW_RUN,
             run_granted,
             CapabilityClass::NonDestructive,
         );
-        if matches!(run_admission, "not_granted" | "approval_required") {
-            blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": run_admission, "recovery": "review flow.run in GUI Permissions"}));
+        match run_admission {
+            CAUSE_POLICY_DENIED => blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": CAUSE_POLICY_DENIED, "recovery": crate::policy::RECOVERY_POLICY_DENIED})),
+            "not_granted" | "approval_required" => blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": run_admission, "recovery": "review flow.run in GUI Permissions"})),
+            _ => {}
         }
         let repo = PathBuf::from(&ctx.caller.repo);
         if let Err(error) = self.approved_repo(&repo).await {
@@ -780,28 +909,9 @@ impl FlowService {
                 }
             },
         };
-        let configured = self
-            .store
-            .get_setting(SETTING_ALLOWED_PROGRAMS)
-            .await
-            .map_err(|error| store_note(&error))?;
-        let allowed: Vec<String> = match configured {
-            Some(raw) => serde_json::from_str(&raw).map_err(|_| {
-                FlowRefusal::new(
-                    "flow_settings_invalid",
-                    "allowed program setting is malformed".to_owned(),
-                    RECOVERY_ALLOWED_PROGRAMS,
-                )
-            })?,
-            None => FlowSettings::platform_default().allowed_programs,
-        };
-        let artifacts_root = self
-            .setting_optional_string(SETTING_ARTIFACTS_ROOT)
-            .await
-            .map_err(|error| store_note(&error))?
-            .is_some();
+        let (allowed, artifacts_root) = self.inspect_settings(&view).await?;
         let (steps, step_blockers) = self
-            .inspect_steps(flow, &vars, &repo, &allowed, artifacts_root)
+            .inspect_steps(flow, &vars, &repo, &allowed, artifacts_root, &view)
             .await?;
         blockers.extend(step_blockers);
         let model = self.inspect_model(flow).await?;
@@ -825,6 +935,40 @@ impl FlowService {
             body,
             evidence: Vec::new(),
         })
+    }
+
+    /// The effective allowlist and whether a build output directory is set,
+    /// read without persisting a default (inspection writes nothing).
+    async fn inspect_settings(
+        &self,
+        view: &PolicyView,
+    ) -> Result<(Vec<String>, bool), FlowRefusal> {
+        let configured = self
+            .store
+            .get_setting(SETTING_ALLOWED_PROGRAMS)
+            .await
+            .map_err(|error| store_note(&error))?;
+        let allowed: Vec<String> = match configured {
+            Some(raw) => serde_json::from_str(&raw).map_err(|_| {
+                FlowRefusal::new(
+                    "flow_settings_invalid",
+                    "allowed program setting is malformed".to_owned(),
+                    RECOVERY_ALLOWED_PROGRAMS,
+                )
+            })?,
+            None => FlowSettings::platform_default().allowed_programs,
+        };
+        let (allowed, _) = view.effective_programs(&allowed);
+        let artifacts_root = view
+            .effective_string(
+                Key::FlowsArtifactsRoot,
+                self.setting_optional_string(SETTING_ARTIFACTS_ROOT)
+                    .await
+                    .map_err(|error| store_note(&error))?,
+            )
+            .0
+            .is_some();
+        Ok((allowed, artifacts_root))
     }
 
     /// What the model will do for this flow, from the heavy tier's readiness record.
@@ -881,6 +1025,38 @@ impl FlowService {
         }))
     }
 
+    /// The admission inspection reports for one gated step, in the gate's
+    /// own order (see [`inspect_admission`]), with its blocker.
+    async fn inspect_step_gate(
+        &self,
+        view: &PolicyView,
+        flow: &Flow,
+        step: &pam_flow::Step,
+        item: &mut Value,
+        blockers: &mut Vec<Value>,
+    ) -> Result<(), FlowRefusal> {
+        let capability = step_capability(&flow.id, &step.id);
+        let granted = self
+            .store
+            .active_grant(&capability)
+            .await
+            .map_err(|error| store_note(&error))?;
+        let class = if matches!(step.action, Action::Connector { .. }) {
+            CapabilityClass::External
+        } else {
+            CapabilityClass::Destructive
+        };
+        let admission = inspect_admission(view, self.gate.profile(), &capability, granted, class);
+        item["grant"] = json!(if granted { "present" } else { "missing" });
+        item["admission"] = json!(admission);
+        match admission {
+            CAUSE_POLICY_DENIED => blockers.push(json!({"step": step.id, "cause": CAUSE_POLICY_DENIED, "recovery": crate::policy::RECOVERY_POLICY_DENIED})),
+            "not_granted" | "approval_required" => blockers.push(json!({"step": step.id, "cause": admission, "recovery": "review this flow step in GUI Permissions"})),
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Read a recipe's step gates and local connector configuration without execution.
     async fn inspect_steps(
         &self,
@@ -889,34 +1065,27 @@ impl FlowService {
         repo: &Path,
         allowed: &[String],
         artifacts_root: bool,
+        view: &PolicyView,
     ) -> Result<(Vec<Value>, Vec<Value>), FlowRefusal> {
         let mut blockers = Vec::new();
         let mut steps = Vec::new();
         for step in &flow.steps {
             let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "watch": step.watch, "live": "unknown"});
             if step.gated() {
-                let granted = self
-                    .store
-                    .active_grant(&step_capability(&flow.id, &step.id))
-                    .await
-                    .map_err(|error| store_note(&error))?;
-                let class = if matches!(step.action, Action::Connector { .. }) {
-                    CapabilityClass::External
-                } else {
-                    CapabilityClass::Destructive
-                };
-                let admission =
-                    crate::flow_contract::inspect_gate(self.gate.profile(), granted, class);
-                item["grant"] = json!(if granted { "present" } else { "missing" });
-                item["admission"] = json!(admission);
-                if matches!(admission, "not_granted" | "approval_required") {
-                    blockers.push(json!({"step": step.id, "cause": admission, "recovery": "review this flow step in GUI Permissions"}));
-                }
+                self.inspect_step_gate(view, flow, step, &mut item, &mut blockers)
+                    .await?;
             }
             match &step.action {
                 Action::Landing { operation } => {
-                    self.inspect_landing_step(repo, step, *operation, &mut item, &mut blockers)
-                        .await;
+                    self.inspect_landing_step(
+                        view,
+                        repo,
+                        step,
+                        *operation,
+                        &mut item,
+                        &mut blockers,
+                    )
+                    .await;
                 }
                 Action::Command { argv } => {
                     inspect_command_step(
@@ -928,6 +1097,14 @@ impl FlowService {
                         &mut item,
                         &mut blockers,
                     );
+                    // A run refuses this before spawn with the policy's
+                    // cause; inspection says so first.
+                    if item["program"]
+                        .as_str()
+                        .is_some_and(|program| policy_forbids_program(view, program))
+                    {
+                        blockers.push(json!({"step": step.id, "cause": CAUSE_POLICY_DENIED, "recovery": RECOVERY_MANAGED}));
+                    }
                 }
                 Action::Connector {
                     connector,
@@ -980,6 +1157,7 @@ impl FlowService {
 
     async fn inspect_landing_step(
         &self,
+        view: &PolicyView,
         repo: &Path,
         step: &Step,
         operation: pam_flow::LandingOperation,
@@ -988,7 +1166,9 @@ impl FlowService {
     ) {
         item["landing"] = json!(operation);
         item["live_state"] = json!("unknown_until_frozen_and_verified");
-        if let Err(error) = landing_runtime::inspect_policy(&self.store, repo, operation).await {
+        if let Err(error) =
+            landing_runtime::inspect_policy(&self.store, view, repo, operation).await
+        {
             blockers.push(json!({"step":step.id,"cause":error.cause,"recovery":error.recovery}));
         }
     }
@@ -1322,7 +1502,7 @@ impl FlowService {
 }
 
 /// Refuses an allowlist entry that is not a bare, non-shell program name.
-fn check_allowed_program(program: &str) -> Result<(), FlowRefusal> {
+pub(crate) fn check_allowed_program(program: &str) -> Result<(), FlowRefusal> {
     let program = program.trim();
     if is_shell(program) {
         return Err(FlowRefusal::new(
@@ -1711,8 +1891,9 @@ impl<'a> RunState<'a> {
         cancel: watch::Receiver<bool>,
     ) -> Result<Self, CapabilityFailure> {
         let correlation = service.freeze_correlation(ctx, &repo, flow, &vars).await?;
-        let (recovery, restored) = crate::flow_recovery::Recovery::open(
+        let (recovery, restored) = crate::flow_recovery::Recovery::open_with_policy(
             &service.store,
+            &service.policy.view(),
             &ctx.request_id,
             flow,
             &repo,
@@ -1971,8 +2152,30 @@ impl RunState<'_> {
 
     async fn check_step_scope(&self, step: &Step) -> Result<(), FlowRefusal> {
         self.service.approved_repo(&self.repo).await?;
+        // A program the managed policy forbids never reaches the gate, so no
+        // human is asked to approve a step that cannot run. The program is
+        // checked again right before spawn, after substitution.
+        if let Action::Command { argv } = &step.action
+            && let Some(program) = argv
+                .first()
+                .and_then(|program| substitute(program, &self.vars).ok())
+            && policy_forbids_program(&self.service.policy.view(), &program)
+        {
+            return Err(FlowRefusal::new(
+                CAUSE_POLICY_DENIED,
+                format!(
+                    "step {:?} runs {program:?}, which your organization's policy does not \
+                     allow on this machine ({})",
+                    step.id,
+                    Key::FlowsPrograms
+                ),
+                RECOVERY_MANAGED,
+            ));
+        }
         if let Action::Landing { operation } = step.action {
-            landing_runtime::inspect_policy(&self.service.store, &self.repo, operation).await?;
+            let view = self.service.policy.view();
+            landing_runtime::inspect_policy(&self.service.store, &view, &self.repo, operation)
+                .await?;
         }
         if let Action::Connector {
             connector,
@@ -2280,6 +2483,23 @@ impl RunState<'_> {
         };
         // Validation guarantees a command step has at least its program.
         let program = argv.first().cloned().unwrap_or_default();
+        // The live policy, not only the settings this run started with: a
+        // program the organization's policy removes is never spawned, and
+        // the refusal names the policy rather than the human's allowlist.
+        if policy_forbids_program(&self.service.policy.view(), &program) {
+            report.fail(
+                StepStatus::Blocked,
+                CAUSE_POLICY_DENIED,
+                format!(
+                    "step {:?} runs {program:?}, which your organization's policy does not \
+                     allow on this machine ({})",
+                    step.id,
+                    Key::FlowsPrograms
+                ),
+                RECOVERY_MANAGED.to_owned(),
+            );
+            return Ok(());
+        }
         if !self.settings.allows(&program) {
             report.fail(
                 StepStatus::Blocked,
@@ -3358,4 +3578,22 @@ pub(crate) fn boundary_read_roots(
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// The admission inspection reports for `capability`: the gate's own order,
+/// so inspection never shows a step admissible that the gate refuses. A
+/// managed never-grant rule refuses first, on every profile and whether or
+/// not a grant exists (`policy_denied`, with no rule text); otherwise the
+/// profile and grant decide (`flow_contract::inspect_gate`).
+pub(crate) fn inspect_admission(
+    view: &PolicyView,
+    profile: crate::policy::Profile,
+    capability: &str,
+    granted: bool,
+    class: CapabilityClass,
+) -> &'static str {
+    if class != CapabilityClass::Control && view.never_match(capability, Some(class)).is_some() {
+        return CAUSE_POLICY_DENIED;
+    }
+    crate::flow_contract::inspect_gate(profile, granted, class)
 }

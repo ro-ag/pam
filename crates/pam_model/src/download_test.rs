@@ -686,6 +686,7 @@ fn every_cause_carries_its_own_recovery_sentence() {
             feature: "a proxy",
         },
         NetFailure::SettingsInvalid("x".to_owned()),
+        NetFailure::PolicyInvalid("x".to_owned()),
         NetFailure::CaBundleTampered,
         NetFailure::RequestInvalid {
             field: "url",

@@ -67,6 +67,17 @@ const BOOT_CHECK_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Longest batch [`Store::fail_expired_requests`] finishes in one transaction.
 pub const MAX_EXPIRY_BATCH: u32 = 64;
 
+/// The `setting` row the daemon keeps the managed policy's last-known-good
+/// copy in: the exact bytes of the last trusted policy file it loaded, with
+/// their digest and time. Written only by the daemon, from a file that
+/// passed the trust check.
+pub const SETTING_POLICY_LAST_GOOD: &str = "policy.last_good";
+
+/// The most bytes the last-known-good row may hold: a 64 KiB policy and its
+/// one-line header. It is the one setting allowed past the 32 KiB bound the
+/// other settings readers apply.
+pub const MAX_POLICY_LAST_GOOD_BYTES: usize = 70 * 1024;
+
 /// SQL predicate over a `request` row: its admission still stands.
 ///
 /// A request snapshots the number of revocations that existed when it was
@@ -2708,6 +2719,72 @@ impl Store {
                 )?;
             }
             Ok(())
+        })
+        .await
+    }
+
+    /// Reads the managed policy's last-known-good row
+    /// ([`SETTING_POLICY_LAST_GOOD`]) with [`MAX_POLICY_LAST_GOOD_BYTES`]
+    /// applied before allocation, or `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnexpectedValue`] when the stored row is larger than
+    /// the bound; the store's own errors otherwise.
+    pub async fn policy_last_good(&self) -> Result<Option<String>, StoreError> {
+        let maximum = i64::try_from(MAX_POLICY_LAST_GOOD_BYTES).unwrap_or(i64::MAX);
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT CASE WHEN LENGTH(CAST(value AS BLOB))<=?2 THEN value ELSE NULL END \
+                 FROM setting WHERE key=?1",
+            )?;
+            let mut rows = stmt.query(params![SETTING_POLICY_LAST_GOOD, maximum])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            row.get::<Option<String>>(0)?
+                .map(Some)
+                .ok_or_else(|| StoreError::UnexpectedValue {
+                    column: "setting",
+                    value: "policy.last_good exceeds its bounded read".to_owned(),
+                })
+        })
+        .await
+    }
+
+    /// Replaces the managed policy's last-known-good row.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnexpectedValue`] for a value over
+    /// [`MAX_POLICY_LAST_GOOD_BYTES`], with nothing written; the store's own
+    /// errors otherwise.
+    pub async fn set_policy_last_good(&self, value: &str) -> Result<(), StoreError> {
+        if value.len() > MAX_POLICY_LAST_GOOD_BYTES {
+            return Err(StoreError::UnexpectedValue {
+                column: "setting",
+                value: format!(
+                    "policy.last_good of {} bytes exceeds {MAX_POLICY_LAST_GOOD_BYTES}",
+                    value.len()
+                ),
+            });
+        }
+        self.set_setting(SETTING_POLICY_LAST_GOOD, value).await
+    }
+
+    /// Deletes the managed policy's last-known-good row, answering whether
+    /// one existed.
+    ///
+    /// # Errors
+    ///
+    /// The store's.
+    pub async fn clear_policy_last_good(&self) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let deleted = conn.execute(
+                "DELETE FROM setting WHERE key = ?1",
+                params![SETTING_POLICY_LAST_GOOD],
+            )?;
+            Ok(deleted != 0)
         })
         .await
     }

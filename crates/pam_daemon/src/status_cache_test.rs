@@ -19,7 +19,12 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     // Never the real models directory.
     let models_dir = tempfile::tempdir().unwrap();
     models.set_models_dir(models_dir.path()).await.unwrap();

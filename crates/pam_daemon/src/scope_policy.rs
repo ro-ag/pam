@@ -3,6 +3,26 @@
 //! This authorizes a canonical working directory and explicit remote targets;
 //! it does not sandbox a command's filesystem access or trust its output.
 //! Missing policy denies work. Grants and caller labels never supply scope.
+//!
+//! Every consumer reads the *effective* scopes, [`ScopePolicy::load_effective`]:
+//! the human's stored document narrowed by the managed policy (see
+//! [`crate::managed_policy`]). A stored entry the policy forbids is dropped
+//! from the effective scopes and reported ([`ScopePolicy::dropped`]), never
+//! deleted: the store keeps what the human saved, and removing the policy
+//! restores it. Only `load_user` reads the stored document as saved; it is
+//! crate-private and named only here and by the admin edit path
+//! (`admin_flows.rs`), which a source test holds.
+//!
+//! What the policy narrows, in order:
+//! - `scopes.allowed_repository_roots`: a repository whose canonical root is
+//!   not under an allowed prefix (compared by path component) is dropped.
+//! - `connectors.disabled`: a connector scope for a disabled connector is
+//!   dropped.
+//! - `connectors.allowed_base_hosts`: a connector scope whose service URL's
+//!   host matches no rule is dropped.
+//! - `scopes.connector_wide: deny`: connector-wide access becomes target
+//!   access with the targets it lists, and a connector-wide scope lists none,
+//!   so the scope is dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -11,6 +31,12 @@ use pam_connectors::{ArgValue, ConnectorId, descriptor, validate_base_url};
 use pam_store::Store;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::managed_policy::{
+    CAUSE_POLICY_NOT_ALLOWED, EffectiveEntry, Key, LeafStatus, Mode, PathRule, PolicyView,
+    WriteRefusal,
+};
+use crate::network_service::Source;
 
 /// One atomic settings value; older installations have no implicit scopes.
 pub const SETTING_SCOPE_POLICY: &str = "flows.scope_policy";
@@ -34,6 +60,11 @@ pub struct ScopePolicy {
     pub version: u16,
     /// Exact canonical roots, including worktrees registered individually.
     pub repositories: Vec<RepositoryScope>,
+    /// What the managed policy removed from the stored document to make
+    /// this effective one; empty for the document as saved. Never
+    /// serialized: the reply carries it as `scope_policy_dropped`.
+    #[serde(skip)]
+    pub(crate) dropped: Vec<ScopeDrop>,
 }
 
 impl Default for ScopePolicy {
@@ -41,7 +72,36 @@ impl Default for ScopePolicy {
         Self {
             version: 1,
             repositories: Vec::new(),
+            dropped: Vec::new(),
         }
+    }
+}
+
+/// One stored scope entry the managed policy forbids: reported, never used,
+/// never deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeDrop {
+    /// The repository root as stored.
+    pub root: PathBuf,
+    /// The connector scope that was dropped; `None` when the whole
+    /// repository was.
+    pub connector: Option<ConnectorId>,
+    /// The policy key that forbids it.
+    pub key: Key,
+    /// The sentence the GUI shows.
+    pub reason: String,
+}
+
+impl ScopeDrop {
+    /// The wire shape of one `scope_policy_dropped` entry.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "root": self.root,
+            "connector": self.connector.map(ConnectorId::as_str),
+            "key": self.key.path(),
+            "reason": self.reason,
+        })
     }
 }
 
@@ -105,8 +165,23 @@ impl ScopeError {
 }
 
 impl ScopePolicy {
-    /// Read the current policy on every admission/attempt so revocation applies.
-    pub async fn load(store: &Store) -> Result<Self, ScopeError> {
+    /// The effective scopes: the stored document narrowed by `view` (see
+    /// the module docs). Read on every admission and attempt, with the
+    /// view the caller's service holds, so a revocation or a tightened
+    /// policy applies to the next check.
+    ///
+    /// # Errors
+    ///
+    /// [`CAUSE_SCOPE_INVALID`] for a stored document that is not a valid
+    /// policy, and a storage failure; neither is ever read as permission.
+    pub async fn load_effective(store: &Store, view: &PolicyView) -> Result<Self, ScopeError> {
+        Ok(Self::load_user(store).await?.managed(view))
+    }
+
+    /// The document exactly as the human saved it, with no policy applied.
+    /// Only the admin edit path (`admin_flows.rs`) and this module may read
+    /// it: every consumer reads [`Self::load_effective`].
+    pub(crate) async fn load_user(store: &Store) -> Result<Self, ScopeError> {
         let Some(raw) = store.get_setting(SETTING_SCOPE_POLICY).await? else {
             return Ok(Self::default());
         };
@@ -120,6 +195,147 @@ impl ScopePolicy {
             .map_err(|_| invalid("scope policy is not valid versioned JSON"))?;
         policy.validate()?;
         Ok(policy)
+    }
+
+    /// This document narrowed by `view`: every entry the policy forbids is
+    /// removed and recorded in [`Self::dropped`]. Pure: the stored roots
+    /// are already canonical (normalized on save) and the policy's prefixes
+    /// are compared as written, by path component, so a symlinked prefix
+    /// never widens anything.
+    #[must_use]
+    pub fn managed(mut self, view: &PolicyView) -> Self {
+        let mut dropped = Vec::new();
+        self.repositories.retain_mut(|repository| {
+            if !view.repository_root_allowed(&repository.root) {
+                dropped.push(ScopeDrop {
+                    root: repository.root.clone(),
+                    connector: None,
+                    key: Key::ScopesAllowedRepositoryRoots,
+                    reason: "this repository is outside the repository roots your \
+                             organization's policy allows"
+                        .to_owned(),
+                });
+                return false;
+            }
+            repository
+                .connectors
+                .retain(|scope| match connector_forbidden(view, scope) {
+                    None => true,
+                    Some((key, reason)) => {
+                        dropped.push(ScopeDrop {
+                            root: repository.root.clone(),
+                            connector: Some(scope.connector),
+                            key,
+                            reason: reason.to_owned(),
+                        });
+                        false
+                    }
+                });
+            true
+        });
+        self.dropped = dropped;
+        self
+    }
+
+    /// The stored entries the managed policy removed from this effective
+    /// document (empty for one that was not narrowed).
+    #[must_use]
+    pub fn dropped(&self) -> &[ScopeDrop] {
+        &self.dropped
+    }
+
+    /// Whether the human may save this (normalized) document under `view`.
+    /// `current` is the document saved now, when it reads: a write that only
+    /// narrows it passes a held key, as tightening always may.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::managed_policy::CAUSE_POLICY_FROZEN`] when a scope key is
+    /// held and the write is not a narrowing, and
+    /// [`CAUSE_POLICY_NOT_ALLOWED`] for a repository outside the allowed
+    /// roots, a connector-wide scope the policy denies, or a connector
+    /// service whose host is not allowed. A disabled connector's scope is
+    /// not refused: it is saved and reported as dropped.
+    pub fn check_write(
+        &self,
+        view: &PolicyView,
+        current: Option<&Self>,
+    ) -> Result<(), WriteRefusal> {
+        if !current.is_some_and(|current| self.narrows(current)) {
+            for key in [
+                Key::ScopesAllowedRepositoryRoots,
+                Key::ScopesConnectorWide,
+                Key::ConnectorsAllowedBaseHosts,
+            ] {
+                view.guard_held(key)?;
+            }
+        }
+        for repository in &self.repositories {
+            let root = repository.root.display();
+            if !view.repository_root_allowed(&repository.root) {
+                return Err(view.refusal(
+                    Key::ScopesAllowedRepositoryRoots,
+                    CAUSE_POLICY_NOT_ALLOWED,
+                    &format!(
+                        "repository {root} is outside the repository roots your organization \
+                         allows"
+                    ),
+                ));
+            }
+            for scope in &repository.connectors {
+                let connector = scope.connector.as_str();
+                if scope.access == ScopeAccess::ConnectorWide && view.connector_wide_denied() {
+                    return Err(view.refusal(
+                        Key::ScopesConnectorWide,
+                        CAUSE_POLICY_NOT_ALLOWED,
+                        &format!(
+                            "connector-wide access for {connector} in {root} is not allowed; \
+                             approve explicit targets instead"
+                        ),
+                    ));
+                }
+                if !base_url_allowed(view, &scope.base_url) {
+                    return Err(view.refusal(
+                        Key::ConnectorsAllowedBaseHosts,
+                        CAUSE_POLICY_NOT_ALLOWED,
+                        &format!(
+                            "the {connector} service {} for {root} is not a host your \
+                             organization allows",
+                            scope.base_url
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every entry of `self` is already in `current`, no broader:
+    /// the same repository roots, the same connector services, and target
+    /// lists that are subsets (or connector-wide where it already was).
+    fn narrows(&self, current: &Self) -> bool {
+        self.repositories.iter().all(|repository| {
+            current
+                .repositories
+                .iter()
+                .find(|earlier| earlier.root == repository.root)
+                .is_some_and(|earlier| {
+                    repository.connectors.iter().all(|scope| {
+                        earlier.connectors.iter().any(|before| {
+                            before.connector == scope.connector
+                                && before.base_url == scope.base_url
+                                && match (scope.access, before.access) {
+                                    (_, ScopeAccess::ConnectorWide) => true,
+                                    (ScopeAccess::ConnectorWide, ScopeAccess::Targets) => false,
+                                    (ScopeAccess::Targets, ScopeAccess::Targets) => scope
+                                        .targets
+                                        .iter()
+                                        .all(|target| before.targets.contains(target)),
+                                }
+                        })
+                    })
+                })
+        })
     }
 
     /// [`Self::normalize`] off the async threads: every repository root is
@@ -210,7 +426,18 @@ impl ScopePolicy {
         self.repositories
             .iter()
             .find(|entry| entry.root == canonical)
-            .ok_or_else(|| denied("repository is not explicitly approved"))
+            .ok_or_else(|| match self.drop_for(canonical, None) {
+                Some(entry) => policy_denied(entry),
+                None => denied("repository is not explicitly approved"),
+            })
+    }
+
+    /// The recorded drop of `root` (the whole repository, or `connector`'s
+    /// scope in it).
+    fn drop_for(&self, root: &Path, connector: Option<ConnectorId>) -> Option<&ScopeDrop> {
+        self.dropped.iter().find(|entry| {
+            entry.root == root && (entry.connector.is_none() || entry.connector == connector)
+        })
     }
 
     /// Check a remote read using validated adapter arguments and configured URL.
@@ -242,7 +469,10 @@ impl ScopePolicy {
             .connectors
             .iter()
             .find(|scope| scope.connector == connector)
-            .ok_or_else(|| denied("connector is not approved for this repository"))?;
+            .ok_or_else(|| match self.drop_for(canonical, Some(connector)) {
+                Some(entry) => policy_denied(entry),
+                None => denied("connector is not approved for this repository"),
+            })?;
         if normalized_url(connector, &scope.base_url)? != normalized_url(connector, base_url)? {
             return Err(denied(
                 "configured connector URL changed; approve its scope again",
@@ -420,6 +650,176 @@ fn drop_removed_connector_scopes(policy: &mut serde_json::Value) {
             );
         }
     }
+}
+
+/// The keys that narrow the scope document, in the order their
+/// constraints are reported.
+pub const SCOPE_KEYS: [Key; 4] = [
+    Key::ScopesAllowedRepositoryRoots,
+    Key::ScopesConnectorWide,
+    Key::ConnectorsAllowedBaseHosts,
+    Key::ConnectorsDisabled,
+];
+
+/// The `effective` entry of a field a set of plain policy constraints
+/// (`keys`) narrows: `source` is `policy` when the constraints removed
+/// something (`clamped`), `locked` when one of the keys is held (its writes
+/// refuse `policy_frozen`), `mode` is `forbid` and `constraint` carries
+/// each in-force key's value under its path. With none of `keys` in the
+/// document it is exactly `{ source: user, locked: false }`.
+#[must_use]
+pub fn constraint_entry(
+    view: &PolicyView,
+    keys: &[Key],
+    constraint: &serde_json::Map<String, serde_json::Value>,
+    clamped: bool,
+) -> EffectiveEntry {
+    let statuses: Vec<&LeafStatus> = keys.iter().filter_map(|key| view.status(*key)).collect();
+    if statuses.is_empty() {
+        return EffectiveEntry::unmanaged(Source::User);
+    }
+    let held = statuses
+        .iter()
+        .any(|status| matches!(status, LeafStatus::Held { .. }));
+    let state = if held {
+        "held"
+    } else if statuses.iter().any(|status| !status.in_force()) {
+        "rejected"
+    } else {
+        "applied"
+    };
+    EffectiveEntry {
+        source: if clamped {
+            Source::Policy
+        } else {
+            Source::User
+        },
+        locked: held,
+        mode: Some(Mode::Forbid),
+        constraint: (!constraint.is_empty()).then(|| serde_json::Value::Object(constraint.clone())),
+        reason: None,
+        state: Some(state),
+        clamped,
+    }
+}
+
+/// The scope keys' constraints in force, each under its key path.
+#[must_use]
+pub fn scope_constraints(view: &PolicyView) -> serde_json::Map<String, serde_json::Value> {
+    let in_force = |key: Key| view.status(key).is_some_and(LeafStatus::in_force);
+    let policy = view.policy();
+    let mut constraint = serde_json::Map::new();
+    if let Some(roots) = policy
+        .allowed_repository_roots
+        .as_ref()
+        .filter(|_| in_force(Key::ScopesAllowedRepositoryRoots))
+    {
+        constraint.insert(
+            Key::ScopesAllowedRepositoryRoots.path().to_owned(),
+            serde_json::json!(roots.iter().map(PathRule::as_str).collect::<Vec<_>>()),
+        );
+    }
+    if view.connector_wide_denied() {
+        constraint.insert(
+            Key::ScopesConnectorWide.path().to_owned(),
+            serde_json::json!("deny"),
+        );
+    }
+    if let Some(hosts) = policy
+        .allowed_base_hosts
+        .as_ref()
+        .filter(|_| in_force(Key::ConnectorsAllowedBaseHosts))
+    {
+        constraint.insert(
+            Key::ConnectorsAllowedBaseHosts.path().to_owned(),
+            serde_json::json!(hosts.entries),
+        );
+    }
+    if let Some(disabled) = policy
+        .disabled_connectors
+        .as_ref()
+        .filter(|_| in_force(Key::ConnectorsDisabled))
+    {
+        constraint.insert(
+            Key::ConnectorsDisabled.path().to_owned(),
+            serde_json::json!(
+                disabled
+                    .iter()
+                    .map(|connector| connector.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    constraint
+}
+
+impl ScopePolicy {
+    /// The `effective` entry of the `scope_policy` field: this (effective)
+    /// document as its `value`, under [`constraint_entry`] over
+    /// [`SCOPE_KEYS`].
+    #[must_use]
+    pub fn effective_json(&self, view: &PolicyView) -> serde_json::Value {
+        let entry = constraint_entry(
+            view,
+            &SCOPE_KEYS,
+            &scope_constraints(view),
+            !self.dropped.is_empty(),
+        );
+        let mut item = entry.to_json();
+        item["value"] = serde_json::json!(self);
+        item
+    }
+
+    /// The `scope_policy_dropped` list of a settings reply.
+    #[must_use]
+    pub fn dropped_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(self.dropped.iter().map(ScopeDrop::to_json).collect())
+    }
+}
+
+/// Why the managed policy forbids `scope`, if it does: the key and the
+/// sentence a [`ScopeDrop`] records.
+fn connector_forbidden(view: &PolicyView, scope: &ConnectorScope) -> Option<(Key, &'static str)> {
+    if view.connector_disabled(scope.connector) {
+        return Some((
+            Key::ConnectorsDisabled,
+            "your organization's policy disables this connector",
+        ));
+    }
+    if !base_url_allowed(view, &scope.base_url) {
+        return Some((
+            Key::ConnectorsAllowedBaseHosts,
+            "this connector's service is not on a host your organization's policy allows",
+        ));
+    }
+    if scope.access == ScopeAccess::ConnectorWide && view.connector_wide_denied() {
+        return Some((
+            Key::ScopesConnectorWide,
+            "your organization's policy does not allow connector-wide access; approve \
+             explicit targets",
+        ));
+    }
+    None
+}
+
+/// Whether the policy allows a stored service URL's host. A URL that does
+/// not parse matches no host rule, so it passes only while no rule is in
+/// force (the stored document was validated when it was saved).
+fn base_url_allowed(view: &PolicyView, base_url: &str) -> bool {
+    match pam_net::Url::parse(base_url) {
+        Ok(url) => view.base_url_allowed(&url),
+        Err(_) => !view
+            .status(Key::ConnectorsAllowedBaseHosts)
+            .is_some_and(LeafStatus::in_force),
+    }
+}
+
+/// A denial that names the policy: the human cannot fix it in Settings.
+fn policy_denied(entry: &ScopeDrop) -> ScopeError {
+    ScopeError::Denied(format!(
+        "{} ({}); managed by your organization's policy, ask your administrator",
+        entry.reason, entry.key
+    ))
 }
 
 fn invalid(detail: &str) -> ScopeError {

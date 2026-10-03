@@ -82,6 +82,7 @@ use crate::framed::{self, HandshakeError, Limits, Policy};
 use crate::image::ImageWatch;
 use crate::ingress::{Ingress, Origin, PeerIdentity, PublicPeer};
 use crate::lifecycle::LifecyclePhase;
+use crate::managed_policy_service::PolicyHandle;
 use crate::policy::CAP_QUERY;
 use crate::transport::{bad_request, envelope_within_limits};
 
@@ -186,6 +187,9 @@ pub struct PublicPolicy {
     /// that is somebody else.
     own_uid: Option<u32>,
     legacy: LegacyLog,
+    /// The managed policy: a follow re-authorizes under the effective
+    /// scopes, so a repository the policy drops stops seeing its tickets.
+    managed: Arc<PolicyHandle>,
 }
 
 impl PublicPolicy {
@@ -198,6 +202,7 @@ impl PublicPolicy {
         phase: watch::Sender<LifecyclePhase>,
         hub: Arc<EventHub>,
         image: Arc<ImageWatch>,
+        managed: Arc<PolicyHandle>,
     ) -> Arc<Self> {
         Self::with_limits(
             ingress,
@@ -207,11 +212,16 @@ impl PublicPolicy {
             image,
             Limits::PUBLIC,
             FollowTimes::DEFAULT,
+            managed,
         )
     }
 
     /// [`Self::new`] with explicit limits and follow clocks (tests).
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the public plane's collaborators plus the two test knobs; a builder would only rename them"
+    )]
     pub fn with_limits(
         ingress: Ingress,
         store: Arc<Store>,
@@ -220,6 +230,7 @@ impl PublicPolicy {
         image: Arc<ImageWatch>,
         limits: Limits,
         follow: FollowTimes,
+        managed: Arc<PolicyHandle>,
     ) -> Arc<Self> {
         Arc::new(Self {
             ingress,
@@ -231,6 +242,7 @@ impl PublicPolicy {
             follow,
             own_uid: own_uid(),
             legacy: LegacyLog::default(),
+            managed,
         })
     }
 
@@ -571,16 +583,18 @@ impl PublicPolicy {
         scope: &FollowScope<'_>,
         terminal: Option<&(u64, Event)>,
     ) -> Option<End> {
-        let status = match authorized_metadata(&self.store, scope.caller_repo, scope.ticket).await {
-            Ok((status, _)) => status,
-            Err(failure) => {
-                return Some(End {
-                    seq: None,
-                    event: None,
-                    response: failure_refusal(scope.id, failure),
-                });
-            }
-        };
+        let view = self.managed.view();
+        let status =
+            match authorized_metadata(&self.store, &view, scope.caller_repo, scope.ticket).await {
+                Ok((status, _)) => status,
+                Err(failure) => {
+                    return Some(End {
+                        seq: None,
+                        event: None,
+                        response: failure_refusal(scope.id, failure),
+                    });
+                }
+            };
         if !status.state.is_terminal() {
             return None;
         }

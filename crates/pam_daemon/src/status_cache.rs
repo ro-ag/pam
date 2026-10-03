@@ -35,6 +35,11 @@
 //! admin-contact observations) comes from the attached
 //! [`crate::boundary::Boundary`], which keeps its census in memory and reloads
 //! it after each of its own writes: no row is read on the poll either.
+//!
+//! The `policy` block is the attached [`crate::managed_policy_service::PolicyHandle`]'s
+//! public status ([`crate::managed_policy_service::PolicyStatus::public_json`]): the state,
+//! revision, short digest, load time and rejected-leaf count, never a value or a reason. It is
+//! held in memory and swapped by the policy's own reloads, so the poll reads no file and no row.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -49,6 +54,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::boundary::Boundary;
+use crate::managed_policy_service::PolicyHandle;
 use crate::model_service::{ModelService, Tier};
 use crate::secrets::SecretStore;
 
@@ -102,6 +108,10 @@ pub struct StatusCache {
     /// through it. Absent in a harness that attached none; `status` then
     /// serves the never-checked block.
     boundary: OnceLock<Arc<Boundary>>,
+    /// The managed policy, attached once at boot: the `policy` block is its
+    /// public status. Absent in a harness that attached none; `status` then
+    /// serves the unmanaged block.
+    policy: OnceLock<Arc<PolicyHandle>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -133,6 +143,7 @@ impl StatusCache {
             activity: RwLock::new(Activity::default()),
             active_requests: AtomicI64::new(-1),
             boundary: OnceLock::new(),
+            policy: OnceLock::new(),
         })
     }
 
@@ -140,6 +151,12 @@ impl StatusCache {
     /// ignored and answers `false`.
     pub fn attach_boundary(&self, boundary: Arc<Boundary>) -> bool {
         self.boundary.set(boundary).is_ok()
+    }
+
+    /// Attaches the managed policy handle. Once: a second attachment is
+    /// ignored and answers `false`.
+    pub fn attach_policy(&self, policy: Arc<PolicyHandle>) -> bool {
+        self.policy.set(policy).is_ok()
     }
 
     /// The attached boundary observer, if any.
@@ -284,6 +301,10 @@ impl StatusCache {
             "boundary": self.boundary.get().map_or_else(
                 crate::boundary::never_checked_block,
                 |boundary| boundary.status_block(),
+            ),
+            "policy": self.policy.get().map_or_else(
+                || PolicyHandle::none().status().public_json(),
+                |policy| policy.status().public_json(),
             ),
             "snapshot": {
                 "stale": stale,

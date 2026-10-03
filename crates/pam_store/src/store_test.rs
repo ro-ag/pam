@@ -2150,3 +2150,35 @@ async fn a_request_row_records_where_it_entered_the_daemon() {
 fn wall_ms_far() -> i64 {
     9_000_000_000_000
 }
+
+/// The managed policy's last-known-good row takes a full 64 KiB policy
+/// (past the 32 KiB bound of the other settings), refuses more than its
+/// own bound, and is deleted when the policy goes away.
+#[tokio::test]
+async fn the_policy_last_good_row_is_bounded_and_deletable() {
+    use crate::{MAX_POLICY_LAST_GOOD_BYTES, SETTING_POLICY_LAST_GOOD};
+
+    let store = Store::open_in_memory().await.unwrap();
+    assert_eq!(store.policy_last_good().await.unwrap(), None);
+    assert!(!store.clear_policy_last_good().await.unwrap());
+
+    let large = "x".repeat(64 * 1024 + 100);
+    store.set_policy_last_good(&large).await.unwrap();
+    assert_eq!(store.policy_last_good().await.unwrap(), Some(large));
+
+    let over = "x".repeat(MAX_POLICY_LAST_GOOD_BYTES + 1);
+    assert!(store.set_policy_last_good(&over).await.is_err());
+    // A row past the bound written some other way is refused, not read.
+    store
+        .set_setting(SETTING_POLICY_LAST_GOOD, &over)
+        .await
+        .unwrap();
+    assert!(store.policy_last_good().await.is_err());
+
+    assert!(store.clear_policy_last_good().await.unwrap());
+    assert_eq!(store.policy_last_good().await.unwrap(), None);
+    assert_eq!(
+        store.get_setting(SETTING_POLICY_LAST_GOOD).await.unwrap(),
+        None
+    );
+}

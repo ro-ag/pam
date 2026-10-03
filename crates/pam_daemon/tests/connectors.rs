@@ -20,7 +20,7 @@ use pam_daemon::daemon::DAEMON_VERSION;
 use pam_daemon::secrets::{SecretBackend, SecretError, account_for};
 use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::RequestState;
-use pam_testkit::{FakeSecretBackend, FakeTransport, TestDaemon, with_deadline};
+use pam_testkit::{FakeSecretBackend, FakeTransport, ScriptedPolicy, TestDaemon, with_deadline};
 
 /// The credential a human types into the Connectors screen.
 const TOKEN: &str = "ghp_socket_secret_13572468";
@@ -420,6 +420,230 @@ async fn save_and_test_uses_current_credentials_against_a_local_http_service() {
             assert!(!listed.to_string().contains(token));
         }
         server.await.unwrap();
+        daemon.assert_invariant_clean().await;
+        daemon.stop().await;
+    })
+    .await;
+}
+
+/// A trusted managed policy a real daemon reads at boot: GitHub may only
+/// use `github.test`, and Jenkins is switched off. Models and retention are
+/// governed too, so one daemon shows every surface this change touches.
+const MANAGED_POLICY: &str = r#"{
+    "version": 1,
+    "revision": "2026-10-02.7",
+    "organization": "Example Corp",
+    "contact": "it@example.test",
+    "connectors": { "allowed_base_hosts": ["github.test"], "disabled": ["jenkins"] },
+    "models": {
+        "engine_source": "import_only",
+        "allowed_sources": ["catalog"],
+        "idle_unload_min": { "max": 60 }
+    },
+    "retention": { "audit_days": { "max": 90 } }
+}"#;
+
+/// One admin op over the daemon's socket.
+async fn call(
+    client: &mut pam_testkit::TestClient,
+    id: &str,
+    op: &str,
+    args: serde_json::Value,
+) -> Response {
+    client.request(&admin_envelope(id, op, args)).await
+}
+
+/// The refused op's request carries the terminal `admin`/`refuse` row and
+/// the policy's `policy.locked_write` row, with the full digest.
+async fn assert_locked_write(daemon: &TestDaemon, id: &str, op: &str, cause: &str, key: &str) {
+    let rows = daemon.audit_rows(id).await;
+    let row = rows
+        .iter()
+        .find(|row| row.action == "policy.locked_write")
+        .unwrap_or_else(|| panic!("{id}: no policy.locked_write row in {rows:?}"));
+    let detail: serde_json::Value =
+        serde_json::from_str(row.detail.as_deref().expect("detail")).expect("detail JSON");
+    assert_eq!(detail["op"], op);
+    assert_eq!(detail["cause"], cause);
+    assert_eq!(detail["keys"], serde_json::json!([key]));
+    assert_eq!(detail["digest"].as_str().map(str::len), Some(64));
+    assert_eq!(detail["revision"], "2026-10-02.7");
+    daemon.assert_row_state(id, RequestState::Refused).await;
+    daemon.assert_single_terminal_audit(id).await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one daemon, every governed surface, in the order a person meets them"
+)]
+async fn a_managed_policy_governs_connectors_models_and_retention_over_the_real_socket() {
+    with_deadline(async {
+        let backend = Arc::new(FakeSecretBackend::default());
+        let transport = Arc::new(FakeTransport::new());
+        let daemon = TestDaemon::spawn_with({
+            let backend = Arc::clone(&backend);
+            let transport = Arc::clone(&transport);
+            move |config| {
+                config.secret_backend = Some(backend as Arc<dyn SecretBackend>);
+                config.http_transport = Some(transport);
+                config.policy_source = Some(ScriptedPolicy::trusted(MANAGED_POLICY));
+            }
+        })
+        .await;
+        let mut client = daemon.client().await;
+        // Connectors: Jenkins is off for good, and GitHub is held to its hosts.
+        let response = call(
+            &mut client,
+            "req_jenkins",
+            OP_CONNECTORS_CONFIGURE,
+            serde_json::json!({ "id": "jenkins", "enabled": true }),
+        )
+        .await;
+        assert_eq!(cause_of(response), "setting_locked");
+        assert_locked_write(
+            &daemon,
+            "req_jenkins",
+            OP_CONNECTORS_CONFIGURE,
+            "setting_locked",
+            "connectors.disabled",
+        )
+        .await;
+        let response = call(
+            &mut client,
+            "req_host",
+            OP_CONNECTORS_CONFIGURE,
+            serde_json::json!({
+                "id": "github", "base_url": "https://evil.example.org/",
+                "credential": { "set": TOKEN },
+            }),
+        )
+        .await;
+        assert_eq!(cause_of(response), "policy_not_allowed");
+        assert_locked_write(
+            &daemon,
+            "req_host",
+            OP_CONNECTORS_CONFIGURE,
+            "policy_not_allowed",
+            "connectors.allowed_base_hosts",
+        )
+        .await;
+        assert_eq!(
+            backend.get(&account_for("github")).expect("backend ok"),
+            None,
+            "a refused save never reaches the keychain"
+        );
+        let response = call(
+            &mut client,
+            "req_ok",
+            OP_CONNECTORS_CONFIGURE,
+            serde_json::json!({
+                "id": "github", "enabled": true, "base_url": BASE_URL,
+                "credential": { "set": TOKEN },
+            }),
+        )
+        .await;
+        body_of(response, Outcome::Changed);
+        let body = body_of(
+            call(
+                &mut client,
+                "req_list",
+                OP_CONNECTORS_LIST,
+                serde_json::json!({}),
+            )
+            .await,
+            Outcome::Verified,
+        );
+        let connectors = body["connectors"].as_array().expect("connectors array");
+        let jenkins = connectors.iter().find(|c| c["id"] == "jenkins").unwrap();
+        assert_eq!(jenkins["enabled"], false);
+        assert_eq!(jenkins["effective"]["enabled"]["source"], "policy");
+        assert_eq!(jenkins["effective"]["enabled"]["locked"], true);
+
+        // Models: the engine only from an imported file; weights only from the catalog.
+        let response = call(
+            &mut client,
+            "req_engine",
+            "admin.models.engine.install",
+            serde_json::json!({ "confirm": true }),
+        )
+        .await;
+        assert_eq!(cause_of(response), "policy_not_allowed");
+        assert_locked_write(
+            &daemon,
+            "req_engine",
+            "admin.models.engine.install",
+            "policy_not_allowed",
+            "models.engine_source",
+        )
+        .await;
+        let response = call(
+            &mut client,
+            "req_url",
+            "admin.models.download",
+            serde_json::json!({ "url": "http://127.0.0.1:9/w.gguf", "vendor": "v" }),
+        )
+        .await;
+        assert_eq!(cause_of(response), "policy_not_allowed");
+        assert_locked_write(
+            &daemon,
+            "req_url",
+            "admin.models.download",
+            "policy_not_allowed",
+            "models.allowed_sources",
+        )
+        .await;
+        let response = call(
+            &mut client,
+            "req_idle",
+            "admin.models.settings.set",
+            serde_json::json!({ "idle_unload_min": 0 }),
+        )
+        .await;
+        assert_eq!(cause_of(response), "policy_not_allowed");
+        assert_locked_write(
+            &daemon,
+            "req_idle",
+            "admin.models.settings.set",
+            "policy_not_allowed",
+            "models.idle_unload_min",
+        )
+        .await;
+
+        // Retention: a ceiling refuses forever and is the window in force.
+        let response = call(
+            &mut client,
+            "req_forever",
+            "admin.retention.set",
+            serde_json::json!({ "audit_days": null }),
+        )
+        .await;
+        assert_eq!(cause_of(response), "policy_not_allowed");
+        assert_locked_write(
+            &daemon,
+            "req_forever",
+            "admin.retention.set",
+            "policy_not_allowed",
+            "retention.audit_days",
+        )
+        .await;
+        let body = body_of(
+            call(
+                &mut client,
+                "req_ret",
+                "admin.retention.get",
+                serde_json::json!({}),
+            )
+            .await,
+            Outcome::Verified,
+        );
+        assert_eq!(body["audit_days"], 90);
+        assert_eq!(body["effective"]["audit_days"]["source"], "policy");
+
+        assert!(
+            transport.requests().is_empty(),
+            "nothing reached the network"
+        );
         daemon.assert_invariant_clean().await;
         daemon.stop().await;
     })

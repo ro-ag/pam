@@ -90,12 +90,21 @@ impl Fixture {
     /// Starts an echo that takes `delay_ms` and returns its ticket. `tag`
     /// keeps two tickets from being one deduplicated request.
     async fn ticket(&self, id: &str, delay_ms: u64) -> String {
-        let request = self.envelope(
+        self.ticket_within(id, delay_ms, None).await
+    }
+
+    /// As [`Fixture::ticket`], with an explicit request deadline: tickets
+    /// that queue behind a long run must outlive the harness default.
+    async fn ticket_within(&self, id: &str, delay_ms: u64, deadline_ms: Option<u64>) -> String {
+        let mut request = self.envelope(
             id,
             "echo",
             serde_json::json!({ "delay_ms": delay_ms, "tag": id }),
             false,
         );
+        if let Some(deadline_ms) = deadline_ms {
+            request.deadline_ms = deadline_ms;
+        }
         let response = self.call(&request).await;
         let Response::Ticket { ticket, .. } = response else {
             panic!("expected a ticket, got {response:?}");
@@ -640,7 +649,13 @@ async fn follower_slots_are_capped_per_ticket_and_in_total_and_come_back() {
         let tickets_needed = MAX_FOLLOWERS / MAX_FOLLOWERS_PER_TICKET + 1;
         let mut tickets = Vec::new();
         for index in 0..tickets_needed {
-            tickets.push(fixture.ticket(&format!("req_cap_{index}"), 30_000).await);
+            // The queued ones wait behind the first; a slow runner must not
+            // expire them before every follower has attached.
+            tickets.push(
+                fixture
+                    .ticket_within(&format!("req_cap_{index}"), 30_000, Some(120_000))
+                    .await,
+            );
         }
 
         // Opens one follow, retrying while the control rate window is spent

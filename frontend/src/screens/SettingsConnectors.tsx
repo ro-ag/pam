@@ -19,6 +19,7 @@ import {
   type ConnectorSummary,
 } from "../lib/ipc";
 import { exactTime, relativeTime } from "../lib/time";
+import { ManagedNote, isLocked } from "./ManagedField";
 import { SonarRepositoryMappingsEditor } from "./SonarRepositoryMappings";
 
 const CAUSE_STORE_DENIED = "store_denied";
@@ -136,7 +137,12 @@ function ConnectorRow({
       setVerdict(connector.last_test);
     }
   }, [connector, dirty, save.isPending]);
+  // A connector the policy disables cannot be enabled or reconfigured; the human may still clear
+  // what they stored.
+  const policyDisabled = isLocked(connector.effective?.enabled);
+  const baseUrlEntry = connector.effective?.base_url;
   const busy = blocked || save.isPending;
+  const editBusy = busy || policyDisabled;
   function act(action: Action) {
     const current = queryClient.getQueryState(["connectors"]);
     if (
@@ -198,13 +204,14 @@ function ConnectorRow({
             type="checkbox"
             aria-label={`enable ${connector.name}`}
             checked={connector.enabled}
-            disabled={busy}
+            disabled={editBusy}
             onChange={(event) => act({ kind: "enable", enabled: event.target.checked })}
             className="size-4.5 cursor-pointer accent-accent-strong"
           />
           <span className="font-sans text-sm font-medium text-ink">{connector.name}</span>
         </label>
         {!connector.enabled && <Badge>Disabled</Badge>}
+        <ManagedNote entry={connector.effective?.enabled} />
         <Badge
           tone={state === "Ready" ? "success" : state === "Test failed" ? "danger" : "neutral"}
         >
@@ -219,6 +226,7 @@ function ConnectorRow({
         <p className="font-data text-xs text-warning">{STORE_UNAVAILABLE_COPY}</p>
       )}
       <div className="grid grid-cols-1 gap-3">
+        {connector.needs_base_url && <ManagedNote entry={baseUrlEntry} />}
         {connector.needs_base_url && (
           <label className="space-y-1">
             <span className={fieldLabelClasses}>Base URL</span>
@@ -226,7 +234,7 @@ function ConnectorRow({
               className={fieldClasses}
               aria-label={`${connector.name} base URL`}
               value={baseUrl}
-              disabled={busy}
+              disabled={editBusy}
               onChange={(event) => edit(() => setBaseUrl(event.target.value))}
               placeholder={guidance?.url ?? "https://service.example.com"}
             />
@@ -239,7 +247,7 @@ function ConnectorRow({
               className={fieldClasses}
               aria-label={`${connector.name} ${connector.username_label}`}
               value={username}
-              disabled={busy}
+              disabled={editBusy}
               onChange={(event) => edit(() => setUsername(event.target.value))}
             />
           </label>
@@ -253,7 +261,7 @@ function ConnectorRow({
           autoComplete="new-password"
           aria-label={`${connector.name} credential`}
           value={secret}
-          disabled={busy}
+          disabled={editBusy}
           onChange={(event) => edit(() => setSecret(event.target.value))}
           placeholder={
             connector.credential_present ? "Stored; type to replace it" : "Paste the token"
@@ -263,7 +271,7 @@ function ConnectorRow({
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
-          disabled={busy || needsUrl || needsCredentials}
+          disabled={editBusy || needsUrl || needsCredentials}
           title={
             needsUrl
               ? "Enter the base URL first"

@@ -360,6 +360,7 @@ async fn connectors(
         store.clone(),
         secrets.clone(),
         transport,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
     connectors
         .configure(
@@ -433,8 +434,14 @@ impl Fixture {
             store.clone(),
             events.clone(),
             Duration::from_secs(10),
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
-        let models = ModelService::new(store.clone()).await.unwrap();
+        let models = ModelService::new(
+            store.clone(),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap();
         let logs = LogService::new(store.clone(), models.clone());
         let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
         let github = Arc::new(Github {

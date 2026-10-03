@@ -487,7 +487,9 @@ async fn a_missing_default_model_is_an_unresolved_handoff_not_an_error() {
     // The real service, real tier resolution, no configured default: the
     // deterministic path stands and the run reports why it did not run.
     let store = Arc::new(pam_store::Store::open_in_memory().await.unwrap());
-    let service = ModelService::new(store).await.unwrap();
+    let service = ModelService::new(store, crate::managed_policy_service::PolicyHandle::none())
+        .await
+        .unwrap();
     let tier_model = TierModel {
         service: service.as_ref(),
         tier: Tier::Heavy,

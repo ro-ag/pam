@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "revision": "2026-10-02.1",
+  "organization": "Example Corp",
+  "contact": "it-help@example.com",
+  "comment": "Network only: PAM goes through the corporate proxy and mirrors; nothing else is managed.",
+  "network": {
+    "proxy": { "locked": { "url": "http://proxy.example.com:8080", "auth": "none" }, "reason": "NET-7" },
+    "no_proxy": { "locked": ["git.example.com", "artifacts.example.com", "10.0.0.0/8"] },
+    "mirror_allowed_hosts": ["artifacts.example.com"],
+    "engine_mirror": { "default": "https://artifacts.example.com/llama.cpp" },
+    "models_mirror": { "default": "https://artifacts.example.com/hf" }
+  }
+}

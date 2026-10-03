@@ -160,9 +160,13 @@ impl ConnectorService {
         revision: &str,
         op: &LandingGithubOp,
     ) -> Result<Option<ConnectorRow>, InvokeError> {
-        let snapshot = crate::landing_policy::Snapshot::load(&self.store)
-            .await
-            .map_err(|_| denied())?;
+        // The effective landing policy: the managed ceiling and server list
+        // are re-checked here too, behind the flow's own checks. The
+        // revision stays the stored document's.
+        let snapshot =
+            crate::landing_policy::Snapshot::load_effective(&self.store, &self.policy().view())
+                .await
+                .map_err(|_| denied())?;
         if snapshot.revision != revision {
             return Err(denied());
         }

@@ -83,6 +83,12 @@ pub enum NetFailure {
     /// The stored network settings cannot be used. Never answered by falling
     /// back to a direct connection.
     SettingsInvalid(String),
+    /// The managed policy's network setting cannot be put in force (a
+    /// proxy, no-proxy list or CA bundle the organization requires was
+    /// rejected or failed its import). Never answered by falling back to a
+    /// direct connection: that would bypass what the organization requires.
+    /// The human cannot fix it from Settings; the administrator can.
+    PolicyInvalid(String),
     /// The private CA bundle copy no longer matches its recorded digest.
     CaBundleTampered,
     /// A value could not be written into curl's config safely, or the
@@ -218,6 +224,7 @@ impl NetFailure {
             Self::CurlUnavailable => "curl_unavailable",
             Self::CurlTooOld { .. } => "curl_too_old",
             Self::SettingsInvalid(_) => "network_settings_invalid",
+            Self::PolicyInvalid(_) => "network_policy_invalid",
             Self::CaBundleTampered => "network_ca_tampered",
             Self::RequestInvalid { .. } => "request_invalid",
             Self::Spawn(_) => "curl_spawn_failed",
@@ -262,6 +269,9 @@ impl NetFailure {
             }
             Self::SettingsInvalid(detail) => {
                 format!("The network settings cannot be used: {detail}")
+            }
+            Self::PolicyInvalid(detail) => {
+                format!("The managed network policy cannot be used: {detail}")
             }
             Self::CaBundleTampered => {
                 "PAM's copy of the CA bundle changed since it was imported; the request was not \
@@ -373,6 +383,10 @@ impl NetFailure {
             Self::SettingsInvalid(_) => {
                 "Open Settings › Network, correct the setting named here and save."
             }
+            Self::PolicyInvalid(_) => {
+                "The managed policy's network setting is invalid: ask your administrator; nothing \
+                 was sent."
+            }
             Self::CaBundleTampered | Self::CaBundleUnreadable => {
                 "Re-import the CA bundle in Settings › Network."
             }
@@ -405,7 +419,7 @@ impl NetFailure {
                  leave through a proxy, set one in Settings › Network."
             }
             Self::TlsUntrustedIssuer { .. } => {
-                "If your organisation inspects TLS, import its root CA in Settings › Network, or \
+                "If your organization inspects TLS, import its root CA in Settings › Network, or \
                  ask IT to deploy it to this computer's trust store."
             }
             Self::TlsHostnameMismatch { .. } => {

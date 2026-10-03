@@ -30,7 +30,12 @@ async fn service_with(
 ) {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let (events, rx) = EventPublisher::for_tests();
-    let service = Arc::new(ApprovalService::new(Arc::clone(&store), events, timeout));
+    let service = Arc::new(ApprovalService::new(
+        Arc::clone(&store),
+        events,
+        timeout,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     (store, service, rx)
 }
 
@@ -568,4 +573,117 @@ async fn a_finished_request_cannot_be_parked_for_approval() {
     })
     .await
     .unwrap();
+}
+
+/// The approval service enforces the managed policy itself, against the
+/// policy in force when it records the answer: a remembered approval the
+/// policy does not allow is a one-time approval (no grant), and the audit
+/// row says the human asked.
+#[tokio::test]
+async fn a_remembered_approval_the_policy_refuses_is_downgraded_to_one_time() {
+    timeout(DEADLINE, async {
+        for policy in [
+            r#"{"version":1,"security":{"grants":{"remember":"deny"}}}"#,
+            r#"{"version":1,"security":{"grants":{"manual":"deny"}}}"#,
+            r#"{"version":1,"security":{"grants":{"never":["rel*"]}}}"#,
+        ] {
+            let store = Arc::new(Store::open_in_memory().await.unwrap());
+            let source = crate::policy_test::SwitchablePolicy::new(Some(policy));
+            let handle = crate::policy_test::managed_handle(&store, &source).await;
+            let (events, mut rx) = EventPublisher::for_tests();
+            let service = Arc::new(ApprovalService::new(
+                Arc::clone(&store),
+                events,
+                LONG_TIMEOUT,
+                handle,
+            ));
+            insert_request(&store, "req_1").await;
+            assert_eq!(service.waiting_capability("req_1").await, None);
+            let (_cancel, wait) = spawn_wait(&service, "req_1");
+            expect_pending_event(&mut rx, "req_1").await;
+            assert_eq!(
+                service.waiting_capability("req_1").await.as_deref(),
+                Some(CAPABILITY)
+            );
+
+            service
+                .resolve("req_1", Resolution::Approve { remember: true })
+                .await
+                .expect("the approval itself goes through");
+            assert_eq!(
+                wait.await.unwrap().unwrap(),
+                ApprovalOutcome::Approved { remember: false },
+                "{policy}"
+            );
+            assert!(!store.active_grant(CAPABILITY).await.unwrap(), "{policy}");
+            let audit = store.audit_for_request("req_1").await.unwrap();
+            assert!(
+                audit
+                    .iter()
+                    .all(|row| row.action != ACTION_GRANT_FROM_APPROVAL)
+            );
+            let approval = audit
+                .iter()
+                .find(|row| row.action == ACTION_APPROVAL)
+                .expect("the approval row");
+            let detail: serde_json::Value =
+                serde_json::from_str(approval.detail.as_deref().unwrap()).unwrap();
+            assert_eq!(detail["remember"], false);
+            assert_eq!(detail["remember_refused"], true);
+        }
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[test]
+fn remember_refusal_names_the_key_that_refuses() {
+    use crate::approval::remember_refusal;
+    use crate::managed_policy::{
+        CAUSE_POLICY_FROZEN, CAUSE_POLICY_NOT_ALLOWED, CAUSE_SETTING_LOCKED, Key, PolicyView,
+        TargetPlatform, inspect_bytes,
+    };
+    let view = |text: &str| -> PolicyView {
+        inspect_bytes(text.as_bytes(), TargetPlatform::host())
+            .result
+            .expect("the document parses")
+            .with_fallback(None)
+    };
+    assert!(remember_refusal(&PolicyView::unmanaged(), Some("release")).is_none());
+    let allow =
+        view(r#"{"version":1,"security":{"grants":{"remember":"allow","manual":"allow"}}}"#);
+    assert!(remember_refusal(&allow, Some("release")).is_none());
+
+    let remember = view(r#"{"version":1,"security":{"grants":{"remember":"deny"}}}"#);
+    let refusal = remember_refusal(&remember, None).unwrap();
+    assert_eq!(
+        (refusal.key, refusal.cause),
+        (Key::GrantsRemember, CAUSE_SETTING_LOCKED)
+    );
+
+    let manual = view(r#"{"version":1,"security":{"grants":{"manual":"deny"}}}"#);
+    let refusal = remember_refusal(&manual, None).unwrap();
+    assert_eq!(
+        (refusal.key, refusal.cause),
+        (Key::GrantsManual, CAUSE_SETTING_LOCKED)
+    );
+
+    let never = view(r#"{"version":1,"security":{"grants":{"never":["release"]}}}"#);
+    assert!(
+        remember_refusal(&never, None).is_none(),
+        "an unknown capability is not matched"
+    );
+    let refusal = remember_refusal(&never, Some("release")).unwrap();
+    assert_eq!(
+        (refusal.key, refusal.cause),
+        (Key::GrantsNever, CAUSE_POLICY_NOT_ALLOWED)
+    );
+    assert!(remember_refusal(&never, Some("deploy")).is_none());
+
+    let held = view(r#"{"version":1,"security":{"grants":{"never":"release"}}}"#);
+    let refusal = remember_refusal(&held, Some("deploy")).unwrap();
+    assert_eq!(
+        (refusal.key, refusal.cause),
+        (Key::GrantsNever, CAUSE_POLICY_FROZEN)
+    );
 }

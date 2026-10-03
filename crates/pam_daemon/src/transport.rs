@@ -90,7 +90,8 @@ impl Transport {
     /// Binds the public endpoint under `dirs` and starts the framed listener
     /// on it: [`RuntimeDir::public_socket`] (unix) or a loopback port behind
     /// [`RuntimeDir::public_control`] (Windows), serving from `store`,
-    /// `phase` and `image`. Valid requests arrive on `incoming`; events go
+    /// `phase`, `image` and the managed policy `managed` (a follow
+    /// re-authorizes under its effective scopes). Valid requests arrive on `incoming`; events go
     /// through `hub`. Must be called inside a tokio runtime and while holding
     /// the daemon's instance lock: stale socket files are removed.
     ///
@@ -104,6 +105,7 @@ impl Transport {
         phase: watch::Sender<LifecyclePhase>,
         hub: Arc<EventHub>,
         image: Arc<ImageWatch>,
+        managed: Arc<crate::managed_policy_service::PolicyHandle>,
     ) -> Result<Self, TransportError> {
         remove_superseded(dirs);
         let acceptor = bind_public(dirs)?;
@@ -113,6 +115,7 @@ impl Transport {
             phase,
             Arc::clone(&hub),
             image,
+            managed,
         );
         Ok(Self {
             hub,

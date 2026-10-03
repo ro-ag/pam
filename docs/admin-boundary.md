@@ -427,6 +427,51 @@ that repository's tickets; the follow is scoped, not private to one agent. The
 stream that carries every ticket with its real notes exists only on the private
 endpoint, for the GUI.
 
+## Managed policy
+
+An organization can constrain this authority from outside the user's account
+with a [managed policy file](policy/README.md)
+([design](specs/2026-10-02-managed-policy-file.md)). The daemon reads it from
+one fixed path, `/Library/Application Support/PAM/policy.json` on macOS or
+`%ProgramData%\PAM\policy.json` on Windows; no flag, environment variable,
+`PAM_BASE_DIR` or admin op can name another, so an agent that starts a daemon
+of its own gets the same machine policy. The file is used only after a trust
+check on one handle: on macOS the file and every folder above it are owned by
+root and not writable by group or others, nothing in the path is a symlink,
+and the daemon cannot open the file for write; on Windows the daemon's own
+token can neither write, delete, re-permission nor take ownership of the file
+or its folder. A daemon running as root or elevated reads every file as
+untrusted. The residuals are stated in the design: an extended ACL on a macOS
+parent folder is not visible to the check, and on Windows the probe cannot see
+an entry that grants write to a different local account.
+
+The policy can only tighten what the human grants and lock what the human
+sets: lock, default, bound or allowlist a setting, deny capabilities by
+pattern or class on every profile even under an active grant, narrow the
+repository roots, connector hosts, GitHub servers, model sources and curators,
+and pin the network path. It is an overlay computed when a setting is read;
+the user's rows in `~/.pam` are never rewritten, and removing the file
+restores them. The daemon refuses an admin write to a managed key
+(`setting_locked`, `policy_not_allowed`, or `policy_frozen` while the file is
+unusable) and records a `policy.locked_write` audit row with the policy's
+digest beside the terminal `admin`/`refuse` row. A file that fails the trust
+check or is damaged never loosens anything: the last good copy stays in force,
+and with none the authority keys are frozen.
+
+It is not an authority path for agents. It adds no capability to the public
+plane: the public `status` carries only the state, revision, a digest prefix
+and the rejected-leaf count, and a request the policy denies is refused
+`policy_denied` without the rule. Control requests (`status`, `query`,
+`cancel`, `doctor.report`) are never denied, so a broad never-grant rule
+cannot take down the control plane. `admin.policy.get` and
+`admin.policy.reload` are private-plane ops like any other, and a reload only
+re-reads the root-owned file. A trusted file that loosens a setting (a locked
+`relaxed` profile) is honoured because whoever could write it already
+administers the machine; an agent that can write as the user cannot produce a
+trusted file. Like the rest of this boundary, the policy does not stop a local
+administrator or a different PAM build; that is the MDM's application
+allow-listing.
+
 ## Failure behavior
 
 Administration uses no bearer secret carried through the public protocol and

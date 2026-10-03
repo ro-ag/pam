@@ -43,7 +43,13 @@ async fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
 /// Return only selected durable metadata, never the protected verdict body.
 pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx).await?;
-    let (status, result) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
+    let (status, result) = authorized_metadata(
+        &ctx.store,
+        &ctx.flows.policy().view(),
+        &ctx.caller.repo,
+        &ticket,
+    )
+    .await?;
     let output = result_output(&ctx.request_id, &ticket, &status, result.as_ref())?;
     let watch = match ctx
         .store
@@ -54,7 +60,13 @@ pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, Capabi
         Some(progress) => {
             let watch: Value = serde_json::from_str(&progress).map_err(|_| unavailable())?;
             // Progress may have been published after the first origin snapshot.
-            authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
+            authorized_metadata(
+                &ctx.store,
+                &ctx.flows.policy().view(),
+                &ctx.caller.repo,
+                &ticket,
+            )
+            .await?;
             Some(watch)
         }
         None => None,
@@ -65,7 +77,13 @@ pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, Capabi
         .await
         .map_err(|_| unavailable())?
         .unwrap_or(Value::Null);
-    authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
+    authorized_metadata(
+        &ctx.store,
+        &ctx.flows.policy().view(),
+        &ctx.caller.repo,
+        &ticket,
+    )
+    .await?;
     fit_optional(
         &ctx.request_id,
         output.outcome,
@@ -157,7 +175,13 @@ pub(crate) fn result_output(
 /// Scoped replacement for the former unrestricted status lookup.
 pub(crate) async fn scoped_query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx).await?;
-    let (status, _) = authorized_metadata(&ctx.store, &ctx.caller.repo, &ticket).await?;
+    let (status, _) = authorized_metadata(
+        &ctx.store,
+        &ctx.flows.policy().view(),
+        &ctx.caller.repo,
+        &ticket,
+    )
+    .await?;
     let outcome = if status.state.is_terminal() {
         status
             .outcome
@@ -176,12 +200,16 @@ pub(crate) async fn scoped_query(ctx: &ExecContext) -> Result<CapabilityOutput, 
 }
 
 /// Authorization happens before exposing existence, including terminal status.
+/// The scopes are the effective ones under `view`, the managed policy.
 pub(crate) async fn authorized_metadata(
     store: &Store,
+    view: &crate::managed_policy::PolicyView,
     caller_repo: &str,
     ticket: &str,
 ) -> Result<(RequestStatusMeta, Option<FlowResultMeta>), CapabilityFailure> {
-    let policy = ScopePolicy::load(store).await.map_err(|_| unavailable())?;
+    let policy = ScopePolicy::load_effective(store, view)
+        .await
+        .map_err(|_| unavailable())?;
     let repo = policy
         .authorize_repo_blocking(Path::new(caller_repo))
         .await
@@ -235,7 +263,9 @@ pub(crate) async fn authorized_metadata(
             .await
             .map_err(|_| unavailable())?;
     }
-    let current = ScopePolicy::load(store).await.map_err(|_| unavailable())?;
+    let current = ScopePolicy::load_effective(store, view)
+        .await
+        .map_err(|_| unavailable())?;
     current
         .authorize_repo_blocking(&repo)
         .await

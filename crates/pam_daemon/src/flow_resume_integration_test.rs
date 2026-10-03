@@ -112,15 +112,15 @@ async fn lifecycle_recovery_skips_checkpointed_read_and_preserves_evidence() {
         store.set_setting("flows.scope_policy",&json!({"version":1,"repositories":[{"root":root,"connectors":[{"connector":"github","base_url":"https://github.test/","access":"targets","targets":["team/repo"]}]}]}).to_string()).await.unwrap();
         let (events,mut receiver)=EventPublisher::for_tests();
         let drain=tokio::spawn(async move{while receiver.recv().await.is_some(){}});
-        let approvals=Arc::new(ApprovalService::new(store.clone(),events.clone(),Duration::from_secs(10)));
-        let models=ModelService::new(store.clone()).await.unwrap();
+        let approvals=Arc::new(ApprovalService::new(store.clone(),events.clone(),Duration::from_secs(10), crate::managed_policy_service::PolicyHandle::none()));
+        let models=ModelService::new(store.clone(), crate::managed_policy_service::PolicyHandle::none()).await.unwrap();
         let logs=LogService::new(store.clone(),models.clone());
         let secrets=Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
         let reads=Arc::new(Reads::default());
-        let connectors=Arc::new(ConnectorService::new(store.clone(),secrets.clone(),reads.clone()));
+        let connectors=Arc::new(ConnectorService::new(store.clone(),secrets.clone(),reads.clone(), crate::managed_policy_service::PolicyHandle::none()));
         connectors.configure(pam_flow::ConnectorId::Github,ConfigurePatch{enabled:Some(true),base_url:Some(Some("https://github.test/".to_owned())),credential:Some(CredentialAction::Set(crate::secrets::Secret::new("fixture-only".to_owned()))),..ConfigurePatch::default()}).await.unwrap();
-        let gate=Arc::new(PolicyGate::new(store.clone()).await.unwrap());
-        let flows=Arc::new(FlowService::new(base.path(),store.clone(),approvals.clone(),connectors,logs,gate));
+        let gate=Arc::new(PolicyGate::new(store.clone(), crate::managed_policy_service::PolicyHandle::none()).await.unwrap());
+        let flows=Arc::new(FlowService::new(base.path(),store.clone(),approvals.clone(),connectors,logs,gate, crate::managed_policy_service::PolicyHandle::none()));
         let queue=Arc::new(QueueManager::new(store.clone()));
         let (_cancel,rx)=tokio::sync::watch::channel(false);
         for step in ["first","second"] {
@@ -208,16 +208,30 @@ impl Gated {
             store.clone(),
             events.clone(),
             Duration::from_secs(20),
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
-        let models = ModelService::new(store.clone()).await.unwrap();
+        let models = ModelService::new(
+            store.clone(),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap();
         let logs = LogService::new(store.clone(), models.clone());
         let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
         let connectors = Arc::new(ConnectorService::new(
             store.clone(),
             secrets.clone(),
             Arc::new(Reads::default()),
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
-        let gate = Arc::new(PolicyGate::new(store.clone()).await.unwrap());
+        let gate = Arc::new(
+            PolicyGate::new(
+                store.clone(),
+                crate::managed_policy_service::PolicyHandle::none(),
+            )
+            .await
+            .unwrap(),
+        );
         let flows = Arc::new(FlowService::new(
             base.path(),
             store.clone(),
@@ -225,6 +239,7 @@ impl Gated {
             connectors,
             logs,
             gate,
+            crate::managed_policy_service::PolicyHandle::none(),
         ));
         let queue = Arc::new(QueueManager::new(store.clone()));
         let (cancel, rx) = tokio::sync::watch::channel(false);

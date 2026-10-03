@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "revision": "2026-10-02.1",
+  "organization": "Example Corp",
+  "contact": "it-help@example.com",
+  "security": {
+    "profile": { "floor": "standard", "reason": "SEC-114: no machine below the standard profile" }
+  }
+}

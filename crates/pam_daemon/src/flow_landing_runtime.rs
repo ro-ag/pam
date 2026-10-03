@@ -116,18 +116,49 @@ fn permitted(policy: &Repository, operation: Op) -> bool {
         _ => true,
     }
 }
+/// The landing permission name of `operation`, for the ceiling check.
+fn permission_name(operation: Op) -> Option<&'static str> {
+    match operation {
+        Op::Push => Some("push"),
+        Op::EnsurePr => Some("create_pr"),
+        Op::Merge => Some("merge"),
+        Op::Sync => Some("sync"),
+        _ => None,
+    }
+}
+/// Whether the effective landing document (the human's recipe under the
+/// managed policy `view`) authorizes `operation` in `repo`. A permission the
+/// policy's ceiling caps off refuses with the policy's cause.
 pub(super) async fn inspect_policy(
     store: &Store,
+    view: &crate::managed_policy::PolicyView,
     repo: &Path,
     operation: Op,
 ) -> Result<(), FlowRefusal> {
-    let policy = Policy::load(store)
+    let policy = Policy::load_effective(store, view)
         .await
         .map_err(|e| FlowRefusal::new(e.cause, e.detail.to_owned(), RECOVERY))?;
-    let repository = policy
-        .repository(repo)
-        .map_err(|e| FlowRefusal::new(e.cause, e.detail.to_owned(), RECOVERY))?;
+    let repository = policy.repository(repo).map_err(|e| {
+        let recovery = if e.cause == crate::managed_policy::CAUSE_POLICY_DENIED {
+            crate::managed_policy::RECOVERY_MANAGED
+        } else {
+            RECOVERY
+        };
+        FlowRefusal::new(e.cause, e.detail.to_owned(), recovery)
+    })?;
     if !permitted(repository, operation) {
+        if let Some(permission) = permission_name(operation)
+            && policy.ceiling_forbids(permission)
+        {
+            return Err(FlowRefusal::new(
+                crate::managed_policy::CAUSE_POLICY_DENIED,
+                format!(
+                    "your organization's policy does not allow landing to {permission} on this \
+                     machine (landing.max_permissions)"
+                ),
+                crate::managed_policy::RECOVERY_MANAGED,
+            ));
+        }
         return Err(FlowRefusal::new(
             "landing_permission_missing",
             "The GUI landing policy does not authorize this operation.".to_owned(),
@@ -209,7 +240,7 @@ impl RunState<'_> {
             && poll.authorization_revision == revision)
     }
     async fn landing_policy(&self) -> Result<(String, Repository), CapabilityFailure> {
-        let policy = Policy::load(&self.service.store)
+        let policy = Policy::load_effective(&self.service.store, &self.service.policy.view())
             .await
             .map_err(|e| refused(e.cause, e.detail))?;
         let repository = policy
@@ -298,9 +329,12 @@ impl RunState<'_> {
                 return Err(failure());
             }
             let origin = serde_json::from_str(&view.origin_json).map_err(|_| failure())?;
-            let scope = crate::scope_policy::ScopePolicy::load(&self.service.store)
-                .await
-                .map_err(|_| failure())?;
+            let scope = crate::scope_policy::ScopePolicy::load_effective(
+                &self.service.store,
+                &self.service.policy.view(),
+            )
+            .await
+            .map_err(|_| failure())?;
             crate::evidence_service::authorize_origin(
                 &self.service.store,
                 &scope,

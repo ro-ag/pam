@@ -38,7 +38,12 @@ async fn service(request_id: &str) -> (Arc<Store>, Arc<LogService>) {
         )
         .await
         .unwrap();
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), models);
     (store, logs)
 }
@@ -274,6 +279,7 @@ fn registry_coordinates(path: &Path) -> (PathBuf, String) {
 /// the variable unset the test prints how to enable it and passes.
 #[tokio::test]
 async fn bench_model_writes_a_summary_row() {
+    let policy = crate::managed_policy_service::PolicyHandle::none();
     let Some(raw) = std::env::var_os(BENCH_MODEL_ENV) else {
         eprintln!("summary bench skipped: set {BENCH_MODEL_ENV}=<models dir>/<vendor>/<file>.gguf");
         return;
@@ -308,7 +314,9 @@ async fn bench_model_writes_a_summary_row() {
         )
         .await
         .unwrap();
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(Arc::clone(&store), policy.clone())
+        .await
+        .unwrap();
     let (sha256, size_bytes) = pam_model::registry::sha256_file(Path::new(&raw)).unwrap();
     models
         .registry()

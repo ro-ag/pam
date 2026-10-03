@@ -281,3 +281,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pipe-masks-exit-before-push
+- kind: habit
+- scope: project
+- rule: Never chain a check into a push through a pipe: 'cargo clippy ... | tail -1 && git push' pushes even when clippy fails, because the pipeline's exit code is tail's. Run the check without a pipe (redirect to a file) or use set -o pipefail before chaining to an irreversible step.
+- fix: 2026-10-02: a clippy too_many_lines error reached PR 167 this way; fixed forward in 4dbf150. Use: cargo clippy ... >log 2>&1 && git push, or bash -o pipefail -c.
+- hits: 2026-10-02
+- cost: 0
+- status: watching
+

@@ -91,7 +91,12 @@ async fn frozen_screening_replays_the_real_deterministic_pipeline_without_label_
         .set_setting(SETTING_MODELS_DIR, temp.path().to_str().unwrap())
         .await
         .unwrap();
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        pam_daemon::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), models);
     let mut results = Vec::new();
     for (case, source) in cases {
@@ -174,7 +179,12 @@ async fn forty_megabyte_derived_log_measures_bounds_without_claiming_model_fit()
         .set_setting(SETTING_MODELS_DIR, temp.path().to_str().unwrap())
         .await
         .unwrap();
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        pam_daemon::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), models);
     let (result, micros) = replay(&store, &logs, &case, &source, 40).await;
     let report = json!({"schema_version":1,"purpose":"derived_stress_not_an_independent_incident",

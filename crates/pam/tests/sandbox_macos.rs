@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use pam_daemon::daemon::run_daemon;
+use pam_daemon::daemon::{DaemonConfig, run_daemon_with};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_store::Store;
 use serde_json::json;
@@ -165,7 +165,20 @@ async fn sandbox_allows_brokered_evidence_but_denies_private_authority() {
         store.set_setting("flows.scope_policy", &json!({"version":1,"repositories":[{"root":repo,"connectors":[]}]}).to_string()).await.unwrap();
         drop(store);
         let (shutdown, receiver) = watch::channel(false);
-        let daemon = run_daemon(Some(base.clone()), receiver).await.unwrap();
+        // A scripted "no policy file": a policy installed on the machine
+        // running the tests is never read.
+        let daemon = run_daemon_with(
+            DaemonConfig {
+                base_dir: Some(base.clone()),
+                policy_source: Some(pam_testkit::ScriptedPolicy::absent()),
+                // An in-memory keychain: tests never touch the real one.
+                secret_backend: Some(std::sync::Arc::new(pam_testkit::FakeSecretBackend::default())),
+                ..DaemonConfig::default()
+            },
+            receiver,
+        )
+        .await
+        .unwrap();
         let profile = root.join("agent.sb");
         let home = std::env::home_dir().unwrap().canonicalize().unwrap();
         let text = include_str!("support/broker-macos.sb")

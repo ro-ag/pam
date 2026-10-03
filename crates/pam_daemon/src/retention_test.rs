@@ -17,7 +17,10 @@ const DAY: i64 = 86_400;
 /// itself so a test can seed rows and read them back.
 async fn service() -> (Arc<Store>, RetentionService) {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    (Arc::clone(&store), RetentionService::new(store))
+    (
+        Arc::clone(&store),
+        RetentionService::new(store, crate::managed_policy_service::PolicyHandle::none()),
+    )
 }
 
 /// One request that has already finished, so a prune may touch it.
@@ -827,5 +830,311 @@ async fn forever_windows_are_never_held_back() {
     assert_eq!(
         store.get_setting(SETTING_WATERMARK).await.unwrap(),
         Some((start + 100 * DAY).to_string())
+    );
+}
+
+// ---- the managed policy -------------------------------------------------
+
+/// A retention service over a fresh store whose policy handle read `policy`,
+/// a trusted scripted file.
+async fn managed_service(policy: &str) -> (Arc<Store>, RetentionService) {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let handle = crate::managed_policy_service::PolicyHandle::load(
+        Arc::clone(&store),
+        Arc::new(crate::daemon_test::ScriptedPolicy::new(Some(policy))),
+        std::path::Path::new("pam-tests-have-no-base"),
+    )
+    .await;
+    assert!(
+        matches!(handle.status().state.as_str(), "active" | "degraded"),
+        "{:?}",
+        handle.status()
+    );
+    (Arc::clone(&store), RetentionService::new(store, handle))
+}
+
+const CEILING: &str = r#"{
+    "version": 1, "revision": "r9", "contact": "it@example.test",
+    "retention": { "evidence_days": { "max": 30 }, "audit_days": { "max": 90 } }
+}"#;
+
+fn policy_refusal(error: RetentionRefusal) -> crate::managed_policy::WriteRefusal {
+    match error {
+        RetentionRefusal::Policy { refusal, .. } => refusal,
+        other => panic!("expected the managed policy's refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_ceiling_clamps_forever_and_every_reader_sees_the_clamped_pair() {
+    let (store, service) = managed_service(CEILING).await;
+    // Nothing stored at all, which reads as forever: the ceiling is the window.
+    let want = RetentionSettings {
+        evidence_days: Some(30),
+        audit_days: Some(90),
+    };
+    assert_eq!(service.settings().await.unwrap(), want);
+    // A stored "forever" is clamped too, and a stored longer window.
+    store
+        .set_setting(SETTING_EVIDENCE_DAYS, "null")
+        .await
+        .unwrap();
+    store.set_setting(SETTING_AUDIT_DAYS, "400").await.unwrap();
+    assert_eq!(service.settings().await.unwrap(), want);
+    // The human's rows are never rewritten.
+    assert_eq!(
+        store
+            .get_setting(SETTING_EVIDENCE_DAYS)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("null")
+    );
+    assert_eq!(
+        store
+            .get_setting(SETTING_AUDIT_DAYS)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("400")
+    );
+    let (_, entries) = service.effective().await.unwrap();
+    for entry in &entries {
+        assert_eq!(entry.source, crate::network_service::Source::Policy);
+        assert!(entry.clamped);
+        assert!(!entry.locked);
+    }
+    assert_eq!(
+        entries[1].constraint,
+        Some(serde_json::json!({ "max": 90 }))
+    );
+
+    // The pass reads the same pair: a record older than 90 days goes, with
+    // the policy's window, although the human stored forever.
+    store.set_setting(SETTING_AUDIT_DAYS, "null").await.unwrap();
+    finished_request(&store, "old").await;
+    let clock = Arc::new(AtomicI64::new(crate::retention::now_ts() + 100 * DAY));
+    let reader = Arc::clone(&clock);
+    let service = service.with_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    let PassOutcome::Ran { report, .. } = service.run_pass(Trigger::Manual).await.unwrap() else {
+        panic!("a manual pass always runs");
+    };
+    // The old request, and the policy's own load request (also older than 90 days).
+    assert!(report.requests >= 1, "{report:?}");
+    assert!(store.get_request("old").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_floor_lengthens_a_shorter_window_and_leaves_forever_alone() {
+    let (store, service) =
+        managed_service(r#"{ "version": 1, "retention": { "audit_days": { "min": 365 } } }"#).await;
+    store.set_setting(SETTING_AUDIT_DAYS, "30").await.unwrap();
+    assert_eq!(service.settings().await.unwrap().audit_days, Some(365));
+    store.set_setting(SETTING_AUDIT_DAYS, "null").await.unwrap();
+    assert_eq!(service.settings().await.unwrap().audit_days, None);
+}
+
+#[tokio::test]
+async fn a_locked_window_is_forced_and_a_default_applies_until_the_human_chooses() {
+    let (store, service) = managed_service(
+        r#"{ "version": 1, "retention": {
+            "evidence_days": { "locked": 14, "reason": "SEC-9" },
+            "audit_days": { "default": 120 } } }"#,
+    )
+    .await;
+    store.set_setting(SETTING_EVIDENCE_DAYS, "7").await.unwrap();
+    let (settings, entries) = service.effective().await.unwrap();
+    assert_eq!(settings.evidence_days, Some(14));
+    assert!(entries[0].locked);
+    assert_eq!(entries[0].reason.as_deref(), Some("SEC-9"));
+    // Unset: the default. Stored (even forever): the human's.
+    assert_eq!(settings.audit_days, Some(120));
+    assert_eq!(entries[1].source, crate::network_service::Source::Policy);
+    assert!(!entries[1].locked);
+    store.set_setting(SETTING_AUDIT_DAYS, "null").await.unwrap();
+    assert_eq!(service.settings().await.unwrap().audit_days, None);
+    store.set_setting(SETTING_AUDIT_DAYS, "200").await.unwrap();
+    assert_eq!(service.settings().await.unwrap().audit_days, Some(200));
+}
+
+#[tokio::test]
+async fn a_save_outside_the_bounds_refuses_and_writes_nothing() {
+    let (store, service) = managed_service(CEILING).await;
+    store.set_setting(SETTING_AUDIT_DAYS, "60").await.unwrap();
+
+    // Forever is above any ceiling.
+    let refusal = policy_refusal(
+        service
+            .set_settings(RetentionPatch {
+                audit_days: Some(None),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(
+        refusal.cause,
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    assert!(
+        refusal.detail.contains("retention.audit_days"),
+        "{}",
+        refusal.detail
+    );
+    assert!(refusal.detail.contains("forever"), "{}", refusal.detail);
+    assert!(
+        refusal.detail.contains("it@example.test"),
+        "{}",
+        refusal.detail
+    );
+    assert!(refusal.detail.contains("rev r9"), "{}", refusal.detail);
+    assert_eq!(refusal.recovery, crate::managed_policy::RECOVERY_MANAGED);
+    // So is a number above it.
+    let refusal = policy_refusal(
+        service
+            .set_settings(RetentionPatch {
+                evidence_days: Some(Some(31)),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(
+        refusal.key,
+        crate::managed_policy::Key::RetentionEvidenceDays
+    );
+    assert_eq!(
+        store
+            .get_setting(SETTING_AUDIT_DAYS)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("60")
+    );
+    assert_eq!(
+        store.get_setting(SETTING_EVIDENCE_DAYS).await.unwrap(),
+        None
+    );
+
+    // Inside the bounds is saved, and answers the windows in force.
+    let saved = service
+        .set_settings(RetentionPatch {
+            evidence_days: Some(Some(20)),
+            audit_days: Some(Some(45)),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        saved,
+        RetentionSettings {
+            evidence_days: Some(20),
+            audit_days: Some(45)
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_locked_window_refuses_setting_locked_and_a_held_one_policy_frozen() {
+    let (store, service) =
+        managed_service(r#"{ "version": 1, "retention": { "audit_days": { "locked": 365 } } }"#)
+            .await;
+    let refusal = policy_refusal(
+        service
+            .set_settings(RetentionPatch {
+                audit_days: Some(Some(365)),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(refusal.cause, crate::managed_policy::CAUSE_SETTING_LOCKED);
+    assert_eq!(store.get_setting(SETTING_AUDIT_DAYS).await.unwrap(), None);
+    // The other window is the human's.
+    service
+        .set_settings(RetentionPatch {
+            evidence_days: Some(Some(30)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // A leaf the file got wrong, with no last-known-good copy, holds the key.
+    let (_store, held) =
+        managed_service(r#"{ "version": 1, "retention": { "audit_days": "ninety" } }"#).await;
+    let refusal = policy_refusal(
+        held.set_settings(RetentionPatch {
+            audit_days: Some(Some(30)),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(refusal.cause, crate::managed_policy::CAUSE_POLICY_FROZEN);
+    // Reads show the human's value, unmanaged.
+    assert_eq!(held.settings().await.unwrap(), RetentionSettings::default());
+}
+
+#[tokio::test]
+async fn a_default_keeps_applying_to_a_window_the_human_never_set() {
+    let (store, service) = managed_service(
+        r#"{ "version": 1, "retention": {
+            "evidence_days": { "default": 45 }, "audit_days": { "default": 120 } } }"#,
+    )
+    .await;
+    service
+        .set_settings(RetentionPatch {
+            audit_days: Some(Some(200)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // The untouched window was not frozen into a stored "forever".
+    assert_eq!(
+        store.get_setting(SETTING_EVIDENCE_DAYS).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        service.settings().await.unwrap(),
+        RetentionSettings {
+            evidence_days: Some(45),
+            audit_days: Some(200)
+        }
+    );
+}
+
+#[tokio::test]
+async fn removing_the_policy_restores_what_the_human_stored() {
+    let (store, service) = managed_service(CEILING).await;
+    store.set_setting(SETTING_AUDIT_DAYS, "400").await.unwrap();
+    assert_eq!(service.settings().await.unwrap().audit_days, Some(90));
+    let plain = RetentionService::new(store, crate::managed_policy_service::PolicyHandle::none());
+    assert_eq!(plain.settings().await.unwrap().audit_days, Some(400));
+}
+
+#[tokio::test]
+async fn the_clock_jump_guard_still_holds_back_a_policy_forced_window() {
+    let (store, service) = managed_service(
+        r#"{ "version": 1, "retention": {
+            "evidence_days": { "locked": 30 }, "audit_days": { "locked": 30 } } }"#,
+    )
+    .await;
+    finished_request(&store, "old").await;
+    let start = crate::retention::now_ts();
+    let clock = Arc::new(AtomicI64::new(start));
+    let reader = Arc::clone(&clock);
+    let service = service
+        .with_clock(Arc::new(move || reader.load(Ordering::SeqCst)))
+        .with_census(census(80, 100));
+    let hourly = Trigger::Scheduled(Duration::from_hours(1));
+    assert!(matches!(
+        service.run_pass(hourly).await.unwrap(),
+        PassOutcome::Ran { .. }
+    ));
+    clock.store(start + 100 * DAY, Ordering::SeqCst);
+    let notice = skipped(service.run_pass(hourly).await.unwrap());
+    assert_eq!(notice.jump_secs, 100 * DAY);
+    assert!(
+        store.get_request("old").await.unwrap().is_some(),
+        "nothing was deleted"
     );
 }

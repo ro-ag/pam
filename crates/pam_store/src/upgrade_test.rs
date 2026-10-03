@@ -31,12 +31,14 @@ fn later_binary(extra: i64) -> Vec<Migration> {
         .map(|migration| Migration {
             version: migration.version,
             sql: migration.sql,
+            code: migration.code,
         })
         .collect();
     for (step, sql) in (1..=extra).zip(LATER) {
         known.push(Migration {
             version: latest + step,
             sql,
+            code: None,
         });
     }
     known
@@ -307,6 +309,7 @@ fn a_failed_migration_leaves_the_database_at_its_version_and_keeps_the_backup() 
     broken.push(Migration {
         version: latest + 2,
         sql: "CREATE TABLE later_1 (y INTEGER);",
+        code: None,
     });
     let error = open_and_close(&path, &broken).unwrap_err();
     assert!(error.to_string().contains("already exists"), "{error}");

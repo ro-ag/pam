@@ -2185,3 +2185,139 @@ async fn the_policy_last_good_row_is_bounded_and_deletable() {
         None
     );
 }
+
+// --- One terminal audit row per request, by the schema (store finding 9) ---
+
+fn terminal_entry(action: &str) -> AuditEntry<'_> {
+    AuditEntry {
+        action,
+        decision: Decision::Allow,
+        actor: Actor::System,
+        detail: None,
+    }
+}
+
+async fn terminal_rows(store: &Store, id: &str) -> Vec<String> {
+    let id = id.to_owned();
+    store
+        .raw(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT action FROM audit WHERE request_id = ?1 AND terminal = 1 ORDER BY id",
+            )?;
+            stmt.query_map([id], |row| row.get(0))?.collect()
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_terminal_writer_flags_its_row_and_no_other() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "r").await;
+    // The managed policy's daemon-owned request carries several rows of the
+    // same terminal-capable action before its finish; none of them counts.
+    for _ in 0..3 {
+        store
+            .append_audit("r", "policy.load", Decision::Allow, Actor::Policy, None)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .finish_request("r", RequestState::Done, None, terminal_entry("policy.load"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        terminal_rows(&store, "r").await,
+        vec!["policy.load".to_owned()]
+    );
+    assert_eq!(store.audit_for_request("r").await.unwrap().len(), 4);
+    // A note after the finish is an ordinary row.
+    store
+        .append_audit("r", "note", Decision::Allow, Actor::System, None)
+        .await
+        .unwrap();
+    assert_eq!(terminal_rows(&store, "r").await.len(), 1);
+    // A second finish is the idempotent no-op it always was.
+    assert!(
+        !store
+            .finish_request("r", RequestState::Failed, None, terminal_entry("execute"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        terminal_rows(&store, "r").await,
+        vec!["policy.load".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn a_second_terminal_audit_row_is_refused_by_the_schema() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "r").await;
+    store
+        .finish_request("r", RequestState::Done, None, terminal_entry("execute"))
+        .await
+        .unwrap();
+    let error = store
+        .raw_execute(
+            "INSERT INTO audit (request_id, action, decision, actor, ts, terminal) \
+             VALUES ('r', 'execute', 'allow', 'system', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("UNIQUE"), "{error}");
+    // Ordinary rows are not limited.
+    store
+        .raw_execute(
+            "INSERT INTO audit (request_id, action, decision, actor, ts, terminal) \
+             VALUES ('r', 'execute', 'allow', 'system', 1, 0)",
+            (),
+        )
+        .await
+        .unwrap();
+    // And the flag is 0 or 1.
+    assert!(
+        store
+            .raw_execute(
+                "INSERT INTO audit (request_id, action, decision, actor, ts, terminal) \
+                 VALUES ('r', 'x', 'allow', 'system', 1, 2)",
+                (),
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_write_that_finds_a_terminal_row_already_there_keeps_it_and_finishes() {
+    let store = Store::open_in_memory().await.unwrap();
+    insert_demo_request(&store, "r").await;
+    // A request moved back out of a terminal state by hand: in flight, with
+    // its terminal row still there.
+    store
+        .raw_execute(
+            "INSERT INTO audit (request_id, action, decision, actor, detail, ts, terminal) \
+             VALUES ('r', 'execute', 'allow', 'system', 'first', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .finish_request(
+                "r",
+                RequestState::Failed,
+                Some("daemon_restart"),
+                terminal_entry("daemon_restart"),
+            )
+            .await
+            .unwrap(),
+        "the duplicate is treated as already written, not as an error"
+    );
+    let row = store.get_request("r").await.unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Failed);
+    assert_eq!(terminal_rows(&store, "r").await, vec!["execute".to_owned()]);
+}

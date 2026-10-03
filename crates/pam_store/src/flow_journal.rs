@@ -1,9 +1,12 @@
 //! Bounded private flow continuation journal. Each mutation is one atomic SQL
-//! statement; cancellation never leaves a transaction open. Authorization and
-//! protected checkpoint/evidence ownership remain the daemon's responsibility.
-use super::{Store, StoreError};
+//! statement, or one transaction where a protected checkpoint is filed with
+//! the journal write that names it; cancellation never leaves a transaction
+//! open. Authorization and the checkpoint's contents remain the daemon's
+//! responsibility.
+use super::{Actor, AuditEntry, Decision, Store, StoreError};
 use crate::db::Db;
 use rusqlite::params;
+use sha2::{Digest, Sha256};
 
 /// Upper bound before JSON parsing or database persistence.
 pub const MAX_FLOW_CHECKPOINT_BYTES: usize = 131_072;
@@ -83,6 +86,87 @@ pub enum FlowJournalBegin {
     Conflict,
 }
 
+/// A protected checkpoint (`flow.checkpoint` evidence) filed in the same
+/// transaction as the journal write whose checkpoint JSON names it.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowCheckpoint<'a> {
+    /// The new evidence row's id, the one the journal's checkpoint names.
+    pub evidence_id: &'a str,
+    /// The snapshot, at most 1 MiB.
+    pub bytes: &'a [u8],
+}
+
+/// `audit.action` of the row that closes a checkpoint left without a journal.
+pub const ACTION_FLOW_CHECKPOINT_ORPHANED: &str = "flow.checkpoint_orphaned";
+
+/// Largest protected checkpoint the store files (the daemon's own bound).
+const MAX_CHECKPOINT_BLOB_BYTES: usize = 1024 * 1024;
+
+/// Orphaned checkpoints one sweep transaction closes.
+const ORPHAN_SWEEP_BATCH: i64 = 64;
+
+/// A checkpoint to file, owned for the job and hashed before the connection
+/// is taken.
+struct OwnedCheckpoint {
+    evidence_id: String,
+    bytes: Vec<u8>,
+    content_hash: String,
+}
+
+impl OwnedCheckpoint {
+    fn new(checkpoint: FlowCheckpoint<'_>) -> Result<Self, StoreError> {
+        identifier(checkpoint.evidence_id, 128)?;
+        if checkpoint.bytes.len() > MAX_CHECKPOINT_BLOB_BYTES {
+            return Err(invalid("protected checkpoint exceeds 1 MiB"));
+        }
+        Ok(Self {
+            evidence_id: checkpoint.evidence_id.to_owned(),
+            bytes: checkpoint.bytes.to_vec(),
+            content_hash: hex::encode(Sha256::digest(checkpoint.bytes)),
+        })
+    }
+
+    fn file(&self, conn: Db<'_>, request_id: &str) -> Result<(), StoreError> {
+        Store::insert_evidence_row(
+            conn,
+            &self.evidence_id,
+            request_id,
+            EVIDENCE_KIND_FLOW_CHECKPOINT,
+            &self.bytes,
+            &self.content_hash,
+            None,
+        )
+    }
+}
+
+/// Test-only fault injection: the request id whose next checkpointed journal
+/// write fails between the journal statement and the checkpoint insert, as a
+/// crash there would interrupt it. Keyed by request so parallel tests do not
+/// trip each other.
+#[cfg(test)]
+pub(crate) static CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn injected_crash(request_id: &str) -> Result<(), StoreError> {
+    let mut armed = CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if armed.as_deref() == Some(request_id) {
+        *armed = None;
+        return Err(StoreError::Unavailable {
+            detail: "injected crash between the journal write and its checkpoint".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)] // Same signature as the test build's fallible injector.
+fn injected_crash(_request_id: &str) -> Result<(), StoreError> {
+    Ok(())
+}
+
 impl Store {
     /// Read a private runtime snapshot only for its exact original request and
     /// kind. SQL withholds oversized blobs before any Rust payload allocation.
@@ -118,23 +202,186 @@ impl Store {
         checkpoint(initial_checkpoint)?;
         let identity = identity.clone();
         let initial_checkpoint = initial_checkpoint.to_owned();
-        self.run(move |conn| {
-            let changed = conn.execute(
-                "INSERT INTO flow_journal(request_id,schema_version,flow_digest,repository,input_fingerprint,revision,state,step_id,attempt,effectful,checkpoint_json,evidence_refs_json) VALUES (?1,1,?2,?3,?4,0,'ready',NULL,0,0,?5,'[]') ON CONFLICT(request_id) DO NOTHING",
-                params![identity.request_id,identity.flow_digest,identity.repository,identity.input_fingerprint,initial_checkpoint],
-            )?;
-            if changed == 1 {
-                return Ok(FlowJournalBegin::Inserted);
+        self.run(move |conn| Self::begin_flow_journal_locked(conn, &identity, &initial_checkpoint))
+            .await
+    }
+
+    /// [`Self::begin_flow_journal`] and the first protected checkpoint in one
+    /// transaction: the journal row is written first, and the checkpoint its
+    /// `initial_checkpoint` names is filed only when that row was inserted.
+    /// A crash anywhere inside leaves neither, so there is never a journal
+    /// whose checkpoint is missing, nor a checkpoint without its journal. An
+    /// existing or conflicting journal files nothing.
+    pub async fn begin_flow_journal_with_checkpoint(
+        &self,
+        identity: &FlowJournalIdentity,
+        initial_checkpoint: &str,
+        snapshot: FlowCheckpoint<'_>,
+    ) -> Result<FlowJournalBegin, StoreError> {
+        validate_identity(identity)?;
+        checkpoint(initial_checkpoint)?;
+        let snapshot = OwnedCheckpoint::new(snapshot)?;
+        let identity = identity.clone();
+        let initial_checkpoint = initial_checkpoint.to_owned();
+        self.transact(move |conn| {
+            let begun = Self::begin_flow_journal_locked(conn, &identity, &initial_checkpoint)?;
+            if begun == FlowJournalBegin::Inserted {
+                injected_crash(&identity.request_id)?;
+                snapshot.file(conn, &identity.request_id)?;
             }
-            let existing = Self::flow_journal_locked(conn, &identity.request_id)?
-                .ok_or_else(|| invalid("conflicting journal disappeared"))?;
-            Ok(if existing.identity == identity {
-                FlowJournalBegin::Existing
-            } else {
-                FlowJournalBegin::Conflict
-            })
+            Ok(begun)
         })
         .await
+    }
+
+    fn begin_flow_journal_locked(
+        conn: Db<'_>,
+        identity: &FlowJournalIdentity,
+        initial_checkpoint: &str,
+    ) -> Result<FlowJournalBegin, StoreError> {
+        let changed = conn.execute(
+            "INSERT INTO flow_journal(request_id,schema_version,flow_digest,repository,input_fingerprint,revision,state,step_id,attempt,effectful,checkpoint_json,evidence_refs_json) VALUES (?1,1,?2,?3,?4,0,'ready',NULL,0,0,?5,'[]') ON CONFLICT(request_id) DO NOTHING",
+            params![identity.request_id,identity.flow_digest,identity.repository,identity.input_fingerprint,initial_checkpoint],
+        )?;
+        if changed == 1 {
+            return Ok(FlowJournalBegin::Inserted);
+        }
+        let existing = Self::flow_journal_locked(conn, &identity.request_id)?
+            .ok_or_else(|| invalid("conflicting journal disappeared"))?;
+        Ok(if existing.identity == *identity {
+            FlowJournalBegin::Existing
+        } else {
+            FlowJournalBegin::Conflict
+        })
+    }
+
+    /// [`Self::settle_flow_attempt`] and the protected checkpoint its
+    /// `checkpoint_json` names, in one transaction: the journal is settled
+    /// first and the checkpoint filed only when the settlement applied. A
+    /// stale revision, a non-prepared phase or a terminal request files
+    /// nothing and answers false; a crash inside leaves the journal
+    /// prepared and no checkpoint.
+    pub async fn settle_flow_attempt_with_checkpoint(
+        &self,
+        request_id: &str,
+        expected_revision: i64,
+        checkpoint_json: &str,
+        evidence_refs: &[String],
+        completed: bool,
+        snapshot: FlowCheckpoint<'_>,
+    ) -> Result<bool, StoreError> {
+        transition_args(request_id, expected_revision)?;
+        checkpoint(checkpoint_json)?;
+        let refs = references(evidence_refs)?;
+        let snapshot = OwnedCheckpoint::new(snapshot)?;
+        let state = if completed { "completed" } else { "ready" };
+        let request_id = request_id.to_owned();
+        let checkpoint_json = checkpoint_json.to_owned();
+        self.transact(move |conn| {
+            if !Self::settle_flow_attempt_locked(
+                conn,
+                &request_id,
+                expected_revision,
+                state,
+                &checkpoint_json,
+                &refs,
+            )? {
+                return Ok(false);
+            }
+            injected_crash(&request_id)?;
+            snapshot.file(conn, &request_id)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    fn settle_flow_attempt_locked(
+        conn: Db<'_>,
+        request_id: &str,
+        expected_revision: i64,
+        state: &str,
+        checkpoint_json: &str,
+        refs: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(conn.execute(
+            "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
+            params![request_id,expected_revision,state,checkpoint_json,refs],
+        )? == 1)
+    }
+
+    /// Boot recovery for checkpoints a crash left without their journal:
+    /// `flow.checkpoint` evidence whose request has no `flow_journal` row.
+    /// A daemon that filed the first checkpoint and the journal in two
+    /// statements could stop between them; nothing can ever read such a
+    /// checkpoint (every read goes through a journal or a landing session
+    /// of a journaled run). Each one is closed with an
+    /// [`ACTION_FLOW_CHECKPOINT_ORPHANED`] audit row on its request, naming
+    /// the evidence id, its size and digest and when it was filed, and the
+    /// row is deleted in the same transaction, so the record says what was
+    /// removed. Bounded batches, oldest first; answers how many it closed.
+    /// A second sweep finds nothing.
+    pub async fn close_orphan_flow_checkpoints(&self) -> Result<u64, StoreError> {
+        let mut closed = 0_u64;
+        loop {
+            let batch = self.transact(Self::close_orphan_checkpoint_batch).await?;
+            closed = closed.saturating_add(batch);
+            if batch < u64::try_from(ORPHAN_SWEEP_BATCH).unwrap_or(u64::MAX) {
+                return Ok(closed);
+            }
+        }
+    }
+
+    fn close_orphan_checkpoint_batch(conn: Db<'_>) -> Result<u64, StoreError> {
+        let orphans: Vec<(String, String, String, i64, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.request_id, e.content_hash, COALESCE(LENGTH(e.content), 0), e.ts \
+                 FROM evidence e \
+                 WHERE e.kind = 'flow.checkpoint' \
+                   AND NOT EXISTS (SELECT 1 FROM flow_journal j WHERE j.request_id = e.request_id) \
+                 ORDER BY e.ts, e.id LIMIT ?1",
+            )?;
+            let mut rows = stmt.query(params![ORPHAN_SWEEP_BATCH])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ));
+            }
+            out
+        };
+        for (evidence_id, request_id, content_hash, bytes, filed_ts) in &orphans {
+            let detail = serde_json::json!({
+                "cause": "flow_checkpoint_without_journal",
+                "evidence_id": evidence_id,
+                "bytes": bytes,
+                "content_hash": content_hash,
+                "filed_ts": filed_ts,
+                "note": "A protected flow checkpoint had no journal, so nothing could read it; it was removed by crash recovery.",
+            })
+            .to_string();
+            Self::insert_audit_row(
+                conn,
+                request_id,
+                AuditEntry {
+                    action: ACTION_FLOW_CHECKPOINT_ORPHANED,
+                    decision: Decision::Timeout,
+                    actor: Actor::System,
+                    detail: Some(&detail),
+                },
+            )?;
+            // A view of a checkpoint is never published; should one exist,
+            // it becomes a tombstone before its evidence goes.
+            conn.execute(
+                "UPDATE evidence_view SET expired_at = ?2 WHERE evidence_id = ?1 AND expired_at IS NULL",
+                params![evidence_id, super::now_ts()],
+            )?;
+            conn.execute("DELETE FROM evidence WHERE id = ?1", params![evidence_id])?;
+        }
+        Ok(u64::try_from(orphans.len()).unwrap_or(u64::MAX))
     }
 
     /// Read limits are applied inside SQL before text is allocated in Rust.
@@ -191,10 +438,14 @@ impl Store {
         let request_id = request_id.to_owned();
         let checkpoint_json = checkpoint_json.to_owned();
         self.run(move |conn| {
-            Ok(conn.execute(
-                "UPDATE flow_journal SET revision=revision+1,state=?3,checkpoint_json=?4,evidence_refs_json=?5 WHERE request_id=?1 AND revision=?2 AND state='prepared' AND EXISTS(SELECT 1 FROM request WHERE id=?1 AND state IN ('queued','running','waiting_approval'))",
-                params![request_id,expected_revision,state,checkpoint_json,refs],
-            )? == 1)
+            Self::settle_flow_attempt_locked(
+                conn,
+                &request_id,
+                expected_revision,
+                state,
+                &checkpoint_json,
+                &refs,
+            )
         })
         .await
     }

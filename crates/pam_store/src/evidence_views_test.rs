@@ -344,20 +344,24 @@ async fn an_empty_view_reads_as_an_empty_page_instead_of_an_invalid_range() {
 }
 
 #[tokio::test]
-async fn a_view_whose_bytes_vanished_without_a_tombstone_is_unavailable_not_an_endless_page() {
+async fn a_view_whose_bytes_vanished_without_a_tombstone_is_corrupt_not_an_endless_page() {
     let (_dir, store, mut r) = fixture().await;
-    // Retention's tombstone sets `expired_at` with the NULL blob; a blob
-    // that is gone without one is damage. The trigger allows the NULLing
-    // write, so this is the state a partial repair would leave.
+    // Retention's tombstone sets `expired_at` and drops the chunks with it;
+    // chunks that are gone without one are damage. The triggers refuse the
+    // deletion, so it takes lifting them, as a partial repair would.
     store
-        .raw_execute("UPDATE evidence_view SET view_blob=NULL", ())
+        .raw(|conn| {
+            conn.execute_batch(
+                "DROP TRIGGER evidence_view_chunk_kept; DELETE FROM evidence_view_chunk;",
+            )
+        })
         .await
         .unwrap();
     r.offset = 0;
     r.length = 4;
     assert!(matches!(
         store.read_evidence_view_range(&r).await.unwrap(),
-        EvidenceRangeOutcome::Unavailable
+        EvidenceRangeOutcome::Corrupt
     ));
 }
 
@@ -429,8 +433,9 @@ async fn the_largest_serialized_segment_times_the_segment_ceiling_fits_the_map_b
 async fn evidence_view_identity_and_bytes_cannot_be_rewritten() {
     let (_dir, store, _r) = fixture().await;
     for tamper in [
-        "UPDATE evidence_view SET view_blob=x'00'",
+        "UPDATE evidence_view SET view_bytes=1",
         "UPDATE evidence_view SET view_sha256='forged'",
+        "UPDATE evidence_view SET evidence_id='other'",
         "UPDATE evidence_view SET map_json='[]', view_id='other'",
         "UPDATE evidence_view SET origin_json='{\"targets\":[]}'",
     ] {

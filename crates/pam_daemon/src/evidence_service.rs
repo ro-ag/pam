@@ -134,6 +134,16 @@ fn unavailable() -> CapabilityFailure {
     )
 }
 
+/// The stored bytes of the page did not match the digest recorded when the
+/// view was written, so none of them were served.
+fn corrupt() -> CapabilityFailure {
+    CapabilityFailure::Refused {
+        cause: "evidence_corrupt".to_owned(),
+        detail: "The stored evidence view no longer matches its recorded digest; no bytes were returned.".to_owned(),
+        recovery: "Re-run the flow to capture fresh evidence. If other views fail the same way, stop PAM and restore the state database from its newest backup.".to_owned(),
+    }
+}
+
 fn store_failure(_: pam_store::StoreError) -> CapabilityFailure {
     refusal(
         "evidence_store_unavailable",
@@ -256,6 +266,7 @@ pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, Capabili
                 "The original request's evidence read allowance has expired or been consumed.",
             ));
         }
+        EvidenceRangeOutcome::Corrupt => return Err(corrupt()),
     };
     read_output(&request, &meta, &range)
 }

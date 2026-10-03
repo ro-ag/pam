@@ -9,8 +9,9 @@ add durable queued parking on this journal; guarded landing remains task #135.
 Schema 9 stores a request-linked flow journal and cumulative work counters.
 A journal binds the recipe digest, canonical repository and resolved-input
 fingerprint. Before each step, the daemon commits its intent. After the step,
-it saves a bounded protected checkpoint and atomically advances the journal
-revision. The journal holds evidence references rather than log bodies.
+it saves a bounded protected checkpoint and advances the journal revision in
+one transaction, the journal write first, so a crash leaves either both or
+neither. The journal holds evidence references rather than log bodies.
 Checkpoints have no public evidence view and cannot be retrieved through the
 agent evidence interface.
 
@@ -25,7 +26,9 @@ its existing ticket and authorization revision. It does not reset the deadline,
 refresh revoked authority, or turn a terminal ticket back into queued work.
 Old pending approval records are timed out; any remaining step passes current
 runtime gates. Legacy in-flight requests without a journal retain the explicit
-`daemon_restart` failure.
+`daemon_restart` failure. Boot recovery removes a checkpoint left without its
+journal by an older daemon, with a `flow.checkpoint_orphaned` audit row; nothing
+could read such a checkpoint.
 
 ## Uncertain effects
 
@@ -57,7 +60,10 @@ Original ceilings remain 256 attempts, 128 HTTP sends, 128 MiB HTTP capture,
 
 All store operations serialize access to the SQLite connection (the store's `ConnGate`). Journal state
 transitions and budget reservations/refunds use individual atomic statements,
-avoiding a cancelled future leaving an explicit transaction open.
+avoiding a cancelled future leaving an explicit transaction open. The two
+transitions that file a checkpoint (beginning a journal with its first
+checkpoint and settling an attempt with its checkpoint) are one transaction
+each.
 
 ## Verification requirements
 

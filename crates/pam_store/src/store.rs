@@ -1901,9 +1901,16 @@ impl Store {
                 }),
             };
         }
-        conn.execute(
-            "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        // The terminal row is flagged, and the schema admits one flagged row
+        // per request (`audit_terminal_once`, schema 19). The state update
+        // above already makes a second one unreachable; should a request
+        // nonetheless carry one (a row moved back out of a terminal state by
+        // hand), the first terminal row stands and this write is a no-op
+        // rather than an error that would leave the request in flight.
+        let written = conn.execute(
+            "INSERT INTO audit (request_id, action, decision, actor, detail, ts, terminal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                 ON CONFLICT (request_id) WHERE terminal = 1 DO NOTHING",
             params![
                 id,
                 audit.action,
@@ -1913,6 +1920,13 @@ impl Store {
                 now_ts()
             ],
         )?;
+        if written == 0 {
+            tracing::warn!(
+                request = id,
+                action = audit.action,
+                "the request already had its terminal audit row; it was kept and this one not written"
+            );
+        }
         Ok(true)
     }
 
@@ -2986,23 +3000,46 @@ impl Store {
         let kind = kind.to_owned();
         let meta_json = meta_json.map(str::to_owned);
         self.run(move |conn| {
-            conn.execute(
-                "INSERT INTO evidence
-                         (id, request_id, kind, content, path, content_hash, meta_json, ts)
-                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-                params![
-                    id,
-                    request_id,
-                    kind,
-                    content,
-                    content_hash,
-                    meta_json,
-                    now_ts()
-                ],
-            )?;
-            Ok(())
+            Self::insert_evidence_row(
+                conn,
+                &id,
+                &request_id,
+                &kind,
+                &content,
+                &content_hash,
+                meta_json.as_deref(),
+            )
         })
         .await
+    }
+
+    /// The statement of [`Self::insert_evidence`], for a caller that files
+    /// evidence inside its own transaction. `content_hash` is the SHA-256
+    /// hex of `content`, computed before the connection was taken.
+    pub(crate) fn insert_evidence_row(
+        conn: Db<'_>,
+        id: &str,
+        request_id: &str,
+        kind: &str,
+        content: &[u8],
+        content_hash: &str,
+        meta_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        conn.execute(
+            "INSERT INTO evidence
+                     (id, request_id, kind, content, path, content_hash, meta_json, ts)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            params![
+                id,
+                request_id,
+                kind,
+                content,
+                content_hash,
+                meta_json,
+                now_ts()
+            ],
+        )?;
+        Ok(())
     }
 
     /// Reads one evidence row by id, blob included, or `None` if it does
@@ -3197,10 +3234,13 @@ impl Store {
             params![cutoff_ts, keep_kind],
         )?;
         if rows > 0 {
+            // The tombstone first: it drops the view's chunks (a trigger),
+            // and only a tombstoned view may lose its evidence row, whose
+            // deletion then clears the view's `source_id`.
             conn.execute(
                 &format!(
-                    "UPDATE evidence_view SET view_blob = NULL, expired_at = ?3 \
-                     WHERE evidence_id IN ({batch})"
+                    "UPDATE evidence_view SET expired_at = ?3 \
+                     WHERE expired_at IS NULL AND evidence_id IN ({batch})"
                 ),
                 params![cutoff_ts, keep_kind, now_ts()],
             )?;

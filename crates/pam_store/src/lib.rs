@@ -41,8 +41,10 @@ mod header;
 mod migrations;
 mod open;
 mod store;
+mod view_chunks;
 
 pub use error::{EngineError, StoreError};
+pub use store::{ACTION_FLOW_CHECKPOINT_ORPHANED, FlowCheckpoint};
 pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
     ConnectorPatch, ConnectorRow, CorrelationBind, CorrelationStep, DEFAULT_REQUEST_LIST_LIMIT,
@@ -95,6 +97,8 @@ mod store_test;
 mod sync_cost_test;
 #[cfg(test)]
 mod upgrade_test;
+#[cfg(test)]
+mod view_chunks_test;
 
 #[cfg(test)]
 mod flow_results_test;

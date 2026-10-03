@@ -19,7 +19,8 @@
 //!   [`CAUSE_DAEMON_RESTART`], audited through [`pam_store::Store::finish_request`]
 //!   ([`ACTION_DAEMON_RESTART`], `timeout`, `system`, with a retry note). `queued` rows are
 //!   untouched — restart-safe by design, restored by
-//!   [`crate::queue::QueueManager::rebuild_from_store`].
+//!   [`crate::queue::QueueManager::rebuild_from_store`]. First of all, protected flow
+//!   checkpoints a crash left without their journal are closed with an audit row each.
 //! - **Self-logging**: [`init_daemon_logging`] writes daemon tracing output to
 //!   `<base>/log/daemon.log`, rotated daily — for debugging PAM itself, never mixed with product
 //!   evidence (which lives in the store's `evidence` table).
@@ -177,10 +178,22 @@ pub fn acquire_instance_lock(run_dir: &Path) -> Result<InstanceLock, LifecycleEr
 /// terminal row. A recovered `waiting_approval` row's dangling approval
 /// is resolved as a timeout (note [`CAUSE_DAEMON_RESTART`]) so the
 /// GUI's pending list does not advertise an approval nobody can grant.
+/// Before any of that, every protected flow checkpoint left without its
+/// journal by a crash is closed ([`Store::close_orphan_flow_checkpoints`]:
+/// one `flow.checkpoint_orphaned` audit row each, and the row removed).
 /// Pages contain at most 16 rows and 8 MiB of selected text. Oversized legacy
 /// rows stop startup explicitly for operator backup/repair; prior recovered
 /// pages remain audited and terminal, making the next startup restart-safe.
 pub async fn recover_stuck_rows(store: &Store) -> Result<usize, LifecycleError> {
+    // A checkpoint an older daemon filed and then crashed before writing its
+    // journal can never be read; close each with an audit row first.
+    let orphans = store.close_orphan_flow_checkpoints().await?;
+    if orphans > 0 {
+        tracing::warn!(
+            orphans,
+            "closed flow checkpoints a crash had left without their journal"
+        );
+    }
     let mut recovered = 0_usize;
     let mut after: Option<(i64, String)> = None;
     loop {

@@ -334,6 +334,28 @@ fn flip_page(path: &Path, page: u64) {
     file.sync_all().unwrap();
 }
 
+/// A page in the middle of an overflow chain of the database at `path`
+/// (the last one in the file), read from the file format itself: an
+/// overflow page starts with the number of the next page of its chain, and
+/// a chain written in one go runs through consecutive pages. Damaging it
+/// breaks the chain, which the integrity check reports by page while the
+/// schema still loads; which page that is moves whenever a migration
+/// rewrites part of the file.
+fn an_overflow_page(path: &Path) -> u64 {
+    let bytes = std::fs::read(path).unwrap();
+    bytes
+        .chunks(4096)
+        .enumerate()
+        .skip(1)
+        .rev()
+        .find_map(|(index, page)| {
+            let number = u64::try_from(index).unwrap() + 1;
+            let next = u64::from(u32::from_be_bytes(page[..4].try_into().unwrap()));
+            (next == number + 1).then_some(number)
+        })
+        .expect("the database has an overflow chain")
+}
+
 /// A page of the `v13-full` fixture that belongs to a table: with it damaged
 /// the schema still loads, so the damage is found by the integrity check
 /// itself rather than by the engine failing to read the file at all.
@@ -360,9 +382,10 @@ async fn damage_after_a_successful_open_is_found_by_the_on_demand_check() {
     // Upgrade it and close, so every page is in the main file.
     Store::open(&path).await.unwrap().close().await.unwrap();
 
-    // The open ran its own check and passed it.
+    // The open ran its own check and passed it. The upgrade rewrote part of
+    // the file, so the page to damage is found in the upgraded file.
     let store = Store::open(&path).await.unwrap();
-    flip_page(&path, A_TABLE_PAGE_OF_V13_FULL);
+    flip_page(&path, an_overflow_page(&path));
 
     match store.check_integrity().await {
         Err(StoreError::Corrupt { detail }) => {

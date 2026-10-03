@@ -1081,7 +1081,7 @@ write whose call had returned.
 | --- | --- | --- |
 | `list_requests_filtered` (Activity) | reader | the review's head-of-line query |
 | `audit_for_request` | reader | list |
-| `read_evidence_view_range`, the page bytes | reader | SQLite loads the whole view (up to 64 MiB) to cut one page |
+| `read_evidence_view_range`, the page bytes | reader | reads the one or two 64 KiB chunks the page covers and checks their digests (schema 20; before it, SQLite loaded the whole view, up to 64 MiB, to cut one page) |
 | `read_evidence_view_range`, the charge | writer | it is a write, and must survive the read failing |
 | `retention_census` | reader | five counts over two tables, one snapshot |
 | `check_integrity` | reader | reads every page |
@@ -1089,6 +1089,102 @@ write whose call had returned.
 | `compression_stats` | reader | scan plus JSON parsing in Rust |
 | `list_model_jobs`, `list_callers` | reader | lists |
 | `list_grants`, `active_grant`, `request_authorization_current`, `evidence_view_meta`, `get_request`, settings, recovery pages, everything else | writer | authorization reads, cheap point reads, or reads whose job also writes |
+
+### Schemas 19 and 20: the review's store leftovers
+
+ptrack task 228 closed what the 2026-10 design review left of store findings
+7, 9 and 13 (`docs/reviews/design-review-2026-10-02.md`).
+
+**One terminal audit row per request (19).** `audit.terminal` is 1 on the
+row the terminal writer (`finish_request_in_txn`, under `finish_request`,
+`fail_expired_requests` and `finish_request_with_grant_change`) writes with
+the terminal state, 0 on every other row, and the partial unique index
+`audit_terminal_once ON audit (request_id) WHERE terminal = 1` admits one per
+request. The flag is not derived from the action: `admin` and `policy.load`
+are a terminal row on one request and ordinary rows on another (the managed
+policy's daemon-owned request carries several `policy.*` rows before its
+finish), and the daemon's `TERMINAL_ACTIONS` list stays the invariant
+query's business. The insert is `ON CONFLICT (request_id) WHERE terminal = 1
+DO NOTHING`: a request that somehow already has its terminal row (moved back
+out of a terminal state by hand) keeps it, the write still finishes the
+request, and a warning is logged. Rows from before 19 read 0; a request that
+was terminal then can never be finished again, so the index covers every
+terminal write from 19 on.
+
+**Views reference their evidence; bytes in chunks (20).** `evidence_view` is
+rebuilt with `source_id TEXT REFERENCES evidence(id) ON DELETE SET NULL`,
+which is `evidence_id` while the evidence row exists and NULL after, and the
+CHECK `source_id IS NOT NULL OR expired_at IS NOT NULL`: a live view without
+its evidence cannot be represented, so a deletion of evidence whose view was
+not tombstoned first fails instead of leaving a dangling view. `view_blob` is
+gone; the bytes live in `evidence_view_chunk (evidence_id, seq, sha256,
+bytes)`, 64 KiB per chunk (the view records its `chunk_bytes`), each with the
+SHA-256 of its bytes. Triggers: chunks are never updated; a live view's
+chunks are never deleted (a request prune deletes the view row, and the
+chunks go by cascade); a chunk is inserted only for a live view; tombstoning
+a view (`expired_at` set) deletes its chunks; a tombstone is final;
+`source_id` only ever changes to NULL. Retention's evidence pass is therefore
+`UPDATE ... SET expired_at` (the trigger drops the chunks) and then the
+`DELETE` of the evidence, in that order, in one batch transaction.
+
+The chunk size is the largest page, so a page touches at most two chunks
+and the default 16 KiB page touches one. A read loads only those, checks
+each chunk's length and digest, and answers `EvidenceRangeOutcome::Corrupt`
+when one is missing, short, or does not hash to its digest; the daemon
+refuses it as `evidence_corrupt` (recovery: re-run the flow, restore the
+newest backup if more views fail). The whole-view `view_sha256`, the offset
+basis and every other part of the retrieval contract are unchanged. 64 KiB
+rather than 256 KiB: a 256 KiB chunk would load and hash 16 times the bytes
+of a default page.
+
+The migration's Rust half (`view_chunks::migrate_v20`, a new optional
+`code` step of a migration, run after its SQL in the same transaction):
+every view still live gets its chunks from its old blob when the blob has
+the recorded length and hashes to `view_sha256`. A live view whose evidence
+row was missing is tombstoned and reported in an `evidence.view_orphaned`
+audit row; a live view whose bytes do not match keeps its row, gets no
+chunks (its reads refuse as corrupt) and is reported as
+`evidence.view_corrupt`. No view row is dropped. None of the three turso
+fixtures has either kind; their recorded reads are unchanged.
+
+Measured, a 64 KiB page of a 32 MiB view on a file-backed store, median of
+20 reads at offsets 0, 16 MiB and 32 MiB − 64 KiB (`tests/view_page_read.rs`,
+`--ignored`), including the charge on the writer:
+
+| Build | Before (one blob) | After (chunks) |
+| --- | --- | --- |
+| release | 3.77, 3.77, 3.84 ms | 0.18, 0.17, 0.16 ms |
+| debug | 3.80, 4.27, 4.58 ms | 2.72, 2.34, 2.38 ms (unoptimised SHA-256 of the chunk dominates) |
+
+Inserting the 32 MiB view went from 0.18 s to 0.27 s (release), the cost of
+hashing each chunk as well as the whole view, done before the connection is
+taken.
+
+**Journal before checkpoint (store 13).** The daemon files a protected
+checkpoint (`flow.checkpoint` evidence) only in the transaction that writes
+the journal row naming it: `begin_flow_journal_with_checkpoint` (insert the
+journal, then the first checkpoint, only when the row was inserted) and
+`settle_flow_attempt_with_checkpoint` (settle the prepared attempt, then the
+checkpoint, only when the settlement applied). The old order could leave a
+journal naming a checkpoint that was never filed (an unrecoverable journal)
+or, at a settlement, a checkpoint no journal names. A test-only fault
+(`CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT`) fails the transaction between the
+two statements and shows that neither is left. Boot recovery
+(`recover_stuck_rows`) first runs `Store::close_orphan_flow_checkpoints`:
+each `flow.checkpoint` row whose request has no journal (no reader can reach
+it) is deleted with a `flow.checkpoint_orphaned` audit row on its request
+(evidence id, size, digest, when it was filed), in batches of 64, oldest
+first; a second boot finds nothing. A legacy settlement crash's checkpoint
+(the request has a journal) cannot be told apart from a superseded one and
+is left to retention, as superseded checkpoints are; the journal it belongs
+to is `prepared`, which recovery already reports or redoes.
+
+Upgrade tests: `migrations_test::v18_database_moves_views_into_chunks_and_reports_what_it_cannot_move`
+(a schema-18 file with a live, an orphaned, a tombstoned, a mismatched and
+an empty view, and audit rows from before the flag). The on-demand-check
+test in `tests/store_upgrade.rs` now finds the page it damages in the
+upgraded file (the last page in the middle of an overflow chain), because
+migration 20 rewrote the page it used to name.
 
 ### Deviations and what is open
 

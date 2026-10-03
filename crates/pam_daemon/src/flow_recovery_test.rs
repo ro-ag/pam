@@ -434,3 +434,67 @@ async fn an_armed_effect_is_uncertain_when_the_ticket_ends_before_it_settles() {
         Some("flow_effect_uncertain")
     );
 }
+
+/// A settlement and the checkpoint it names commit together: a settlement
+/// that does not apply (here, the ticket finished in between) files no
+/// checkpoint, so no snapshot is left that no journal names.
+#[tokio::test]
+async fn a_settlement_that_does_not_apply_files_no_checkpoint() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (mut recovery, snapshot) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    recovery
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .await
+        .unwrap();
+    assert_eq!(checkpoint_count(&store).await, 1);
+    assert!(end_cancelled(&store).await.is_some());
+    assert!(
+        recovery
+            .settle(&store, "r", &snapshot, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        checkpoint_count(&store).await,
+        1,
+        "the refused settlement filed nothing"
+    );
+}
+
+async fn checkpoint_count(store: &Store) -> usize {
+    store
+        .list_evidence("r")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == crate::flow_recovery::KIND)
+        .count()
+}
+
+#[tokio::test]
+async fn a_settlement_files_the_checkpoint_its_journal_names() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (mut recovery, snapshot) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    recovery
+        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .await
+        .unwrap();
+    recovery
+        .settle(&store, "r", &snapshot, false)
+        .await
+        .unwrap();
+    let journal = store.read_flow_journal("r").await.unwrap().unwrap();
+    let cursor: serde_json::Value = serde_json::from_str(&journal.checkpoint_json).unwrap();
+    let named = cursor["evidence_id"].as_str().unwrap();
+    assert!(
+        store
+            .read_flow_checkpoint("r", named)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

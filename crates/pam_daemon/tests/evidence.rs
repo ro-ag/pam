@@ -418,3 +418,95 @@ async fn every_captured_connector_target_is_reauthorized_before_bytes_or_tombsto
     );
     fixture.stop().await;
 }
+
+/// A byte of a stored view changed on disk while PAM was stopped: the page
+/// that covers it is refused as `evidence_corrupt` and not one of its bytes
+/// is returned, while the pages around it, each checked against its own
+/// chunk digest, still read.
+#[tokio::test]
+async fn a_view_byte_changed_on_disk_is_refused_as_corrupt() {
+    const CHUNK: usize = 64 * 1024;
+    const MARKER: &[u8] = b"pam-corruption-probe-0123456789abcdef";
+    let fixture = Fixture::new().await;
+    // Three chunks; the marker sits inside the second.
+    let mut bytes = vec![b'a'; 3 * CHUNK];
+    bytes[CHUNK + 1000..CHUNK + 1000 + MARKER.len()].copy_from_slice(MARKER);
+    let store = fixture.daemon.store();
+    store
+        .insert_evidence("ev_large", ORIGINAL, "log_source", b"source", None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .insert_evidence_view(&EvidenceViewInsert {
+                evidence_id: "ev_large".into(),
+                request_id: ORIGINAL.into(),
+                repository: fixture.repo.clone(),
+                origin_json: json!({"targets": []}).to_string(),
+                identity_json: json!({"schema_version": 1}).to_string(),
+                map_json: json!([{"view":{"start":0,"end":bytes.len()},"parent":{"start":0,"end":bytes.len()},"relation":"identity"}])
+                    .to_string(),
+                view_id: "view_large".into(),
+                view_bytes: bytes.clone(),
+            })
+            .await
+            .unwrap()
+    );
+    drop(store);
+    let Fixture {
+        daemon,
+        client,
+        repo,
+        _repo: repo_dir,
+    } = fixture;
+    drop(client);
+    let tmp = daemon.stop().await;
+
+    let database = pam_testkit::base_of(&tmp).join("state.sqlite3");
+    let mut file = std::fs::read(&database).unwrap();
+    let at = file
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .expect("the view's bytes are in the database file");
+    assert!(
+        file[at + 1..]
+            .windows(MARKER.len())
+            .all(|window| window != MARKER),
+        "the marker is stored once"
+    );
+    file[at + 5] ^= 0x01;
+    std::fs::write(&database, &file).unwrap();
+
+    let daemon = TestDaemon::spawn_at(tmp).await;
+    let client = daemon.client().await;
+    let mut fixture = Fixture {
+        daemon,
+        client,
+        repo,
+        _repo: repo_dir,
+    };
+    let digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(&bytes))
+    };
+    let page = |offset: usize| {
+        json!({
+            "request_id": ORIGINAL, "evidence_id": "ev_large", "offset": offset,
+            "length": 65_536, "expected_view_id": "view_large", "expected_sha256": digest,
+        })
+    };
+    let first = result(fixture.read("first-chunk", page(0)).await);
+    assert_eq!(first["returned_bytes"], 65_536);
+    match fixture.read("damaged-chunk", page(CHUNK)).await {
+        Response::Refusal {
+            cause, recovery, ..
+        } => {
+            assert_eq!(cause, "evidence_corrupt");
+            assert!(recovery.contains("backup"), "{recovery}");
+        }
+        other => panic!("expected evidence_corrupt, got {other:?}"),
+    }
+    let last = result(fixture.read("last-chunk", page(2 * CHUNK)).await);
+    assert_eq!(last["eof"], true);
+    fixture.stop().await;
+}

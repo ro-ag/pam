@@ -39,6 +39,14 @@ Completeness remains explicit. Retention removes view content but preserves a
 scoped tombstone until request retention, allowing `evidence_expired` to be
 distinguished from unknown evidence only after authorization.
 
+How a view is stored is invisible to callers: offsets, page sizes, digests and
+`next_offset` are the same whatever the layout. Every page is cut from the
+stored 64 KiB chunks it covers, each checked against the SHA-256 recorded when
+the view was written. A chunk that is missing or does not match refuses the
+read as `evidence_corrupt` and no byte is returned (recovery: re-run the flow to
+capture fresh evidence; restore the newest state backup if other views fail
+too).
+
 ## Redaction and provenance
 
 Protected originals and public views have separate identities. Redaction runs

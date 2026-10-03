@@ -787,3 +787,270 @@ async fn v15_database_gains_the_boundary_tables_and_the_peer_columns() {
     assert!(bad.is_err());
     assert!(store.boundary_census().await.unwrap().last_report.is_some());
 }
+
+/// A version-18 database with one of each kind of evidence view the upgrade
+/// to 20 must handle, and audit rows from before the terminal flag.
+fn build_v18_database(path: &std::path::Path, live_view: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let conn = Connection::open(path).unwrap();
+    for migration in migrations::MIGRATIONS.iter().filter(|m| m.version <= 18) {
+        assert!(migration.code.is_none());
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.execute_batch("PRAGMA user_version = 18").unwrap();
+    for (id, state) in [("in_flight", "running"), ("finished", "done")] {
+        conn.execute(
+            "INSERT INTO request (id, capability, repo, caller_agent, args_json, state, created_ts, updated_ts)
+             VALUES (?1, 'flow.run', '/r', 'claude', '{}', ?2, 1, 2)",
+            params![id, state],
+        )
+        .unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO audit (request_id, action, decision, actor, ts) VALUES ('finished', 'execute', 'allow', 'system', 3);
+         INSERT INTO audit (request_id, action, decision, actor, ts) VALUES ('in_flight', 'policy.load', 'allow', 'policy', 3);",
+    )
+    .unwrap();
+    for evidence in ["e_live", "e_bad", "e_empty"] {
+        conn.execute(
+            "INSERT INTO evidence (id, request_id, kind, content, content_hash, ts)
+             VALUES (?1, 'finished', 'log', x'00', ?2, 4)",
+            params![evidence, "0".repeat(64)],
+        )
+        .unwrap();
+    }
+    let sha = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+    let view = |evidence: &str,
+                blob: Option<&[u8]>,
+                digest: String,
+                length: usize,
+                expired: Option<i64>| {
+        conn.execute(
+            "INSERT INTO evidence_view (evidence_id, request_id, repository, origin_json, identity_json,
+                 map_json, view_id, view_sha256, view_bytes, view_blob, expired_at)
+             VALUES (?1, 'finished', '/r', '{}', '{}', '[]', ?2, ?3, ?4, ?5, ?6)",
+            params![
+                evidence,
+                format!("view_{evidence}"),
+                digest,
+                i64::try_from(length).unwrap(),
+                blob,
+                expired
+            ],
+        )
+        .unwrap();
+    };
+    view(
+        "e_live",
+        Some(live_view),
+        sha(live_view),
+        live_view.len(),
+        None,
+    );
+    // Its evidence row is gone, the view still live: the orphan.
+    view(
+        "e_gone",
+        Some(b"orphaned bytes"),
+        sha(b"orphaned bytes"),
+        14,
+        None,
+    );
+    // Retention's tombstone, evidence gone as it should be.
+    view("e_tomb", None, sha(b"was here"), 8, Some(5));
+    // Bytes that do not hash to the recorded digest.
+    view("e_bad", Some(b"tampered"), sha(b"original"), 8, None);
+    view("e_empty", Some(b""), sha(b""), 0, None);
+    drop(conn);
+}
+
+fn upgraded_range(
+    evidence: &str,
+    digest: String,
+    offset: u64,
+    length: u32,
+) -> crate::EvidenceRangeRequest {
+    crate::EvidenceRangeRequest {
+        request_id: "finished".into(),
+        evidence_id: evidence.into(),
+        repository: "/r".into(),
+        expected_view_id: format!("view_{evidence}"),
+        expected_sha256: digest,
+        offset,
+        length,
+        now: 100,
+    }
+}
+
+/// Every page of the upgraded view `evidence`, read in 64 KiB steps.
+async fn read_whole_view(store: &Store, evidence: &str) -> Vec<u8> {
+    let meta = store
+        .evidence_view_meta("finished", evidence, "/r")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut offset = 0_u64;
+    let mut read = Vec::new();
+    while let crate::EvidenceRangeOutcome::Range(page) = store
+        .read_evidence_view_range(&upgraded_range(
+            evidence,
+            meta.view_sha256.clone(),
+            offset,
+            65_536,
+        ))
+        .await
+        .unwrap()
+    {
+        read.extend_from_slice(&page.bytes);
+        let Some(next) = page.next_offset else { break };
+        offset = next;
+    }
+    read
+}
+
+/// What reading the first four bytes of the upgraded view `evidence` answers.
+async fn first_page(store: &Store, evidence: &str) -> crate::EvidenceRangeOutcome {
+    let meta = store
+        .evidence_view_meta("finished", evidence, "/r")
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .read_evidence_view_range(&upgraded_range(evidence, meta.view_sha256, 0, 4))
+        .await
+        .unwrap()
+}
+
+/// The audit rows from before migration 19 read 0, and the next finish is
+/// the one terminal row of its request.
+async fn assert_terminal_flag_starts_after_the_upgrade(store: &Store) {
+    let flagged: i64 = store
+        .raw_scalar("SELECT count(*) FROM audit WHERE terminal = 1", ())
+        .await
+        .unwrap();
+    assert_eq!(flagged, 0);
+    assert!(
+        store
+            .finish_request(
+                "in_flight",
+                crate::RequestState::Failed,
+                Some("daemon_restart"),
+                crate::AuditEntry {
+                    action: "daemon_restart",
+                    decision: crate::Decision::Timeout,
+                    actor: crate::Actor::System,
+                    detail: None,
+                },
+            )
+            .await
+            .unwrap()
+    );
+    let flagged: i64 = store
+        .raw_scalar(
+            "SELECT count(*) FROM audit WHERE terminal = 1 AND request_id = 'in_flight'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(flagged, 1);
+}
+
+/// The upgrade from 18: views move into chunks with their bytes and digests
+/// intact; an orphaned live view is tombstoned and reported, a view whose
+/// bytes do not match is kept, reported and refused as corrupt; nothing is
+/// dropped; the audit table gains its terminal flag and its index.
+#[tokio::test]
+async fn v18_database_moves_views_into_chunks_and_reports_what_it_cannot_move() {
+    use crate::EvidenceRangeOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    // Three and a bit chunks.
+    let live: Vec<u8> = (0..200_000_u32)
+        .map(|i| u8::try_from(i % 241).unwrap())
+        .collect();
+    build_v18_database(&path, &live);
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
+    let views: i64 = store
+        .raw_scalar("SELECT count(*) FROM evidence_view", ())
+        .await
+        .unwrap();
+    assert_eq!(views, 5, "no view is dropped");
+    let violations: i64 = store
+        .raw_scalar("SELECT count(*) FROM pragma_foreign_key_check", ())
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+
+    // The live view reads back byte for byte across its chunk boundaries.
+    assert_eq!(read_whole_view(&store, "e_live").await, live);
+    let chunks: i64 = store
+        .raw_scalar(
+            "SELECT count(*) FROM evidence_view_chunk WHERE evidence_id = 'e_live'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunks, 4);
+
+    // The orphan: tombstoned, reported once on its request.
+    let orphan = store
+        .evidence_view_meta("finished", "e_gone", "/r")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(orphan.expired_at.is_some());
+    assert_eq!(orphan.view_bytes, 14);
+    assert!(matches!(
+        first_page(&store, "e_gone").await,
+        EvidenceRangeOutcome::Expired
+    ));
+    // The old tombstone stays one, unreported.
+    let tomb = store
+        .evidence_view_meta("finished", "e_tomb", "/r")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tomb.expired_at, Some(5));
+    // The mismatched view keeps its identity and refuses as corrupt.
+    assert!(matches!(
+        first_page(&store, "e_bad").await,
+        EvidenceRangeOutcome::Corrupt
+    ));
+    // The empty view still answers its empty end-of-view page.
+    assert!(matches!(
+        first_page(&store, "e_empty").await,
+        EvidenceRangeOutcome::Range(page) if page.bytes.is_empty()
+    ));
+
+    let audit = store.audit_for_request("finished").await.unwrap();
+    let reported: Vec<(String, String)> = audit
+        .iter()
+        .filter(|row| row.action.starts_with("evidence.view_"))
+        .map(|row| {
+            let detail: serde_json::Value =
+                serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+            (
+                row.action.clone(),
+                detail["evidence_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            ("evidence.view_orphaned".to_owned(), "e_gone".to_owned()),
+            ("evidence.view_corrupt".to_owned(), "e_bad".to_owned()),
+        ]
+    );
+
+    assert_terminal_flag_starts_after_the_upgrade(&store).await;
+    // A reopen moves nothing twice.
+    store.close().await.unwrap();
+    let store = Store::open(&path).await.unwrap();
+    let audit_after = store.audit_for_request("finished").await.unwrap();
+    assert_eq!(audit_after.len(), audit.len());
+}

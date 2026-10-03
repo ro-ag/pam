@@ -1106,6 +1106,7 @@ fn range_outcome(outcome: Result<EvidenceRangeOutcome, StoreError>) -> Value {
         EvidenceRangeOutcome::Expired => json!({ "outcome": "expired" }),
         EvidenceRangeOutcome::InvalidRange => json!({ "outcome": "invalid_range" }),
         EvidenceRangeOutcome::BudgetExhausted => json!({ "outcome": "budget_exhausted" }),
+        EvidenceRangeOutcome::Corrupt => json!({ "outcome": "corrupt" }),
         EvidenceRangeOutcome::Range(range) => json!({
             "outcome": "range",
             "view_id": range.view_id,

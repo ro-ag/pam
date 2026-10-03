@@ -1740,8 +1740,13 @@ export interface NetworkProxy {
 
 /** The private, digest-checked copy PAM made of an imported CA bundle. */
 export interface NetworkCaBundle {
-  sha256: string;
-  certificates: number;
+  /** Absent on a platform that does not take a bundle file (Windows). */
+  sha256?: string;
+  certificates?: number;
+  /** False on Windows: the OS certificate store is the supported way to trust a CA. */
+  supported?: boolean;
+  /** Why the bundle is unsupported here, in the daemon's words. */
+  reason?: string;
   /** Where it was imported from; display only. */
   source_path?: string;
   imported_ts?: number;
@@ -1825,7 +1830,11 @@ export function networkGet(): Promise<NetworkGetReply> {
  * Saves a patch. A proxy URL, password or CA bundle that is set or changed needs the typed
  * phrase (`CONFIRM_NETWORK`); the bridge checks it in Rust before the op reaches the daemon.
  */
-export function networkSet(patch: NetworkPatch, confirmation?: string): Promise<unknown> {
+/** A save can carry a `warning` (macOS: a bundle replaces system trust); nothing else is read. */
+export function networkSet(
+  patch: NetworkPatch,
+  confirmation?: string,
+): Promise<{ warning?: string } | null> {
   return adminCall("admin.network.set", { ...patch }, confirmation);
 }
 

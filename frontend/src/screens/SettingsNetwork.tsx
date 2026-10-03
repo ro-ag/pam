@@ -627,8 +627,12 @@ export function SettingsNetworkSection() {
       return networkSet(patch, "confirmation" in job ? job.confirmation : undefined);
     },
     onMutate: () => setNote(null),
-    onSuccess: (_reply, job) => {
+    onSuccess: (reply, job) => {
       setConfirming(null);
+      const warning =
+        reply && typeof reply === "object" && typeof reply.warning === "string"
+          ? reply.warning
+          : null;
       setDraft((current) => {
         const rest = { ...current };
         const drop: readonly (keyof Form)[] =
@@ -640,15 +644,15 @@ export function SettingsNetworkSection() {
         for (const key of drop) delete rest[key];
         return rest;
       });
-      setNote(
+      const done =
         job.kind === "save"
           ? "Saved. Run the test below to check the new settings."
           : job.kind === "ca-import"
             ? "CA bundle imported. Run the test below to check it."
             : job.kind === "ca-remove"
               ? "CA bundle removed."
-              : "Stored password cleared.",
-      );
+              : "Stored password cleared.";
+      setNote(warning ? `${done} ${warning}` : done);
     },
     onError: () => setConfirming(null),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ["network"] }),
@@ -679,7 +683,10 @@ export function SettingsNetworkSection() {
     : patchEmpty
       ? "Nothing has changed"
       : undefined;
-  const bundle = reply?.settings.ca_bundle ?? null;
+  const caBundle = reply?.settings.ca_bundle ?? null;
+  // Windows: the daemon takes no bundle file; the OS certificate store is the way.
+  const caUnsupported = caBundle?.supported === false;
+  const bundle = caBundle?.sha256 ? caBundle : null;
   const credential = reply?.settings.credential;
   const allowedHosts = reply?.settings.mirror_allowed_hosts ?? [];
   const failure = network.isError
@@ -847,9 +854,9 @@ export function SettingsNetworkSection() {
             className="select-text space-y-1 rounded-card border border-line p-3"
           >
             <p className="font-sans text-sm text-ink">
-              PAM holds a private copy: {bundle.certificates}{" "}
-              {bundle.certificates === 1 ? "certificate" : "certificates"}, SHA-256{" "}
-              <span className="font-data text-xs">{digestPrefix(bundle.sha256)}…</span>
+              PAM holds a private copy: {bundle.certificates ?? 0}{" "}
+              {(bundle.certificates ?? 0) === 1 ? "certificate" : "certificates"}, SHA-256{" "}
+              <span className="font-data text-xs">{digestPrefix(bundle.sha256 ?? "")}…</span>
             </p>
             {bundle.source_path && (
               <p className="font-data text-xs text-ink-muted">
@@ -873,14 +880,20 @@ export function SettingsNetworkSection() {
           </div>
         ) : (
           <p className="font-sans text-sm text-ink-muted">
-            No CA bundle is set; PAM uses this computer's own trust.
+            {caUnsupported ? (
+              <SafeText
+                value={caBundle?.reason ?? "A CA bundle file is not used on this computer."}
+              />
+            ) : (
+              "No CA bundle is set; PAM uses this computer's own trust."
+            )}
           </p>
         )}
         <Field label="PEM file path" error={check.errors.caPath}>
           <TextField
             aria-label="CA bundle path"
             value={form.caPath}
-            disabled={busy || caLocked}
+            disabled={busy || caLocked || caUnsupported}
             autoComplete="off"
             spellCheck={false}
             placeholder="/etc/corp/ca.pem"
@@ -891,7 +904,13 @@ export function SettingsNetworkSection() {
           <Button
             size="sm"
             variant="secondary"
-            disabled={busy || caLocked || check.caPath === null || confirming === "ca-import"}
+            disabled={
+              busy ||
+              caLocked ||
+              caUnsupported ||
+              check.caPath === null ||
+              confirming === "ca-import"
+            }
             title={check.caPath === null ? "Give the path of a PEM file first" : undefined}
             onClick={() => setConfirming("ca-import")}
           >
@@ -901,7 +920,7 @@ export function SettingsNetworkSection() {
             label="Remove CA bundle"
             confirmLabel="remove it?"
             busy={apply.isPending}
-            disabled={loading || caLocked || bundle === null}
+            disabled={loading || caLocked || caUnsupported || bundle === null}
             title={bundle === null ? "No CA bundle is set" : undefined}
             onConfirm={() => apply.mutate({ kind: "ca-remove" })}
           />

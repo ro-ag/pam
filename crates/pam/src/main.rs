@@ -131,8 +131,9 @@ enum Cmd {
         /// Give up after this many milliseconds.
         #[arg(long, default_value_t = DEFAULT_FOLLOW_TIMEOUT_MS)]
         timeout_ms: u64,
-        /// Print the durable terminal response as JSON (events still
-        /// stream as text lines first).
+        /// Machine output: stdout carries only JSON, one compact object per
+        /// event as it arrives and then the durable terminal response;
+        /// nothing human-readable is mixed in (errors go to stderr).
         #[arg(long)]
         json: bool,
     },
@@ -1032,7 +1033,10 @@ fn print_response(capability: &str, response: &Response, json: bool) -> ExitCode
 /// successful stream completion.
 ///
 /// `subcommand` is `wait` (quiet) or `subscribe` (prints each event); it
-/// also prefixes every error line. A follow that ends without a terminal
+/// also prefixes every error line. With `--json`, `subscribe` keeps stdout
+/// machine-only: each event is one compact JSON object on its own line
+/// ([`render::render_event_line`]), then the terminal response as `wait
+/// --json` prints it; the human `[queued]` lines are not printed at all. A follow that ends without a terminal
 /// event — refused, or past `timeout_ms` — is a stderr line, or with
 /// `--json` a refusal object on stdout ([`render::render_follow_failure`])
 /// so a machine reader never has to parse prose; the exit code is the
@@ -1051,7 +1055,7 @@ async fn follow(
     let verbose = subcommand == "subscribe";
     let on_event = |event: &Event| {
         if verbose {
-            println!("{}", render::render_event(event));
+            println!("{}", render::render_event_line(event, json));
         }
     };
     match client::follow_ticket_to_end(base, ticket, timeout, on_event).await {

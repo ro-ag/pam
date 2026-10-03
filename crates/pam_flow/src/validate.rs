@@ -15,9 +15,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::duration::parse_duration;
+use crate::reserved_env::{RESERVED_ENV_SUMMARY, reserved_env_reason};
 use crate::schema::{
-    Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, RawFlow, RawRetry, RawStep,
-    Retry, Role, SCHEMA_VERSION, Step, When,
+    Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, RawFlow, RawInput, RawRetry,
+    RawStep, Retry, Role, SCHEMA_VERSION, Step, When,
 };
 
 /// Why a flow file was refused.
@@ -411,6 +412,43 @@ fn from_yaml_error(error: &serde_yaml_ng::Error) -> FlowError {
     FlowError::invalid("yaml", text)
 }
 
+/// Each declared input: its name, its secrets, its type declaration, and a
+/// literal default against the type.
+fn validate_inputs(
+    raw_inputs: BTreeMap<String, RawInput>,
+) -> Result<BTreeMap<String, Input>, FlowError> {
+    let mut inputs = BTreeMap::new();
+    for (name, raw_input) in raw_inputs {
+        check_input_name(&name)?;
+        check_secrets(
+            &raw_input.description,
+            &format!("inputs.{name}.description"),
+        )?;
+        crate::input_type::check_declaration(raw_input.kind, &raw_input.values)
+            .map_err(|message| FlowError::invalid(format!("inputs.{name}.values"), message))?;
+        let input = Input {
+            description: raw_input.description,
+            default: raw_input.default,
+            kind: raw_input.kind,
+            values: raw_input.values,
+        };
+        if let Some(default) = &input.default {
+            let path = format!("inputs.{name}.default");
+            check_secrets(default, &path)?;
+            check_references(default, &path, &Scope::default())?;
+            // A default that reads `${repo.*}` is only known at run time;
+            // the run checks it then. A literal one is checked now.
+            if crate::vars::references(default).is_empty() {
+                input
+                    .check(&name, default)
+                    .map_err(|error| FlowError::invalid(&path, error.to_string()))?;
+            }
+        }
+        inputs.insert(name, input);
+    }
+    Ok(inputs)
+}
+
 fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
     if raw.schema != SCHEMA_VERSION {
         return Err(FlowError::invalid(
@@ -439,26 +477,7 @@ fn validate(raw: RawFlow) -> Result<Flow, FlowError> {
             ),
         ));
     }
-    let mut inputs = BTreeMap::new();
-    for (name, raw_input) in raw.inputs {
-        check_input_name(&name)?;
-        check_secrets(
-            &raw_input.description,
-            &format!("inputs.{name}.description"),
-        )?;
-        if let Some(default) = &raw_input.default {
-            let path = format!("inputs.{name}.default");
-            check_secrets(default, &path)?;
-            check_references(default, &path, &Scope::default())?;
-        }
-        inputs.insert(
-            name,
-            Input {
-                description: raw_input.description,
-                default: raw_input.default,
-            },
-        );
-    }
+    let inputs = validate_inputs(raw.inputs)?;
 
     if raw.steps.is_empty() {
         return Err(FlowError::invalid(
@@ -655,6 +674,8 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         ));
     }
 
+    check_stateful_order(&raw.id, index, effect, &needs, &when, &at)?;
+
     let retry = validate_retry(raw.retry, &at)?;
 
     let watch = crate::watch::validate(raw.watch, &action, effect, retry, &at)?;
@@ -681,6 +702,32 @@ fn validate_step(raw: RawStep, index: usize, scope: &Scope) -> Result<Step, Flow
         env,
         note,
     })
+}
+
+/// A stateful step after the first must say what it depends on. The engine
+/// already refuses to run one after a failure it did not opt into, but a
+/// flow that leaves the dependency implicit is ambiguous to read, so it is
+/// refused here instead.
+fn check_stateful_order(
+    id: &str,
+    index: usize,
+    effect: Effect,
+    needs: &[String],
+    when: &When,
+    at: &str,
+) -> Result<(), FlowError> {
+    if index > 0 && effect == Effect::Stateful && needs.is_empty() && *when == When::NeedsSucceeded
+    {
+        return Err(FlowError::invalid(
+            at,
+            format!(
+                "step `{id}` is stateful and not the first step, but it does not say what it \
+                 depends on: add `needs: [...]` (it runs after those steps succeed) or \
+                 `when: always` (it runs whatever came before)"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A note is trimmed — whitespace alone is no note — bounded like the
@@ -753,6 +800,15 @@ fn validate_env(env: &BTreeMap<String, String>, at: &str, scope: &Scope) -> Resu
             return Err(FlowError::invalid(
                 &path,
                 "an environment name is upper-case letters, digits and `_`, and never starts with a digit",
+            ));
+        }
+        if let Some(reason) = reserved_env_reason(name) {
+            return Err(FlowError::invalid(
+                &path,
+                format!(
+                    "`{name}` is reserved: {reason}. A step may not set {RESERVED_ENV_SUMMARY}; \
+                     drop it from `env`, or pass the value as an argument"
+                ),
             ));
         }
         check_secrets(value, &path)?;

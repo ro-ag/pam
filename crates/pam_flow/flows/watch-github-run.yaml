@@ -10,12 +10,15 @@ inputs:
   repository:
     description: explicit repository; no inferred latest execution
   commit:
+    type: sha
     description: explicit commit; no inferred latest execution
   repo:
     description: explicit repo; no inferred latest execution
   run_id:
+    type: int
     description: explicit run_id; no inferred latest execution
   run_attempt:
+    type: int
     description: explicit run_attempt; no inferred latest execution
 correlation:
   repository: "${inputs.repository}"

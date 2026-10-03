@@ -476,6 +476,52 @@ describe("the YAML tab", () => {
       expect(mocks.flowsSave).toHaveBeenCalledWith(
         "mine",
         "id: mine\nname: PR readiness\nsteps: []\n# edited\n",
+        { expected_digest: "sha256:abcd" },
+      ),
+    );
+  });
+
+  it("shows a conflict when someone else saved first, and reloads their version on request", async () => {
+    mocks.flowsSave.mockRejectedValue({
+      cause: "flow_changed",
+      detail:
+        'flow "mine" was changed since you opened it (someone saved it in between); nothing was saved',
+      recovery: "reload the flow in Pam → Flows, review what the other save changed",
+    });
+    await renderFlows();
+    const editor = await pick("mine");
+    fireEvent.change(editor, { target: { value: editor.value + "# mine\n" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(/flow library · flow_changed/)).toBeInTheDocument();
+    expect(screen.getByText(/someone saved it in between/)).toBeInTheDocument();
+    // The edit is still there: nothing was lost by the refusal.
+    expect(screen.getByLabelText("mine yaml")).toHaveValue(editor.value);
+
+    // The other save is what the daemon holds now; Reload shows it and drops the draft.
+    const reads = mocks.flowsGet.mock.calls.length;
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reload the saved flow (discards your edits)" }),
+    );
+    await waitFor(() => expect(mocks.flowsGet.mock.calls.length).toBeGreaterThan(reads));
+    await waitFor(() =>
+      expect(screen.getByLabelText("mine yaml")).toHaveValue(
+        "id: mine\nname: PR readiness\nsteps: []\n",
+      ),
+    );
+    expect(screen.queryByText(/flow_changed/)).not.toBeInTheDocument();
+  });
+
+  it("pins a save to the digest it opened, and an unreadable flow is saved unpinned", async () => {
+    await renderFlows();
+    const editor = await pick("broken");
+    fireEvent.change(editor, { target: { value: "id: broken\nname: Fixed\nsteps: []\n" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(mocks.flowsSave).toHaveBeenCalledWith(
+        "broken",
+        "id: broken\nname: Fixed\nsteps: []\n",
       ),
     );
   });
@@ -1206,6 +1252,9 @@ it("guards real sidebar navigation, preserving cancel and saving before leaving"
   expect(mocks.flowsSave).toHaveBeenCalledWith(
     "mine",
     expect.stringContaining("keep this draft"),
+    {
+      expected_digest: "sha256:abcd",
+    },
   );
 });
 
@@ -1235,7 +1284,11 @@ it("waits for the newest canvas normalization before saving through navigation",
   );
   await waitFor(() => expect(save).toBeEnabled());
   fireEvent.click(save);
-  await waitFor(() => expect(mocks.flowsSave).toHaveBeenCalledWith("mine", newestYaml));
+  await waitFor(() =>
+    expect(mocks.flowsSave).toHaveBeenCalledWith("mine", newestYaml, {
+      expected_digest: "sha256:abcd",
+    }),
+  );
   expect(raw.steps.some((step) => step.id === "step-1")).toBe(true);
 });
 

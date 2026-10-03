@@ -28,9 +28,15 @@ mod flow_results;
 pub use flow_results::*;
 #[path = "boundary.rs"]
 mod boundary;
+#[path = "refusal.rs"]
+mod refusal;
+pub use refusal::*;
+#[path = "grant_binding.rs"]
+mod grant_binding;
 #[path = "watch_progress.rs"]
 mod watch_progress;
 pub use boundary::*;
+pub use grant_binding::{FLOW_STEP_PREFIX, GrantBinding, SCOPE_REPOSITORY};
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,12 +90,15 @@ pub const MAX_POLICY_LAST_GOOD_BYTES: usize = 70 * 1024;
 /// admitted (`authorization_revision`), and every revocation is numbered in
 /// order (`grant.revoked_seq`). The admission is void once a grant the request
 /// depends on was revoked after that snapshot — its own capability, or, for a
-/// `flow.run` ticket, any `flow.step:` capability, since the steps a run
-/// reaches are gated under those names. Re-granting does not restore it. A
-/// revocation of anything else leaves the request alone: it never depended on
-/// that grant. A revoked row without a sequence number counts as later than
-/// every admission, so a gap can only invalidate, never authorize.
-const ADMISSION_STANDS: &str = "request.authorization_revision IS NOT NULL AND NOT EXISTS (     SELECT 1 FROM \"grant\" g WHERE g.revoked_ts IS NOT NULL      AND (g.revoked_seq IS NULL OR g.revoked_seq > request.authorization_revision)      AND (g.capability = request.capability           OR (request.capability = 'flow.run' AND g.capability LIKE 'flow.step:%')))";
+/// `flow.run` ticket, a `flow.step:` capability of the flow it runs
+/// (`request.flow_id`, recorded at admission), since the steps a run reaches
+/// are gated under those names. A `flow.run` row that names no flow (written
+/// before migration 17) depends on every flow's step grants, as it always
+/// did. Re-granting does not restore it. A revocation of anything else leaves
+/// the request alone: it never depended on that grant. A revoked row without
+/// a sequence number counts as later than every admission, so a gap can only
+/// invalidate, never authorize.
+const ADMISSION_STANDS: &str = "request.authorization_revision IS NOT NULL AND NOT EXISTS (     SELECT 1 FROM \"grant\" g WHERE g.revoked_ts IS NOT NULL      AND (g.revoked_seq IS NULL OR g.revoked_seq > request.authorization_revision)      AND (g.capability = request.capability           OR (request.capability = 'flow.run' AND g.capability LIKE 'flow.step:%'               AND (request.flow_id IS NULL                    OR substr(g.capability, 11, length(request.flow_id) + 1) = request.flow_id || '/'))))";
 
 /// Fixed startup subsets; never interpolate caller-supplied SQL predicates.
 #[derive(Clone, Copy)]
@@ -430,12 +439,18 @@ pub struct GrantRow {
     pub id: i64,
     /// Capability the grant covers.
     pub capability: String,
-    /// Grant scope; only `global` exists today.
+    /// Grant scope: `global`, or [`SCOPE_REPOSITORY`] for a flow step's
+    /// grant bound to one repository.
     pub scope: String,
     /// Unix seconds when the grant was recorded.
     pub granted_ts: i64,
     /// Unix seconds when the grant was revoked, once it was.
     pub revoked_ts: Option<i64>,
+    /// What a flow step's grant is bound to; `None` for an unbound legacy
+    /// flow step grant and for every other capability.
+    pub binding: Option<GrantBinding>,
+    /// Unix seconds when the binding was last recorded.
+    pub bound_ts: Option<i64>,
 }
 
 /// One row of the `caller` table — an observed agent+repo pair. An
@@ -473,7 +488,12 @@ pub struct AuditEntry<'a> {
 pub enum GrantChange<'a> {
     /// Record a new active global grant for this capability.
     Add(&'a str),
-    /// Revoke this capability's active grant; the row stays as history.
+    /// Record a flow step's grant bound to what it runs: re-points the
+    /// active grant of the same repository, or binds an unbound legacy one,
+    /// or adds a row (see `Store::bind_grant_rows`). Unchanged when the same
+    /// binding is active already.
+    Bind(&'a str, &'a GrantBinding),
+    /// Revoke this capability's active grants; the rows stay as history.
     Revoke(&'a str),
 }
 
@@ -762,6 +782,7 @@ impl OwnedAudit {
 /// An owned copy of a [`GrantChange`], for the same reason.
 enum OwnedGrantChange {
     Add(String),
+    Bind(String, GrantBinding),
     Revoke(String),
 }
 
@@ -769,6 +790,9 @@ impl OwnedGrantChange {
     fn new(change: GrantChange<'_>) -> Self {
         match change {
             GrantChange::Add(capability) => Self::Add(capability.to_owned()),
+            GrantChange::Bind(capability, binding) => {
+                Self::Bind(capability.to_owned(), binding.clone())
+            }
             GrantChange::Revoke(capability) => Self::Revoke(capability.to_owned()),
         }
     }
@@ -776,6 +800,7 @@ impl OwnedGrantChange {
     fn change(&self) -> GrantChange<'_> {
         match self {
             Self::Add(capability) => GrantChange::Add(capability),
+            Self::Bind(capability, binding) => GrantChange::Bind(capability, binding),
             Self::Revoke(capability) => GrantChange::Revoke(capability),
         }
     }
@@ -1448,18 +1473,19 @@ impl Store {
         let args_json = args_json.to_owned();
         let idempotency_key = idempotency_key.map(str::to_owned);
         let origin = *origin;
+        let flow_id = grant_binding::flow_id_of(&capability, &args_json);
         self.run(move |conn| {
             let now = now_ts();
             conn.execute(
                 "INSERT INTO request
                          (id, capability, repo, caller_agent, args_json,
                           idempotency_key, state, outcome, created_ts, updated_ts, expires_at_ms,
-                          authorization_revision, ingress, peer_uid, peer_pid, relayed)
+                          authorization_revision, ingress, peer_uid, peer_pid, relayed, flow_id)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, ?9,
                           CASE WHEN ?9 IS NOT NULL THEN
                             (SELECT COUNT(*) FROM \"grant\" WHERE revoked_ts IS NOT NULL)
                           ELSE NULL END,
-                          ?10, ?11, ?12, ?13)",
+                          ?10, ?11, ?12, ?13, ?14)",
                 params![
                     id,
                     capability,
@@ -1473,7 +1499,8 @@ impl Store {
                     origin.ingress.as_str(),
                     origin.peer_uid.map(i64::from),
                     origin.peer_pid.map(i64::from),
-                    i64::from(origin.relayed)
+                    i64::from(origin.relayed),
+                    flow_id
                 ],
             )?;
             Ok(())
@@ -1874,9 +1901,16 @@ impl Store {
                 }),
             };
         }
-        conn.execute(
-            "INSERT INTO audit (request_id, action, decision, actor, detail, ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        // The terminal row is flagged, and the schema admits one flagged row
+        // per request (`audit_terminal_once`, schema 19). The state update
+        // above already makes a second one unreachable; should a request
+        // nonetheless carry one (a row moved back out of a terminal state by
+        // hand), the first terminal row stands and this write is a no-op
+        // rather than an error that would leave the request in flight.
+        let written = conn.execute(
+            "INSERT INTO audit (request_id, action, decision, actor, detail, ts, terminal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                 ON CONFLICT (request_id) WHERE terminal = 1 DO NOTHING",
             params![
                 id,
                 audit.action,
@@ -1886,6 +1920,13 @@ impl Store {
                 now_ts()
             ],
         )?;
+        if written == 0 {
+            tracing::warn!(
+                request = id,
+                action = audit.action,
+                "the request already had its terminal audit row; it was kept and this one not written"
+            );
+        }
         Ok(true)
     }
 
@@ -2133,6 +2174,9 @@ impl Store {
                 }
                 !active
             }
+            GrantChange::Bind(capability, binding) => {
+                Self::bind_grant_rows(conn, capability, binding)?
+            }
             GrantChange::Revoke(capability) => Self::revoke_grant_rows(conn, capability)?,
         };
         Ok(if applied {
@@ -2249,20 +2293,14 @@ impl Store {
     /// GUI's capability view.
     pub async fn list_grants(&self) -> Result<Vec<GrantRow>, StoreError> {
         self.run(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, capability, scope, granted_ts, revoked_ts
-                     FROM \"grant\" ORDER BY granted_ts DESC, id DESC",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM \"grant\" ORDER BY granted_ts DESC, id DESC",
+                grant_binding::GRANT_COLUMNS
+            ))?;
             let mut rows = stmt.query(())?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
-                out.push(GrantRow {
-                    id: row.get(0)?,
-                    capability: row.get(1)?,
-                    scope: row.get(2)?,
-                    granted_ts: row.get(3)?,
-                    revoked_ts: row.get(4)?,
-                });
+                out.push(Self::grant_row(&row)?);
             }
             Ok(out)
         })
@@ -2474,11 +2512,36 @@ impl Store {
         audit: AuditEntry<'_>,
         remember: Option<(&str, AuditEntry<'_>)>,
     ) -> Result<bool, StoreError> {
+        self.resolve_approval_with_grant(
+            request_id,
+            resolution,
+            note,
+            audit,
+            remember.map(|(capability, grant_audit)| (GrantChange::Add(capability), grant_audit)),
+        )
+        .await
+    }
+
+    /// [`Self::resolve_approval_audited`] with the grant change the
+    /// remembered approval makes spelled out: [`GrantChange::Add`] for a
+    /// plain grant, [`GrantChange::Bind`] for a flow step's grant bound to
+    /// what the approved step runs. Returns `true` when the grant table
+    /// changed (a new row, or a binding re-pointed or bound); the grant's
+    /// audit row is written only then.
+    pub async fn resolve_approval_with_grant(
+        &self,
+        request_id: &str,
+        resolution: ApprovalResolution,
+        note: Option<&str>,
+        audit: AuditEntry<'_>,
+        remember: Option<(GrantChange<'_>, AuditEntry<'_>)>,
+    ) -> Result<bool, StoreError> {
         let request_id = request_id.to_owned();
         let note = note.map(str::to_owned);
         let audit = OwnedAudit::new(audit);
-        let remember = remember
-            .map(|(capability, grant_audit)| (capability.to_owned(), OwnedAudit::new(grant_audit)));
+        let remember = remember.map(|(change, grant_audit)| {
+            (OwnedGrantChange::new(change), OwnedAudit::new(grant_audit))
+        });
         self.transact(move |conn| {
             let changed = conn.execute(
                 "UPDATE approval SET resolved_ts = ?2, resolution = ?3, note = ?4
@@ -2492,11 +2555,11 @@ impl Store {
                 });
             }
             Self::insert_audit_row(conn, &request_id, audit.entry())?;
-            let Some((capability, grant_audit)) = remember else {
+            let Some((change, grant_audit)) = remember else {
                 return Ok(false);
             };
-            let granted = Self::apply_grant_change(conn, GrantChange::Add(&capability))?
-                == GrantChangeOutcome::Applied;
+            let granted =
+                Self::apply_grant_change(conn, change.change())? == GrantChangeOutcome::Applied;
             if granted {
                 Self::insert_audit_row(conn, &request_id, grant_audit.entry())?;
             }
@@ -2937,23 +3000,46 @@ impl Store {
         let kind = kind.to_owned();
         let meta_json = meta_json.map(str::to_owned);
         self.run(move |conn| {
-            conn.execute(
-                "INSERT INTO evidence
-                         (id, request_id, kind, content, path, content_hash, meta_json, ts)
-                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-                params![
-                    id,
-                    request_id,
-                    kind,
-                    content,
-                    content_hash,
-                    meta_json,
-                    now_ts()
-                ],
-            )?;
-            Ok(())
+            Self::insert_evidence_row(
+                conn,
+                &id,
+                &request_id,
+                &kind,
+                &content,
+                &content_hash,
+                meta_json.as_deref(),
+            )
         })
         .await
+    }
+
+    /// The statement of [`Self::insert_evidence`], for a caller that files
+    /// evidence inside its own transaction. `content_hash` is the SHA-256
+    /// hex of `content`, computed before the connection was taken.
+    pub(crate) fn insert_evidence_row(
+        conn: Db<'_>,
+        id: &str,
+        request_id: &str,
+        kind: &str,
+        content: &[u8],
+        content_hash: &str,
+        meta_json: Option<&str>,
+    ) -> Result<(), StoreError> {
+        conn.execute(
+            "INSERT INTO evidence
+                     (id, request_id, kind, content, path, content_hash, meta_json, ts)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            params![
+                id,
+                request_id,
+                kind,
+                content,
+                content_hash,
+                meta_json,
+                now_ts()
+            ],
+        )?;
+        Ok(())
     }
 
     /// Reads one evidence row by id, blob included, or `None` if it does
@@ -3148,10 +3234,13 @@ impl Store {
             params![cutoff_ts, keep_kind],
         )?;
         if rows > 0 {
+            // The tombstone first: it drops the view's chunks (a trigger),
+            // and only a tombstoned view may lose its evidence row, whose
+            // deletion then clears the view's `source_id`.
             conn.execute(
                 &format!(
-                    "UPDATE evidence_view SET view_blob = NULL, expired_at = ?3 \
-                     WHERE evidence_id IN ({batch})"
+                    "UPDATE evidence_view SET expired_at = ?3 \
+                     WHERE expired_at IS NULL AND evidence_id IN ({batch})"
                 ),
                 params![cutoff_ts, keep_kind, now_ts()],
             )?;

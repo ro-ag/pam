@@ -41,8 +41,10 @@ mod header;
 mod migrations;
 mod open;
 mod store;
+mod view_chunks;
 
 pub use error::{EngineError, StoreError};
+pub use store::{ACTION_FLOW_CHECKPOINT_ORPHANED, FlowCheckpoint};
 pub use store::{
     Actor, ApprovalResolution, ApprovalRow, AuditEntry, AuditRow, CallerRow, CompressionStats,
     ConnectorPatch, ConnectorRow, CorrelationBind, CorrelationStep, DEFAULT_REQUEST_LIST_LIMIT,
@@ -63,6 +65,12 @@ pub use store::{
     OBSERVATION_ADMIN_HANDSHAKE_FAILED, OBSERVATION_PUBLIC_UNKNOWN_HARNESS,
     SETTING_ADMIN_CONTACTS_EXPECTED_TOTAL, SETTING_ADMIN_CONTACTS_TOTAL,
     SETTING_PUBLIC_UNKNOWN_TOTAL,
+};
+pub use store::{FLOW_STEP_PREFIX, GrantBinding, SCOPE_REPOSITORY};
+pub use store::{
+    MAX_AGENT_BYTES, MAX_CAPABILITY_BYTES, MAX_CAUSE_BYTES, MAX_DETAIL_BYTES, MAX_PEER_EXE_BYTES,
+    MAX_REFUSAL_LIST_LIMIT, MAX_REFUSALS, MAX_REPO_BYTES, MAX_REQUEST_ID_BYTES, RefusalRecord,
+    RefusalRow, RefusalWrite, bounded,
 };
 
 #[cfg(test)]
@@ -89,9 +97,14 @@ mod store_test;
 mod sync_cost_test;
 #[cfg(test)]
 mod upgrade_test;
+#[cfg(test)]
+mod view_chunks_test;
 
 #[cfg(test)]
 mod flow_results_test;
+
+#[cfg(test)]
+mod grant_binding_test;
 
 #[cfg(test)]
 mod correlation_test;
@@ -118,3 +131,6 @@ mod landing_session_test;
 
 #[cfg(test)]
 mod boundary_test;
+
+#[cfg(test)]
+mod refusal_test;

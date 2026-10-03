@@ -18,6 +18,7 @@ fn main() {
         "daemon_status",
         "admin_call",
         "daemon_stop",
+        "daemon_start",
         "events_subscribe",
         "read_daemon_log",
         "service_status",

@@ -9,6 +9,7 @@
     "allow-daemon-status",
     "allow-admin-call",
     "allow-daemon-stop",
+    "allow-daemon-start",
     "allow-events-subscribe",
     "allow-read-daemon-log",
     "allow-service-status",

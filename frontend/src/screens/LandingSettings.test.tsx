@@ -1,7 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
-import { LandingSettings, parseTimeout } from "./LandingSettings";
+import {
+  LandingSettings,
+  formatRequiredCheck,
+  parseRequiredCheck,
+  parseTimeout,
+  unpinnedChecks,
+} from "./LandingSettings";
 import type { LandingPolicy, LandingRepository } from "../lib/landing";
 const mocks = vi.hoisted(() => ({ landingGet: vi.fn(), landingSet: vi.fn() }));
 vi.mock("../lib/landing", async (original) => ({
@@ -26,8 +32,9 @@ const saved: LandingPolicy = { revision: "revision-a", repositories: [repository
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.landingGet.mockResolvedValue(saved);
-  mocks.landingSet.mockImplementation(async (_revision, repositories) => ({
+  mocks.landingSet.mockImplementation(async (_revision, repositories, git_path) => ({
     revision: "revision-b",
+    git_path,
     repositories,
   }));
 });
@@ -59,13 +66,17 @@ it("saves a structured revision-bound recipe and only selected permission", asyn
   fireEvent.click(screen.getByLabelText("Landing repository 1: Push branch"));
   fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
   await waitFor(() => expect(mocks.landingSet).toHaveBeenCalledTimes(1));
-  expect(mocks.landingSet).toHaveBeenCalledWith("revision-a", [
-    {
-      ...repository,
-      checks: [{ ...repository.checks[0], argv: ["cargo", "test", "--workspace"] }],
-      permissions: { push: true, create_pr: false, merge: false, sync: false },
-    },
-  ]);
+  expect(mocks.landingSet).toHaveBeenCalledWith(
+    "revision-a",
+    [
+      {
+        ...repository,
+        checks: [{ ...repository.checks[0], argv: ["cargo", "test", "--workspace"] }],
+        permissions: { push: true, create_pr: false, merge: false, sync: false },
+      },
+    ],
+    null,
+  );
   await waitFor(() =>
     expect(screen.queryByText(/Unsaved landing changes/)).not.toBeInTheDocument(),
   );
@@ -75,7 +86,7 @@ it("removal is draft-only until saving the empty deny policy", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Remove landing repository 1" }));
   expect(mocks.landingSet).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
-  await waitFor(() => expect(mocks.landingSet).toHaveBeenCalledWith("revision-a", []));
+  await waitFor(() => expect(mocks.landingSet).toHaveBeenCalledWith("revision-a", [], null));
 });
 it("pending saves block duplicate submission and edits", async () => {
   let resolve!: (value: LandingPolicy) => void;
@@ -91,7 +102,7 @@ it("pending saves block duplicate submission and edits", async () => {
   fireEvent.click(save);
   fireEvent.click(save);
   expect(save).toBeDisabled();
-  expect(screen.getByLabelText("Landing repository 1: Squash merge")).toBeDisabled();
+  expect(screen.getByLabelText("Landing repository 1: Merge pull request")).toBeDisabled();
   expect(screen.getByRole("button", { name: "Reload landing policy" })).toBeDisabled();
   expect(mocks.landingSet).toHaveBeenCalledTimes(1);
   await act(async () =>
@@ -100,7 +111,7 @@ it("pending saves block duplicate submission and edits", async () => {
       repositories: [{ ...repository, permissions: { ...repository.permissions, push: true } }],
     }),
   );
-  expect(screen.getByLabelText("Landing repository 1: Squash merge")).not.toBeChecked();
+  expect(screen.getByLabelText("Landing repository 1: Merge pull request")).not.toBeChecked();
 });
 it("background revisions preserve the draft and require explicit reload", async () => {
   const client = await setup();
@@ -122,11 +133,11 @@ it("CAS rejection requires reload and does not silently retry authority", async 
     recovery: "Reload",
   });
   await setup();
-  fireEvent.click(screen.getByLabelText("Landing repository 1: Squash merge"));
+  fireEvent.click(screen.getByLabelText("Landing repository 1: Merge pull request"));
   fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
   await screen.findByRole("alert");
   expect(screen.getByRole("button", { name: "Save landing policy" })).toBeDisabled();
-  expect(screen.getByLabelText("Landing repository 1: Squash merge")).toBeChecked();
+  expect(screen.getByLabelText("Landing repository 1: Merge pull request")).toBeChecked();
   expect(mocks.landingSet).toHaveBeenCalledTimes(1);
 });
 
@@ -140,12 +151,16 @@ it("cache access requires explicit exact directories in the saved recipe", async
   expect(mocks.landingSet).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
   await waitFor(() =>
-    expect(mocks.landingSet).toHaveBeenCalledWith("revision-a", [
-      {
-        ...repository,
-        read_cache_roots: ["/home/dev/.cargo/registry", "/home/dev/.npm/_cacache"],
-      },
-    ]),
+    expect(mocks.landingSet).toHaveBeenCalledWith(
+      "revision-a",
+      [
+        {
+          ...repository,
+          read_cache_roots: ["/home/dev/.cargo/registry", "/home/dev/.npm/_cacache"],
+        },
+      ],
+      null,
+    ),
   );
 });
 it("keeps the saved timeout while the field is blank or out of range", async () => {
@@ -260,4 +275,76 @@ it("renders a refused save with the daemon's cause, detail and recovery", async 
   fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
   expect(await screen.findByText(/landing policy · policy_not_allowed/)).toBeInTheDocument();
   expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+});
+
+it("pins a required check to its GitHub App and flags the unpinned ones", async () => {
+  expect(parseRequiredCheck("ci / build @15368")).toEqual({
+    name: "ci / build",
+    app_id: 15368,
+  });
+  expect(parseRequiredCheck("ci")).toBe("ci");
+  expect(parseRequiredCheck("ci @0")).toBe("ci @0");
+  expect(parseRequiredCheck("@15368")).toBe("@15368");
+  expect(formatRequiredCheck({ name: "ci", app_id: 15368 })).toBe("ci @15368");
+  expect(unpinnedChecks({ ...repository, main_checks: [{ name: "ci", app_id: 1 }] })).toEqual([
+    "ci",
+  ]);
+  await setup();
+  expect(screen.getByLabelText("Landing repository 1 unpinned checks")).toHaveTextContent(
+    "Unpinned app: ci.",
+  );
+  for (const label of ["required PR checks", "required main checks"]) {
+    fireEvent.change(screen.getByLabelText(`Landing repository 1 ${label} (one per line)`), {
+      target: { value: "ci @15368\n" },
+    });
+  }
+  expect(
+    screen.queryByLabelText("Landing repository 1 unpinned checks"),
+  ).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
+  await waitFor(() => expect(mocks.landingSet).toHaveBeenCalled());
+  const sent = mocks.landingSet.mock.calls[0][1][0];
+  expect(sent.required_checks).toEqual([{ name: "ci", app_id: 15368 }]);
+  expect(sent.main_checks).toEqual([{ name: "ci", app_id: 15368 }]);
+});
+
+it("saves the merge method and the Git path", async () => {
+  await setup();
+  const method = screen.getByLabelText("Landing repository 1 merge method");
+  expect(method).toHaveValue("squash");
+  fireEvent.change(method, { target: { value: "rebase" } });
+  fireEvent.change(screen.getByLabelText(/Git for landing/), {
+    target: { value: " /Library/Developer/CommandLineTools/usr/bin/git " },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save landing policy" }));
+  await waitFor(() => expect(mocks.landingSet).toHaveBeenCalled());
+  const [, repositories, gitPath] = mocks.landingSet.mock.calls[0];
+  expect(repositories[0].merge_method).toBe("rebase");
+  expect(gitPath).toBe("/Library/Developer/CommandLineTools/usr/bin/git");
+});
+
+it("shows a Git path and merge method the policy locks as read-only", async () => {
+  mocks.landingGet.mockResolvedValue({
+    ...saved,
+    git_path: "/opt/homebrew/bin/git",
+    effective: {
+      git_path: {
+        source: "policy",
+        locked: true,
+        mode: "locked",
+        reason: "SEC-7",
+        value: "/Library/Developer/CommandLineTools/usr/bin/git",
+      },
+      merge_method: { source: "policy", locked: true, mode: "locked", value: "merge" },
+    },
+  });
+  await setup();
+  const git = screen.getByLabelText(/Git for landing/);
+  expect(git).toBeDisabled();
+  expect(git).toHaveValue("/Library/Developer/CommandLineTools/usr/bin/git");
+  const method = screen.getByLabelText("Landing repository 1 merge method");
+  expect(method).toBeDisabled();
+  expect(method).toHaveValue("merge");
+  expect(screen.getByText("SEC-7")).toBeInTheDocument();
+  expect(screen.getAllByText("Managed by your organization")).toHaveLength(2);
 });

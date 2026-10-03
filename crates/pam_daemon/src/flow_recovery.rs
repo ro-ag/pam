@@ -1,4 +1,5 @@
 //! Protected bounded runtime snapshots. Public evidence readers never receive these blobs.
+use crate::flow_intent::{EffectIntent, StepAttempt};
 use crate::{
     evidence_service::{ConnectorTarget, EvidenceOrigin, authorize_origin},
     executor::CapabilityFailure,
@@ -277,29 +278,28 @@ impl Recovery {
             origins: BTreeMap::new(),
             all_origins: Vec::new(),
         };
-        // The journal row is bound before its first checkpoint is filed, so
-        // a conflicting identity leaves no orphaned checkpoint row behind.
-        let (cursor, initial) = if prior.is_none() {
+        // The journal row and its first checkpoint are written in one
+        // transaction, journal first: a conflicting identity files no
+        // checkpoint, and a crash leaves neither a journal naming a missing
+        // checkpoint nor a checkpoint without its journal.
+        let begun = if prior.is_none() {
             let (cursor, evidence_id) = initial_cursor(&empty)?;
-            (cursor, Some(evidence_id))
+            let bytes = encode(&empty)?;
+            store
+                .begin_flow_journal_with_checkpoint(
+                    &identity,
+                    &cursor,
+                    pam_store::FlowCheckpoint {
+                        evidence_id: &evidence_id,
+                        bytes: &bytes,
+                    },
+                )
+                .await
         } else {
-            ("{}".to_owned(), None)
+            store.begin_flow_journal(&identity, "{}").await
         };
-        match store
-            .begin_flow_journal(&identity, &cursor)
-            .await
-            .map_err(|_| failure())?
-        {
-            pam_store::FlowJournalBegin::Conflict => return Err(failure()),
-            pam_store::FlowJournalBegin::Inserted => {
-                if let Some(evidence_id) = initial {
-                    store
-                        .insert_evidence(&evidence_id, ticket, KIND, &encode(&empty)?, None)
-                        .await
-                        .map_err(|_| failure())?;
-                }
-            }
-            pam_store::FlowJournalBegin::Existing => {}
+        if begun.map_err(|_| failure())? == pam_store::FlowJournalBegin::Conflict {
+            return Err(failure());
         }
         let row = store
             .read_flow_journal(ticket)
@@ -337,25 +337,24 @@ impl Recovery {
             snapshot,
         ))
     }
-    /// Commits the intent to attempt `step` before any I/O. A
-    /// [`Prepare::Run`] of a stateful step is journaled as effectful; a
-    /// [`Prepare::Gate`] is not until [`Self::arm_effect`], and a
-    /// [`Prepare::Skip`] never is, whatever the step declares.
+    /// Commits the intent to attempt a step before any I/O
+    /// ([`EffectIntent::attempt`] says when it is effectful: a
+    /// [`Prepare::Run`] of a stateful step is; a [`Prepare::Gate`] is not
+    /// until [`Self::arm_effect`], and a [`Prepare::Skip`] never is,
+    /// whatever the step declares).
     pub async fn prepare(
         &mut self,
         store: &Store,
         ticket: &str,
-        step: &pam_flow::Step,
-        prepare: Prepare,
+        intent: &EffectIntent<StepAttempt>,
     ) -> Result<(), CapabilityFailure> {
-        let stateful = step.effect == pam_flow::Effect::Stateful;
         if !store
             .prepare_flow_attempt(
                 ticket,
                 self.revision,
-                &step.id,
+                &intent.step_id,
                 1,
-                prepare == Prepare::Run && stateful,
+                intent.operation.effectful,
             )
             .await
             .map_err(|_| failure())?
@@ -363,7 +362,7 @@ impl Recovery {
             return Err(failure());
         }
         self.revision += 1;
-        self.gating = (prepare == Prepare::Gate && stateful).then(|| step.id.clone());
+        self.gating = intent.operation.gating.then(|| intent.step_id.clone());
         Ok(())
     }
     /// Journals the effect of a step that was prepared with [`Prepare::Gate`]
@@ -377,9 +376,9 @@ impl Recovery {
         &mut self,
         store: &Store,
         ticket: &str,
-        step: &pam_flow::Step,
+        intent: &EffectIntent<StepAttempt>,
     ) -> Result<(), CapabilityFailure> {
-        if self.gating.as_deref() != Some(step.id.as_str()) {
+        if self.gating.as_deref() != Some(intent.step_id.as_str()) {
             return Ok(());
         }
         if !store
@@ -391,7 +390,13 @@ impl Recovery {
         }
         self.revision += 1;
         if !store
-            .prepare_flow_attempt(ticket, self.revision, &step.id, 1, true)
+            .prepare_flow_attempt(
+                ticket,
+                self.revision,
+                &intent.step_id,
+                1,
+                intent.operation.effectful,
+            )
             .await
             .map_err(|_| failure())?
         {
@@ -472,21 +477,29 @@ impl Recovery {
         snapshot: &Snapshot,
         completed: bool,
     ) -> Result<(), CapabilityFailure> {
-        let mut cursor: Cursor =
-            serde_json::from_str(&file(store, ticket, snapshot).await?).map_err(|_| failure())?;
+        let bytes = encode(snapshot)?;
+        let (cursor, evidence_id) = initial_cursor(snapshot)?;
+        let mut cursor: Cursor = serde_json::from_str(&cursor).map_err(|_| failure())?;
         cursor.last_watch_evidence = self
             .watch
             .as_ref()
             .map(|w| w.last_evidence.clone())
             .or_else(|| self.cursor.last_watch_evidence.clone());
         let cursor = serde_json::to_string(&cursor).map_err(|_| failure())?;
+        // The settlement and the checkpoint it names commit together, the
+        // journal first: a stale revision files no checkpoint, and a crash
+        // leaves the attempt prepared with no checkpoint beside it.
         if !store
-            .settle_flow_attempt(
+            .settle_flow_attempt_with_checkpoint(
                 ticket,
                 self.revision,
                 &cursor,
                 &snapshot.evidence,
                 completed,
+                pam_store::FlowCheckpoint {
+                    evidence_id: &evidence_id,
+                    bytes: &bytes,
+                },
             )
             .await
             .map_err(|_| failure())?
@@ -558,22 +571,9 @@ impl Cursor {
         Ok(())
     }
 }
-async fn file(
-    store: &Store,
-    ticket: &str,
-    snapshot: &Snapshot,
-) -> Result<String, CapabilityFailure> {
-    let bytes = encode(snapshot)?;
-    let (cursor, evidence_id) = initial_cursor(snapshot)?;
-    store
-        .insert_evidence(&evidence_id, ticket, KIND, &bytes, None)
-        .await
-        .map_err(|_| failure())?;
-    Ok(cursor)
-}
 /// A cursor at `snapshot`'s progress naming a fresh checkpoint evidence id
-/// that the caller files; encoding is checked first so an oversized
-/// snapshot refuses before any row is written.
+/// that the caller files with the journal write; encoding is checked first
+/// so an oversized snapshot refuses before any row is written.
 fn initial_cursor(snapshot: &Snapshot) -> Result<(String, String), CapabilityFailure> {
     encode(snapshot)?;
     let evidence_id = format!("ev_{}", ulid::Ulid::new());

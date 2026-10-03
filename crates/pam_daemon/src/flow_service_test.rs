@@ -975,7 +975,7 @@ fn inspection_reports_a_never_rule_as_policy_denied_on_every_profile() {
                     granted,
                     CapabilityClass::Destructive
                 ),
-                crate::flow_contract::inspect_gate(profile, granted, CapabilityClass::Destructive),
+                profile_and_grant(profile, granted),
                 "no rule matches"
             );
         }
@@ -989,6 +989,218 @@ fn inspection_reports_a_never_rule_as_policy_denied_on_every_profile() {
             true,
             CapabilityClass::Destructive
         ),
-        crate::flow_contract::inspect_gate(Profile::Relaxed, true, CapabilityClass::Destructive)
+        profile_and_grant(Profile::Relaxed, true)
     );
+}
+
+/// What the profile and the grant alone decide for a destructive step, as
+/// inspection labels it.
+fn profile_and_grant(profile: crate::policy::Profile, granted: bool) -> &'static str {
+    use crate::policy::{CapabilityClass, GrantStanding, decide_with_grant};
+    let grant = if granted {
+        GrantStanding::Granted
+    } else {
+        GrantStanding::Missing
+    };
+    crate::flow_service::admission_label(
+        &decide_with_grant(
+            profile,
+            "flow.step:x/y",
+            CapabilityClass::Destructive,
+            &grant,
+        )
+        .decision("flow.step:x/y"),
+    )
+}
+
+/// The one step of `steps` (a YAML step list) in a flow named `f`.
+fn only_step(steps: &str) -> pam_flow::Step {
+    let flow = pam_flow::parse(&format!("schema: 1\nid: f\nname: F\nsteps:\n{steps}"))
+        .expect("the fixture flow parses");
+    flow.steps.into_iter().next().expect("one step")
+}
+
+#[test]
+fn the_effect_digest_follows_what_runs_and_ignores_how_it_is_written() {
+    use crate::flow_service::{step_binding, step_effect_digest};
+    let base =
+        only_step("  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {A: x}\n");
+    let digest = step_effect_digest(&base);
+    assert_eq!(digest.len(), 64);
+    // Comments, block style, key order, a note and a timeout: the same step.
+    let same = only_step(
+        "  # tidied by hand\n  - id: s   # same\n    env:\n      A: x\n    effect: stateful\n    \
+         note: a note\n    run:\n      - git\n      - push\n",
+    );
+    assert_eq!(step_effect_digest(&same), digest);
+    // What runs changes the digest.
+    for changed in [
+        "  - id: s\n    run: [git, push, --force]\n    effect: stateful\n    env: {A: x}\n",
+        "  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {A: y}\n",
+        "  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {B: x}\n",
+        "  - id: s\n    run: [git, push]\n    env: {A: x}\n    approval: required\n",
+    ] {
+        assert_ne!(step_effect_digest(&only_step(changed)), digest, "{changed}");
+    }
+    // The digest reads the normalized step: a stateful step always asks, so
+    // saying so changes nothing.
+    let spelled_out = only_step(
+        "  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {A: x}\n    approval: required\n",
+    );
+    assert_eq!(step_effect_digest(&spelled_out), digest);
+    let connector = |with: &str| {
+        step_effect_digest(&only_step(&format!(
+            "  - id: s\n    connector: github\n    call: run\n    with: {with}\n    role: observe\n"
+        )))
+    };
+    let call = connector("{repo: 'o/r', run_id: 1, run_attempt: 1}");
+    assert_eq!(connector("{run_attempt: 1, repo: 'o/r', run_id: 1}"), call);
+    assert_ne!(
+        connector("{repo: 'o/other', run_id: 1, run_attempt: 1}"),
+        call
+    );
+    assert_ne!(connector("{repo: 'o/r', run_id: 2, run_attempt: 1}"), call);
+    // The binding carries the gate class the step is evaluated under.
+    let flow = pam_flow::parse(
+        "schema: 1\nid: f\nname: F\nsteps:\n  - id: s\n    connector: github\n    call: run\n    \
+         with: {repo: 'o/r', run_id: 1, run_attempt: 1}\n    role: observe\n",
+    )
+    .unwrap();
+    let binding = step_binding(&flow, &flow.steps[0], Some("/r".to_owned()));
+    assert_eq!(binding.effect_class, "external");
+    assert_eq!(binding.effect_digest, call);
+    assert_eq!(binding.repository.as_deref(), Some("/r"));
+}
+
+/// `flow.inspect` and the run cannot disagree about a step's gate: for a
+/// matrix of gated steps (a stateful command, an always-asking read-only
+/// command, a connector call, a landing operation), every profile, every
+/// way a grant can stand (none, bound to the step as it is, bound to an
+/// older definition, bound to another repository, an unbound legacy row)
+/// and with and without a managed never-grant rule, the pure decision
+/// inspection reports is the decision the run's gate returns.
+#[tokio::test]
+async fn inspection_and_the_run_reach_the_same_gate_decision_for_every_step() {
+    use crate::flow_service::{inspect_gate, step_binding, step_capability, step_class};
+    use crate::policy::Profile;
+    use pam_store::{Actor, AuditEntry, Decision, GrantChange};
+
+    let flow = pam_flow::parse(
+        "schema: 1\nid: matrix\nname: Matrix\ncorrelation:\n  repository: 'https://git.example/team/app.git'\n  \
+         commit: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nsteps:\n  - id: build\n    run: [cargo, build]\n    \
+         effect: stateful\n  - id: look\n    run: [git, status]\n    approval: required\n  \
+         - id: call\n    connector: github\n    call: run\n    with: {repo: 'o/r', run_id: 1, run_attempt: 1}\n    \
+         role: observe\n  - id: freeze\n    landing: freeze\n",
+    )
+    .expect("the matrix flow parses");
+    let repository = Path::new("/repo/matrix");
+    let policies = [
+        None,
+        Some(r#"{"version":1,"security":{"grants":{"never":["flow.step:matrix/build"]}}}"#),
+        Some(r#"{"version":1,"security":{"grants":{"never_classes":["external"]}}}"#),
+    ];
+    let grants = ["none", "bound", "older", "elsewhere", "legacy"];
+    let audit = AuditEntry {
+        action: "grant_from_approval",
+        decision: Decision::Allow,
+        actor: Actor::Human,
+        detail: None,
+    };
+    let mut checked = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    for policy in policies {
+        for profile in [Profile::Relaxed, Profile::Standard, Profile::Strict] {
+            for grant in grants {
+                let (store, handle, gate) = matrix_gate(policy, profile).await;
+                for step in &flow.steps {
+                    assert!(step.gated(), "{}", step.id);
+                    let capability = step_capability(&flow.id, &step.id);
+                    let binding =
+                        step_binding(&flow, step, Some(repository.to_string_lossy().into_owned()));
+                    let mut other = binding.clone();
+                    match grant {
+                        "older" => other.effect_digest = "0".repeat(64),
+                        "elsewhere" => other.repository = Some("/repo/other".to_owned()),
+                        _ => {}
+                    }
+                    let seeded = match grant {
+                        "bound" => Some(GrantChange::Bind(&capability, &binding)),
+                        "legacy" => Some(GrantChange::Add(&capability)),
+                        "older" | "elsewhere" => Some(GrantChange::Bind(&capability, &other)),
+                        _ => None,
+                    };
+                    if let Some(change) = seeded {
+                        store
+                            .apply_grant_change_audited("req_1", change, audit)
+                            .await
+                            .unwrap();
+                    }
+                    // Inspection first: the run binds a legacy grant.
+                    let rows = store.active_grants(&capability).await.unwrap();
+                    let (inspected, _) = inspect_gate(
+                        &flow,
+                        step,
+                        Some(repository),
+                        &handle.view(),
+                        gate.profile(),
+                        &rows,
+                    );
+                    let (ran, _) = gate
+                        .evaluate_step("req_1", &capability, step_class(step), &binding)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        inspected, ran,
+                        "{} under {profile:?}, grant {grant}, policy {policy:?}",
+                        step.id
+                    );
+                    seen.insert(crate::flow_service::admission_label(&ran));
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 3 * 3 * 5 * 4);
+    // The matrix reaches every decision a gated step can get.
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [
+            "allowed",
+            "approval_required",
+            "not_granted",
+            "policy_denied"
+        ]
+    );
+}
+
+/// A gate over the stored `profile` under the managed `policy`, with the
+/// request row the matrix's gate decisions are audited against.
+async fn matrix_gate(
+    policy: Option<&str>,
+    profile: crate::policy::Profile,
+) -> (
+    Arc<Store>,
+    Arc<crate::managed_policy_service::PolicyHandle>,
+    PolicyGate,
+) {
+    use crate::policy::PROFILE_SETTING_KEY;
+    use crate::policy_test::{SwitchablePolicy, managed_handle};
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    store
+        .set_setting(
+            PROFILE_SETTING_KEY,
+            &serde_json::to_string(&profile).unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .insert_request("req_1", "flow.run", "/repo/matrix", "claude", "{}", None)
+        .await
+        .unwrap();
+    let source = SwitchablePolicy::new(policy);
+    let handle = managed_handle(&store, &source).await;
+    let gate = PolicyGate::new(Arc::clone(&store), Arc::clone(&handle))
+        .await
+        .unwrap();
+    (store, handle, gate)
 }

@@ -82,7 +82,7 @@ export function approvalMeaning(capability: string): { before: string; after: st
     return {
       before: "The flow asks to run a gated step, ",
       after:
-        ". Approving runs that step this once; remember grants the capability to every repository.",
+        ". Approving runs that step this once; remember keeps it for this repository and this exact step.",
     };
   }
   switch (capability.split(".")[0]) {
@@ -225,6 +225,8 @@ function ApprovalCard({
   const clock = waitingClock(approval.requested_ts, now);
   const command = commandView(approval.args);
   const resolved = approval.resolved ?? null;
+  // A flow step's grant is bound to the step as it is now, in this repository.
+  const scope = approval.remember ?? null;
   const options = () => ({
     remember: remember && !rememberBlocked,
     ...(note.trim() ? { note: note.trim() } : {}),
@@ -293,6 +295,12 @@ function ApprovalCard({
         </span>
         {meaning.after}
       </p>
+
+      {scope?.changed && (
+        <p className="max-w-md font-sans text-sm text-warning">
+          Asked again: <SafeText value={scope.changed} />.
+        </p>
+      )}
 
       <dl aria-label="what will run" className="space-y-1 font-data text-xs text-ink-muted">
         {resolved !== null && (
@@ -406,7 +414,9 @@ function ApprovalCard({
           >
             {rememberBlocked
               ? REMEMBER_BLOCKED_NOTE
-              : "grants it for every repository, not just this one"}
+              : scope !== null
+                ? "remembers it for this repository and this exact step; an edited step asks again"
+                : "grants it for every repository, not just this one"}
           </span>
         </span>
         {!noteOpen && (
@@ -424,7 +434,11 @@ function ApprovalCard({
       {confirming && remember && (
         <TypedConfirm
           phrase={CONFIRM_GRANT}
-          title="Approve and grant this capability everywhere?"
+          title={
+            scope !== null
+              ? "Approve and remember this step for this repository?"
+              : "Approve and grant this capability everywhere?"
+          }
           confirmLabel="Approve and remember"
           busy={busy}
           onCancel={() => setConfirming(false)}
@@ -433,13 +447,27 @@ function ApprovalCard({
             submit("approved", { confirmation: typed });
           }}
         >
-          <p>
-            Remembering turns this answer into a standing grant of{" "}
-            <span className="font-data text-ink">
-              <SafeText value={capabilityLabel(approval.capability)} />
-            </span>{" "}
-            for every repository and every agent, until you revoke it in Settings.
-          </p>
+          {scope !== null ? (
+            <p>
+              Remembering turns this answer into a standing grant of{" "}
+              <span className="font-data text-ink">
+                <SafeText value={capabilityLabel(approval.capability)} />
+              </span>{" "}
+              for{" "}
+              <span className="font-data text-ink">
+                <SafeText value={scope.repository ?? "every repository"} />
+              </span>{" "}
+              and this exact step, until you revoke it in Settings or the step changes.
+            </p>
+          ) : (
+            <p>
+              Remembering turns this answer into a standing grant of{" "}
+              <span className="font-data text-ink">
+                <SafeText value={capabilityLabel(approval.capability)} />
+              </span>{" "}
+              for every repository and every agent, until you revoke it in Settings.
+            </p>
+          )}
         </TypedConfirm>
       )}
 

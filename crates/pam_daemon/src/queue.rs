@@ -19,8 +19,9 @@
 //!   (`queued`/`running`/`waiting_approval`) by `idempotency_key` when present, else by shape —
 //!   byte equality of capability + repo + serialized args (`serde_json` sorts map keys, so this is
 //!   deterministic). A hit returns [`AdmitOutcome::Attached`]; the caller subscribes instead of
-//!   re-executing. Terminal requests never match, so retries after completion run fresh. The mutex
-//!   is held across check-then-insert so concurrent admissions cannot both miss the check.
+//!   re-executing. Terminal requests never match, so retries after completion run fresh. The
+//!   admission mutex (not the lane lock) is held across check-then-insert so concurrent admissions
+//!   cannot both miss the check, and the caps are counted against the rows already inserted.
 //! - **Leases**: [`QueueManager::take_next`] marks the request `running` with a deadline from
 //!   `deadline_ms`, clamped to [`MAX_LEASE`]. An expired lease is reaped
 //!   (`QueueManager::reap_expired_notifying`, driven by [`QueueManager::run_reaper`]): terminal
@@ -41,11 +42,37 @@
 //!   transaction. The queue never calls `update_request_state` with a terminal state; the
 //!   already-terminal guard makes reaper-vs-executor double-finish races a first-wins no-op with no
 //!   duplicate audit row.
-//! - **Concurrency**: one `QueueManager` behind `&self`, a single `tokio::sync::Mutex` over the
-//!   in-memory maps (low-contention monolith); no lock is ever held across an `.await` on anything
-//!   but the store. There are no lane worker tasks — the executor loop drives
-//!   [`QueueManager::take_next`]/[`QueueManager::complete`].
+//! - **Concurrency (the lock invariant)**: one `QueueManager` behind `&self`. Three things guard
+//!   it, each for one job, taken in this order and never the other way round:
+//!   1. the **admission mutex** (async) serializes [`QueueManager::admit_from`]'s dedupe check,
+//!      cap count and row insert, which are store calls; it guards no in-memory state and nothing
+//!      else waits on it;
+//!   2. the **lane lock** (a synchronous mutex, so it cannot be held across an `.await`) guards
+//!      only the in-memory index: lanes, leases, busy lanes, parked checkpoints, terminal notices,
+//!      and the claims below. It is held for map updates only, never across store I/O;
+//!   3. the **store** guards durable truth: every state change is one store call whose own guard
+//!      (`queued` → `running` only from `queued`, the already-terminal refusal, first terminal
+//!      write wins) decides a race between two writers.
+//!
+//!   Every operation that changes a request in the store follows the same three steps: under the
+//!   lane lock it decides and **claims** the request (and, for a lease, reserves the lane as busy
+//!   and, for a terminal, one terminal-notice slot); it releases the lock and calls the store; it
+//!   re-takes the lock and applies the result. A claimed request is owned by its claimant until
+//!   it settles: any other operation on the same request waits for the claim to settle and starts
+//!   over from what it then sees, so operations on one request are still linearized while every
+//!   other lane carries on. The one writer that cannot claim first is the stranded-row
+//!   reconciler, whose store sweep chooses its own rows: when it finishes a request that another
+//!   operation holds, it marks the claim **withdrawn**, and the claimant, applying its result,
+//!   sees the mark and takes the outcome it would have had if the reconciler had run first (no
+//!   lease, no lane entry, no parked checkpoint). Apply steps only remove what they own: a lane
+//!   is freed only if it is busy with that request, an entry is removed by id, never by
+//!   position. A claim dropped mid-call (a cancelled future) releases itself, rolling back its
+//!   reservations, and the store guard decides what the interrupted call left behind, exactly as
+//!   when the queue held its lock across the call. There are no lane worker tasks — the
+//!   executor loop drives [`QueueManager::take_next`]/[`QueueManager::complete`].
 //! - **Boot**: [`QueueManager::rebuild_from_store`] reloads `queued` rows into lanes, oldest first.
+//!   It runs once at boot, before any other queue operation: its store reads happen without the
+//!   lane lock and the rebuilt index replaces the in-memory one in a single locked swap at the end.
 //!   Crash recovery of `running`/`waiting_approval` rows left by a dead daemon (failed with cause
 //!   `daemon_restart`) happens elsewhere, not here.
 //! - **Stranded rows**: a row can outlive every in-memory owner — a terminal write the store
@@ -60,8 +87,9 @@
 //!   release its waiters. The grace exists so a handler still writing its own verdict a moment
 //!   past the deadline wins.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use pam_proto::Envelope;
@@ -70,6 +98,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
+
+use crate::request_state::{self, RequestEvent};
 
 /// Upper bound on any lease: an envelope `deadline_ms` beyond this is
 /// clamped. Admission persists the absolute expiry for placement and recovery.
@@ -236,31 +266,252 @@ struct Lease {
     cancel_tx: watch::Sender<bool>,
 }
 
-/// The in-memory queue state, all guarded by one mutex.
+/// The in-memory queue index, all guarded by the lane lock (see the module
+/// docs on the lock invariant).
 #[derive(Default)]
 struct Inner {
     /// repo → queued request entries, oldest first.
     lanes: HashMap<String, VecDeque<QueuedEntry>>,
     /// request id → its outstanding lease.
     leases: HashMap<String, Lease>,
-    /// repo → the leased request id keeping the lane busy.
+    /// repo → the leased request id keeping the lane busy, or the request a
+    /// claim is about to lease.
     busy: HashMap<String, String>,
     /// Original request id → durable watch waiting for its next poll.
     parked: HashMap<String, ParkedEntry>,
     /// Terminal parked tickets whose original waiting caller must be finished.
     parked_terminals: Vec<String>,
+    /// Requests an operation is changing in the store right now.
+    claimed: HashSet<String>,
+    /// Claimed requests the reconciler finished while their claimant was in
+    /// the store.
+    withdrawn: HashSet<String>,
+    /// Terminal-notice slots promised to operations that are in the store.
+    reserved_terminals: usize,
+}
+
+impl Inner {
+    /// Room left for terminal notices, counting the slots already promised.
+    fn terminal_room(&self) -> usize {
+        MAX_PARKED_TERMINALS
+            .saturating_sub(self.parked_terminals.len())
+            .saturating_sub(self.reserved_terminals)
+    }
+
+    /// Frees `repo`'s lane if, and only if, `request_id` keeps it busy.
+    fn free_lane(&mut self, repo: &str, request_id: &str) {
+        if self
+            .busy
+            .get(repo)
+            .is_some_and(|holder| holder == request_id)
+        {
+            self.busy.remove(repo);
+        }
+    }
+
+    /// Removes `request_id`'s entry from `repo`'s lane by id (never by
+    /// position), dropping the lane once it is empty.
+    fn remove_from_lane(&mut self, repo: &str, request_id: &str) {
+        if let Some(lane) = self.lanes.get_mut(repo) {
+            lane.retain(|entry| entry.id != request_id);
+            if lane.is_empty() {
+                self.lanes.remove(repo);
+            }
+        }
+    }
+
+    /// Drops every in-memory trace of a request that is now terminal: its
+    /// lease (signalling the holder and freeing its lane), its lane entry and
+    /// its parked checkpoint.
+    fn forget(&mut self, request_id: &str) {
+        if let Some(lease) = self.leases.remove(request_id) {
+            self.free_lane(&lease.repo, request_id);
+            let _ = lease.cancel_tx.send(true);
+        }
+        for lane in self.lanes.values_mut() {
+            lane.retain(|entry| entry.id != request_id);
+        }
+        self.lanes.retain(|_, lane| !lane.is_empty());
+        self.parked.remove(request_id);
+    }
+}
+
+/// What one operation holds while it is in the store with the lane lock
+/// released (see the module docs on claims). Settled under the lock when
+/// the result is applied; dropped unsettled (an error or a cancelled
+/// future), it settles itself and rolls its reservations back.
+struct Claim<'q> {
+    queue: &'q QueueManager,
+    /// The claimed request; `None` for the reconciler, which only reserves
+    /// notice slots.
+    id: Option<String>,
+    /// A lane this claim reserved as busy for the lease it is handing out.
+    lane: Option<String>,
+    /// Terminal-notice slots promised to this claim.
+    slots: usize,
+    settled: bool,
+}
+
+impl<'q> Claim<'q> {
+    /// Claims `id`, which the caller has just seen unclaimed under `inner`.
+    fn on(queue: &'q QueueManager, inner: &mut Inner, id: &str) -> Self {
+        inner.claimed.insert(id.to_owned());
+        Self {
+            queue,
+            id: Some(id.to_owned()),
+            lane: None,
+            slots: 0,
+            settled: false,
+        }
+    }
+
+    /// Promises `slots` terminal-notice slots and claims no request.
+    fn slots(queue: &'q QueueManager, inner: &mut Inner, slots: usize) -> Self {
+        inner.reserved_terminals += slots;
+        Self {
+            queue,
+            id: None,
+            lane: None,
+            slots,
+            settled: false,
+        }
+    }
+
+    /// Keeps `repo`'s lane busy for the claimed request until it is leased
+    /// or the claim settles without a lease.
+    fn reserve_lane(&mut self, inner: &mut Inner, repo: &str) {
+        if let Some(id) = &self.id {
+            inner.busy.insert(repo.to_owned(), id.clone());
+            self.lane = Some(repo.to_owned());
+        }
+    }
+
+    /// Promises one terminal-notice slot to this claim.
+    fn reserve_slot(&mut self, inner: &mut Inner) {
+        inner.reserved_terminals += 1;
+        self.slots += 1;
+    }
+
+    /// The reserved lane now belongs to a lease: settling keeps it busy.
+    fn keep_lane(&mut self) {
+        self.lane = None;
+    }
+
+    /// Whether the reconciler finished the claimed request while it was in
+    /// the store.
+    fn withdrawn(&self, inner: &Inner) -> bool {
+        self.id
+            .as_ref()
+            .is_some_and(|id| inner.withdrawn.contains(id))
+    }
+
+    /// Releases what the claim still holds, under the lock: the claim and
+    /// its withdrawn mark, a lane reservation that did not become a lease,
+    /// and the promised notice slots.
+    fn settle(&mut self, inner: &mut Inner) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        if let Some(id) = &self.id {
+            inner.claimed.remove(id);
+            inner.withdrawn.remove(id);
+            if let Some(repo) = self.lane.take()
+                && !inner.leases.contains_key(id)
+            {
+                inner.free_lane(&repo, id);
+            }
+        }
+        inner.reserved_terminals = inner.reserved_terminals.saturating_sub(self.slots);
+        self.slots = 0;
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            let mut inner = self.queue.lock();
+            self.settle(&mut inner);
+        }
+        self.queue.settled.notify_waiters();
+    }
+}
+
+/// What a decision taken under the lane lock tells its operation to do.
+enum Step<T, R> {
+    /// Another operation holds the request: wait for it to settle, then
+    /// decide again.
+    Wait,
+    /// Nothing to do in the store: return this.
+    Done(R),
+    /// Claimed: go to the store with this.
+    Go(T),
+}
+
+/// Whether a sweep over many requests may claim the next one.
+enum Sweep<'q> {
+    /// Claimed, with a notice slot promised; the flag says the request's
+    /// deadline has passed.
+    Claimed(Claim<'q>, bool),
+    /// Gone or held by another operation, which settles it: skip it.
+    Skip,
+    /// No room for another terminal notice: stop this sweep.
+    Full,
+}
+
+#[cfg(test)]
+type Entered<'a> = tokio::sync::RwLockReadGuard<'a, ()>;
+#[cfg(not(test))]
+type Entered<'a> = std::marker::PhantomData<&'a ()>;
+
+/// A test's hold on the store calls the queue makes for one request: they
+/// wait inside `QueueManager::io`, with the lane lock released, until the
+/// hold is released or dropped.
+#[cfg(test)]
+pub(crate) struct StoreHold {
+    release: watch::Sender<bool>,
+    reached: watch::Receiver<usize>,
+}
+
+#[cfg(test)]
+impl StoreHold {
+    /// Waits until a store call for the held request is waiting on the hold.
+    pub(crate) async fn reached(&mut self) {
+        let _ = self.reached.wait_for(|calls| *calls > 0).await;
+    }
+
+    /// Lets the held calls, and every later one, through.
+    pub(crate) fn release(self) {
+        let _ = self.release.send(true);
+    }
 }
 
 /// The queue manager service. See the module docs for the design.
 pub struct QueueManager {
     store: Arc<Store>,
-    inner: Mutex<Inner>,
+    /// The lane lock: the in-memory index only, never held across store I/O.
+    inner: std::sync::Mutex<Inner>,
+    /// Serializes admission's check-then-insert in the store.
+    admission: Mutex<()>,
+    /// Fires whenever a claim settles; an operation waiting on a claimed
+    /// request waits on it.
+    settled: Notify,
     work: Notify,
     /// See [`DEFAULT_RECONCILE_GRACE`].
     reconcile_grace: Duration,
     /// Test seam: see `fail_next_completes`.
     #[cfg(test)]
     injected_complete_failures: std::sync::atomic::AtomicUsize,
+    /// Test seam: see `stall`.
+    #[cfg(test)]
+    stall_gate: tokio::sync::RwLock<()>,
+    /// Test seam: see `hold_store`.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity, reason = "a test seam's private map")]
+    store_holds: std::sync::Mutex<HashMap<String, (watch::Receiver<bool>, watch::Sender<usize>)>>,
+    /// Test seam: see `with_paused_clock`.
+    #[cfg(test)]
+    clock: Option<(i64, Instant)>,
 }
 
 impl std::fmt::Debug for QueueManager {
@@ -276,11 +527,19 @@ impl QueueManager {
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
-            inner: Mutex::new(Inner::default()),
+            inner: std::sync::Mutex::new(Inner::default()),
+            admission: Mutex::new(()),
+            settled: Notify::new(),
             work: Notify::new(),
             reconcile_grace: DEFAULT_RECONCILE_GRACE,
             #[cfg(test)]
             injected_complete_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            stall_gate: tokio::sync::RwLock::new(()),
+            #[cfg(test)]
+            store_holds: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            clock: None,
         }
     }
 
@@ -290,6 +549,80 @@ impl QueueManager {
     pub fn with_reconcile_grace(mut self, grace: Duration) -> Self {
         self.reconcile_grace = grace;
         self
+    }
+
+    /// The lane lock. A poisoned lock is taken over: every update under it
+    /// is a handful of map operations that leave the index consistent.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Entered at the top of every public operation; a test's `stall`
+    /// holds it shut.
+    #[cfg_attr(
+        not(test),
+        allow(clippy::unused_self, reason = "only the test build reads its seam")
+    )]
+    fn enter(&self) -> impl Future<Output = Entered<'_>> {
+        #[cfg(test)]
+        {
+            self.stall_gate.read()
+        }
+        #[cfg(not(test))]
+        {
+            std::future::ready(std::marker::PhantomData)
+        }
+    }
+
+    /// Every store call the queue makes goes through here, with the lane
+    /// lock released; a test can hold the calls made for one request (see
+    /// `hold_store`).
+    async fn io<T>(&self, request_id: &str, call: impl Future<Output = T>) -> T {
+        #[cfg(test)]
+        {
+            self.store_latency(request_id).await;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = request_id;
+        }
+        call.await
+    }
+
+    /// Milliseconds since the epoch: the wall clock, or in a test the
+    /// paused Tokio clock (see `with_paused_clock`).
+    #[cfg_attr(
+        not(test),
+        allow(clippy::unused_self, reason = "only the test build reads its seam")
+    )]
+    fn now_ms(&self) -> i64 {
+        #[cfg(test)]
+        {
+            if let Some((base_ms, base)) = self.clock {
+                return base_ms
+                    .saturating_add(i64::try_from(base.elapsed().as_millis()).unwrap_or(i64::MAX));
+            }
+        }
+        wall_clock_ms()
+    }
+
+    /// Waits until no other operation holds `request_id`, then claims it.
+    async fn claim(&self, request_id: &str) -> Claim<'_> {
+        loop {
+            let settled = self.settled.notified();
+            if let Some(claim) = self.try_claim(request_id) {
+                return claim;
+            }
+            settled.await;
+        }
+    }
+
+    fn try_claim(&self, request_id: &str) -> Option<Claim<'_>> {
+        let mut inner = self.lock();
+        if inner.claimed.contains(request_id) {
+            return None;
+        }
+        Some(Claim::on(self, &mut inner, request_id))
     }
 
     /// Admits `envelope` (classified as `class`) into the queue: dedupe
@@ -319,9 +652,13 @@ impl QueueManager {
         class: crate::policy::CapabilityClass,
         origin: &RequestOrigin,
     ) -> Result<AdmitOutcome, QueueError> {
+        let _entered = self.enter().await;
+        let id = envelope.id.as_str();
         let args_json = envelope.args.to_string();
-        let _inner = self.inner.lock().await;
-        let now = wall_clock_ms();
+        // Admission touches no lane state: its own mutex serializes the
+        // store's check-then-insert, and no other queue operation waits on it.
+        let _admission = self.admission.lock().await;
+        let now = self.now_ms();
         let duration = clamp_lease(envelope.deadline_ms);
         if duration.is_zero() {
             return Err(QueueError::Expired);
@@ -330,13 +667,15 @@ impl QueueManager {
             now.saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
         if !class.bypasses_lanes() {
             let existing = self
-                .store
-                .find_admitted_by_shape(
-                    &envelope.capability,
-                    &envelope.caller.repo,
-                    &args_json,
-                    envelope.idempotency_key.as_deref(),
-                    now,
+                .io(
+                    id,
+                    self.store.find_admitted_by_shape(
+                        &envelope.capability,
+                        &envelope.caller.repo,
+                        &args_json,
+                        envelope.idempotency_key.as_deref(),
+                        now,
+                    ),
                 )
                 .await?;
             if let Some(row) = existing {
@@ -347,7 +686,7 @@ impl QueueManager {
         }
         // Only admissions whose deadline is still ahead: a row stranded past
         // its deadline can no longer run and must not hold a slot.
-        let (count, bytes) = self.store.admission_usage_at(now).await?;
+        let (count, bytes) = self.io(id, self.store.admission_usage_at(now)).await?;
         if count >= MAX_ADMITTED_REQUESTS {
             return Err(QueueError::Capacity {
                 cause: "queue_count_limit",
@@ -376,8 +715,9 @@ impl QueueManager {
                 maximum: MAX_ADMITTED_BYTES,
             });
         }
-        self.store
-            .insert_admitted_request_from(
+        self.io(
+            id,
+            self.store.insert_admitted_request_from(
                 &envelope.id,
                 &envelope.capability,
                 &envelope.caller.repo,
@@ -386,8 +726,9 @@ impl QueueManager {
                 envelope.idempotency_key.as_deref(),
                 expires_at_ms,
                 origin,
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok(if class.bypasses_lanes() {
             AdmitOutcome::Bypass
         } else {
@@ -401,22 +742,33 @@ impl QueueManager {
     /// ahead of it (0 = lane head; a currently leased request is not
     /// counted).
     pub async fn place_in_lane(&self, request_id: &str, repo: &str) -> Result<usize, QueueError> {
-        let mut inner = self.inner.lock().await;
+        let _entered = self.enter().await;
+        let mut claim = self.claim(request_id).await;
         let row = self
-            .store
-            .get_request(request_id)
+            .io(request_id, self.store.get_request(request_id))
             .await?
             .ok_or(QueueError::NotAdmitted)?;
         let expires = row.expires_at_ms.ok_or(QueueError::NotAdmitted)?;
-        let remaining = expires.saturating_sub(wall_clock_ms());
+        let remaining = expires.saturating_sub(self.now_ms());
         if remaining <= 0 {
             return Err(QueueError::Expired);
         }
-        if !self
-            .store
-            .authorize_queued_request(request_id, repo, wall_clock_ms())
-            .await?
-        {
+        let authorized = self
+            .io(
+                request_id,
+                self.store
+                    .authorize_queued_request(request_id, repo, self.now_ms()),
+            )
+            .await?;
+        let mut inner = self.lock();
+        // The reconciler failed the row past its deadline while it was being
+        // placed: placement after it would have found it expired.
+        if claim.withdrawn(&inner) {
+            claim.settle(&mut inner);
+            return Err(QueueError::Expired);
+        }
+        if !authorized {
+            claim.settle(&mut inner);
             return Err(QueueError::NotAdmitted);
         }
         let lane = inner.lanes.entry(repo.to_owned()).or_default();
@@ -425,6 +777,7 @@ impl QueueManager {
             id: request_id.to_owned(),
             deadline: Instant::now() + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
         });
+        claim.settle(&mut inner);
         Ok(position)
     }
 
@@ -432,7 +785,8 @@ impl QueueManager {
     /// lanes a [`Self::take_next`] call would currently serve. The
     /// executor loop polls this to know where to look.
     pub async fn ready_repos(&self) -> Vec<String> {
-        let inner = self.inner.lock().await;
+        let _entered = self.enter().await;
+        let inner = self.lock();
         inner
             .lanes
             .keys()
@@ -448,64 +802,98 @@ impl QueueManager {
     /// The request row is moved to `running` before the lease is handed
     /// out.
     pub async fn take_next(&self, repo: &str) -> Result<Option<LeasedWork>, QueueError> {
-        let mut inner = self.inner.lock().await;
-        if inner.busy.contains_key(repo) {
-            return Ok(None);
-        }
+        let _entered = self.enter().await;
+        // The lane stays reserved as busy while the head is in the store, so
+        // no second lease can be taken off it meanwhile.
+        let (mut claim, id, deadline) = loop {
+            let settled = self.settled.notified();
+            match self.claim_lane_head(repo) {
+                Step::Go(head) => break head,
+                Step::Done(()) => return Ok(None),
+                Step::Wait => settled.await,
+            }
+        };
         // Capacity is reserved before any terminal write; admission remains in
         // its lane on every database failure or notification backpressure.
-        let Some(entry) = inner.lanes.get(repo).and_then(VecDeque::front) else {
-            return Ok(None);
-        };
-        let entry = QueuedEntry {
-            id: entry.id.clone(),
-            deadline: entry.deadline,
-        };
-        let cause = if entry.deadline <= Instant::now() {
+        let cause = if deadline <= Instant::now() {
             Some(CAUSE_LEASE_EXPIRED)
         } else if self
-            .store
-            .start_queued_request(&entry.id, wall_clock_ms())
+            .io(&id, self.store.start_queued_request(&id, self.now_ms()))
             .await?
         {
             None
         } else if self
-            .store
-            .request_admission_expired(&entry.id, wall_clock_ms())
+            .io(
+                &id,
+                self.store.request_admission_expired(&id, self.now_ms()),
+            )
             .await?
         {
             Some(CAUSE_LEASE_EXPIRED)
         } else {
             Some("authorization_changed")
         };
-        if let Some(cause) = cause {
-            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
-                self.work.notify_one();
+        let Some(cause) = cause else {
+            return Ok(self.lease_out(claim, repo, id, deadline));
+        };
+        {
+            let mut inner = self.lock();
+            if claim.withdrawn(&inner) {
+                claim.settle(&mut inner);
                 return Ok(None);
             }
-            let finished = self.fail_recovered(&entry.id, cause).await?;
-            if let Some(lane) = inner.lanes.get_mut(repo) {
-                lane.pop_front();
-            }
-            if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
-                inner.lanes.remove(repo);
-            }
-            if finished {
-                inner.parked_terminals.push(entry.id);
+            if inner.terminal_room() == 0 {
                 self.work.notify_one();
+                claim.settle(&mut inner);
+                return Ok(None);
             }
-            return Ok(None);
+            claim.reserve_slot(&mut inner);
         }
-        if let Some(lane) = inner.lanes.get_mut(repo) {
-            lane.pop_front();
+        let finished = self.io(&id, self.fail_recovered(&id, cause)).await?;
+        let mut inner = self.lock();
+        inner.remove_from_lane(repo, &id);
+        claim.settle(&mut inner);
+        if finished {
+            inner.parked_terminals.push(id);
+            self.work.notify_one();
         }
-        if inner.lanes.get(repo).is_some_and(VecDeque::is_empty) {
-            inner.lanes.remove(repo);
-        }
+        Ok(None)
+    }
 
+    /// Under the lock: claims `repo`'s head and reserves the lane for it.
+    fn claim_lane_head(&self, repo: &str) -> Step<(Claim<'_>, String, Instant), ()> {
+        let mut inner = self.lock();
+        if inner.busy.contains_key(repo) {
+            return Step::Done(());
+        }
+        let Some(head) = inner.lanes.get(repo).and_then(VecDeque::front) else {
+            return Step::Done(());
+        };
+        if inner.claimed.contains(&head.id) {
+            return Step::Wait;
+        }
+        let (id, deadline) = (head.id.clone(), head.deadline);
+        let mut claim = Claim::on(self, &mut inner, &id);
+        claim.reserve_lane(&mut inner, repo);
+        Step::Go((claim, id, deadline))
+    }
+
+    /// Under the lock: turns a started head into a lease, unless the
+    /// reconciler finished it meanwhile.
+    fn lease_out(
+        &self,
+        mut claim: Claim<'_>,
+        repo: &str,
+        request_id: String,
+        lease_deadline: Instant,
+    ) -> Option<LeasedWork> {
+        let mut inner = self.lock();
+        if claim.withdrawn(&inner) {
+            claim.settle(&mut inner);
+            return None;
+        }
+        inner.remove_from_lane(repo, &request_id);
         let (cancel_tx, cancel) = watch::channel(false);
-        let lease_deadline = entry.deadline;
-        let request_id = entry.id;
         inner.leases.insert(
             request_id.clone(),
             Lease {
@@ -514,18 +902,20 @@ impl QueueManager {
                 cancel_tx,
             },
         );
-        inner.busy.insert(repo.to_owned(), request_id.clone());
-        Ok(Some(LeasedWork {
+        claim.keep_lane();
+        claim.settle(&mut inner);
+        Some(LeasedWork {
             request_id,
             lease_deadline,
             cancel,
-        }))
+        })
     }
 
     /// Ids of every outstanding lease — the in-flight work a graceful
     /// drain waits for (and, past the drain bound, cancels).
     pub async fn leased_ids(&self) -> Vec<String> {
-        let inner = self.inner.lock().await;
+        let _entered = self.enter().await;
+        let inner = self.lock();
         inner.leases.keys().cloned().collect()
     }
 
@@ -538,102 +928,166 @@ impl QueueManager {
     /// Drain bounded terminal notices for the executor to publish and finish
     /// through the original ticket's router. Explicit cancellation is separate.
     pub async fn take_parked_terminals(&self) -> Vec<String> {
-        let mut inner = self.inner.lock().await;
+        let _entered = self.enter().await;
+        let mut inner = self.lock();
         std::mem::take(&mut inner.parked_terminals)
     }
 
     /// Persist a future poll before releasing the current lease. Failure leaves
     /// lease ownership intact; parked admissions still count against store caps.
     pub async fn park(&self, request_id: &str, resume_at_ms: i64) -> Result<bool, QueueError> {
-        let mut inner = self.inner.lock().await;
-        let Some(lease) = inner.leases.get(request_id) else {
-            return Ok(false);
+        let _entered = self.enter().await;
+        let (mut claim, repo, deadline) = loop {
+            let settled = self.settled.notified();
+            match self.claim_lease_to_park(request_id) {
+                Step::Go(lease) => break lease,
+                Step::Done(parked) => return Ok(parked),
+                Step::Wait => settled.await,
+            }
         };
-        if lease.deadline <= Instant::now() || *lease.cancel_tx.borrow() {
+        let parked = self
+            .io(
+                request_id,
+                self.store
+                    .park_flow_request(request_id, resume_at_ms, self.now_ms()),
+            )
+            .await?;
+        let mut inner = self.lock();
+        if !parked {
+            claim.settle(&mut inner);
             return Ok(false);
         }
-        let repo = lease.repo.clone();
-        let deadline = lease.deadline;
-        if !self
-            .store
-            .park_flow_request(request_id, resume_at_ms, wall_clock_ms())
-            .await?
-        {
-            return Ok(false);
+        // Parked in the store: the lease is over either way. Withdrawn, the
+        // reconciler has already failed the checkpoint and parked its notice.
+        if inner.leases.remove(request_id).is_some() {
+            inner.free_lane(&repo, request_id);
         }
-        inner.leases.remove(request_id);
-        inner.busy.remove(&repo);
-        inner.parked.insert(
-            request_id.to_owned(),
-            ParkedEntry {
-                repo,
-                entry: QueuedEntry {
-                    id: request_id.to_owned(),
-                    deadline,
+        if !claim.withdrawn(&inner) {
+            inner.parked.insert(
+                request_id.to_owned(),
+                ParkedEntry {
+                    repo,
+                    entry: QueuedEntry {
+                        id: request_id.to_owned(),
+                        deadline,
+                    },
+                    resume_at_ms,
                 },
-                resume_at_ms,
-            },
-        );
+            );
+        }
+        claim.settle(&mut inner);
         self.work.notify_one();
         Ok(true)
+    }
+
+    /// Under the lock: claims a live, uncancelled lease to park it.
+    fn claim_lease_to_park(&self, request_id: &str) -> Step<(Claim<'_>, String, Instant), bool> {
+        let mut inner = self.lock();
+        if inner.claimed.contains(request_id) {
+            return Step::Wait;
+        }
+        let Some(lease) = inner.leases.get(request_id) else {
+            return Step::Done(false);
+        };
+        if lease.deadline <= Instant::now() || *lease.cancel_tx.borrow() {
+            return Step::Done(false);
+        }
+        let (repo, deadline) = (lease.repo.clone(), lease.deadline);
+        Step::Go((Claim::on(self, &mut inner, request_id), repo, deadline))
     }
 
     /// Move due parked checkpoints into ordinary lanes, retaining the original
     /// monotonic expiry. Authorization changes and expiry fail without dispatch.
     pub async fn wake_due(&self, now: Instant, now_ms: i64) -> Result<usize, QueueError> {
-        let mut inner = self.inner.lock().await;
-        let mut due: Vec<_> = inner
-            .parked
-            .iter()
-            .filter(|(_, parked)| parked.entry.deadline <= now || parked.resume_at_ms <= now_ms)
-            .map(|(id, parked)| (parked.resume_at_ms, id.clone()))
-            .collect();
-        due.sort();
+        let _entered = self.enter().await;
+        let due = {
+            let inner = self.lock();
+            let mut due: Vec<_> = inner
+                .parked
+                .iter()
+                .filter(|(_, parked)| parked.entry.deadline <= now || parked.resume_at_ms <= now_ms)
+                .map(|(id, parked)| (parked.resume_at_ms, id.clone()))
+                .collect();
+            due.sort();
+            due
+        };
         let mut ready = 0;
         for (_, id) in due {
             // Retain admissions until the executor has consumed older notices.
             // Never terminalize a parked request whose notification cannot fit.
-            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
-                self.work.notify_one();
-                break;
-            }
-            let Some(parked) = inner.parked.get(&id) else {
-                continue;
+            let (mut claim, expired) = match self.claim_due(&id, now) {
+                Sweep::Claimed(claim, expired) => (claim, expired),
+                Sweep::Skip => continue,
+                Sweep::Full => break,
             };
-            if parked.entry.deadline <= now {
-                if self.expire_locked(&mut inner, &id).await? {
-                    inner.parked_terminals.push(id);
-                    self.work.notify_one();
-                }
-                continue;
-            }
-            if !self.store.wake_parked_flow_request(&id, now_ms).await? {
-                let cause = if self.store.request_admission_expired(&id, now_ms).await? {
-                    CAUSE_LEASE_EXPIRED
-                } else {
-                    "authorization_changed"
-                };
-                let finished = self.fail_recovered(&id, cause).await?;
-                inner.parked.remove(&id);
+            if expired {
+                let finished = self.io(&id, self.finish_expired(&id)).await?;
+                let mut inner = self.lock();
+                inner.forget(&id);
+                claim.settle(&mut inner);
                 if finished {
                     inner.parked_terminals.push(id);
                     self.work.notify_one();
                 }
                 continue;
             }
-            let Some(parked) = inner.parked.remove(&id) else {
+            if !self
+                .io(&id, self.store.wake_parked_flow_request(&id, now_ms))
+                .await?
+            {
+                let cause = if self
+                    .io(&id, self.store.request_admission_expired(&id, now_ms))
+                    .await?
+                {
+                    CAUSE_LEASE_EXPIRED
+                } else {
+                    "authorization_changed"
+                };
+                let finished = self.io(&id, self.fail_recovered(&id, cause)).await?;
+                let mut inner = self.lock();
+                inner.parked.remove(&id);
+                claim.settle(&mut inner);
+                if finished {
+                    inner.parked_terminals.push(id);
+                    self.work.notify_one();
+                }
                 continue;
-            };
-            inner
-                .lanes
-                .entry(parked.repo)
-                .or_default()
-                .push_back(parked.entry);
-            ready += 1;
+            }
+            let mut inner = self.lock();
+            if !claim.withdrawn(&inner)
+                && let Some(parked) = inner.parked.remove(&id)
+            {
+                inner
+                    .lanes
+                    .entry(parked.repo)
+                    .or_default()
+                    .push_back(parked.entry);
+                ready += 1;
+            }
+            claim.settle(&mut inner);
             // A later store failure must not strand work already made ready.
             self.work.notify_one();
         }
         Ok(ready)
+    }
+
+    /// Under the lock: claims a due parked checkpoint with a notice slot.
+    fn claim_due(&self, request_id: &str, now: Instant) -> Sweep<'_> {
+        let mut inner = self.lock();
+        if inner.terminal_room() == 0 {
+            self.work.notify_one();
+            return Sweep::Full;
+        }
+        if inner.claimed.contains(request_id) {
+            return Sweep::Skip;
+        }
+        let Some(parked) = inner.parked.get(request_id) else {
+            return Sweep::Skip;
+        };
+        let expired = parked.entry.deadline <= now;
+        let mut claim = Claim::on(self, &mut inner, request_id);
+        claim.reserve_slot(&mut inner);
+        Sweep::Claimed(claim, expired)
     }
 
     /// Releases `request_id`'s lease and records its terminal
@@ -653,14 +1107,17 @@ impl QueueManager {
         outcome: Option<&str>,
         audit: AuditEntry<'_>,
     ) -> Result<bool, QueueError> {
-        if !final_state.is_terminal() {
-            return Err(QueueError::NotTerminal { state: final_state });
-        }
-        let mut inner = self.inner.lock().await;
-        let Some(lease) = inner.leases.get(request_id) else {
-            return Ok(false);
+        let final_state = request_state::target(RequestEvent::Finish(final_state))
+            .map_err(|_| QueueError::NotTerminal { state: final_state })?;
+        let _entered = self.enter().await;
+        let mut claim = loop {
+            let settled = self.settled.notified();
+            match self.claim_lease(request_id) {
+                Step::Go(claim) => break claim,
+                Step::Done(()) => return Ok(false),
+                Step::Wait => settled.await,
+            }
         };
-        let repo = lease.repo.clone();
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
@@ -677,12 +1134,30 @@ impl QueueManager {
         // A failed terminal write must retain ownership so completion can be
         // retried or reaped; it is not evidence that another writer finished.
         let finished = self
-            .store
-            .finish_request(request_id, final_state, outcome, audit)
+            .io(
+                request_id,
+                self.store
+                    .finish_request(request_id, final_state, outcome, audit),
+            )
             .await?;
-        inner.leases.remove(request_id);
-        inner.busy.remove(&repo);
+        let mut inner = self.lock();
+        if let Some(lease) = inner.leases.remove(request_id) {
+            inner.free_lane(&lease.repo, request_id);
+        }
+        claim.settle(&mut inner);
         Ok(finished)
+    }
+
+    /// Under the lock: claims an outstanding lease.
+    fn claim_lease(&self, request_id: &str) -> Step<Claim<'_>, ()> {
+        let mut inner = self.lock();
+        if inner.claimed.contains(request_id) {
+            return Step::Wait;
+        }
+        if !inner.leases.contains_key(request_id) {
+            return Step::Done(());
+        }
+        Step::Go(Claim::on(self, &mut inner, request_id))
     }
 
     /// Cancels `request_id` on behalf of `actor` (see the module docs
@@ -694,24 +1169,21 @@ impl QueueManager {
         request_id: &str,
         actor: Actor,
     ) -> Result<CancelOutcome, QueueError> {
-        let mut inner = self.inner.lock().await;
-        if let Some(lease) = inner.leases.get(request_id) {
-            // Receiver may already be dropped; the signal is best-effort
-            // and the reaper backstops a holder that never listens.
-            let _ = lease.cancel_tx.send(true);
-            return Ok(CancelOutcome::SignalledRunning);
-        }
-        let found = inner.parked.contains_key(request_id)
-            || inner
-                .lanes
-                .values()
-                .any(|lane| lane.iter().any(|entry| entry.id == request_id));
-        if !found {
-            return Ok(CancelOutcome::NotFound);
-        }
+        let _entered = self.enter().await;
+        // A request another operation holds is cancelled once that settles,
+        // as it would have been had the operation held the whole queue.
+        let mut claim = loop {
+            let settled = self.settled.notified();
+            match self.claim_to_cancel(request_id) {
+                Step::Go(claim) => break claim,
+                Step::Done(outcome) => return Ok(outcome),
+                Step::Wait => settled.await,
+            }
+        };
         let detail = serde_json::json!({ "actor": actor.as_str() }).to_string();
-        self.store
-            .finish_request(
+        self.io(
+            request_id,
+            self.store.finish_request(
                 request_id,
                 RequestState::Failed,
                 Some(CAUSE_CANCELLED),
@@ -721,14 +1193,41 @@ impl QueueManager {
                     actor,
                     detail: Some(&detail),
                 },
-            )
-            .await?;
+            ),
+        )
+        .await?;
+        let mut inner = self.lock();
         inner.parked.remove(request_id);
         for lane in inner.lanes.values_mut() {
             lane.retain(|entry| entry.id != request_id);
         }
         inner.lanes.retain(|_, lane| !lane.is_empty());
+        claim.settle(&mut inner);
         Ok(CancelOutcome::CancelledQueued)
+    }
+
+    /// Under the lock: signals a lease, or claims a queued or parked
+    /// request to cancel it.
+    fn claim_to_cancel(&self, request_id: &str) -> Step<Claim<'_>, CancelOutcome> {
+        let mut inner = self.lock();
+        if inner.claimed.contains(request_id) {
+            return Step::Wait;
+        }
+        if let Some(lease) = inner.leases.get(request_id) {
+            // Receiver may already be dropped; the signal is best-effort
+            // and the reaper backstops a holder that never listens.
+            let _ = lease.cancel_tx.send(true);
+            return Step::Done(CancelOutcome::SignalledRunning);
+        }
+        let found = inner.parked.contains_key(request_id)
+            || inner
+                .lanes
+                .values()
+                .any(|lane| lane.iter().any(|entry| entry.id == request_id));
+        if !found {
+            return Step::Done(CancelOutcome::NotFound);
+        }
+        Step::Go(Claim::on(self, &mut inner, request_id))
     }
 
     /// Reaps every lease whose deadline is at or before `now`: the
@@ -740,16 +1239,20 @@ impl QueueManager {
     /// parks the terminal for the executor loop to finish.
     #[cfg(test)]
     pub async fn reap_expired(&self, now: Instant) -> Result<Vec<String>, QueueError> {
-        let mut inner = self.inner.lock().await;
-        let expired: Vec<String> = inner
-            .leases
-            .iter()
-            .filter(|(_, lease)| lease.deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let _entered = self.enter().await;
+        let expired = self.expired_lease_ids(now);
         let mut reaped = Vec::with_capacity(expired.len());
         for id in expired {
-            if self.expire_locked(&mut inner, &id).await? {
+            let mut claim = match self.claim_expired_lease(&id, now, false) {
+                Sweep::Claimed(claim, _) => claim,
+                Sweep::Skip => continue,
+                Sweep::Full => break,
+            };
+            let finished = self.io(&id, self.finish_expired(&id)).await?;
+            let mut inner = self.lock();
+            inner.forget(&id);
+            claim.settle(&mut inner);
+            if finished {
                 reaped.push(id);
             }
         }
@@ -760,16 +1263,22 @@ impl QueueManager {
     /// original waiter and lease reaper use the same durable timeout cause.
     /// Explicit user cancellation continues through [`Self::cancel`].
     pub async fn expire(&self, request_id: &str) -> Result<bool, QueueError> {
-        let mut inner = self.inner.lock().await;
-        self.expire_locked(&mut inner, request_id).await
+        let _entered = self.enter().await;
+        let mut claim = self.claim(request_id).await;
+        // Persist first: a store failure must leave ownership intact for retry.
+        // The claim excludes executor completion until this terminal write.
+        let finished = self.io(request_id, self.finish_expired(request_id)).await?;
+        let mut inner = self.lock();
+        inner.forget(request_id);
+        claim.settle(&mut inner);
+        Ok(finished)
     }
 
-    async fn expire_locked(&self, inner: &mut Inner, request_id: &str) -> Result<bool, QueueError> {
+    /// The lease-expiry terminal write and audit row, shared by expiry,
+    /// parked-checkpoint expiry and the lease reaper.
+    async fn finish_expired(&self, request_id: &str) -> Result<bool, StoreError> {
         let detail = serde_json::json!({ "cause": "timeout" }).to_string();
-        // Persist first: a store failure must leave ownership intact for retry.
-        // The queue mutex excludes executor completion until this terminal write.
-        let finished = self
-            .store
+        self.store
             .finish_request(
                 request_id,
                 RequestState::Failed,
@@ -781,24 +1290,12 @@ impl QueueManager {
                     detail: Some(&detail),
                 },
             )
-            .await?;
-        if let Some(lease) = inner.leases.remove(request_id) {
-            inner.busy.remove(&lease.repo);
-            let _ = lease.cancel_tx.send(true);
-        }
-        for lane in inner.lanes.values_mut() {
-            lane.retain(|entry| entry.id != request_id);
-        }
-        inner.lanes.retain(|_, lane| !lane.is_empty());
-        inner.parked.remove(request_id);
-        Ok(finished)
+            .await
     }
 
-    /// Background-only expiry delivery. Explicit `reap_expired` callers own
-    /// their returned ids; this path reserves notice capacity before releasing
-    /// leases whose executor may already have exited after a store failure.
-    pub(crate) async fn reap_expired_notifying(&self, now: Instant) -> Result<usize, QueueError> {
-        let mut inner = self.inner.lock().await;
+    /// Ids of the leases whose deadline is at or before `now`, sorted.
+    fn expired_lease_ids(&self, now: Instant) -> Vec<String> {
+        let inner = self.lock();
         let mut expired: Vec<_> = inner
             .leases
             .iter()
@@ -806,13 +1303,51 @@ impl QueueManager {
             .map(|(id, _)| id.clone())
             .collect();
         expired.sort();
+        expired
+    }
+
+    /// Under the lock: claims an expired lease for the reaper, with a
+    /// notice slot when `notice`.
+    fn claim_expired_lease(&self, request_id: &str, now: Instant, notice: bool) -> Sweep<'_> {
+        let mut inner = self.lock();
+        if notice && inner.terminal_room() == 0 {
+            self.work.notify_one();
+            return Sweep::Full;
+        }
+        // A claimed lease is being completed, parked or expired: whoever
+        // holds it settles it, and a lease still out is reaped next sweep.
+        if inner.claimed.contains(request_id)
+            || inner
+                .leases
+                .get(request_id)
+                .is_none_or(|lease| lease.deadline > now)
+        {
+            return Sweep::Skip;
+        }
+        let mut claim = Claim::on(self, &mut inner, request_id);
+        if notice {
+            claim.reserve_slot(&mut inner);
+        }
+        Sweep::Claimed(claim, true)
+    }
+
+    /// Background-only expiry delivery. Explicit `reap_expired` callers own
+    /// their returned ids; this path reserves notice capacity before releasing
+    /// leases whose executor may already have exited after a store failure.
+    pub(crate) async fn reap_expired_notifying(&self, now: Instant) -> Result<usize, QueueError> {
+        let _entered = self.enter().await;
         let mut count = 0;
-        for id in expired {
-            if inner.parked_terminals.len() >= MAX_PARKED_TERMINALS {
-                self.work.notify_one();
-                break;
-            }
-            if self.expire_locked(&mut inner, &id).await? {
+        for id in self.expired_lease_ids(now) {
+            let mut claim = match self.claim_expired_lease(&id, now, true) {
+                Sweep::Claimed(claim, _) => claim,
+                Sweep::Skip => continue,
+                Sweep::Full => break,
+            };
+            let finished = self.io(&id, self.finish_expired(&id)).await?;
+            let mut inner = self.lock();
+            inner.forget(&id);
+            claim.settle(&mut inner);
+            if finished {
                 inner.parked_terminals.push(id);
                 count += 1;
                 self.work.notify_one();
@@ -831,44 +1366,49 @@ impl QueueManager {
     ///
     /// Bounded by the room left for terminal notices: with none, it does
     /// nothing this tick rather than finish a row nobody would be told
-    /// about.
+    /// about. A row it finishes while another operation holds it is marked
+    /// withdrawn for that operation (see the module docs).
     pub async fn reconcile_expired(&self, now_ms: i64) -> Result<usize, QueueError> {
-        let mut inner = self.inner.lock().await;
-        let room = MAX_PARKED_TERMINALS.saturating_sub(inner.parked_terminals.len());
-        if room == 0 {
-            self.work.notify_one();
-            return Ok(0);
-        }
-        let limit = u32::try_from(room)
-            .unwrap_or(u32::MAX)
-            .min(pam_store::MAX_EXPIRY_BATCH);
+        let _entered = self.enter().await;
+        let (mut claim, limit) = {
+            let mut inner = self.lock();
+            let room = inner.terminal_room();
+            if room == 0 {
+                self.work.notify_one();
+                return Ok(0);
+            }
+            let limit = u32::try_from(room)
+                .unwrap_or(u32::MAX)
+                .min(pam_store::MAX_EXPIRY_BATCH);
+            let slots = usize::try_from(limit).unwrap_or(room);
+            (Claim::slots(self, &mut inner, slots), limit)
+        };
         let grace_ms = i64::try_from(self.reconcile_grace.as_millis()).unwrap_or(i64::MAX);
         let detail = serde_json::json!({ "cause": "reconciled_past_deadline" }).to_string();
         let finished = self
-            .store
-            .fail_expired_requests(
-                now_ms.saturating_sub(grace_ms),
-                limit,
-                CAUSE_LEASE_EXPIRED,
-                AuditEntry {
-                    action: ACTION_LEASE_REAPED,
-                    decision: Decision::Timeout,
-                    actor: Actor::System,
-                    detail: Some(&detail),
-                },
+            .io(
+                "",
+                self.store.fail_expired_requests(
+                    now_ms.saturating_sub(grace_ms),
+                    limit,
+                    CAUSE_LEASE_EXPIRED,
+                    AuditEntry {
+                        action: ACTION_LEASE_REAPED,
+                        decision: Decision::Timeout,
+                        actor: Actor::System,
+                        detail: Some(&detail),
+                    },
+                ),
             )
             .await?;
         let count = finished.len();
+        let mut inner = self.lock();
+        claim.settle(&mut inner);
         for id in finished {
-            if let Some(lease) = inner.leases.remove(&id) {
-                inner.busy.remove(&lease.repo);
-                let _ = lease.cancel_tx.send(true);
+            if inner.claimed.contains(&id) {
+                inner.withdrawn.insert(id.clone());
             }
-            for lane in inner.lanes.values_mut() {
-                lane.retain(|entry| entry.id != id);
-            }
-            inner.lanes.retain(|_, lane| !lane.is_empty());
-            inner.parked.remove(&id);
+            inner.forget(&id);
             tracing::warn!(request = %id, "closed an in-flight request stranded past its deadline");
             inner.parked_terminals.push(id);
         }
@@ -884,21 +1424,22 @@ impl QueueManager {
     /// row's verdict is the caller's to retry, and the reconciler closes it
     /// if nothing ever does. Returns whether a lease was held.
     pub async fn abandon_lease(&self, request_id: &str) -> bool {
-        let mut inner = self.inner.lock().await;
+        let _entered = self.enter().await;
+        let mut inner = self.lock();
         let Some(lease) = inner.leases.remove(request_id) else {
             return false;
         };
-        inner.busy.remove(&lease.repo);
+        inner.free_lane(&lease.repo, request_id);
         self.work.notify_one();
         true
     }
 
-    /// Holds the queue's mutex for as long as the returned guard lives:
-    /// every queue operation waits behind it. For tests of what the daemon
-    /// does when its bookkeeping is wedged.
+    /// Holds every queue operation at its entry for as long as the returned
+    /// guard lives. For tests of what the daemon does when its bookkeeping
+    /// is wedged.
     #[cfg(test)]
     pub(crate) async fn stall(&self) -> impl Drop + '_ {
-        self.inner.lock().await
+        self.stall_gate.write().await
     }
 
     /// Makes the next `count` [`Self::complete`] calls fail before they
@@ -907,6 +1448,44 @@ impl QueueManager {
     pub(crate) fn fail_next_completes(&self, count: usize) {
         self.injected_complete_failures
             .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Holds every store call the queue makes for `request_id` until the
+    /// returned hold is released: a store that is slow for one request.
+    #[cfg(test)]
+    pub(crate) fn hold_store(&self, request_id: &str) -> StoreHold {
+        let (release, release_rx) = watch::channel(false);
+        let (reached_tx, reached) = watch::channel(0);
+        self.store_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(request_id.to_owned(), (release_rx, reached_tx));
+        StoreHold { release, reached }
+    }
+
+    #[cfg(test)]
+    async fn store_latency(&self, request_id: &str) {
+        let hold = self
+            .store_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(request_id)
+            .map(|(release, reached)| (release.clone(), reached.clone()));
+        if let Some((mut release, reached)) = hold {
+            reached.send_modify(|calls| *calls += 1);
+            // A dropped hold lets the call through as well.
+            let _ = release.wait_for(|released| *released).await;
+        }
+    }
+
+    /// Ties this queue's wall clock to Tokio's clock, so a paused test
+    /// clock moves admission, placement and lease deadlines together and
+    /// no real time can pass between them.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_paused_clock(mut self) -> Self {
+        self.clock = Some((wall_clock_ms(), Instant::now()));
+        self
     }
 
     /// Spawns the background reaper: every `interval` until `shutdown`
@@ -935,12 +1514,12 @@ impl QueueManager {
                         if let Err(error) = self.reap_expired_notifying(Instant::now()).await {
                             tracing::error!(%error, "reaping expired leases failed; retrying next tick");
                         }
-                        if let Err(error) = self.wake_due(Instant::now(), wall_clock_ms()).await {
+                        if let Err(error) = self.wake_due(Instant::now(), self.now_ms()).await {
                             tracing::error!(%error, "waking due watches failed; retrying next tick");
                         }
                         if reconciled_at.is_none_or(|at| at.elapsed() >= reconcile_every) {
                             reconciled_at = Some(Instant::now());
-                            if let Err(error) = self.reconcile_expired(wall_clock_ms()).await {
+                            if let Err(error) = self.reconcile_expired(self.now_ms()).await {
                                 tracing::error!(%error, "closing stranded requests failed; retrying next pass");
                             }
                         }
@@ -958,21 +1537,25 @@ impl QueueManager {
     /// oversized legacy row stops startup for operator backup/repair; recovery
     /// does not fetch or silently delete its payload.
     ///
+    /// Boot-only (see the module docs): the store is read without the lane
+    /// lock and the rebuilt lanes replace the in-memory ones at the end.
+    ///
     /// Crash recovery of `running` / `waiting_approval` rows left behind
     /// by a dead daemon is task #12, not handled here.
     pub async fn rebuild_from_store(&self) -> Result<usize, QueueError> {
-        let mut inner = self.inner.lock().await;
-        inner.lanes.clear();
-        inner.parked.clear();
+        let _entered = self.enter().await;
+        let mut rebuilt = Inner::default();
         let mut restored = 0;
         let mut retained_bytes = 0u64;
         let mut after: Option<(i64, String)> = None;
         loop {
             let queued = self
-                .store
-                .queued_recovery_page(
-                    after.as_ref().map(|(ts, id)| (*ts, id.as_str())),
-                    MAX_ADMITTED_BYTES,
+                .io(
+                    "",
+                    self.store.queued_recovery_page(
+                        after.as_ref().map(|(ts, id)| (*ts, id.as_str())),
+                        MAX_ADMITTED_BYTES,
+                    ),
                 )
                 .await?
                 .ok_or(QueueError::LegacyQueueOversized)?;
@@ -981,7 +1564,7 @@ impl QueueManager {
             for row in queued {
                 let remaining = row
                     .expires_at_ms
-                    .map_or(0, |expires| expires.saturating_sub(wall_clock_ms()));
+                    .map_or(0, |expires| expires.saturating_sub(self.now_ms()));
                 let bytes = [
                     &row.id,
                     &row.capability,
@@ -995,7 +1578,10 @@ impl QueueManager {
                 .saturating_add(row.idempotency_key.as_ref().map_or(0, |v| v.len() as u64));
                 let cause = if !row.queue_authorized || row.expires_at_ms.is_none() {
                     Some("admission_invalid")
-                } else if !self.store.request_authorization_current(&row.id).await? {
+                } else if !self
+                    .io(&row.id, self.store.request_authorization_current(&row.id))
+                    .await?
+                {
                     // Scoped: only a revocation of a grant this request
                     // depends on voids it, and re-granting never restores.
                     Some("authorization_changed")
@@ -1009,23 +1595,32 @@ impl QueueManager {
                     None
                 };
                 if let Some(cause) = cause {
-                    self.fail_recovered(&row.id, cause).await?;
+                    self.io(&row.id, self.fail_recovered(&row.id, cause))
+                        .await?;
                     continue;
                 }
                 if row.resume_at_ms.is_some()
                     && !self
-                        .store
-                        .validate_parked_flow_request(&row.id, wall_clock_ms())
+                        .io(
+                            &row.id,
+                            self.store
+                                .validate_parked_flow_request(&row.id, self.now_ms()),
+                        )
                         .await?
                 {
-                    self.fail_recovered(&row.id, "admission_invalid").await?;
+                    self.io(&row.id, self.fail_recovered(&row.id, "admission_invalid"))
+                        .await?;
                     continue;
                 }
                 retained_bytes += bytes;
                 restored += 1;
-                restore_queued_entry(&mut inner, row, remaining);
+                restore_queued_entry(&mut rebuilt, row, remaining);
             }
         }
+        let mut inner = self.lock();
+        inner.lanes = rebuilt.lanes;
+        inner.parked = rebuilt.parked;
+        drop(inner);
         Ok(usize::try_from(restored).unwrap_or(usize::MAX))
     }
 

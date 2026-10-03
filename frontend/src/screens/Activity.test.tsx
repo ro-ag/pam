@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { createAppRouter } from "../router";
-import type { ActivityRow, PamEventPayload } from "../lib/ipc";
+import type { ActivityRow, PamEventPayload, RefusalEntry } from "../lib/ipc";
 import { EVENT_REFRESH_MS, rowEnter, toLanes } from "./Activity";
 
 /**
@@ -146,6 +146,8 @@ describe("the tide", () => {
       agent: undefined,
       state: undefined,
       hide_probes: true,
+      // The ledger cannot hold a refusal decided before admission; the human is owed it here.
+      include_refusals: true,
     });
   });
 
@@ -472,5 +474,207 @@ describe("quiet and broken water", () => {
     const before = mocks.activityList.mock.calls.length;
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(mocks.activityList.mock.calls.length).toBeGreaterThan(before));
+  });
+});
+
+/** One refusal the daemon decided before a request row existed. */
+function refusal(overrides: Partial<RefusalEntry>): RefusalEntry {
+  return {
+    kind: "refusal",
+    id: "refusal_1",
+    cause: "client_version_mismatch",
+    detail: "this client is 0.4.0 and the daemon is 0.5.0",
+    count: 1,
+    capability: null,
+    repo: null,
+    agent: null,
+    request_id: null,
+    created_ts: Math.floor(Date.now() / 1000) - 60,
+    updated_ts: Math.floor(Date.now() / 1000) - 60,
+    ingress: "public",
+    peer_uid: 501,
+    peer_pid: 4242,
+    peer_exe: "/usr/local/bin/pam",
+    ...overrides,
+  };
+}
+
+describe("refused before admission", () => {
+  async function section() {
+    return within(await screen.findByRole("region", { name: "Refused before admission" }));
+  }
+
+  it("asks for refusals and shows each with its cause, its count and who knocked", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: [
+        refusal({
+          id: "refusal_2",
+          cause: "request_rate_exhausted",
+          count: 1_000,
+          capability: "status",
+          agent: "poller",
+          peer_pid: 777,
+          peer_exe: "/opt/agent/bin/agent",
+        }),
+        ...TIDE,
+        refusal({ id: "refusal_1" }),
+      ],
+    });
+    renderActivity();
+    const refused = await section();
+    expect(mocks.activityList).toHaveBeenCalledWith(
+      expect.objectContaining({ include_refusals: true }),
+    );
+    const rows = refused.getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    // Newest first, as the daemon sent them; the cause as words.
+    expect(rows[0]).toHaveTextContent("request rate exhausted");
+    expect(rows[0]).toHaveTextContent("status");
+    expect(rows[0]).toHaveTextContent("×1,000");
+    // The kernel's view of the peer wins over whatever the client called itself.
+    expect(rows[0]).toHaveTextContent("agent (pid 777)");
+    expect(rows[1]).toHaveTextContent("client version mismatch");
+    expect(rows[1]).toHaveTextContent("pam (pid 4242)");
+    expect(rows[1]).toHaveTextContent("refused");
+    expect(refused.getByText(/2 refusals · 1,001 attempts/)).toBeInTheDocument();
+    // They are not requests: no lane, and the request count is unchanged.
+    expect(screen.getByText(/3 requests · 2 lanes/)).toBeInTheDocument();
+  });
+
+  it("says a claimed label is a claim, and a missing peer is unknown", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: [
+        refusal({
+          id: "refusal_a",
+          peer_pid: null,
+          peer_uid: null,
+          peer_exe: null,
+          agent: "claude",
+        }),
+        refusal({
+          id: "refusal_b",
+          peer_pid: null,
+          peer_uid: null,
+          peer_exe: null,
+          agent: null,
+        }),
+        refusal({ id: "refusal_c", peer_pid: 9, peer_exe: null }),
+      ],
+    });
+    renderActivity();
+    const rows = (await section()).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent("claude (claimed)");
+    expect(rows[1]).toHaveTextContent("unknown peer");
+    expect(rows[2]).toHaveTextContent("pid 9");
+  });
+
+  it("renders everything a client chose through SafeText, hidden characters spelled out", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: [
+        refusal({
+          agent: "cla\u202Eude",
+          peer_pid: null,
+          peer_uid: null,
+          peer_exe: null,
+          capability: "echo\u200B",
+          detail: "evil\u202Etxt.exe",
+          repo: "/r\u202Ep",
+          request_id: "req\u0007",
+        }),
+      ],
+    });
+    renderActivity();
+    const refused = await section();
+    // The row: agent and capability.
+    expect(
+      refused.getAllByTitle("a hidden character, shown as its escape").length,
+    ).toBeGreaterThan(1);
+    fireEvent.click(
+      refused.getAllByRole("listitem")[0]!.querySelector("button") as HTMLElement,
+    );
+    // The escapes appear in the row and in each field the client chose.
+    const escapes = refused.getAllByText("\\u{202E}");
+    expect(escapes.length).toBeGreaterThanOrEqual(4);
+    expect(refused.getByText("\\u{0007}")).toBeInTheDocument();
+    // Detail, repo and request id are escaped too: no raw override reaches the DOM.
+    expect(refused.getByRole("list").textContent).not.toContain("\u202E");
+    expect(refused.getByRole("list").textContent).not.toContain("\u0007");
+  });
+
+  it("opens into the facts and says there is no audit trail to read", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: [
+        refusal({
+          count: 25,
+          agent: "claude",
+          repo: "/Users/dev/pam",
+          capability: "echo",
+          request_id: "req_never",
+        }),
+      ],
+    });
+    renderActivity();
+    const refused = await section();
+    fireEvent.click(
+      refused.getAllByRole("listitem")[0]!.querySelector("button") as HTMLElement,
+    );
+    expect(refused.getByText(/no request row exists/)).toBeInTheDocument();
+    expect(
+      refused.getByText("this client is 0.4.0 and the daemon is 0.5.0"),
+    ).toBeInTheDocument();
+    expect(refused.getByText("25")).toBeInTheDocument();
+    expect(refused.getByText("/usr/local/bin/pam")).toBeInTheDocument();
+    expect(refused.getByText("req_never")).toBeInTheDocument();
+    // There is no request to read an audit trail of.
+    expect(mocks.auditRequest).not.toHaveBeenCalled();
+    expect(mocks.evidenceList).not.toHaveBeenCalled();
+  });
+
+  it("shows refusals under the all and refused lenses only", async () => {
+    mocks.activityList.mockResolvedValue({ requests: [...TIDE, refusal({})] });
+    renderActivity("/activity?state=refused");
+    expect(
+      await screen.findByRole("region", { name: "Refused before admission" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides them under every other lens even if the daemon sent them", async () => {
+    mocks.activityList.mockResolvedValue({ requests: [...TIDE, refusal({})] });
+    renderActivity("/activity?state=active");
+    expect(await screen.findByText("compress.log")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Refused before admission" })).toBeNull();
+  });
+
+  it("is not 'no activity yet' when only refusals exist", async () => {
+    mocks.activityList.mockResolvedValue({ requests: [refusal({})] });
+    renderActivity();
+    await section();
+    expect(screen.queryByText(/No activity yet/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "lanes" })).toBeNull();
+  });
+
+  it("keeps a long list short until asked, then shows all", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: Array.from({ length: 9 }, (_, index) =>
+        refusal({ id: `refusal_${index}`, cause: `cause_${index}` }),
+      ),
+    });
+    renderActivity();
+    const refused = await section();
+    expect(refused.getAllByRole("listitem")).toHaveLength(6);
+    fireEvent.click(refused.getByRole("button", { name: "Show all 9" }));
+    expect(refused.getAllByRole("listitem")).toHaveLength(9);
+    fireEvent.click(refused.getByRole("button", { name: "Show fewer" }));
+    expect(refused.getAllByRole("listitem")).toHaveLength(6);
+  });
+
+  it("offers the refusing agent as a chip", async () => {
+    mocks.activityList.mockResolvedValue({
+      requests: [refusal({ agent: "poller", repo: "/Users/dev/polled" })],
+    });
+    renderActivity();
+    await section();
+    expect(await screen.findByRole("button", { name: "agent poller" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "repo polled" })).toBeInTheDocument();
   });
 });

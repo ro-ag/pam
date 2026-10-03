@@ -1,6 +1,7 @@
 //! Immutable redacted evidence views and durable, non-renewable read allowances.
-use super::{Store, StoreError, blob_column};
+use super::{Store, StoreError};
 use crate::db::Db;
+use crate::view_chunks;
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
@@ -121,6 +122,10 @@ pub enum EvidenceRangeOutcome {
     InvalidRange,
     /// The originating request's finite allowance is exhausted or expired.
     BudgetExhausted,
+    /// The stored bytes of the page no longer match the digest recorded when
+    /// the view was written (or are missing): nothing was served. Charged,
+    /// like any other attempt.
+    Corrupt,
     /// A charged exact byte range.
     Range(EvidenceRange),
 }
@@ -172,8 +177,10 @@ impl Store {
             return Err(invalid());
         }
         // Hash before taking the connection: up to 64 MiB of CPU work that
-        // no other store call should queue behind.
+        // no other store call should queue behind, twice (the whole view,
+        // and each chunk on its own).
         let view_sha256 = hex::encode(Sha256::digest(&view.view_bytes));
+        let chunks = view_chunks::plan(&view.view_bytes);
         let mut identity: serde_json::Value =
             serde_json::from_str(&view.identity_json).map_err(|_| invalid())?;
         if !identity.is_object() {
@@ -192,7 +199,9 @@ impl Store {
             view_id: view.view_id.clone(),
             view_bytes: view.view_bytes.clone(),
         };
-        self.run(move |conn| {
+        // One transaction: the view row and every chunk of its bytes land
+        // together or not at all.
+        self.transact(move |conn| {
             let identity_fields = identity.as_object_mut().ok_or_else(invalid)?;
             // Only bounded metadata is loaded; the protected source may be a large
             // serialized compact rather than the logical text passed to redaction.
@@ -214,10 +223,14 @@ impl Store {
                 return Err(invalid());
             }
             let affected = conn.execute(
-                "INSERT INTO evidence_view (evidence_id,request_id,repository,origin_json,identity_json,map_json,view_id,view_sha256,view_bytes,view_blob) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM evidence e JOIN request r ON r.id=e.request_id WHERE e.id=?1 AND e.request_id=?2)",
-                params![view.evidence_id,view.request_id,view.repository,view.origin_json,identity_json,view.map_json,view.view_id,view_sha256, i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes],
+                "INSERT INTO evidence_view (evidence_id,request_id,source_id,repository,origin_json,identity_json,map_json,view_id,view_sha256,view_bytes,chunk_bytes) SELECT ?1,?2,?1,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM evidence e JOIN request r ON r.id=e.request_id WHERE e.id=?1 AND e.request_id=?2)",
+                params![view.evidence_id,view.request_id,view.repository,view.origin_json,identity_json,view.map_json,view.view_id,view_sha256, i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?, i64::try_from(view_chunks::CHUNK_BYTES).map_err(|_| invalid())?],
             )?;
-            Ok(affected > 0)
+            if affected == 0 {
+                return Ok(false);
+            }
+            view_chunks::insert(conn, &view.evidence_id, &view.view_bytes, &chunks)?;
+            Ok(true)
         })
         .await
     }
@@ -261,9 +274,10 @@ impl Store {
     /// Two steps. The charge is a write and runs on the writing connection,
     /// each statement committing on its own: it must survive whatever happens
     /// to the read. The page itself is then read on the read-only connection
-    /// (see `Store::read`): the engine loads a whole view, up to 64 MiB, to
-    /// cut one page out of it, and no write should wait behind that. A view
-    /// that retention removes between the two steps answers `Expired` or
+    /// (see `Store::read`), from the one or two stored chunks it covers, each
+    /// checked against its recorded digest before a byte is served; a chunk
+    /// that is missing or does not match answers `Corrupt`. A view that
+    /// retention removes between the two steps answers `Expired` or
     /// `Unavailable`, charged, like any other delivery that did not happen.
     pub async fn read_evidence_view_range(
         &self,
@@ -351,31 +365,38 @@ impl Store {
         r: &EvidenceRangeRequest,
         charge: &RangeCharge,
     ) -> Result<EvidenceRangeOutcome, StoreError> {
-        let mut stmt = conn.prepare("SELECT substr(view_blob,?6,?7),expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5")?;
+        let mut stmt = conn.prepare("SELECT view_bytes,chunk_bytes,expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5")?;
         let mut rows = stmt.query(params![
             r.evidence_id.clone(),
             r.request_id.clone(),
             r.repository.clone(),
             r.expected_view_id.clone(),
             r.expected_sha256.clone(),
-            i64::try_from(r.offset).map_err(|_| invalid())? + 1,
-            i64::from(r.length)
         ])?;
         let Some(row) = rows.next()? else {
             // The record went away after the charge.
             return Ok(EvidenceRangeOutcome::Unavailable);
         };
-        if row.get::<Option<i64>>(1)?.is_some() {
+        if row.get::<Option<i64>>(2)?.is_some() {
             return Ok(EvidenceRangeOutcome::Expired);
         }
-        let bytes = blob_column(&row, 0)?;
-        if bytes.is_empty() {
-            // `offset < total` yet no bytes: the blob is gone without a
-            // retention tombstone. Answering an empty page would hand the
-            // reader the same `next_offset` forever, a page charged each
-            // time; say the view is unavailable instead.
-            return Ok(EvidenceRangeOutcome::Unavailable);
+        let total = u64::try_from(row.get::<i64>(0)?).map_err(|_| invalid())?;
+        let chunk_bytes = u64::try_from(row.get::<i64>(1)?).map_err(|_| invalid())?;
+        drop(rows);
+        if total != charge.total || r.offset >= total {
+            return Ok(EvidenceRangeOutcome::Corrupt);
         }
+        let bytes = match view_chunks::read_page(
+            conn,
+            &r.evidence_id,
+            r.offset,
+            r.length,
+            total,
+            chunk_bytes,
+        )? {
+            view_chunks::PageBytes::Sound(bytes) => bytes,
+            view_chunks::PageBytes::Corrupt => return Ok(EvidenceRangeOutcome::Corrupt),
+        };
         let next = r.offset + u64::try_from(bytes.len()).map_err(|_| invalid())?;
         Ok(EvidenceRangeOutcome::Range(EvidenceRange {
             view_id: r.expected_view_id.clone(),

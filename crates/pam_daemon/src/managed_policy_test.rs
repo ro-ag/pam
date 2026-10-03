@@ -197,6 +197,8 @@ fn tiers_match_the_spec() {
         "flows.read_cache_roots",
         "landing.max_permissions",
         "landing.allowed_github_servers",
+        "landing.git_path",
+        "landing.merge_method",
         "models.allowed_sources",
         "models.allowed_curators",
         "retention.evidence_days",
@@ -1510,4 +1512,54 @@ fn a_verbatim_windows_path_is_covered_by_the_prefix_a_policy_writes() {
     ));
     assert!(mac.repository_root_allowed(Path::new("/Users/me/repo")));
     assert!(!mac.repository_root_allowed(Path::new(r"\\?\C:\Users\me")));
+}
+
+/// `landing.git_path` takes an absolute path for the target platform and
+/// `landing.merge_method` one of the three GitHub methods; both lock or
+/// default.
+#[test]
+fn landing_git_path_and_merge_method_leaves() {
+    let policy = view(&doc(&json!({ "landing": {
+        "git_path": { "locked": "/Library/Developer/CommandLineTools/usr/bin/git" },
+        "merge_method": { "default": "rebase" }
+    }})));
+    assert!(applied(&policy, Key::LandingGitPath));
+    assert!(applied(&policy, Key::LandingMergeMethod));
+    assert!(policy.is_locked(Key::LandingGitPath));
+    assert!(!policy.is_locked(Key::LandingMergeMethod));
+    assert_eq!(
+        policy
+            .effective_string(Key::LandingMergeMethod, None)
+            .0
+            .as_deref(),
+        Some("rebase")
+    );
+    assert_eq!(
+        policy
+            .effective_string(Key::LandingMergeMethod, Some("merge".into()))
+            .0
+            .as_deref(),
+        Some("merge"),
+        "a default yields to the human's value"
+    );
+    for (leaf, value) in [
+        ("git_path", json!({ "locked": "bin/git" })),
+        ("git_path", json!({ "locked": "~/bin/git" })),
+        ("merge_method", json!({ "locked": "fast_forward" })),
+    ] {
+        let rejected = view(&doc(&json!({ "landing": { leaf: value } })));
+        let key = Key::parse(&format!("landing.{leaf}")).unwrap();
+        assert_eq!(
+            rejected_code(&rejected, key),
+            CODE_VALUE_INVALID,
+            "{leaf}: {value}"
+        );
+    }
+    let windows = view_for(
+        &doc(&json!({ "landing": {
+            "git_path": { "locked": r"C:\Program Files\Git\mingw64\bin\git.exe" }
+        }})),
+        WIN,
+    );
+    assert!(applied(&windows, Key::LandingGitPath));
 }

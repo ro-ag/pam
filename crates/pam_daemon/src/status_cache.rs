@@ -40,6 +40,11 @@
 //! public status ([`crate::managed_policy_service::PolicyStatus::public_json`]): the state,
 //! revision, short digest, load time and rejected-leaf count, never a value or a reason. It is
 //! held in memory and swapped by the policy's own reloads, so the poll reads no file and no row.
+//!
+//! The `refusals` block is the attached [`crate::refusal_log::RefusalLog`]'s counters: `recorded` (refusals
+//! decided before any request row existed and accepted for recording), `dropped` (not recorded, because a
+//! flood outran the log's bound; the caller was still answered) and `pending` (not yet written to the
+//! store). Counters in memory: the poll reads no row.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -56,6 +61,7 @@ use tokio::time::Instant;
 use crate::boundary::Boundary;
 use crate::managed_policy_service::PolicyHandle;
 use crate::model_service::{ModelService, Tier};
+use crate::refusal_log::RefusalLog;
 use crate::secrets::SecretStore;
 
 /// How often the background task refreshes the snapshot while `status` is
@@ -112,6 +118,9 @@ pub struct StatusCache {
     /// public status. Absent in a harness that attached none; `status` then
     /// serves the unmanaged block.
     policy: OnceLock<Arc<PolicyHandle>>,
+    /// The log of refusals decided before a request row exists, attached once at boot: the
+    /// `refusals` block reports what it accepted, dropped and has not yet written.
+    refusals: OnceLock<RefusalLog>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -144,6 +153,7 @@ impl StatusCache {
             active_requests: AtomicI64::new(-1),
             boundary: OnceLock::new(),
             policy: OnceLock::new(),
+            refusals: OnceLock::new(),
         })
     }
 
@@ -157,6 +167,12 @@ impl StatusCache {
     /// ignored and answers `false`.
     pub fn attach_policy(&self, policy: Arc<PolicyHandle>) -> bool {
         self.policy.set(policy).is_ok()
+    }
+
+    /// Attaches the pre-admission refusal log. Once: a second attachment is
+    /// ignored and answers `false`.
+    pub fn attach_refusals(&self, refusals: RefusalLog) -> bool {
+        self.refusals.set(refusals).is_ok()
     }
 
     /// The attached boundary observer, if any.
@@ -306,6 +322,13 @@ impl StatusCache {
                 || PolicyHandle::none().status().public_json(),
                 |policy| policy.status().public_json(),
             ),
+            // Refusals decided before a request row exists: what was accepted for
+            // recording, what was dropped to keep the log bounded (a flood), and
+            // what the store does not have yet.
+            "refusals": self
+                .refusals
+                .get()
+                .map_or_else(|| RefusalLog::disabled().status_block(), RefusalLog::status_block),
             "snapshot": {
                 "stale": stale,
                 "model_age_ms": age_ms(&snapshot.model),

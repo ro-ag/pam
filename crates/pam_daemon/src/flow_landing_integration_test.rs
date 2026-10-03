@@ -52,6 +52,14 @@ struct Github {
     merged: AtomicBool,
     /// The PR was closed by hand without a merge.
     abandoned: AtomicBool,
+    /// What `GET /repos/team/repo` answers (the merge methods allowed).
+    repository: Mutex<Value>,
+    /// A refusal GitHub answers the PR creation with, instead of creating.
+    reject_create: Mutex<Option<(u16, Value)>>,
+    /// A refusal GitHub answers the merge with, instead of merging.
+    reject_merge: Mutex<Option<(u16, Value)>>,
+    /// The merge happens but its answer is lost on the way back.
+    lose_merge: AtomicBool,
     requests: Mutex<Vec<Recorded>>,
 }
 impl Github {
@@ -89,6 +97,11 @@ impl Github {
             existing: AtomicBool::new(false),
             merged: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
+            repository: Mutex::new(json!({"full_name":"team/repo","allow_squash_merge":true,
+                "allow_merge_commit":true,"allow_rebase_merge":true})),
+            reject_create: Mutex::new(None),
+            reject_merge: Mutex::new(None),
+            lose_merge: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
         }
     }
@@ -183,7 +196,30 @@ impl HttpTransport for Github {
                     body,
                 });
             }
-            let body = if path.ends_with("/pulls") && request.method == Method::Get {
+            let refusal = |status: u16, body: &Value| HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::to_vec(body).unwrap(),
+            };
+            if path.ends_with("/pulls")
+                && request.method == Method::Post
+                && let Some((status, body)) = self.reject_create.lock().unwrap().clone()
+            {
+                return Ok(refusal(status, &body));
+            }
+            if path.ends_with("/pulls/7/merge") {
+                if let Some((status, body)) = self.reject_merge.lock().unwrap().clone() {
+                    return Ok(refusal(status, &body));
+                }
+                if self.lose_merge.load(Ordering::SeqCst) {
+                    self.merged.store(true, Ordering::SeqCst);
+                    return Err(TransportError::Network("connection reset by peer".into()));
+                }
+            }
+            let body = if path == "/repos/team/repo" {
+                assert_eq!(request.method, Method::Get);
+                self.repository.lock().unwrap().clone()
+            } else if path.ends_with("/pulls") && request.method == Method::Get {
                 if self.existing.load(Ordering::SeqCst) {
                     json!([self.pr()])
                 } else {
@@ -506,7 +542,11 @@ impl Fixture {
             }
             state
                 .recovery
-                .prepare(&self.ctx.store, &self.ctx.request_id, step, Prepare::Run)
+                .prepare(
+                    &self.ctx.store,
+                    &self.ctx.request_id,
+                    &crate::flow_intent::EffectIntent::attempt(step, Prepare::Run),
+                )
                 .await
                 .unwrap();
             let report = state.run_step(step).await.unwrap();
@@ -1266,4 +1306,185 @@ fn a_journalled_rejected_push_resumes_as_the_typed_refusal() {
     )
     .unwrap_err();
     assert_eq!(cause(contradiction), "landing_effect_uncertain");
+}
+
+/// The observation the run reported for `step`.
+fn observation(output: &CapabilityOutput, step: &str) -> Value {
+    output.body["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observation| observation["step"] == step)
+        .cloned()
+        .unwrap_or_else(|| panic!("{step} is reported: {}", output.body))
+}
+
+/// Whether the ticket's journal holds what the daemon reports as
+/// `flow_effect_uncertain`.
+async fn journal_uncertain(fixture: &Fixture) -> bool {
+    let journal = fixture
+        .ctx
+        .store
+        .read_flow_journal(&fixture.ctx.request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    journal.state == pam_store::FlowJournalState::Uncertain
+        || (journal.state == pam_store::FlowJournalState::Prepared && journal.effectful)
+}
+
+/// GitHub refusing the PR creation or the merge is a definite refusal: the
+/// step blocks with the typed cause, the intent is settled `rejected`, and
+/// nothing reads as an uncertain effect.
+#[tokio::test]
+async fn github_refusals_of_creation_and_merge_block_with_their_typed_cause() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(async {
+            let fixture = Fixture::new(false, false).await;
+            fixture.prefix(3).await;
+            *fixture.github.reject_create.lock().unwrap() = Some((
+                422,
+                json!({"message":"Validation Failed","errors":[{"message":"A pull request already exists for team:feature/work."}]}),
+            ));
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Blocked, "{}", output.body);
+            let ensure = observation(&output, "ensure-pr");
+            assert_eq!(ensure["status"], "blocked", "{ensure}");
+            // The compact result carries the typed refusal's sentence; the
+            // cause itself is asserted at the connector.
+            assert!(
+                ensure["text"].as_str().unwrap().contains("one already exists"),
+                "{ensure}"
+            );
+            assert!(
+                !output.body["effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|effect| effect["step"] == "ensure-pr"),
+                "a refused creation is not an effect: {}",
+                output.body
+            );
+            assert_eq!(fixture.github.count(Method::Post), 1);
+            let (_, session) = fixture.session().await;
+            assert_eq!(session["intent"]["state"], "rejected", "{session}");
+            assert!(!journal_uncertain(&fixture).await);
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(async {
+            let fixture = Fixture::new(false, false).await;
+            fixture.prefix(5).await;
+            *fixture.github.reject_merge.lock().unwrap() =
+                Some((405, json!({"message":"Pull Request is not mergeable"})));
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Blocked, "{}", output.body);
+            let merge = observation(&output, "merge");
+            assert_eq!(merge["status"], "blocked", "{merge}");
+            assert!(
+                merge["text"].as_str().unwrap().contains("not mergeable"),
+                "{merge}"
+            );
+            assert!(
+                !output.body["effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|effect| effect["step"] == "merge"),
+                "a refused merge is not an effect: {}",
+                output.body
+            );
+            assert_eq!(fixture.github.count(Method::Put), 1);
+            let (_, session) = fixture.session().await;
+            assert_eq!(session["intent"]["state"], "rejected", "{session}");
+            assert_eq!(session["intent"]["expected"]["merge_method"], "squash");
+            assert!(session["receipts"].get("merge").is_none());
+            assert!(!journal_uncertain(&fixture).await);
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// A merge whose answer is lost after the request left stays uncertain:
+/// the intent remains prepared and nothing is resent.
+#[tokio::test]
+async fn a_lost_merge_answer_stays_an_uncertain_effect() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(async {
+            let fixture = Fixture::new(false, false).await;
+            fixture.prefix(5).await;
+            fixture.github.lose_merge.store(true, Ordering::SeqCst);
+            let cause = run_refused(&fixture).await;
+            assert_eq!(cause, "connector_network");
+            assert_eq!(fixture.github.count(Method::Put), 1);
+            let (_, session) = fixture.session().await;
+            assert_eq!(session["intent"]["state"], "prepared", "{session}");
+            assert!(journal_uncertain(&fixture).await);
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// A repository whose settings forbid the configured merge method refuses
+/// before any merge intent or PUT, naming what it does allow.
+#[tokio::test]
+async fn a_repository_that_forbids_the_merge_method_refuses_before_merging() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(async {
+            let fixture = Fixture::new(false, false).await;
+            fixture.prefix(5).await;
+            *fixture.github.repository.lock().unwrap() = json!({"full_name":"team/repo",
+                "allow_squash_merge":false,"allow_merge_commit":true,"allow_rebase_merge":false});
+            let output = fixture.run().await;
+            assert_eq!(output.outcome, Outcome::Blocked, "{}", output.body);
+            let merge = observation(&output, "merge");
+            let text = merge.to_string();
+            assert!(text.contains("allow_squash_merge"), "{merge}");
+            assert!(text.contains("it allows: merge"), "{merge}");
+            assert_eq!(fixture.github.count(Method::Put), 0);
+            let (_, session) = fixture.session().await;
+            assert!(session["intent"].is_null() || session["intent"]["operation"] != "merge");
+            assert!(!journal_uncertain(&fixture).await);
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+/// The landing session records the trusted Git it froze with: the
+/// allowlisted installation's canonical path and its `git --version`.
+#[tokio::test]
+async fn freeze_records_the_trusted_git_and_its_version() {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(async {
+            let fixture = Fixture::new(false, false).await;
+            fixture.prefix(1).await;
+            let (_, session) = fixture.session().await;
+            let git = &session["git"];
+            assert_eq!(git["source"], "allowlist", "{session}");
+            assert!(
+                git["version"].as_str().unwrap().starts_with("git version "),
+                "{git}"
+            );
+            let path = PathBuf::from(git["path"].as_str().unwrap());
+            assert!(path.is_absolute() && path.ends_with("git"), "{git}");
+            assert_ne!(
+                path,
+                Path::new("/usr/bin/git"),
+                "the xcrun shim is never run"
+            );
+            assert_eq!(session["receipts"]["freeze"]["git"], *git);
+        }),
+    )
+    .await
+    .unwrap();
 }

@@ -31,12 +31,14 @@ fn later_binary(extra: i64) -> Vec<Migration> {
         .map(|migration| Migration {
             version: migration.version,
             sql: migration.sql,
+            code: migration.code,
         })
         .collect();
     for (step, sql) in (1..=extra).zip(LATER) {
         known.push(Migration {
             version: latest + step,
             sql,
+            code: None,
         });
     }
     known
@@ -155,29 +157,32 @@ fn a_pre_boundary_database_gets_the_one_time_backup_and_a_later_migration_its_ow
 
     // This binary: across the engine boundary to its latest version, with
     // the one pre-engine copy.
-    assert_eq!(open_and_close(&path, MIGRATIONS).unwrap(), 16);
+    let latest = migrations::latest_version();
+    assert_eq!(open_and_close(&path, MIGRATIONS).unwrap(), latest);
     assert_eq!(labels(&path), ["pre-sqlite"]);
     assert_eq!(
         std::fs::read(backup_dir(&path, &backups(&path)[0]).join("state.sqlite3")).unwrap(),
         as_found
     );
-    assert_eq!(header_version(&path), 16);
+    assert_eq!(header_version(&path), latest);
 
     // A later binary with one more migration: a migration backup of the
     // database as this binary left it.
-    let before_17 = std::fs::read(&path).unwrap();
-    assert_eq!(open_and_close(&path, &later_binary(1)).unwrap(), 17);
-    assert_eq!(labels(&path), ["pre-sqlite", "pre-v17"]);
+    let next = latest + 1;
+    let next_label = format!("pre-v{next}");
+    let before_next = std::fs::read(&path).unwrap();
+    assert_eq!(open_and_close(&path, &later_binary(1)).unwrap(), next);
+    assert_eq!(labels(&path), ["pre-sqlite", next_label.as_str()]);
     let migration_backup = backup_dir(&path, &backups(&path)[1]);
     assert_eq!(
         std::fs::read(migration_backup.join("state.sqlite3")).unwrap(),
-        before_17
+        before_next
     );
-    assert_eq!(header_version(&path), 17);
+    assert_eq!(header_version(&path), next);
 
     // The same binary again: nothing pending, nothing copied.
-    assert_eq!(open_and_close(&path, &later_binary(1)).unwrap(), 17);
-    assert_eq!(labels(&path), ["pre-sqlite", "pre-v17"]);
+    assert_eq!(open_and_close(&path, &later_binary(1)).unwrap(), next);
+    assert_eq!(labels(&path), ["pre-sqlite", next_label.as_str()]);
 
     // The row survived both upgrades.
     let conn = Connection::open(&path).unwrap();
@@ -196,15 +201,23 @@ fn migration_backups_are_bounded_and_the_pre_engine_one_is_kept() {
     build_pre_boundary(&path, 11);
     open_and_close(&path, MIGRATIONS).unwrap();
     // Five later binaries, one schema version apart.
+    let latest = migrations::latest_version();
     for extra in 1..=5 {
         assert_eq!(
             open_and_close(&path, &later_binary(extra)).unwrap(),
-            16 + extra
+            latest + extra
         );
     }
+    // The pre-engine copy, then the newest three migration copies.
+    let kept: Vec<String> = (3..=5)
+        .map(|extra| format!("pre-v{}", latest + extra))
+        .collect();
     assert_eq!(
         labels(&path),
-        ["pre-sqlite", "pre-v19", "pre-v20", "pre-v21"]
+        ["pre-sqlite".to_owned()]
+            .into_iter()
+            .chain(kept)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -221,7 +234,7 @@ fn an_older_binary_refuses_a_later_database_and_touches_nothing() {
         let supported = known.last().unwrap().version;
         let error = open_and_close(&path, known).unwrap_err();
         assert!(
-            matches!(error, StoreError::VersionTooNew { found: 18, supported: s } if s == supported),
+            matches!(error, StoreError::VersionTooNew { found, supported: s } if found == migrations::latest_version() + 2 && s == supported),
             "{error:?}"
         );
         let text = error.to_string();
@@ -251,38 +264,36 @@ fn leave_the_stamp_in_the_log(path: &Path, sql: &str, version: i64) {
 fn a_header_that_lags_the_log_leaves_no_mislabelled_backup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");
-    // Schema 13 in the main file; the boundary migration and the two after
+    // Schema 13 in the main file; the boundary migration and every one after
     // it only in the log, as a daemon killed between their commit and the
     // checkpoint leaves it.
+    let latest = migrations::latest_version();
     build_pre_boundary(&path, 13);
-    let past_the_boundary = format!(
-        "{}{}{}",
-        MIGRATIONS[13].sql, MIGRATIONS[14].sql, MIGRATIONS[15].sql
-    );
-    leave_the_stamp_in_the_log(&path, &past_the_boundary, 16);
+    let past_the_boundary: String = MIGRATIONS[13..].iter().map(|m| m.sql).collect();
+    leave_the_stamp_in_the_log(&path, &past_the_boundary, latest);
     assert_eq!(header_version(&path), 13);
 
     // The header says "pre-engine", the log says "already upgraded": the
     // copy made on the header's word is not a pre-engine database and does
     // not stay under that name.
-    assert_eq!(open_and_close(&path, MIGRATIONS).unwrap(), 16);
+    assert_eq!(open_and_close(&path, MIGRATIONS).unwrap(), latest);
     assert!(backups(&path).is_empty(), "{:?}", backups(&path));
     // And the header has caught up, so the next open does not even copy.
-    assert_eq!(header_version(&path), 16);
+    assert_eq!(header_version(&path), latest);
 
-    // The same one migration later: header 16, log 17.
-    leave_the_stamp_in_the_log(&path, "CREATE TABLE later_1 (x INTEGER);", 17);
-    assert_eq!(header_version(&path), 16);
-    assert_eq!(open_and_close(&path, &later_binary(1)).unwrap(), 17);
+    // The same one migration later: header at latest, log one past it.
+    leave_the_stamp_in_the_log(&path, "CREATE TABLE later_1 (x INTEGER);", latest + 1);
+    assert_eq!(header_version(&path), latest);
+    assert_eq!(open_and_close(&path, &later_binary(1)).unwrap(), latest + 1);
     assert!(backups(&path).is_empty(), "{:?}", backups(&path));
-    assert_eq!(header_version(&path), 17);
+    assert_eq!(header_version(&path), latest + 1);
 
-    // A header that lags a log which is itself behind: 17 on disk says the
-    // header, 18 says the log, and the binary knows 19. One migration is
-    // really pending, and its backup carries the right label.
-    leave_the_stamp_in_the_log(&path, "CREATE TABLE later_2 (x INTEGER);", 18);
-    assert_eq!(open_and_close(&path, &later_binary(3)).unwrap(), 19);
-    assert_eq!(labels(&path), ["pre-v19"]);
+    // A header that lags a log which is itself behind: the header says one
+    // past the latest, the log says two past, and the binary knows three. One
+    // migration is really pending, and its backup carries the right label.
+    leave_the_stamp_in_the_log(&path, "CREATE TABLE later_2 (x INTEGER);", latest + 2);
+    assert_eq!(open_and_close(&path, &later_binary(3)).unwrap(), latest + 3);
+    assert_eq!(labels(&path), [format!("pre-v{}", latest + 3)]);
 }
 
 #[test]
@@ -292,24 +303,26 @@ fn a_failed_migration_leaves_the_database_at_its_version_and_keeps_the_backup() 
     open_and_close(&path, MIGRATIONS).unwrap();
     let before = std::fs::read(&path).unwrap();
 
+    let latest = migrations::latest_version();
     let mut broken = later_binary(1);
     // A migration that cannot apply: the table exists.
     broken.push(Migration {
-        version: 18,
+        version: latest + 2,
         sql: "CREATE TABLE later_1 (y INTEGER);",
+        code: None,
     });
     let error = open_and_close(&path, &broken).unwrap_err();
     assert!(error.to_string().contains("already exists"), "{error}");
 
-    // Migration 17 committed, 18 did not, and the copy from before both is
-    // there to go back to.
+    // The first later migration committed, the second did not, and the copy
+    // from before both is there to go back to.
     let conn = Connection::open(&path).unwrap();
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, latest + 1);
     drop(conn);
-    assert_eq!(labels(&path), ["pre-v18"]);
+    assert_eq!(labels(&path), [format!("pre-v{}", latest + 2)]);
     assert_eq!(
         std::fs::read(backup_dir(&path, &backups(&path)[0]).join("state.sqlite3")).unwrap(),
         before

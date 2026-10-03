@@ -15,10 +15,59 @@ granted, sync included.
 In **Settings → Flows → Landing**, configure the canonical local repository,
 exact HTTPS remote, GitHub API server and owner/repository, base branch, exact
 allowed feature branches, private workspace directory, mandatory local checks,
-required PR and main check names, and separate push/PR/merge/sync permissions.
-The connector must also have a current repository scope and credential. Editing
-this policy requires the private GUI administration channel. A flow cannot grant
-itself any of these permissions. Stale GUI editors must reload before saving.
+required PR and main checks, the merge method, and separate push/PR/merge/sync
+permissions. One Git path, optional, applies to every recipe. The connector must
+also have a current repository scope and credential. Editing this policy
+requires the private GUI administration channel. A flow cannot grant itself any
+of these permissions. Stale GUI editors must reload before saving.
+
+**Required checks** are written one per line as `name`, or `name @app-id` to
+pin the check to the GitHub App that reports it (GitHub Actions is app 15368);
+the stored form is `{ "name": …, "app_id": … }`. A pinned check is satisfied only
+by a check run whose `app.id` is that app: a same-named check run from any other
+app, or one with no app identity, is ignored (and counted in the evidence as
+`other_apps`), and a commit status never satisfies it, since statuses carry no
+app identity. A name-only check still works as before, matched by name across
+check runs and commit statuses, and the form shows it as "Unpinned app" with the
+recommendation to pin it. A recipe whose checks are all pinned reads check runs
+only.
+
+**Merge method** is `squash` (the default), `merge` or `rebase`. Before
+journalling the merge, `merge` reads the repository (`GET /repos/{owner}/{repo}`)
+and refuses `landing_merge_method_forbidden`, naming the methods it does allow,
+when GitHub reports the chosen one as not allowed (`allow_squash_merge`,
+`allow_merge_commit`, `allow_rebase_merge` false). A field GitHub does not report
+(a credential without enough access to see the settings) does not refuse there;
+GitHub's own refusal of the merge is then typed (below).
+
+**The Git** the landing runs is never looked up on `PATH`. With no Git path set,
+the broker takes the first qualifying entry of a fixed allowlist: on macOS the
+active developer directory's Git (Apple's `/usr/bin/git` is an `xcrun` shim and
+is never run; PAM reads the root-owned `/var/db/xcode_select_link`, which is what
+`xcode-select -p` reports, and takes `<developer dir>/usr/bin/git`), then
+`/Library/Developer/CommandLineTools/usr/bin/git`, then `/opt/homebrew/bin/git`;
+on Windows `C:\Program Files\Git\clangarm64\bin\git.exe` (ARM64) or
+`C:\Program Files\Git\mingw64\bin\git.exe` (x64), then
+`C:\Program Files\Git\cmd\git.exe` (the launcher for it). A candidate qualifies
+when it is an existing executable regular file and the spelled path, its
+canonical target and every directory above each are owned by root or the
+daemon's user and writable by neither a group nor others (on Windows: no link or
+junction on the way, and the daemon's account holds no right to write, delete,
+re-permission or re-own the file or any folder above it). Homebrew's default
+prefix is group-writable for `admin`, so a default Homebrew Git does not qualify.
+An explicit Git path is checked the same way when it is saved and at every use,
+and is never replaced by an allowlist entry when it fails. None qualifying
+refuses `landing_git_untrusted`, naming each candidate and why it failed. The
+freeze records the resolved path, who chose it (`policy`, `settings` or
+`allowlist`) and its `git --version` in the landing session and the freeze
+receipt; every later stage must resolve to the same executable or refuses
+`landing_git_changed`, and the Git broker re-checks it before every Git process
+it starts.
+
+A managed policy can set these too: `landing.git_path` (an absolute path) and
+`landing.merge_method` each take `locked` or `default`. A locked value replaces
+the human's in every check, shows read-only in the form, and refuses a save that
+changes it (`setting_locked`).
 
 The workspace directory must already exist, be private to the daemon user
 (`0700` on Unix), and be outside both the source repository and PAM's private
@@ -47,7 +96,7 @@ profile and per-stage approval rules still apply at execution time.
 | `push` | Fresh unchanged source and policy; exact authorized remote ref receives the frozen SHA, with an explicit old-ref lease |
 | `ensure_pr` | One matching same-repository PR has the exact head, base and frozen head SHA: open, or already merged at that exact head |
 | `verify_pr` | Every declared required check is successful for that exact head SHA; a PR merged at that head is accepted, one closed without a merge conflicts |
-| `merge` | Fresh PR and check evidence, separate permission and GitHub's expected-head-SHA merge condition |
+| `merge` | Fresh PR and check evidence, separate permission, a merge method the repository does not forbid, and GitHub's expected-head-SHA merge condition |
 | `verify_main` | Every declared main check succeeds for the merge SHA returned by GitHub |
 | `sync` | The verified merge commit fetched as a bounds-proven thin pack through the HTTP broker, indexed privately, installed into the source object store, and the base branch fast-forwarded under an exact old-value lease; working tree untouched |
 
@@ -68,7 +117,8 @@ re-creates it at the frozen commit before `ensure_pr` finds the merged PR.
 GitHub's merge API atomically checks the head SHA. The observed base SHA is not
 an atomic base guard. PAM must not claim otherwise or treat a preceding GET as
 closing that race. Required checks must have unique, complete membership;
-missing, duplicate, pending, skipped or ambiguous results cannot produce green.
+missing, duplicate, pending, skipped or ambiguous results cannot produce green,
+and a pinned check is matched by `{ name, app_id }`, never by name alone.
 
 ## Local checks and boundaries
 
@@ -121,6 +171,22 @@ Git reported complete while the ref stayed put, and a ref that moved to
 anything else all refuse as `landing_effect_uncertain`, with the detail saying
 which of the three it was. None of them is resent automatically.
 
+PR creation and merge are classified the same way. GitHub answering the POST or
+PUT with a refusal is definite: nothing changed, the intent is settled
+`rejected`, and the step blocks with a typed cause and its recovery instead of
+`landing_effect_uncertain`. The causes are `landing_pr_already_exists`,
+`landing_pr_no_commits` and `landing_pr_rejected` (422 on creation), and
+`landing_merge_head_modified` (409, or "head branch was modified"),
+`landing_merge_method_not_allowed`, `landing_merge_checks_required` ("required
+status checks are expected"), `landing_merge_conflict`,
+`landing_merge_not_mergeable` (405) and `landing_merge_rejected` (another 422).
+A rejected credential, a forbidden or missing resource and throttling (401, 403,
+404, 429) are definite too, as is anything refused before the request left. The
+response body only selects the cause; it is never kept. Only a failure after the
+request was sent that leaves the outcome unknown (a lost answer, a timeout, a
+5xx, a redirect, a success body PAM cannot read) keeps the intent prepared and
+stays uncertain.
+
 Policy revision, original admission, grant revision, scope, expiry and shared
 budget are checked again before work. Git credentials are supplied only to the
 fixed broker operation; source Git configuration, hooks and credential helpers
@@ -134,9 +200,20 @@ file), so a directory swapped for a symlink stops the write. A swap in the
 instants between that walk and the write is not excluded: the workspace has no
 `openat`-style handle API.
 
-PR and main verification each allow at most 20 polls at five-second intervals,
-within the original request deadline and budget. Waiting releases the repository
-lane. Unchanged polls reuse the protected checkpoint rather than copying it.
+PR and main verification poll with exponential backoff: about five seconds
+before the second look, doubling to a sixty-second cap, each wait shortened by a
+jitter of up to a fifth drawn from the ticket and step. There is no fixed poll
+count: the landing keeps polling while the original request deadline leaves
+room, cutting the last wait to what remains after a two-second headroom, and
+refuses `request_deadline_exhausted` only when less than one second would be
+left (the recovery: a new ticket for the same commit resumes from GitHub's state
+without repeating any effect). The deadline (one hour at most) therefore bounds
+the number of polls, about sixty at the cap. The request's HTTP allowance is a
+separate bound: a poll that would leave fewer than twelve calls for the
+remaining verification refuses `landing_poll_budget_exhausted`, and a pinned
+check list spends one call per poll instead of two. Waiting releases the
+repository lane. Unchanged polls reuse the protected checkpoint rather than
+copying it.
 The CLI receives compact published evidence; private intents and manifests are
 not exposed as public evidence pages.
 

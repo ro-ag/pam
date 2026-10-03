@@ -184,6 +184,10 @@ impl TerminalWriter {
         outcome: Option<&str>,
         audit: AuditEntry<'_>,
     ) -> Written {
+        debug_assert!(
+            crate::request_state::target(crate::request_state::RequestEvent::Finish(state)).is_ok(),
+            "the terminal writer records terminal states only, not {state:?}"
+        );
         let mut pause = None;
         let mut backoff = RETRY_BACKOFF.iter();
         loop {
@@ -230,6 +234,10 @@ impl TerminalWriter {
         outcome: Option<&str>,
         audit: AuditEntry<'_>,
     ) {
+        debug_assert!(
+            crate::request_state::target(crate::request_state::RequestEvent::Finish(state)).is_ok(),
+            "the terminal writer parks terminal states only, not {state:?}"
+        );
         let entry = ParkedTerminal {
             id: id.to_owned(),
             state,

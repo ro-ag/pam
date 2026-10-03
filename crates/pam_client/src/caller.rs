@@ -15,6 +15,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pam_proto::Caller;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -33,6 +36,29 @@ pub fn detect_caller() -> Caller {
     let repo = detect_repo();
     Caller { agent, repo, pid }
 }
+
+/// The detected identity of this process, detected once and then reused.
+///
+/// A request envelope needs it every time, and detecting it walks the process's ancestors
+/// through the operating system and canonicalizes the working directory. A CLI invocation sends
+/// a handful of requests, but the GUI polls `status` every few seconds for as long as it is open
+/// and would repeat that walk each time. The pid, the ancestry and the working directory of a
+/// running `pam` process do not change, so the first answer stands.
+#[must_use]
+pub fn cached_caller() -> Caller {
+    static CALLER: OnceLock<Caller> = OnceLock::new();
+    CALLER
+        .get_or_init(|| {
+            #[cfg(test)]
+            DETECTIONS.fetch_add(1, Ordering::SeqCst);
+            detect_caller()
+        })
+        .clone()
+}
+
+/// How many times [`cached_caller`] has actually detected (tests only).
+#[cfg(test)]
+pub(crate) static DETECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Finds the repository top level containing `start`, if any.
 ///

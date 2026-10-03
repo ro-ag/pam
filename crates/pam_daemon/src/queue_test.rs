@@ -399,10 +399,19 @@ async fn cancel_unknown_or_terminal_request_is_not_found() {
     .expect("test within deadline");
 }
 
+/// A queue whose wall clock is the paused Tokio clock: admission, placement
+/// and the lease deadline then see the same time, and a short deadline
+/// cannot expire under load between admission and placement.
+async fn paused_manager() -> (Arc<Store>, Arc<QueueManager>) {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let queue = Arc::new(QueueManager::new(Arc::clone(&store)).with_paused_clock());
+    (store, queue)
+}
+
 #[tokio::test(start_paused = true)]
 async fn lease_reaping_fails_the_row_audits_and_frees_the_lane() {
     timeout(DEADLINE, async {
-        let (store, queue) = manager().await;
+        let (store, queue) = paused_manager().await;
         let mut env = envelope("req_1", REPO_A, serde_json::json!({ "n": 1 }), None);
         env.deadline_ms = 100;
         enqueue(&queue, &env).await;
@@ -733,7 +742,7 @@ async fn restart_refuses_expired_authorized_work_without_refreshing_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn time_waiting_in_a_lane_consumes_the_original_deadline() {
-    let (store, queue) = manager().await;
+    let (store, queue) = paused_manager().await;
     let mut env = envelope("waiting", REPO_A, serde_json::json!({}), None);
     env.deadline_ms = 100;
     enqueue(&queue, &env).await;
@@ -1468,8 +1477,12 @@ async fn reconciling_a_leased_row_releases_its_lane_and_signals_the_holder() {
         let store = Arc::new(Store::open_in_memory().await.unwrap());
         let queue =
             QueueManager::new(Arc::clone(&store)).with_reconcile_grace(Duration::from_secs(1));
+        // The deadline only has to be shorter than the follower's: the
+        // reconciler below is handed a clock past this row's recorded expiry,
+        // so no real time has to pass (a 50 ms deadline used to expire under
+        // load between admission and lane placement).
         let mut short = envelope("held", REPO_A, serde_json::json!({}), None);
-        short.deadline_ms = 50;
+        short.deadline_ms = 30_000;
         enqueue(&queue, &short).await;
         let work = queue.take_next(REPO_A).await.unwrap().unwrap();
         enqueue(
@@ -1482,9 +1495,17 @@ async fn reconciling_a_leased_row_releases_its_lane_and_signals_the_holder() {
             "lane busy"
         );
 
-        // Long past the deadline and the grace, as the reaper would see it
-        // if its own lease sweep had been failing.
-        let later = wall_now_ms() + 10_000;
+        // Past the deadline and the grace, as the reaper would see it if its
+        // own lease sweep had been failing; still inside the follower's
+        // 60 s deadline, which was recorded after this one.
+        let expires = store
+            .get_request("held")
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at_ms
+            .unwrap();
+        let later = expires + 2_000;
         assert_eq!(queue.reconcile_expired(later).await.unwrap(), 1);
         assert!(*work.cancel.borrow(), "the holder is told to stop");
         assert!(queue.leased_ids().await.is_empty());
@@ -1629,6 +1650,205 @@ async fn admit_from_records_the_origin_and_changes_nothing_else() {
         let row = store.get_request("req_origin").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Running);
         assert_eq!(row.origin, peer);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+// --- the lane lock is never held across store I/O --------------------------
+
+/// A store call that is slow for one lane's head (held at the queue's store
+/// boundary, with the lane lock released) does not hold up another lane:
+/// its lease is handed out and the in-memory reads answer while the first
+/// call is still in the store. The held lane stays reserved, so no second
+/// lease can be taken off it meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_store_call_on_one_lane_does_not_block_another_lanes_lease() {
+    timeout(DEADLINE, async {
+        let (_store, queue) = manager().await;
+        enqueue(
+            &queue,
+            &envelope("slow_a", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+        enqueue(
+            &queue,
+            &envelope("fast_b", REPO_B, serde_json::json!({}), None),
+        )
+        .await;
+
+        let mut hold = queue.hold_store("slow_a");
+        let slow = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.take_next(REPO_A).await }
+        });
+        hold.reached().await;
+
+        let fast = queue.take_next(REPO_B).await.unwrap().unwrap();
+        assert_eq!(fast.request_id, "fast_b");
+        assert_eq!(queue.leased_ids().await, ["fast_b"]);
+        assert!(
+            queue.ready_repos().await.is_empty(),
+            "lane A is reserved for its head, lane B is leased"
+        );
+        assert!(
+            queue.take_next(REPO_A).await.unwrap().is_none(),
+            "no second lease off a reserved lane"
+        );
+        assert_eq!(
+            queue.cancel("fast_b", Actor::System).await.unwrap(),
+            CancelOutcome::SignalledRunning
+        );
+        assert!(!slow.is_finished(), "the slow call is still in the store");
+
+        hold.release();
+        let slow = slow.await.unwrap().unwrap().unwrap();
+        assert_eq!(slow.request_id, "slow_a");
+        let mut leased = queue.leased_ids().await;
+        leased.sort();
+        assert_eq!(leased, ["fast_b", "slow_a"]);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// Operations on the same request are still linearized: a cancel arriving
+/// while the request's lease is being written waits for that write and then
+/// signals the new lease, exactly as if the lease had held the whole queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operation_on_a_claimed_request_waits_for_its_claim_to_settle() {
+    timeout(DEADLINE, async {
+        let (_store, queue) = manager().await;
+        enqueue(
+            &queue,
+            &envelope("claimed", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+
+        let mut hold = queue.hold_store("claimed");
+        let take = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.take_next(REPO_A).await }
+        });
+        hold.reached().await;
+        let cancel = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.cancel("claimed", Actor::System).await }
+        });
+        // Waiting for the claim, not finding the request queued and
+        // cancelling it underneath the lease being written.
+        assert!(
+            timeout(Duration::from_millis(100), async {
+                while !cancel.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "the cancel waits for the claim"
+        );
+
+        hold.release();
+        let mut work = take.await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            cancel.await.unwrap().unwrap(),
+            CancelOutcome::SignalledRunning
+        );
+        work.cancel.changed().await.unwrap();
+        assert!(*work.cancel.borrow());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The reconciler cannot claim before its sweep. When it finishes a request
+/// another operation is writing, that operation sees the claim withdrawn and
+/// takes the outcome it would have had after the reconciler: no lease, the
+/// lane free, one terminal notice (the reconciler's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reconciler_withdraws_a_request_from_the_operation_holding_it() {
+    timeout(DEADLINE, async {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let queue = Arc::new(
+            QueueManager::new(Arc::clone(&store)).with_reconcile_grace(Duration::from_secs(1)),
+        );
+        enqueue(
+            &queue,
+            &envelope("stranded", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+        let expires = store
+            .get_request("stranded")
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at_ms
+            .unwrap();
+
+        let mut hold = queue.hold_store("stranded");
+        let take = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.take_next(REPO_A).await }
+        });
+        hold.reached().await;
+        assert_eq!(queue.reconcile_expired(expires + 2_000).await.unwrap(), 1);
+        hold.release();
+
+        assert!(take.await.unwrap().unwrap().is_none(), "no lease");
+        assert!(queue.leased_ids().await.is_empty());
+        assert!(queue.ready_repos().await.is_empty(), "the lane is gone");
+        assert_eq!(queue.take_parked_terminals().await, ["stranded"]);
+        let row = store.get_request("stranded").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Failed);
+        assert_eq!(row.outcome.as_deref(), Some(CAUSE_LEASE_EXPIRED));
+        assert_eq!(store.audit_for_request("stranded").await.unwrap().len(), 1);
+
+        // The lane serves its next request at once.
+        enqueue(
+            &queue,
+            &envelope("after", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+        let next = queue.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(next.request_id, "after");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A queue operation cut off while it is in the store (its future dropped,
+/// as a handler deadline does) releases its claim and the lane it reserved:
+/// the request is still at the head of its lane, and the next lease takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_store_call_gives_back_its_claim_and_lane() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        enqueue(
+            &queue,
+            &envelope("cut_off", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+
+        let mut hold = queue.hold_store("cut_off");
+        let take = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.take_next(REPO_A).await }
+        });
+        hold.reached().await;
+        assert!(queue.ready_repos().await.is_empty(), "reserved");
+        take.abort();
+        assert!(take.await.unwrap_err().is_cancelled());
+        hold.release();
+
+        assert_eq!(queue.ready_repos().await, [REPO_A]);
+        let row = store.get_request("cut_off").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        let work = queue.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "cut_off");
+        assert_eq!(
+            queue.cancel("cut_off", Actor::System).await.unwrap(),
+            CancelOutcome::SignalledRunning
+        );
     })
     .await
     .expect("test within deadline");

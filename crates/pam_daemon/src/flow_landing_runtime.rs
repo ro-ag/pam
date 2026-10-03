@@ -2,22 +2,37 @@
 use super::{
     Action, Arc, ArgValue, Attempt, BTreeMap, CapabilityFailure, ConnectorId, Duration,
     FlowRefusal, Instant, Path, PathBuf, RunState, Step, StepReport, StepStatus, Store, Value,
-    digest, failed, json, new_evidence_id, resolve_program,
+    digest, failed, json, new_evidence_id,
 };
 use crate::connector_service::{InvokeError, LandingGithubOp};
+use crate::flow_intent::EffectIntent;
 use crate::flow_recovery::{KIND, MAX_INLINE_BYTES, failure};
 use crate::landing_checkout::{self, CANCELLED, CheckoutReceipt, CheckoutRequest, valid_oid};
 use crate::landing_git::{
-    GitTarget, LandingCall, PushObservation, PushState, Reconciliation, RemoteRef, reconcile,
+    GitSource, GitTarget, LandingCall, PushObservation, PushState, Reconciliation, RemoteRef,
+    reconcile,
 };
 use crate::landing_policy::{Repository, Snapshot as Policy};
-use pam_connectors::github_landing::{CheckState, Checks, PullRequest, Target};
+use pam_connectors::github_landing::{
+    CheckState, Checks, MergeMethod, MergeMethods, PullRequest, Target, definite_refusal,
+};
 use pam_flow::LandingOperation as Op;
 use serde::{Deserialize, Serialize};
 
 const RECOVERY: &str = "Inspect the original landing ticket and retained receipts; reconcile uncertain effects before starting new work.";
-const MAX_POLLS: u32 = 20;
-const POLL_MS: i64 = 5_000;
+/// The first required-check poll waits about this long.
+pub(super) const POLL_FIRST: Duration = Duration::from_secs(5);
+/// Each later wait doubles up to this cap.
+pub(super) const POLL_CAP: Duration = Duration::from_secs(60);
+/// Kept free before the request deadline for the poll itself and the
+/// verification that follows it.
+pub(super) const POLL_HEADROOM: Duration = Duration::from_secs(2);
+/// The shortest wait scheduled; less than this left before the headroom
+/// means no further poll fits.
+pub(super) const POLL_MIN: Duration = Duration::from_secs(1);
+/// A persisted poll count above this is corrupt: the request deadline (one
+/// hour at most) admits far fewer polls at [`POLL_MIN`] apart.
+const MAX_POLL_RECORD: u32 = 3_600;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,16 +46,22 @@ struct Session {
     checktree: PathBuf,
     target: pam_flow::CorrelationTarget,
     receipts: BTreeMap<String, Value>,
-    intent: Option<Intent>,
+    intent: Option<EffectIntent<Op>>,
     poll: Option<Poll>,
+    /// The broker Git frozen with this landing; every later stage must
+    /// resolve to the same executable. Absent on sessions frozen before it
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git: Option<GitRecord>,
 }
-#[derive(Serialize, Deserialize)]
+/// The Git a landing froze with: its canonical path, who chose it and what
+/// `git --version` reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Intent {
-    step_id: String,
-    operation: Op,
-    state: String,
-    expected: Value,
+pub(super) struct GitRecord {
+    pub path: PathBuf,
+    pub source: GitSource,
+    pub version: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,11 +93,51 @@ fn key(operation: Op) -> &'static str {
     }
 }
 fn refused(cause: &str, detail: impl Into<String>) -> CapabilityFailure {
+    refused_with(cause, detail, RECOVERY)
+}
+fn refused_with(
+    cause: &str,
+    detail: impl Into<String>,
+    recovery: impl Into<String>,
+) -> CapabilityFailure {
     CapabilityFailure::Refused {
         cause: cause.into(),
         detail: detail.into(),
-        recovery: RECOVERY.into(),
+        recovery: recovery.into(),
     }
+}
+/// Whether a failed typed GitHub mutation proves nothing changed: GitHub
+/// answered it with a refusal, or it was refused before the request left
+/// (every invoke failure other than a connector one happens before the
+/// transport is reached). A lost answer, a server error or an unexpected
+/// success body stays uncertain.
+pub(super) fn mutation_refused(error: &InvokeError) -> bool {
+    match error {
+        InvokeError::Connector(error) => definite_refusal(error),
+        _ => true,
+    }
+}
+/// The wait before required-check poll number `polls` (1 for the first):
+/// [`POLL_FIRST`] doubling to [`POLL_CAP`], less up to a fifth as jitter
+/// drawn from `seed` (the ticket and step), and never past the request
+/// deadline: with `remaining` until it, the wait is cut to what is left
+/// after [`POLL_HEADROOM`], and `None` once that is under [`POLL_MIN`]. The
+/// landing therefore keeps polling while time remains, and the number of
+/// polls is bounded by the deadline, not by a count.
+pub(super) fn poll_delay(polls: u32, seed: &str, remaining: Duration) -> Option<Duration> {
+    let doubling = 1u64 << polls.saturating_sub(1).min(16);
+    let base = u64::try_from(POLL_FIRST.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(doubling)
+        .min(u64::try_from(POLL_CAP.as_millis()).unwrap_or(u64::MAX));
+    let hash = pam_compact::sha256_hex(format!("{seed}/{polls}").as_bytes());
+    let draw = u64::from_str_radix(&hash[..4], 16).unwrap_or(0);
+    let jittered = base - base * draw / (5 * 0x1_0000);
+    let available = remaining.checked_sub(POLL_HEADROOM)?;
+    if available < POLL_MIN {
+        return None;
+    }
+    Some(Duration::from_millis(jittered).min(available))
 }
 /// A local checkout or Git failure; the cancel signal is the one cause that
 /// ends the run cancelled instead of blocked.
@@ -184,7 +245,10 @@ impl RunState<'_> {
             || session.repository != self.repo.to_string_lossy()
             || Some(&session.target) != self.correlation.target()
             || session.receipts.len() > 8
-            || session.poll.as_ref().is_some_and(|p| p.polls > MAX_POLLS)
+            || session
+                .poll
+                .as_ref()
+                .is_some_and(|p| p.polls > MAX_POLL_RECORD)
         {
             return Err(failure());
         }
@@ -218,7 +282,7 @@ impl RunState<'_> {
         Ok(self.landing_session().await?.is_some_and(|(_, session)| {
             session
                 .intent
-                .is_some_and(|intent| intent.step_id == step.id && intent.state == "prepared")
+                .is_some_and(|intent| intent.is_prepared_for(&step.id))
         }))
     }
     pub(super) async fn landing_approval_valid(
@@ -252,21 +316,35 @@ impl RunState<'_> {
             .map_err(|e| refused(e.cause, e.detail))?;
         Ok((policy.revision, repository))
     }
+    /// The checkout identity of this landing, with the broker Git resolved
+    /// from the configured path or the trusted allowlist (never `PATH`).
+    /// `pinned` is the Git the session froze with; a different resolution
+    /// now refuses rather than running another executable.
     fn checkout_request(
         &self,
         policy: &Repository,
         commit: &str,
+        pinned: Option<&GitRecord>,
     ) -> Result<CheckoutRequest, CapabilityFailure> {
-        // The broker trusts only a canonical installation path, so a
-        // symlinked launcher (Homebrew's `bin/git`) resolves to its target here
-        // rather than passing freeze and refusing at push.
-        let git_program = resolve_program(
-            "git",
-            &self.settings.extra_path_dirs(),
-            &std::env::var_os("PATH").unwrap_or_default(),
+        let git = crate::landing_git::resolve_broker_git(
+            policy.configured_git(),
+            &self.service.protected_base,
         )
-        .and_then(|path| path.canonicalize().ok())
-        .ok_or_else(|| refused("program_missing", "Git is unavailable"))?;
+        .map_err(|e| refused_with(e.cause, e.detail, e.recovery))?;
+        if let Some(pinned) = pinned
+            && pinned.path != git.path
+        {
+            return Err(refused_with(
+                "landing_git_changed",
+                format!(
+                    "This landing froze with Git {} but the landing settings now resolve to {}; PAM never switches Git inside a landing",
+                    pinned.path.display(),
+                    git.path.display()
+                ),
+                "Start a new landing ticket; it freezes with the Git the settings name now.",
+            ));
+        }
+        let git_program = git.path;
         Ok(CheckoutRequest {
             repository: self.repo.clone(),
             protected_base: self.service.protected_base.clone(),
@@ -392,7 +470,11 @@ impl RunState<'_> {
                 "The admission or policy profile changed after this stage was gated",
             ));
         }
-        let request = self.checkout_request(&loaded.policy, &loaded.receipt.commit)?;
+        let request = self.checkout_request(
+            &loaded.policy,
+            &loaded.receipt.commit,
+            loaded.session.git.as_ref(),
+        )?;
         // Once GitHub reported a merge, the only other base value this
         // ticket may find is that merge commit: what its own sync installs.
         let landed: Vec<String> = merge_commit(loaded).ok().into_iter().collect();
@@ -456,7 +538,7 @@ impl RunState<'_> {
                 if self.landing_session().await?.is_some_and(|(_, s)| {
                     s.intent
                         .as_ref()
-                        .is_some_and(|i| i.step_id == step.id && i.state == "prepared")
+                        .is_some_and(|i| i.is_prepared_for(&step.id))
                 }) {
                     return Err(error);
                 }
@@ -516,6 +598,35 @@ impl RunState<'_> {
         self.landing_save(&mut loaded).await?;
         Ok(Some(value))
     }
+    /// The Git this landing freezes with: the resolved executable, who
+    /// chose it, and what its `git --version` reports.
+    async fn freeze_git(
+        &mut self,
+        policy: &Repository,
+        path: &Path,
+        deadline: Instant,
+    ) -> Result<GitRecord, CapabilityFailure> {
+        let source = crate::landing_git::resolve_broker_git(
+            policy.configured_git(),
+            &self.service.protected_base,
+        )
+        .map_err(|e| refused_with(e.cause, e.detail, e.recovery))?
+        .source;
+        let version = crate::landing_git::git_version(
+            path,
+            &policy.workspace_root,
+            Arc::clone(&self.ctx.budget),
+            &mut self.cancel,
+            deadline,
+        )
+        .await
+        .map_err(checkout_error)?;
+        Ok(GitRecord {
+            path: path.to_owned(),
+            source,
+            version,
+        })
+    }
     async fn landing_freeze(&mut self, deadline: Instant) -> Result<(), CapabilityFailure> {
         let target = self.correlation.target().cloned().ok_or_else(|| {
             refused(
@@ -540,7 +651,10 @@ impl RunState<'_> {
                 "The declared PR head differs from the frozen landing commit",
             ));
         }
-        let request = self.checkout_request(&policy, &target.commit)?;
+        let request = self.checkout_request(&policy, &target.commit, None)?;
+        let git = self
+            .freeze_git(&policy, &request.git_program, deadline)
+            .await?;
         let snapshot = landing_checkout::capture(
             &request,
             Arc::clone(&self.ctx.budget),
@@ -570,7 +684,7 @@ impl RunState<'_> {
             .insert_evidence(&id, &self.ctx.request_id, KIND, &bytes, None)
             .await
             .map_err(failed)?;
-        let receipt = json!({"repository":target.repository,"commit":target.commit,"branch":branch,"tree":snapshot.receipt.tree,"manifest_sha256":snapshot.receipt.manifest_sha256});
+        let receipt = json!({"repository":target.repository,"commit":target.commit,"branch":branch,"tree":snapshot.receipt.tree,"manifest_sha256":snapshot.receipt.manifest_sha256,"git":{"path":git.path,"source":git.source,"version":git.version}});
         let session = Session {
             version: 1,
             flow_digest: digest(self.flow),
@@ -583,6 +697,7 @@ impl RunState<'_> {
             receipts: BTreeMap::from([("freeze".into(), receipt)]),
             intent: None,
             poll: None,
+            git: Some(git),
         };
         if !self
             .service
@@ -757,12 +872,7 @@ impl RunState<'_> {
         }) {
             return Err(failure());
         }
-        loaded.session.intent = Some(Intent {
-            step_id: step.id.clone(),
-            operation,
-            state: "prepared".into(),
-            expected,
-        });
+        loaded.session.intent = Some(EffectIntent::prepared(&step.id, operation, expected));
         self.landing_save(loaded).await
     }
     /// Journals what the mutating process itself reported, before the exact
@@ -815,12 +925,47 @@ impl RunState<'_> {
         self.intent(loaded, step, Op::EnsurePr, json!({"target":target}))
             .await?;
         self.landing_live(loaded, deadline).await?;
-        self.github(
-            loaded,
-            LandingGithubOp::CreatePr(target, format!("Land {}", loaded.receipt.branch)),
-            deadline,
-        )
-        .await
+        let title = format!("Land {}", loaded.receipt.branch);
+        self.github_mutation(loaded, LandingGithubOp::CreatePr(target, title), deadline)
+            .await
+    }
+    /// A typed GitHub mutation under a journalled intent. A definite
+    /// refusal (GitHub answered with a refusal, or the call stopped before
+    /// it was sent) settles the intent as `rejected` and refuses with the
+    /// typed cause and its recovery, so the step blocks instead of reading
+    /// as an uncertain effect; any other failure keeps the intent prepared.
+    async fn github_mutation(
+        &self,
+        loaded: &mut Loaded,
+        operation: LandingGithubOp,
+        deadline: Instant,
+    ) -> Result<Value, CapabilityFailure> {
+        match self
+            .service
+            .connectors
+            .landing_github(
+                &self.repo,
+                &self.ctx.request_id,
+                &loaded.session.policy_revision,
+                &operation,
+                Arc::clone(&self.ctx.budget),
+                deadline,
+            )
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(error) if error.cause() != CANCELLED && mutation_refused(&error) => {
+                let intent = loaded.session.intent.as_mut().ok_or_else(failure)?;
+                intent.reject(error.cause());
+                self.landing_save(loaded).await?;
+                Err(refused_with(
+                    error.cause(),
+                    error.detail(),
+                    error.recovery(ConnectorId::Github),
+                ))
+            }
+            Err(error) => Err(broker_error(&error)),
+        }
     }
     async fn landing_push(
         &mut self,
@@ -832,7 +977,7 @@ impl RunState<'_> {
         let service = self.service;
         let commit = loaded.receipt.commit.clone();
         let mut target = GitTarget {
-            request: self.checkout_request(&loaded.policy, &commit)?,
+            request: self.checkout_request(&loaded.policy, &commit, loaded.session.git.as_ref())?,
             receipt: loaded.receipt.clone(),
             branch: loaded
                 .receipt
@@ -932,24 +1077,77 @@ impl RunState<'_> {
                 "Fresh PR checks do not all succeed",
             ));
         }
+        let method = loaded.policy.merge_method();
+        self.merge_method_allowed(loaded, method, deadline).await?;
         self.intent(
             loaded,
             step,
             Op::Merge,
-            json!({"number":number,"head_sha":target.head_sha,"base_sha_observed":pr.base_sha}),
+            json!({"number":number,"head_sha":target.head_sha,"base_sha_observed":pr.base_sha,"merge_method":method}),
         )
         .await?;
         self.landing_live(loaded, deadline).await?;
         let response = self
-            .github(
+            .github_mutation(
                 loaded,
-                LandingGithubOp::MergePr(target.clone(), number),
+                LandingGithubOp::MergePr(target.clone(), number, method),
                 deadline,
             )
             .await?;
         Ok(
-            json!({"number":number,"sha":response["sha"],"head_sha":target.head_sha,"base_sha_observed":pr.base_sha,"confirmed_by":"merge_response"}),
+            json!({"number":number,"sha":response["sha"],"head_sha":target.head_sha,"base_sha_observed":pr.base_sha,"merge_method":method,"confirmed_by":"merge_response"}),
         )
+    }
+    /// Refuses before any merge intent when GitHub reports that the
+    /// repository forbids `method`. An unreported method (a credential
+    /// without enough access to see the repository's settings) is left to
+    /// the merge call, whose refusal is typed and definite.
+    async fn merge_method_allowed(
+        &self,
+        loaded: &Loaded,
+        method: MergeMethod,
+        deadline: Instant,
+    ) -> Result<(), CapabilityFailure> {
+        let methods: MergeMethods = serde_json::from_value(
+            self.github(
+                loaded,
+                LandingGithubOp::MergeMethods(loaded.policy.github_repository.clone()),
+                deadline,
+            )
+            .await?,
+        )
+        .map_err(|_| failure())?;
+        if methods.reported(method) != Some(false) {
+            return Ok(());
+        }
+        let field = match method {
+            MergeMethod::Squash => "allow_squash_merge",
+            MergeMethod::Merge => "allow_merge_commit",
+            MergeMethod::Rebase => "allow_rebase_merge",
+        };
+        let allowed: Vec<&str> = MergeMethod::ALL
+            .into_iter()
+            .filter(|other| methods.reported(*other) == Some(true))
+            .map(MergeMethod::as_str)
+            .collect();
+        Err(refused_with(
+            "landing_merge_method_forbidden",
+            format!(
+                "The landing merges by {} but GitHub reports that {} does not allow it ({field} is false; it allows: {}). Nothing was merged",
+                method.as_str(),
+                loaded.policy.github_repository,
+                if allowed.is_empty() {
+                    "none it reports".to_owned()
+                } else {
+                    allowed.join(", ")
+                }
+            ),
+            if loaded.policy.merge_method_locked {
+                crate::managed_policy::RECOVERY_MANAGED
+            } else {
+                "Choose a merge method the repository allows in Settings → Flows → Landing, or ask the repository's administrator to allow this one, then start a new landing ticket."
+            },
+        ))
     }
     /// Brings the verified merge commit into the canonical repository and
     /// fast-forwards the base branch. Local ref observation is a plain file
@@ -968,7 +1166,11 @@ impl RunState<'_> {
         let service = self.service;
         let merge_commit = merge_commit(loaded)?;
         let mut target = GitTarget {
-            request: self.checkout_request(&loaded.policy, &loaded.receipt.commit)?,
+            request: self.checkout_request(
+                &loaded.policy,
+                &loaded.receipt.commit,
+                loaded.session.git.as_ref(),
+            )?,
             receipt: loaded.receipt.clone(),
             branch: loaded.policy.base.clone(),
             expected_old: None,
@@ -1058,12 +1260,6 @@ impl RunState<'_> {
             .as_ref()
             .filter(|p| p.step == step.id)
             .map_or(0, |p| p.polls);
-        if polls >= MAX_POLLS {
-            return Err(refused(
-                "landing_poll_budget_exhausted",
-                "Required checks did not converge within the persisted polling budget",
-            ));
-        }
         let value = self
             .github(
                 loaded,
@@ -1116,7 +1312,6 @@ impl RunState<'_> {
         value: Value,
         polls: u32,
     ) -> Result<Value, CapabilityFailure> {
-        let next = now_ms().saturating_add(POLL_MS);
         if self
             .ctx
             .budget
@@ -1130,18 +1325,25 @@ impl RunState<'_> {
                 "Insufficient HTTP headroom remains for another poll and exact landing verification",
             ));
         }
-        if self
+        let remaining = self
             .ctx
             .budget
             .remaining()
-            .map_err(|e| refused(e.cause, e.resource))?
-            < Duration::from_millis(u64::try_from(POLL_MS).unwrap_or(5000)) + Duration::from_secs(2)
-        {
-            return Err(refused(
+            .map_err(|e| refused(e.cause, e.resource))?;
+        let Some(wait) = poll_delay(
+            polls,
+            &format!("{}/{}", self.ctx.request_id, step.id),
+            remaining,
+        ) else {
+            return Err(refused_with(
                 "request_deadline_exhausted",
-                "No deadline headroom remains for another required-check poll",
+                format!(
+                    "Required checks were still pending after {polls} polls and the request deadline leaves no time for another"
+                ),
+                "Start a new landing ticket for the same commit; it resumes from what GitHub shows without repeating any push, pull request or merge.",
             ));
-        }
+        };
+        let next = now_ms().saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
         let digest = pam_compact::sha256_hex(&crate::flow_recovery::encode(&value)?);
         let changed = loaded
             .session
@@ -1307,7 +1509,7 @@ fn require_predecessor(session: &Session, operation: Op) -> Result<(), Capabilit
 fn has_intent(loaded: &Loaded, step: &Step, operation: Op) -> Result<bool, CapabilityFailure> {
     match &loaded.session.intent {
         Some(intent) if intent.step_id == step.id => {
-            if intent.operation != operation || intent.state != "prepared" {
+            if !intent.is_prepared(&step.id, &operation) {
                 return Err(failure());
             }
             Ok(true)

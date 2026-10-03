@@ -32,7 +32,11 @@ async fn settled_prefix_restores_variables_and_refuses_changed_recipe_inputs_or_
         .await
         .unwrap();
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     snapshot
@@ -88,7 +92,11 @@ async fn prepared_effect_never_restores_as_ready() {
     let mut effect = flow.steps[0].clone();
     effect.effect = pam_flow::Effect::Stateful;
     recovery
-        .prepare(&store, "r", &effect, Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&effect, Prepare::Run),
+        )
         .await
         .unwrap();
     assert!(
@@ -132,7 +140,11 @@ async fn missing_checkpoint_and_changed_connector_configuration_refuse_restore()
     };
     snapshot.all_origins.push(origin);
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     recovery
@@ -199,7 +211,11 @@ async fn pruned_source_and_expired_view_cannot_restore_verified_variables() {
         .await
         .unwrap();
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     snapshot
@@ -384,7 +400,11 @@ async fn a_gated_effect_is_not_started_until_it_is_armed() {
     let mut effect = flow.steps[0].clone();
     effect.effect = pam_flow::Effect::Stateful;
     recovery
-        .prepare(&store, "r", &effect, Prepare::Gate)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&effect, Prepare::Gate),
+        )
         .await
         .unwrap();
     let gating = store.read_flow_journal("r").await.unwrap().unwrap();
@@ -392,7 +412,11 @@ async fn a_gated_effect_is_not_started_until_it_is_armed() {
     assert!(!gating.effectful);
     // Arming a different step is a no-op: only the gated one becomes an effect.
     recovery
-        .arm_effect(&store, "r", &flow.steps[1])
+        .arm_effect(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::armed(&flow.steps[1]),
+        )
         .await
         .unwrap();
     assert_eq!(store.read_flow_journal("r").await.unwrap().unwrap(), gating);
@@ -415,10 +439,21 @@ async fn an_armed_effect_is_uncertain_when_the_ticket_ends_before_it_settles() {
     let mut effect = flow.steps[0].clone();
     effect.effect = pam_flow::Effect::Stateful;
     recovery
-        .prepare(&store, "r", &effect, Prepare::Gate)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&effect, Prepare::Gate),
+        )
         .await
         .unwrap();
-    recovery.arm_effect(&store, "r", &effect).await.unwrap();
+    recovery
+        .arm_effect(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::armed(&effect),
+        )
+        .await
+        .unwrap();
     let armed = store.read_flow_journal("r").await.unwrap().unwrap();
     assert_eq!(armed.state, pam_store::FlowJournalState::Prepared);
     assert!(
@@ -427,10 +462,89 @@ async fn an_armed_effect_is_uncertain_when_the_ticket_ends_before_it_settles() {
     );
     assert_eq!(armed.step_id.as_deref(), Some("first"));
     // Arming twice changes nothing; the journal revision is still ours.
-    recovery.arm_effect(&store, "r", &effect).await.unwrap();
+    recovery
+        .arm_effect(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::armed(&effect),
+        )
+        .await
+        .unwrap();
     assert_eq!(store.read_flow_journal("r").await.unwrap().unwrap(), armed);
     assert_eq!(
         end_cancelled(&store).await.as_deref(),
         Some("flow_effect_uncertain")
+    );
+}
+
+/// A settlement and the checkpoint it names commit together: a settlement
+/// that does not apply (here, the ticket finished in between) files no
+/// checkpoint, so no snapshot is left that no journal names.
+#[tokio::test]
+async fn a_settlement_that_does_not_apply_files_no_checkpoint() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (mut recovery, snapshot) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    recovery
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checkpoint_count(&store).await, 1);
+    assert!(end_cancelled(&store).await.is_some());
+    assert!(
+        recovery
+            .settle(&store, "r", &snapshot, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        checkpoint_count(&store).await,
+        1,
+        "the refused settlement filed nothing"
+    );
+}
+
+async fn checkpoint_count(store: &Store) -> usize {
+    store
+        .list_evidence("r")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == crate::flow_recovery::KIND)
+        .count()
+}
+
+#[tokio::test]
+async fn a_settlement_files_the_checkpoint_its_journal_names() {
+    let (store, repo, flow, vars) = fixture().await;
+    let (mut recovery, snapshot) = Recovery::open(&store, "r", &flow, repo.path(), &vars)
+        .await
+        .unwrap();
+    recovery
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
+        .await
+        .unwrap();
+    recovery
+        .settle(&store, "r", &snapshot, false)
+        .await
+        .unwrap();
+    let journal = store.read_flow_journal("r").await.unwrap().unwrap();
+    let cursor: serde_json::Value = serde_json::from_str(&journal.checkpoint_json).unwrap();
+    let named = cursor["evidence_id"].as_str().unwrap();
+    assert!(
+        store
+            .read_flow_checkpoint("r", named)
+            .await
+            .unwrap()
+            .is_some()
     );
 }

@@ -889,3 +889,230 @@ async fn never_classes_refuse_a_flow_step_of_that_class_only() {
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["rule"], "class:external");
 }
+
+// --- flow step grants bound to what runs -----------------------------------
+
+fn step_binding(digest: char, class: &str, repository: Option<&str>) -> pam_store::GrantBinding {
+    pam_store::GrantBinding {
+        flow_id: "f".to_owned(),
+        step_id: "push".to_owned(),
+        effect_digest: digest.to_string().repeat(64),
+        effect_class: class.to_owned(),
+        repository: repository.map(str::to_owned),
+    }
+}
+
+fn grant_row(id: i64, binding: Option<pam_store::GrantBinding>) -> pam_store::GrantRow {
+    pam_store::GrantRow {
+        id,
+        capability: "flow.step:f/push".to_owned(),
+        scope: "global".to_owned(),
+        granted_ts: 1,
+        revoked_ts: None,
+        binding,
+        bound_ts: None,
+    }
+}
+
+#[test]
+fn a_step_grant_covers_only_its_definition_class_and_repository() {
+    use crate::policy::{StepGrant, match_step_grant};
+    let wanted = step_binding('a', "destructive", Some("/a"));
+    assert_eq!(match_step_grant(&[], &wanted), StepGrant::Missing);
+    // Covered: the same definition and class, here or everywhere.
+    for repository in [Some("/a"), None] {
+        let rows = [grant_row(
+            1,
+            Some(step_binding('a', "destructive", repository)),
+        )];
+        assert_eq!(match_step_grant(&rows, &wanted), StepGrant::Bound);
+    }
+    // A covering row beats a legacy one; a legacy one beats a stale one.
+    let rows = [
+        grant_row(1, None),
+        grant_row(2, Some(step_binding('a', "destructive", Some("/a")))),
+    ];
+    assert_eq!(match_step_grant(&rows, &wanted), StepGrant::Bound);
+    let rows = [
+        grant_row(1, Some(step_binding('b', "destructive", Some("/a")))),
+        grant_row(2, None),
+    ];
+    assert_eq!(match_step_grant(&rows, &wanted), StepGrant::Legacy(2));
+    // What changed is said, and a same-repository row explains first.
+    let rows = [
+        grant_row(1, Some(step_binding('a', "destructive", Some("/other")))),
+        grant_row(2, Some(step_binding('b', "destructive", Some("/a")))),
+    ];
+    assert_eq!(
+        match_step_grant(&rows, &wanted),
+        StepGrant::Changed("the step's command changed since it was approved".to_owned())
+    );
+    let rows = [grant_row(
+        1,
+        Some(step_binding('a', "external", Some("/a"))),
+    )];
+    assert_eq!(
+        match_step_grant(&rows, &wanted),
+        StepGrant::Changed(
+            "the step's effect class changed since it was approved (approved as external, now \
+             destructive)"
+                .to_owned()
+        )
+    );
+    let rows = [grant_row(
+        1,
+        Some(step_binding('a', "destructive", Some("/other"))),
+    )];
+    assert_eq!(
+        match_step_grant(&rows, &wanted),
+        StepGrant::Changed("the step was approved for /other, not for /a".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_step_grant_that_no_longer_covers_the_step_asks_on_every_profile() {
+    for profile in [Profile::Relaxed, Profile::Standard, Profile::Strict] {
+        let store = fresh_store().await;
+        let gate = gate_with(&store, profile).await;
+        let cap = "flow.step:f/push";
+        // No grant: what the profile always did.
+        let (missing, changed) = gate
+            .evaluate_step(
+                "req_1",
+                cap,
+                CapabilityClass::Destructive,
+                &step_binding('a', "destructive", Some("/a")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, None);
+        if profile == Profile::Relaxed {
+            assert!(matches!(missing, GateDecision::RequireApproval { .. }));
+        } else {
+            assert!(
+                matches!(missing, GateDecision::Refuse { ref cause, .. } if cause == CAUSE_NOT_GRANTED)
+            );
+        }
+        // A grant for another definition: an approval, with the reason.
+        store
+            .apply_grant_change_audited(
+                "req_1",
+                pam_store::GrantChange::Bind(cap, &step_binding('b', "destructive", Some("/a"))),
+                pam_store::AuditEntry {
+                    action: "grant_from_approval",
+                    decision: Decision::Allow,
+                    actor: Actor::Human,
+                    detail: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (decision, changed) = gate
+            .evaluate_step(
+                "req_1",
+                cap,
+                CapabilityClass::Destructive,
+                &step_binding('a', "destructive", Some("/a")),
+            )
+            .await
+            .unwrap();
+        let GateDecision::RequireApproval { reason } = decision else {
+            panic!("{profile:?}: a changed step must ask, got {decision:?}");
+        };
+        assert!(reason.contains("changed since it was approved"), "{reason}");
+        assert_eq!(
+            changed.as_deref(),
+            Some("the step's command changed since it was approved")
+        );
+        // The covered definition: what a granted step always got.
+        let (decision, changed) = gate
+            .evaluate_step(
+                "req_1",
+                cap,
+                CapabilityClass::Destructive,
+                &step_binding('b', "destructive", Some("/a")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, None);
+        if profile == Profile::Relaxed {
+            assert_eq!(
+                decision,
+                GateDecision::Allow {
+                    auto_granted: false
+                }
+            );
+        } else {
+            assert!(matches!(decision, GateDecision::RequireApproval { .. }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_never_rule_refuses_a_legacy_step_grant_before_it_is_bound() {
+    let text = r#"{"version":1,"security":{"grants":{"never":["flow.step:f/*"]}}}"#;
+    let (store, _source, _handle, gate) = managed_gate(Profile::Relaxed, Some(text)).await;
+    store.insert_grant("flow.step:f/push").await.unwrap();
+    let (decision, changed) = gate
+        .evaluate_step(
+            "req_1",
+            "flow.step:f/push",
+            CapabilityClass::Destructive,
+            &step_binding('a', "destructive", Some("/a")),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(decision, GateDecision::Refuse { ref cause, .. } if cause == CAUSE_POLICY_DENIED),
+        "{decision:?}"
+    );
+    assert_eq!(changed, None);
+    // The row stays the human's and stays unbound: the policy decided first.
+    let rows = store.active_grants("flow.step:f/push").await.unwrap();
+    assert_eq!(rows[0].binding, None);
+    assert!(
+        store
+            .audit_for_request("req_1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.action != crate::policy::ACTION_GRANT_BOUND)
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_step_grant_binds_once_with_its_audit_row() {
+    let store = fresh_store().await;
+    let gate = gate_with(&store, Profile::Relaxed).await;
+    store.insert_grant("flow.step:f/push").await.unwrap();
+    let wanted = step_binding('a', "destructive", Some("/a"));
+    for _ in 0..2 {
+        let (decision, changed) = gate
+            .evaluate_step(
+                "req_1",
+                "flow.step:f/push",
+                CapabilityClass::Destructive,
+                &wanted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            GateDecision::Allow {
+                auto_granted: false
+            }
+        );
+        assert_eq!(changed, None);
+    }
+    let rows = store.active_grants("flow.step:f/push").await.unwrap();
+    assert_eq!(rows[0].binding.as_ref(), Some(&wanted));
+    let bound: Vec<_> = store
+        .audit_for_request("req_1")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.action == crate::policy::ACTION_GRANT_BOUND)
+        .collect();
+    assert_eq!(bound.len(), 1, "bound on first use only");
+    assert_eq!(bound[0].actor, Actor::Policy);
+}

@@ -1137,6 +1137,18 @@ pub fn render_event(event: &Event) -> String {
     }
 }
 
+/// One `pam subscribe` output line for `event`: the human line, or with `json` the event as one
+/// compact JSON object (`{"kind":"progress","pct":40,"note":"..."}`), so a machine reader can
+/// parse every line of stdout as JSON.
+#[must_use]
+pub fn render_event_line(event: &Event, json: bool) -> String {
+    if json {
+        serde_json::to_string(event).unwrap_or_else(|_| "{}".to_owned())
+    } else {
+        render_event(event)
+    }
+}
+
 /// The `pam flow list` table — `id  source  steps  name`, one row per
 /// flow, every column padded to its widest value.
 ///

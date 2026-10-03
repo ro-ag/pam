@@ -3,6 +3,7 @@ use super::{
     Action, Arc, ArgValue, Attempt, BTreeMap, CallResult, CapabilityFailure, ConnectorId, Duration,
     Instant, RunState, Step, StepReport, StepStatus, Value, cancelled, json, rate_limit_wait,
 };
+use crate::flow_intent::EffectIntent;
 use crate::flow_recovery::{Prepare, WatchState, failure};
 use crate::flow_watch::{self, State, WatchError};
 
@@ -108,12 +109,13 @@ impl RunState<'_> {
         if !row.authorization_current {
             return Err(failure());
         }
-        // Stamp the scoped count of revocations a flow run depends on, so an
-        // unrelated revoke does not kill a parked watch.
+        // Stamp the scoped count of revocations this flow's run depends on
+        // (`flow.run` and this flow's step grants), so neither an unrelated
+        // revoke nor another flow's step revocation kills a parked watch.
         let revision = self
             .service
             .store
-            .grant_revocation_revision_for(crate::flow_service::CAP_FLOW_RUN)
+            .grant_revocation_revision_for_flow(&self.flow.id)
             .await
             .map_err(|_| failure())?;
         Ok((pam_compact::sha256_hex(profile.as_bytes()), revision))
@@ -238,8 +240,7 @@ impl RunState<'_> {
                 .prepare(
                     &self.service.store,
                     &self.ctx.request_id,
-                    step,
-                    Prepare::Run,
+                    &EffectIntent::attempt(step, Prepare::Run),
                 )
                 .await?;
             return Ok(None);
@@ -250,8 +251,7 @@ impl RunState<'_> {
                 .prepare(
                     &self.service.store,
                     &self.ctx.request_id,
-                    step,
-                    Prepare::Run,
+                    &EffectIntent::attempt(step, Prepare::Run),
                 )
                 .await?;
             return Ok(Some(self.watch_blocked(step, &error)));
@@ -390,8 +390,7 @@ impl RunState<'_> {
             .prepare(
                 &self.service.store,
                 &self.ctx.request_id,
-                step,
-                Prepare::Run,
+                &EffectIntent::attempt(step, Prepare::Run),
             )
             .await?;
         self.retained_watch_conflict(step).ok_or_else(failure)

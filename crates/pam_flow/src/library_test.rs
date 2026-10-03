@@ -373,3 +373,26 @@ fn a_file_that_cannot_be_read_is_listed_with_the_read_error() {
         other => panic!("a single get still reports the read error, got {other:?}"),
     }
 }
+
+#[test]
+fn a_library_flow_that_breaks_a_newer_rule_is_listed_with_its_message() {
+    let (_dir, library) = library();
+    fs::create_dir_all(library.dir()).unwrap();
+    let reserved = "schema: 1\nid: old-env\nname: Old env\nsteps:\n  - id: a\n    run: [make]\n    env: { PATH: /tmp }\n";
+    let unordered = "schema: 1\nid: old-order\nname: Old order\nsteps:\n  - id: a\n    run: [git, status]\n  - id: b\n    run: [git, push]\n    effect: stateful\n";
+    fs::write(library.dir().join("old-env.yaml"), reserved).unwrap();
+    fs::write(library.dir().join("old-order.yaml"), unordered).unwrap();
+    let entries = library.list().expect("list");
+    for (id, needle) in [
+        ("old-env", "`PATH` is reserved"),
+        ("old-order", "does not say what it depends on"),
+    ] {
+        let entry = entries.iter().find(|entry| entry.id == id).expect("listed");
+        match &entry.parsed {
+            Err(FlowError::Invalid { message, .. }) => {
+                assert!(message.contains(needle), "{id}: {message}");
+            }
+            other => panic!("{id}: expected a refusal, got {other:?}"),
+        }
+    }
+}

@@ -87,6 +87,7 @@ use crate::managed_policy_service::{PolicyHandle, audit_locked_write};
 use crate::model_service::ModelService;
 use crate::network_service::{NetworkService, Source};
 use crate::policy::{CAP_CANCEL, Profile, SetProfileError, classify};
+use crate::refusal_log::RefusalLog;
 use crate::terminal::{TerminalWriter, Written};
 use crate::transport::IncomingRequest;
 
@@ -144,8 +145,12 @@ const REQUESTS_CANCEL_DEADLINE_MS: u64 = 10_000;
 /// the detail column is a receipt, not a document.
 pub const MAX_APPROVAL_NOTE_BYTES: usize = 1024;
 
-/// `admin.activity.list { limit?, repo?, agent?, state?, capability? }`
-/// → recent request rows, newest first, bounded.
+/// `admin.activity.list { limit?, repo?, agent?, state?, capability?, hide_probes?, include_refusals? }`
+/// → recent request rows (`kind: "request"`), newest first, bounded. With
+/// `include_refusals: true` the refusals decided before a request row existed
+/// (`kind: "refusal"`, see [`crate::refusal_log`]) are interleaved by time under
+/// the same filters and the same limit; they answer to `state: "refused"` and
+/// to no other state.
 pub const OP_ACTIVITY_LIST: &str = "admin.activity.list";
 
 /// `admin.callers.list` → the observed agent+repo registry.
@@ -177,6 +182,14 @@ pub const CAUSE_NO_ACTIVE_GRANT: &str = "no_active_grant";
 
 /// Refusal cause for granting a capability that is already granted.
 pub const CAUSE_ALREADY_GRANTED: &str = "already_granted";
+
+/// `admin.grants.add` named a flow step the library does not hold: a flow
+/// step's grant is bound to the step as it is defined, so there must be one.
+pub const CAUSE_FLOW_STEP_UNKNOWN: &str = "flow_step_unknown";
+
+/// Recovery line for [`CAUSE_FLOW_STEP_UNKNOWN`].
+const RECOVERY_FLOW_STEP_UNKNOWN: &str = "Save the flow in Flows first and grant one of its steps, \
+     or approve the step with Remember when it first asks.";
 
 /// Refusal cause for resolving a request with no pending approval.
 pub const CAUSE_NO_PENDING_APPROVAL: &str = "no_pending_approval";
@@ -309,6 +322,10 @@ pub struct AdminService {
     /// The managed policy in force (see [`crate::managed_policy_service`]);
     /// the `admin.*` ops read and refuse through it.
     pub(crate) policy: Arc<PolicyHandle>,
+    /// Where the private plane's listener reports the connections and hellos
+    /// it refuses before any request row exists ([`crate::refusal_log`]);
+    /// disabled until the daemon hands over its log.
+    refusals: RefusalLog,
     /// Seconds the retention ops' wall clock runs ahead of the real one.
     /// Tests stage a forward clock jump over real rows with it (see
     /// [`crate::admin_retention`]); production has no such field and reads
@@ -355,6 +372,7 @@ impl AdminService {
             network,
             submit,
             policy,
+            refusals: RefusalLog::disabled(),
             #[cfg(test)]
             retention_clock_ahead: std::sync::atomic::AtomicI64::new(0),
         }
@@ -366,6 +384,20 @@ impl AdminService {
     pub fn with_network(mut self, network: Arc<NetworkService>) -> Self {
         self.network = network;
         self
+    }
+
+    /// The same service reporting the private plane's pre-admission refusals
+    /// to `refusals` ([`crate::refusal_log`]).
+    #[must_use]
+    pub fn with_refusals(mut self, refusals: RefusalLog) -> Self {
+        self.refusals = refusals;
+        self
+    }
+
+    /// Where the private plane's listener reports what it refuses.
+    #[must_use]
+    pub fn refusals(&self) -> &RefusalLog {
+        &self.refusals
     }
 
     /// The managed policy handle the `admin.*` ops read through (see
@@ -616,6 +648,26 @@ impl AdminService {
                 let blocked = view
                     .never_match(&grant.capability, classify(&grant.capability))
                     .is_some();
+                // A flow step's grant shows what it is bound to; an unbound
+                // one is a legacy grant the step's next run binds.
+                let binding = match &grant.binding {
+                    Some(binding) => json!({
+                        "state": "bound",
+                        "flow": binding.flow_id,
+                        "step": binding.step_id,
+                        "repository": binding.repository,
+                        "effect_digest": crate::approval::digest_prefix(&binding.effect_digest),
+                        "effect_class": binding.effect_class,
+                        "bound_ts": grant.bound_ts,
+                    }),
+                    None if grant
+                        .capability
+                        .starts_with(crate::flow_service::STEP_CAPABILITY_PREFIX) =>
+                    {
+                        json!({ "state": "legacy" })
+                    }
+                    None => serde_json::Value::Null,
+                };
                 json!({
                     "id": grant.id,
                     "capability": grant.capability,
@@ -623,6 +675,7 @@ impl AdminService {
                     "granted_ts": grant.granted_ts,
                     "revoked_ts": grant.revoked_ts,
                     "blocked_by_policy": blocked,
+                    "binding": binding,
                 })
             })
             .collect();
@@ -640,6 +693,12 @@ impl AdminService {
     /// Records a new global grant, refusing a duplicate active one (a
     /// second active row would only muddy the history). The grant, this
     /// op's terminal state and its audit row are one transaction.
+    ///
+    /// A flow step's grant is bound to the step as the library defines it
+    /// now ([`crate::flow_service::step_binding`]) and to the optional
+    /// `repository` argument (canonical; every repository when absent, as
+    /// the human confirmed). A step the library does not hold is refused
+    /// [`CAUSE_FLOW_STEP_UNKNOWN`]: there is nothing to bind to.
     async fn grants_add(
         &self,
         request_id: &str,
@@ -652,14 +711,35 @@ impl AdminService {
                 .policy_refusal(request_id, OP_GRANTS_ADD, refusal, &view)
                 .await);
         }
-        let audit = json!({ "op": OP_GRANTS_ADD, "capability": capability });
-        match self
-            .change_grant(request_id, GrantChange::Add(capability), &audit)
-            .await?
-        {
+        let binding = self.manual_step_binding(capability, args)?;
+        let mut audit = json!({ "op": OP_GRANTS_ADD, "capability": capability });
+        if let Some(binding) = &binding {
+            audit["binding"] = json!({
+                "flow": binding.flow_id,
+                "step": binding.step_id,
+                "repository": binding.repository,
+                "effect_digest": binding.effect_digest,
+                "effect_class": binding.effect_class,
+            });
+        }
+        let change = match &binding {
+            Some(binding) => GrantChange::Bind(capability, binding),
+            None => GrantChange::Add(capability),
+        };
+        match self.change_grant(request_id, change, &audit).await? {
             GrantChangeOutcome::Applied => Ok(AdminOk {
                 outcome: Outcome::Changed,
-                body: json!({ "capability": capability, "granted": true }),
+                body: json!({
+                    "capability": capability,
+                    "granted": true,
+                    "binding": binding.as_ref().map(|binding| json!({
+                        "flow": binding.flow_id,
+                        "step": binding.step_id,
+                        "repository": binding.repository,
+                        "effect_digest": crate::approval::digest_prefix(&binding.effect_digest),
+                        "effect_class": binding.effect_class,
+                    })),
+                }),
                 audit,
             }),
             GrantChangeOutcome::Unchanged => Err(AdminRefusal {
@@ -668,6 +748,70 @@ impl AdminService {
                 recovery: RECOVERY_GRANTS_VIEW,
             }),
         }
+    }
+
+    /// The binding a hand-added grant of `capability` gets, when it names a
+    /// flow step (see [`Self::grants_add`]); `None` for any other
+    /// capability.
+    fn manual_step_binding(
+        &self,
+        capability: &str,
+        args: &serde_json::Value,
+    ) -> Result<Option<pam_store::GrantBinding>, AdminRefusal> {
+        let Some(rest) = capability.strip_prefix(crate::flow_service::STEP_CAPABILITY_PREFIX)
+        else {
+            return Ok(None);
+        };
+        let unknown = || AdminRefusal {
+            cause: CAUSE_FLOW_STEP_UNKNOWN,
+            detail: format!(
+                "{capability:?} names no step of a valid flow in the library; a flow step's grant \
+                 is bound to the step as it is defined"
+            ),
+            recovery: RECOVERY_FLOW_STEP_UNKNOWN,
+        };
+        let (flow_id, step_id) = rest.split_once('/').ok_or_else(unknown)?;
+        let flow = self
+            .flows
+            .entry(flow_id)
+            .ok()
+            .and_then(|entry| entry.parsed.ok())
+            .ok_or_else(unknown)?;
+        let step = flow
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .ok_or_else(unknown)?;
+        let repository = match args.get("repository") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(path)) => {
+                // The run binds the canonical form of an absolute directory
+                // (`scope_policy`), so the grant must name it the same way.
+                let raw = std::path::Path::new(path);
+                let canonical = Some(raw)
+                    .filter(|raw| raw.is_absolute())
+                    .and_then(|raw| raw.canonicalize().ok())
+                    .filter(|canonical| canonical.is_dir())
+                    .ok_or_else(|| AdminRefusal {
+                        cause: CAUSE_INVALID_ADMIN_ARGS,
+                        detail: format!(
+                            "repository {path:?} is not an absolute directory on this machine"
+                        ),
+                        recovery: RECOVERY_FIX_ARGS,
+                    })?;
+                Some(canonical.to_string_lossy().into_owned())
+            }
+            Some(other) => {
+                return Err(AdminRefusal {
+                    cause: CAUSE_INVALID_ADMIN_ARGS,
+                    detail: format!("{other} is not a string repository"),
+                    recovery: RECOVERY_FIX_ARGS,
+                });
+            }
+        };
+        Ok(Some(crate::flow_service::step_binding(
+            &flow, step, repository,
+        )))
     }
 
     /// Revokes the active grant (sets `revoked_ts`; history stays), in
@@ -844,6 +988,12 @@ impl AdminService {
             // GUI returns `resolved.digest` with the answer.
             if let Some(snapshot) = self.approvals.snapshot(&approval.request_id).await {
                 entry["resolved"] = json!(snapshot);
+            }
+            // What Remember would record: this step as it is now, in this
+            // repository — and what changed, when an earlier grant of the
+            // step no longer covers it.
+            if let Some(scope) = self.approvals.remember_scope(&approval.request_id).await {
+                entry["remember"] = scope.to_json();
             }
             pending.push(entry);
         }
@@ -1049,13 +1199,28 @@ impl AdminService {
                 });
             }
         };
-        let requests: Vec<serde_json::Value> = self
+        // Refusals decided before a request row existed are in the list only
+        // when the caller asks: every other consumer of the list (the Flows
+        // run history, Ask Pam) reads request rows and nothing else.
+        let include_refusals = match args.get("include_refusals") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            Some(other) => {
+                return Err(AdminRefusal {
+                    cause: CAUSE_INVALID_ADMIN_ARGS,
+                    detail: format!("{other} is not a boolean include_refusals"),
+                    recovery: RECOVERY_FIX_ARGS,
+                });
+            }
+        };
+        let mut requests: Vec<serde_json::Value> = self
             .store
             .list_requests_filtered(limit, repo, agent, state, capability, hide_probes)
             .await?
             .into_iter()
             .map(|row| {
                 json!({
+                    "kind": "request",
                     "id": row.id,
                     "capability": row.capability,
                     "repo": row.repo,
@@ -1077,6 +1242,29 @@ impl AdminService {
                 })
             })
             .collect();
+        // A refusal is a refused request that never got a row, so it
+        // answers to the same filters, and to the `refused` state alone.
+        if include_refusals && state.is_none_or(|state| state == RequestState::Refused) {
+            let limit = limit
+                .unwrap_or(pam_store::DEFAULT_REQUEST_LIST_LIMIT)
+                .clamp(1, pam_store::MAX_LIST_LIMIT);
+            let refusals = self
+                .store
+                .list_refusals(limit, repo, agent, capability)
+                .await?;
+            requests.extend(refusals.into_iter().map(|row| refusal_entry(&row)));
+            // Newest first by the first attempt; a request and a refusal in
+            // the same second keep the request first. Stable.
+            requests.sort_by_key(|entry| {
+                std::cmp::Reverse(
+                    entry
+                        .get("created_ts")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                )
+            });
+            requests.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
         Ok(AdminOk {
             outcome: Outcome::Verified,
             body: json!({ "requests": requests }),
@@ -1390,5 +1578,31 @@ fn grants_effective_json(view: &PolicyView) -> serde_json::Value {
         "remember": entry(Key::GrantsRemember, "remember"),
         "never": entry(Key::GrantsNever, "never"),
         "never_classes": entry(Key::GrantsNeverClasses, "never_classes"),
+    })
+}
+
+/// One refusal row as an `admin.activity.list` entry (`kind: "refusal"`): the
+/// shape of a request entry where it can be (`id`, `capability`, `repo`,
+/// `agent`, `created_ts`, `updated_ts`, `ingress`, `peer_*`), plus the cause,
+/// the detail, how many attempts the row stands for, and the request id the
+/// client supplied (there is no such request). The claimed fields are
+/// attribution and may be null.
+fn refusal_entry(row: &pam_store::RefusalRow) -> serde_json::Value {
+    json!({
+        "kind": "refusal",
+        "id": format!("refusal_{}", row.id),
+        "cause": row.cause,
+        "detail": row.detail,
+        "count": row.count,
+        "capability": row.capability,
+        "repo": row.repo,
+        "agent": row.agent,
+        "request_id": row.request_id,
+        "created_ts": row.ts,
+        "updated_ts": row.last_ts,
+        "ingress": row.ingress.as_str(),
+        "peer_uid": row.peer_uid,
+        "peer_pid": row.peer_pid,
+        "peer_exe": row.peer_exe,
     })
 }

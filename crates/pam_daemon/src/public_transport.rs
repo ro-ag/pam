@@ -21,6 +21,14 @@
 //!   the binary on disk is the one running, and `error daemon_outdated` — with
 //!   the daemon moving to `Restarting` — once it was replaced. Neither writes a
 //!   request row. The envelope's own `client_version` decides nothing here.
+//! - **Refusals are recorded.** Every refusal this plane decides before the core
+//!   sees the request — a refused hello, a malformed, mistyped or oversized
+//!   frame, a handshake that timed out, an envelope over its limits, an
+//!   `admin.*` operation, a request while the daemon leaves `Serving`, a full
+//!   follower table, the connection cap — has no request row, so it is reported
+//!   to the [`crate::refusal_log::RefusalLog`] on the [`Ingress`], with the peer
+//!   the kernel reported and what the client claimed, and answered without
+//!   waiting for it. A connection that closes without a byte is not a refusal.
 //! - **Request.** The envelope's identity and scope fields are bounded,
 //!   `admin.*` is refused before anything is retained, and the request is
 //!   handed to the daemon core through [`Ingress`]. The connection then waits
@@ -65,7 +73,7 @@ use pam_proto::wire::{
     End, Follow, Following, Frame, FrameError, HelloAck, Via, WIRE_PROTOCOL, cause,
 };
 use pam_proto::{Envelope, Event, Outcome, Response};
-use pam_store::{RequestState, Store};
+use pam_store::{RequestIngress, RequestState, Store};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
@@ -84,6 +92,7 @@ use crate::ingress::{Ingress, Origin, PeerIdentity, PublicPeer};
 use crate::lifecycle::LifecyclePhase;
 use crate::managed_policy_service::PolicyHandle;
 use crate::policy::CAP_QUERY;
+use crate::refusal_log::{self, Refusal, RefusalLog};
 use crate::transport::{bad_request, envelope_within_limits};
 
 /// The longest one follow connection lives: the request wall-time ceiling. A
@@ -260,6 +269,20 @@ impl PublicPolicy {
         }
     }
 
+    /// Where this plane reports the refusals it decides before a request row
+    /// exists ([`crate::refusal_log`]).
+    fn refusals(&self) -> &RefusalLog {
+        self.ingress.refusals()
+    }
+
+    /// Records a handshake that was refused (not one the peer simply
+    /// abandoned).
+    fn record_handshake(&self, error: &HandshakeError, identity: PeerIdentity) {
+        if let Some((cause, detail)) = refusal_log::of_handshake(error) {
+            self.refusals().record(&refused(identity, cause, &detail));
+        }
+    }
+
     /// The refusal every request gets once the daemon has left `Serving`:
     /// `daemon_outdated` while it restarts into a replaced binary (the
     /// client waits for the replacement and retries once),
@@ -293,6 +316,16 @@ impl PublicPolicy {
             .unwrap_or_else(|| internal_refusal(id))
     }
 
+    /// Records the refusal this plane is about to answer a request with
+    /// before the core saw it. A response that is not a refusal records
+    /// nothing.
+    fn record_answer(&self, response: &Response, envelope: &Envelope, peer: PublicPeer) {
+        if let Response::Refusal { cause, detail, .. } = response {
+            self.refusals()
+                .record(&refused(peer.identity, cause, detail).claimed(envelope));
+        }
+    }
+
     /// Hands `envelope` to the daemon core and waits for its one response,
     /// the peer, the listener's stop and the backstop at once.
     async fn run<S>(
@@ -311,6 +344,7 @@ impl PublicPolicy {
         // dispatcher may already be gone, and the answer must not depend on
         // which of the two went first.
         if let Some(refusal) = self.leaving(&id, &version) {
+            self.record_answer(&refusal, &envelope, peer);
             return Ran::Answer(refusal);
         }
         let deadline_ms = envelope.deadline_ms;
@@ -323,10 +357,18 @@ impl PublicPolicy {
             .await
         else {
             // The dispatcher is gone: the daemon is on its way out.
-            return Ran::Answer(
-                self.leaving(&id, &version)
-                    .unwrap_or_else(|| shutting_down_refusal(&id)),
+            let refusal = self
+                .leaving(&id, &version)
+                .unwrap_or_else(|| shutting_down_refusal(&id));
+            self.refusals().record(
+                &refused(
+                    peer.identity,
+                    cause::DAEMON_SHUTTING_DOWN,
+                    "the daemon core stopped accepting requests",
+                )
+                .request_id(&id),
             );
+            return Ran::Answer(refusal);
         };
         match await_answer(stream, &mut answer, stop, backstop).await {
             Awaited::Answer(response) => Ran::Answer(response),
@@ -360,6 +402,7 @@ impl PublicPolicy {
                 "unknown".to_owned(),
                 "request identity or scope fields exceed their limits",
             );
+            self.record_answer(&refusal, &envelope, peer);
             let _ = write_reply(stream, &refusal, maximum).await;
             return;
         }
@@ -373,7 +416,9 @@ impl PublicPolicy {
                 peer_pid = ?peer.identity.pid(),
                 "refused an admin operation on the public socket"
             );
-            let _ = write_reply(stream, &admin_refusal(&envelope.id), maximum).await;
+            let refusal = admin_refusal(&envelope.id);
+            self.record_answer(&refusal, &envelope, peer);
+            let _ = write_reply(stream, &refusal, maximum).await;
             return;
         }
         let id = envelope.id.clone();
@@ -389,6 +434,64 @@ impl PublicPolicy {
                 tracing::debug!(request = %id, "the client went away before its reply");
             }
             Ran::PeerSpoke => refuse_extra_bytes(stream).await,
+        }
+    }
+
+    /// Answers the one frame a connection sent behind its hello: a request, a
+    /// follow, or a refusal of whatever else it was.
+    async fn dispatch<S>(
+        &self,
+        stream: &mut S,
+        body: &[u8],
+        peer: PublicPeer,
+        stop: &mut watch::Receiver<bool>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let identity = peer.identity;
+        let maximum = self.limits.reply_bytes;
+        match Frame::decode(body) {
+            Ok(Frame::Request { envelope }) => {
+                self.request(stream, envelope, peer, stop).await;
+            }
+            Ok(Frame::Follow(follow)) => self.follow(stream, follow, peer, stop).await,
+            // JSON of the right type whose envelope does not parse keeps
+            // today's shape: a `bad_request` refusal naming the request.
+            Err(FrameError::Invalid { t, detail }) if t == "request" || t == "follow" => {
+                let id = pam_proto::wire::salvage_envelope_id(body)
+                    .filter(|id| !id.is_empty() && id.len() <= 128)
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let refusal = bad_request(id, &format!("cannot parse request envelope: {detail}"));
+                if let Response::Refusal {
+                    id, cause, detail, ..
+                } = &refusal
+                {
+                    let known = (id != "unknown").then_some(id.as_str());
+                    let mut refused = refused(identity, cause, detail);
+                    refused.request_id = known;
+                    self.refusals().record(&refused);
+                }
+                let _ = if t == "request" {
+                    write_reply(stream, &refusal, maximum).await
+                } else {
+                    write_end(stream, None, None, refusal, maximum).await
+                };
+            }
+            Ok(other) => {
+                let detail = format!(
+                    "expected request or follow on the public socket, got {}",
+                    other.type_name()
+                );
+                self.refusals()
+                    .record(&refused(identity, cause::BAD_FRAME, &detail));
+                framed::refuse(stream, cause::BAD_FRAME, &detail, RECOVERY_BAD_FRAME).await;
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.refusals()
+                    .record(&refused(identity, cause::BAD_FRAME, &detail));
+                framed::refuse(stream, cause::BAD_FRAME, &detail, RECOVERY_BAD_FRAME).await;
+            }
         }
     }
 
@@ -418,6 +521,7 @@ impl PublicPolicy {
                 },
                 "a follow carries a waiting query envelope whose args.ticket names one ticket",
             );
+            self.record_answer(&refusal, &envelope, peer);
             let _ = write_end(stream, None, None, refusal, maximum).await;
             return;
         };
@@ -453,10 +557,15 @@ impl PublicPolicy {
         let attached = match self.hub.attach(&ticket, after_seq) {
             Ok(attached) => attached,
             Err(AttachError::TotalCapacity | AttachError::TicketCapacity) => {
+                let detail = "every follower slot for this ticket or for the daemon is taken";
+                self.refusals().record(
+                    &refused(peer.identity, cause::FOLLOWER_CAPACITY_EXHAUSTED, detail)
+                        .request_id(&id),
+                );
                 let refusal = Response::transient_refusal(
                     id,
                     cause::FOLLOWER_CAPACITY_EXHAUSTED,
-                    "every follower slot for this ticket or for the daemon is taken",
+                    detail,
                     RECOVERY_FOLLOWERS,
                 );
                 let _ = write_end(stream, None, None, refusal, maximum).await;
@@ -624,6 +733,14 @@ where
         "public"
     }
 
+    fn connection_refused(&self, peer: PeerIdentity) {
+        self.refusals().record(&refused(
+            peer,
+            cause::CONNECTION_CAPACITY_EXHAUSTED,
+            "the public listener was serving its maximum number of connections",
+        ));
+    }
+
     fn limits(&self) -> Limits {
         self.limits
     }
@@ -648,8 +765,12 @@ where
         let deadline = framed::handshake_deadline(&self.limits);
         let hello = match framed::read_hello(stream, deadline).await {
             Ok(hello) => hello,
-            Err(HandshakeError::LegacyZmtp) => return self.log_legacy_peer(identity),
-            Err(HandshakeError::Untyped(_)) => {
+            Err(HandshakeError::LegacyZmtp) => {
+                self.record_handshake(&HandshakeError::LegacyZmtp, identity);
+                return self.log_legacy_peer(identity);
+            }
+            Err(error @ HandshakeError::Untyped(_)) => {
+                self.record_handshake(&error, identity);
                 framed::refuse(
                     stream,
                     cause::BAD_FRAME,
@@ -661,7 +782,10 @@ where
             }
             // Answered on the wire where the peer can read an answer, and
             // the request behind a refused hello already read off.
-            Err(error) => return log_handshake(&error, identity),
+            Err(error) => {
+                self.record_handshake(&error, identity);
+                return log_handshake(&error, identity);
+            }
         };
         // The same rule as on the administration plane, by the same
         // function: it answers, reads off the request behind the hello, and
@@ -675,6 +799,8 @@ where
                 peer_pid = ?identity.pid(),
                 "refused a hello"
             );
+            self.refusals()
+                .record(&refused(identity, &refusal.cause, &refusal.detail));
             return;
         }
         let ack = HelloAck {
@@ -686,48 +812,16 @@ where
         let body =
             match framed::accept_hello(stream, ack, self.limits.request_bytes, deadline).await {
                 Ok(body) => body,
-                Err(error) => return log_handshake(&error, identity),
+                Err(error) => {
+                    self.record_handshake(&error, identity);
+                    return log_handshake(&error, identity);
+                }
             };
         let peer = PublicPeer {
             identity,
             relayed: hello.via == Via::Relay,
         };
-        let maximum = self.limits.reply_bytes;
-        match Frame::decode(&body) {
-            Ok(Frame::Request { envelope }) => {
-                self.request(stream, envelope, peer, &mut stop).await;
-            }
-            Ok(Frame::Follow(follow)) => self.follow(stream, follow, peer, &mut stop).await,
-            // JSON of the right type whose envelope does not parse keeps
-            // today's shape: a `bad_request` refusal naming the request.
-            Err(FrameError::Invalid { t, detail }) if t == "request" || t == "follow" => {
-                let id = pam_proto::wire::salvage_envelope_id(&body)
-                    .filter(|id| !id.is_empty() && id.len() <= 128)
-                    .unwrap_or_else(|| "unknown".to_owned());
-                let refusal = bad_request(id, &format!("cannot parse request envelope: {detail}"));
-                let _ = if t == "request" {
-                    write_reply(stream, &refusal, maximum).await
-                } else {
-                    write_end(stream, None, None, refusal, maximum).await
-                };
-            }
-            Ok(other) => {
-                let detail = format!(
-                    "expected request or follow on the public socket, got {}",
-                    other.type_name()
-                );
-                framed::refuse(stream, cause::BAD_FRAME, &detail, RECOVERY_BAD_FRAME).await;
-            }
-            Err(error) => {
-                framed::refuse(
-                    stream,
-                    cause::BAD_FRAME,
-                    &error.to_string(),
-                    RECOVERY_BAD_FRAME,
-                )
-                .await;
-            }
-        }
+        self.dispatch(stream, &body, peer, &mut stop).await;
     }
 }
 
@@ -1033,6 +1127,12 @@ async fn drain_extra<S: AsyncRead + Unpin>(stream: &mut S, deadline: Instant) {
         }
     })
     .await;
+}
+
+/// A refusal on the public plane from the connection `identity`; the caller
+/// adds what the client claimed when it got that far.
+fn refused<'a>(identity: PeerIdentity, cause: &'a str, detail: &'a str) -> Refusal<'a> {
+    Refusal::new(RequestIngress::Public, cause, detail).peer(identity)
 }
 
 /// Logs a handshake that did not produce a request. Timeouts and bad frames

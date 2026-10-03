@@ -23,10 +23,12 @@
 pub mod builtin;
 pub mod correlation;
 pub mod duration;
+pub mod input_type;
 pub mod landing;
 pub mod library;
 pub use landing::LandingOperation;
 pub mod normalize;
+pub mod reserved_env;
 pub mod schema;
 pub mod validate;
 pub mod vars;
@@ -37,8 +39,10 @@ pub use correlation::{
     validate_full_commit,
 };
 pub use duration::{DurationError, format_duration, parse_duration};
+pub use input_type::{InputError, InputType};
 pub use library::{Entry, Library, Source};
 pub use normalize::{digest, to_normalized_yaml};
+pub use reserved_env::{RESERVED_ENV_SUMMARY, reserved_env_reason};
 pub use schema::{
     Action, Approval, ArgValue, ConnectorId, Effect, Flow, Input, OutputPolicy, Prior, Retry, Role,
     SCHEMA_VERSION, Step, Watch, When,
@@ -58,9 +62,13 @@ mod correlation_test;
 #[cfg(test)]
 mod duration_test;
 #[cfg(test)]
+mod input_type_test;
+#[cfg(test)]
 mod library_test;
 #[cfg(test)]
 mod normalize_test;
+#[cfg(test)]
+mod reserved_env_test;
 #[cfg(test)]
 mod schema_test;
 #[cfg(test)]

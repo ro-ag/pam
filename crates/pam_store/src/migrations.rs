@@ -9,79 +9,346 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::{StoreError, engine};
 
-/// One schema migration: the version it produces and the SQL that gets there.
+/// One schema migration: the version it produces and what gets there.
 pub(crate) struct Migration {
     pub(crate) version: i64,
+    /// Runs first.
     pub(crate) sql: &'static str,
+    /// Runs after `sql`, in the same transaction, for the work SQL cannot
+    /// do on its own (hashing, for one). `None` for a migration that is
+    /// SQL only.
+    pub(crate) code: Option<MigrationCode>,
 }
+
+/// The Rust half of a migration: handed the migration's transaction.
+pub(crate) type MigrationCode = fn(&Connection) -> Result<(), StoreError>;
 
 /// Every migration this binary knows, ordered by ascending version.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         sql: SCHEMA_V1,
+        code: None,
     },
     Migration {
         version: 2,
         sql: SCHEMA_V2,
+        code: None,
     },
     Migration {
         version: 3,
         sql: SCHEMA_V3,
+        code: None,
     },
     Migration {
         version: 4,
         sql: SCHEMA_V4,
+        code: None,
     },
     Migration {
         version: 5,
         sql: SCHEMA_V5,
+        code: None,
     },
     Migration {
         version: 6,
         sql: SCHEMA_V6,
+        code: None,
     },
     Migration {
         version: 7,
         sql: SCHEMA_V7,
+        code: None,
     },
     Migration {
         version: 8,
         sql: SCHEMA_V8,
+        code: None,
     },
     Migration {
         version: 9,
         sql: SCHEMA_V9,
+        code: None,
     },
     Migration {
         version: 10,
         sql: SCHEMA_V10,
+        code: None,
     },
     Migration {
         version: 11,
         sql: SCHEMA_V11,
+        code: None,
     },
     Migration {
         version: 12,
         sql: SCHEMA_V12,
+        code: None,
     },
     Migration {
         version: 13,
         sql: SCHEMA_V13,
+        code: None,
     },
     Migration {
         version: ENGINE_BOUNDARY,
         sql: SCHEMA_V14,
+        code: None,
     },
     Migration {
         version: 15,
         sql: SCHEMA_V15,
+        code: None,
     },
     Migration {
         version: 16,
         sql: SCHEMA_V16,
+        code: None,
+    },
+    Migration {
+        version: 17,
+        sql: SCHEMA_V17,
+        code: None,
+    },
+    Migration {
+        version: 18,
+        sql: SCHEMA_V18,
+        code: None,
+    },
+    Migration {
+        version: 19,
+        sql: SCHEMA_V19,
+        code: None,
+    },
+    Migration {
+        version: 20,
+        sql: SCHEMA_V20,
+        code: Some(crate::view_chunks::migrate_v20),
     },
 ];
+
+/// Migration 20: an evidence view references its evidence row, and its
+/// bytes are stored in fixed-size chunks, each with its own digest.
+///
+/// - `evidence_view.source_id` is the evidence row a live view was cut from,
+///   a foreign key with `ON DELETE SET NULL`: retention tombstones a view
+///   (`expired_at`) and then deletes its evidence, which clears the link.
+///   The CHECK `source_id IS NOT NULL OR expired_at IS NOT NULL` makes a
+///   live view without its evidence unrepresentable, so deleting evidence
+///   whose view was not tombstoned first fails instead of leaving a view
+///   that points at nothing. `source_id` is `evidence_id` or NULL, never
+///   anything else; `evidence_id` stays the view's identity, tombstone or
+///   not.
+/// - `evidence_view_chunk` holds the bytes: `chunk_bytes` (64 KiB for every
+///   view this binary writes) per row, the last one shorter, each with the
+///   SHA-256 of its bytes. A page read loads the one or two chunks it
+///   covers and checks them against their digests before serving a byte;
+///   the whole-view `view_sha256` is unchanged and is still what readers
+///   pin. Tombstoning a view deletes its chunks (a trigger), and deleting a
+///   view deletes them by cascade; a live view's chunks cannot be updated
+///   or deleted.
+/// - Existing views move over in the migration (`view_chunks::migrate_v20`):
+///   a live view whose evidence row is missing is tombstoned and reported
+///   in an `evidence.view_orphaned` audit row on its request; a live view
+///   whose bytes do not hash to its `view_sha256` keeps its identity, gets
+///   no chunks (so a read refuses as corrupt rather than serving them) and
+///   is reported as `evidence.view_corrupt`. Nothing is dropped silently.
+///
+/// `view_blob` is gone with the rebuild; the immutability trigger is
+/// recreated over the new columns: identity never changes, `source_id`
+/// only to NULL, `expired_at` only from NULL.
+const SCHEMA_V20: &str = "
+CREATE TABLE evidence_view_v20 (
+ evidence_id TEXT NOT NULL PRIMARY KEY,
+ request_id TEXT NOT NULL REFERENCES request(id),
+ source_id TEXT REFERENCES evidence(id) ON DELETE SET NULL
+   CHECK (source_id IS NULL OR source_id = evidence_id),
+ repository TEXT NOT NULL,
+ origin_json TEXT NOT NULL,
+ identity_json TEXT NOT NULL,
+ map_json TEXT NOT NULL,
+ view_id TEXT NOT NULL UNIQUE,
+ view_sha256 TEXT NOT NULL,
+ view_bytes INTEGER NOT NULL CHECK (view_bytes >= 0),
+ chunk_bytes INTEGER NOT NULL CHECK (chunk_bytes BETWEEN 1 AND 4194304),
+ expired_at INTEGER,
+ CHECK (source_id IS NOT NULL OR expired_at IS NOT NULL)
+);
+INSERT INTO audit (request_id, action, decision, actor, detail, ts)
+SELECT v.request_id, 'evidence.view_orphaned', 'refuse', 'system',
+       json_object('cause', 'evidence_missing', 'evidence_id', v.evidence_id,
+                   'view_id', v.view_id, 'view_sha256', v.view_sha256,
+                   'view_bytes', v.view_bytes, 'migration', 20,
+                   'note', 'The view''s evidence row was missing; the view is now a tombstone.'),
+       CAST(strftime('%s', 'now') AS INTEGER)
+FROM evidence_view v
+WHERE v.expired_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.id = v.evidence_id)
+ORDER BY v.evidence_id;
+INSERT INTO evidence_view_v20 (evidence_id, request_id, source_id, repository, origin_json,
+    identity_json, map_json, view_id, view_sha256, view_bytes, chunk_bytes, expired_at)
+SELECT v.evidence_id, v.request_id,
+       (SELECT e.id FROM evidence e WHERE e.id = v.evidence_id),
+       v.repository, v.origin_json, v.identity_json, v.map_json, v.view_id, v.view_sha256,
+       v.view_bytes, 65536,
+       CASE WHEN v.expired_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.id = v.evidence_id)
+            THEN CAST(strftime('%s', 'now') AS INTEGER)
+            ELSE v.expired_at END
+FROM evidence_view v;
+CREATE TABLE evidence_view_chunk (
+ evidence_id TEXT NOT NULL REFERENCES evidence_view_v20(evidence_id) ON DELETE CASCADE,
+ seq INTEGER NOT NULL CHECK (seq >= 0),
+ sha256 TEXT NOT NULL CHECK (length(CAST(sha256 AS BLOB)) = 64),
+ bytes BLOB NOT NULL CHECK (length(bytes) BETWEEN 1 AND 4194304),
+ PRIMARY KEY (evidence_id, seq)
+);
+";
+
+/// Migration 20, after its Rust half: the old table goes, the new one takes
+/// its name (SQLite rewrites the chunk table's foreign key to follow), and
+/// the indexes and triggers are recreated.
+pub(crate) const SCHEMA_V20_TAIL: &str = "
+DROP TABLE evidence_view;
+ALTER TABLE evidence_view_v20 RENAME TO evidence_view;
+CREATE INDEX evidence_view_request_idx ON evidence_view(request_id);
+CREATE INDEX evidence_view_source_idx ON evidence_view(source_id);
+CREATE TRIGGER evidence_view_immutable BEFORE UPDATE ON evidence_view
+WHEN NEW.evidence_id IS NOT OLD.evidence_id
+  OR NEW.request_id IS NOT OLD.request_id
+  OR NEW.repository IS NOT OLD.repository
+  OR NEW.origin_json IS NOT OLD.origin_json
+  OR NEW.identity_json IS NOT OLD.identity_json
+  OR NEW.map_json IS NOT OLD.map_json
+  OR NEW.view_id IS NOT OLD.view_id
+  OR NEW.view_sha256 IS NOT OLD.view_sha256
+  OR NEW.view_bytes IS NOT OLD.view_bytes
+  OR NEW.chunk_bytes IS NOT OLD.chunk_bytes
+  OR (NEW.source_id IS NOT OLD.source_id AND NEW.source_id IS NOT NULL)
+  OR (OLD.expired_at IS NOT NULL AND NEW.expired_at IS NOT OLD.expired_at)
+BEGIN
+    SELECT RAISE(ABORT, 'evidence views are immutable');
+END;
+CREATE TRIGGER evidence_view_tombstone_drops_chunks AFTER UPDATE OF expired_at ON evidence_view
+WHEN OLD.expired_at IS NULL AND NEW.expired_at IS NOT NULL
+BEGIN
+    DELETE FROM evidence_view_chunk WHERE evidence_id = NEW.evidence_id;
+END;
+CREATE TRIGGER evidence_view_chunk_immutable BEFORE UPDATE ON evidence_view_chunk
+BEGIN
+    SELECT RAISE(ABORT, 'evidence view chunks are immutable');
+END;
+CREATE TRIGGER evidence_view_chunk_kept BEFORE DELETE ON evidence_view_chunk
+WHEN EXISTS (SELECT 1 FROM evidence_view v
+             WHERE v.evidence_id = OLD.evidence_id AND v.expired_at IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'a live evidence view keeps its chunks');
+END;
+CREATE TRIGGER evidence_view_chunk_live_only BEFORE INSERT ON evidence_view_chunk
+WHEN NOT EXISTS (SELECT 1 FROM evidence_view v
+                 WHERE v.evidence_id = NEW.evidence_id AND v.expired_at IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'chunks belong to a live evidence view');
+END;
+";
+
+/// Migration 19: at most one terminal audit row per request, by the schema.
+///
+/// `audit.terminal` is 1 on the row the store's terminal writer
+/// (`Store::finish_request` and the transactions built on it) writes with
+/// the terminal state, and 0 on every other row: notes, approvals, grant
+/// changes, the managed policy's `policy.*` rows on its daemon-owned
+/// request, a `doctor.report`. The partial unique index then holds the
+/// invariant the writer's compare-and-swap on the request state already
+/// keeps: a second terminal row for one request is a constraint violation,
+/// which the writer treats as already written. The flag is not inferred
+/// from the action name, because the same action (`admin`, `policy.load`)
+/// is a terminal row on one request and an ordinary one on another.
+///
+/// Rows written before this migration read 0: a request that was terminal
+/// then cannot be finished again (the writer only moves in-flight rows), so
+/// the index covers every terminal write from here on.
+const SCHEMA_V19: &str = "
+ALTER TABLE audit ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1));
+CREATE UNIQUE INDEX audit_terminal_once ON audit (request_id) WHERE terminal = 1;
+";
+
+/// Migration 18: refusals that happen before a request row exists.
+///
+/// `audit.request_id` is NOT NULL with a foreign key to `request`, so a
+/// refusal decided before admission (the dispatcher's capacity or rate
+/// refusal, a repository that cannot be normalised, an elapsed deadline at
+/// admission, a malformed envelope, a refused hello, an oversized frame, the
+/// connection cap) could never have an audit row. `refusal` is where they
+/// live instead, one row per distinct refusal, not per attempt:
+///
+/// - `ts` is the first attempt and `last_ts` the latest of a run of identical
+///   refusals (same plane, cause, peer pid and capability) the daemon
+///   coalesced into the row; `count` is how many attempts the row stands for.
+/// - `peer_uid`, `peer_pid` and `peer_exe` are the daemon's own view of the
+///   connection (the kernel's, resolved off the reply path; NULL on Windows,
+///   where the public plane has no kernel peer, and when a resolution
+///   missed). `agent`, `repo`, `request_id` and `capability` are what the
+///   client claimed, when it got far enough to claim anything: attribution,
+///   never a key. `request_id` deliberately has no foreign key; there is no
+///   such request.
+/// - Every text column is bounded by its CHECK, and the writer truncates to
+///   the same bounds, so a refusal can always be recorded and none can grow
+///   the table.
+///
+/// The insert path keeps the newest 2,000 rows; the retention service's audit
+/// window removes older ones (`Store::prune_refusals_before`). Nothing
+/// authorizes anything from this table.
+const SCHEMA_V18: &str = "
+CREATE TABLE refusal (
+    id          INTEGER PRIMARY KEY,
+    ts          INTEGER NOT NULL,
+    last_ts     INTEGER NOT NULL,
+    ingress     TEXT NOT NULL CHECK (ingress IN ('public', 'admin')),
+    cause       TEXT NOT NULL CHECK (length(CAST(cause AS BLOB)) BETWEEN 1 AND 128),
+    detail      TEXT NOT NULL CHECK (length(CAST(detail AS BLOB)) <= 512),
+    count       INTEGER NOT NULL CHECK (count >= 1),
+    peer_uid    INTEGER,
+    peer_pid    INTEGER,
+    peer_exe    TEXT CHECK (peer_exe IS NULL OR length(CAST(peer_exe AS BLOB)) <= 1024),
+    agent       TEXT CHECK (agent IS NULL OR length(CAST(agent AS BLOB)) <= 256),
+    repo        TEXT CHECK (repo IS NULL OR length(CAST(repo AS BLOB)) <= 1024),
+    request_id  TEXT CHECK (request_id IS NULL OR length(CAST(request_id AS BLOB)) <= 128),
+    capability  TEXT CHECK (capability IS NULL OR length(CAST(capability AS BLOB)) <= 128)
+);
+CREATE INDEX refusal_ts_idx ON refusal (ts DESC, id DESC);
+";
+
+/// Migration 17: a flow step's grant is bound to what runs, and a flow run
+/// knows its flow.
+///
+/// - `grant.flow_id`, `grant.step_id`, `grant.effect_digest`,
+///   `grant.effect_class`, `grant.repository` and `grant.bound_ts`: the
+///   binding of a `flow.step:<flow>/<step>` grant, recorded when it is made —
+///   the step's effect digest (a hash of the normalized step's program,
+///   arguments, environment, effect, connector call or landing operation),
+///   the gate class it was granted under (`destructive` or `external`) and
+///   the canonical repository the approval was given for (NULL: every
+///   repository, which only a grant a human adds by hand in Settings can
+///   say). A bound grant authorizes a step only while all three still match.
+///   Every row written before this migration has a NULL `effect_digest`: an
+///   unbound legacy grant, which still authorizes and is bound to what runs
+///   the first time it is used (audited as `grant_bound`). Grants of any
+///   other capability never carry a binding.
+/// - `request.flow_id`: the flow a `flow.run` request names, recorded at
+///   admission, so revoking one flow's step grant voids only that flow's
+///   tickets. NULL for every other capability and for every row written
+///   before this migration, which a revocation of any flow's step grant
+///   still voids, as before: an unknown flow is never spared.
+const SCHEMA_V17: &str = r#"
+ALTER TABLE "grant" ADD COLUMN flow_id TEXT CHECK (flow_id IS NULL OR length(CAST(flow_id AS BLOB)) BETWEEN 1 AND 256);
+ALTER TABLE "grant" ADD COLUMN step_id TEXT CHECK (step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256);
+ALTER TABLE "grant" ADD COLUMN effect_digest TEXT CHECK (effect_digest IS NULL OR length(CAST(effect_digest AS BLOB)) = 64);
+ALTER TABLE "grant" ADD COLUMN effect_class TEXT CHECK (effect_class IS NULL OR effect_class IN ('destructive', 'external'));
+ALTER TABLE "grant" ADD COLUMN repository TEXT CHECK (repository IS NULL OR length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096);
+ALTER TABLE "grant" ADD COLUMN bound_ts INTEGER;
+ALTER TABLE request ADD COLUMN flow_id TEXT CHECK (flow_id IS NULL OR length(CAST(flow_id AS BLOB)) BETWEEN 1 AND 256);
+"#;
 
 /// Migration 16: the boundary self-check record.
 ///
@@ -330,6 +597,9 @@ fn apply(conn: &mut Connection, migration: &Migration) -> Result<(), StoreError>
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(engine)?;
     txn.execute_batch(migration.sql).map_err(engine)?;
+    if let Some(code) = migration.code {
+        code(&txn)?;
+    }
     // An integer of ours, not caller text: the pragma takes no bound value.
     txn.execute_batch(&format!("PRAGMA user_version = {}", migration.version))
         .map_err(engine)?;

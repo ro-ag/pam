@@ -398,3 +398,80 @@ async fn expired_revoked_or_mismatched_landing_intent_stays_terminal_uncertain()
         );
     }
 }
+
+/// A checkpoint a crash left without its journal (the state a daemon that
+/// filed the two in separate statements could stop in) is closed at boot
+/// with an audit row on its request, before the stuck rows are recovered;
+/// the run itself is failed as legacy work, and a second boot finds nothing.
+#[tokio::test]
+async fn a_checkpoint_left_without_its_journal_is_closed_at_boot_with_an_audit_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    {
+        let store = Store::open(&path).await.unwrap();
+        store
+            .insert_admitted_request(
+                "orphan",
+                "flow.run",
+                REPO,
+                "test",
+                "{}",
+                None,
+                future_expiry(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .authorize_queued_request("orphan", REPO, 0)
+                .await
+                .unwrap()
+        );
+        assert!(store.start_queued_request("orphan", 0).await.unwrap());
+        store
+            .insert_evidence(
+                "ev_orphan",
+                "orphan",
+                crate::flow_recovery::KIND,
+                b"{}",
+                None,
+            )
+            .await
+            .unwrap();
+        // A journaled run's checkpoint stays where it is.
+        admitted(&store, "journaled", future_expiry()).await;
+        store
+            .insert_evidence(
+                "ev_kept",
+                "journaled",
+                crate::flow_recovery::KIND,
+                b"{}",
+                None,
+            )
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+    }
+    let store = Store::open(&path).await.unwrap();
+    recover_stuck_rows(&store).await.unwrap();
+    assert!(store.get_evidence("ev_orphan").await.unwrap().is_none());
+    assert!(store.get_evidence("ev_kept").await.unwrap().is_some());
+    let audit = store.audit_for_request("orphan").await.unwrap();
+    let actions: Vec<&str> = audit.iter().map(|row| row.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        [
+            pam_store::ACTION_FLOW_CHECKPOINT_ORPHANED,
+            crate::lifecycle::ACTION_DAEMON_RESTART
+        ]
+    );
+    assert_eq!(
+        store.get_request("orphan").await.unwrap().unwrap().state,
+        RequestState::Failed
+    );
+    store.close().await.unwrap();
+
+    let store = Store::open(&path).await.unwrap();
+    recover_stuck_rows(&store).await.unwrap();
+    assert_eq!(store.audit_for_request("orphan").await.unwrap().len(), 2);
+}

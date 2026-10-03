@@ -91,6 +91,10 @@ is "installed into" a repo; repos are just callers.
 - One audit row per operation — including refused and failed operations
   (v1 lesson, issue #49: the audit trail under-reported exactly the
   operations most worth auditing).
+  A refusal decided before a request row exists (capacity, rate, a malformed
+  or oversized frame, a refused hello…) has no row to audit, so it is
+  recorded in its own bounded, coalesced table and listed in Activity (see
+  [the audit contract](admin-boundary.md#the-audit-contract-request-rows-and-refusal-rows)).
 - Fail-closed, but every refusal names its cause and a recovery path
   (v1 lessons, issues #44 and #52: opaque refusals are a product failure).
 - **Security administration is GUI-only** (owner decision): grants,

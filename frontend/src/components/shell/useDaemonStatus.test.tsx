@@ -6,22 +6,25 @@ import type { PamEventPayload, PendingApproval } from "../../lib/ipc";
 
 vi.mock("../../lib/ipc", () => ({
   daemonStatus: vi.fn(),
+  daemonStart: vi.fn(),
   approvalsPending: vi.fn(),
   subscribeEvents: vi.fn(),
 }));
 
-import { approvalsPending, daemonStatus, subscribeEvents } from "../../lib/ipc";
+import { approvalsPending, daemonStart, daemonStatus, subscribeEvents } from "../../lib/ipc";
 import {
   APPROVALS_PENDING_KEY,
   DAEMON_STATUS_KEY,
   OFFLINE_AFTER_MISSES,
   STATUS_POLL_MS,
   useDaemonStatus,
+  useStartDaemon,
 } from "./useDaemonStatus";
 
 const mockStatus = vi.mocked(daemonStatus);
 const mockPending = vi.mocked(approvalsPending);
 const mockSubscribe = vi.mocked(subscribeEvents);
+const mockStart = vi.mocked(daemonStart);
 
 const approval: PendingApproval = {
   request_id: "req_01ABC",
@@ -77,6 +80,54 @@ describe("useDaemonStatus", () => {
     const { result } = mount();
     expect(result.current).toBe("connecting");
     await waitFor(() => expect(result.current).toBe("connected"));
+  });
+
+  it("reads the human's own Stop as stopped at once, not as a miss", async () => {
+    vi.useFakeTimers();
+    mockStatus.mockResolvedValue(up);
+    const { result } = mount();
+    await tick(0);
+    expect(result.current).toBe("connected");
+
+    // The human pressed Stop: the bridge answers "stopped by you", and the first such answer is
+    // the state — a green beacon does not coast through a grace period for a stop it was told of.
+    mockStatus.mockResolvedValue({ ...down, stopped_by_you: true });
+    await tick(STATUS_POLL_MS);
+    expect(result.current).toBe("stopped");
+
+    // Start brings it back.
+    mockStatus.mockResolvedValue(up);
+    await tick(60_000);
+    expect(result.current).toBe("connected");
+  });
+
+  it("leaves an unreachable daemon red when nobody stopped it", async () => {
+    mockStatus.mockResolvedValue({ ...down, stopped_by_you: false });
+    const { result } = mount();
+    await waitFor(() => expect(result.current).toBe("down"));
+  });
+
+  it("starts the daemon on the human's Start and shows the answer at once", async () => {
+    mockStatus.mockResolvedValue({ ...down, stopped_by_you: true });
+    mockStart.mockResolvedValue(up);
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(
+      () => ({ beacon: useDaemonStatus(), start: useStartDaemon() }),
+      {
+        wrapper,
+      },
+    );
+    await waitFor(() => expect(result.current.beacon).toBe("stopped"));
+    expect(mockStart).not.toHaveBeenCalled();
+
+    mockStatus.mockResolvedValue(up);
+    await act(async () => {
+      result.current.start.mutate();
+    });
+    await waitFor(() => expect(result.current.beacon).toBe("connected"));
+    expect(mockStart).toHaveBeenCalledTimes(1);
   });
 
   it("turns amber while approvals wait", async () => {

@@ -134,7 +134,7 @@ describe("raised hands", () => {
     const meaning = approvalMeaning("flow.step:pr-readiness/tests");
     expect(meaning.before).toBe("The flow asks to run a gated step, ");
     expect(meaning.after).toBe(
-      ". Approving runs that step this once; remember grants the capability to every repository.",
+      ". Approving runs that step this once; remember keeps it for this repository and this exact step.",
     );
     // `flow.run` is an ordinary capability, not a gated step.
     expect(approvalMeaning("flow.run").after).toMatch(/continue this once/);
@@ -186,6 +186,46 @@ describe("resolving", () => {
         confirmation: "grant",
       }),
     );
+  });
+
+  it("says a remembered flow step is kept for this repository and this exact step", async () => {
+    mocks.approvalsPending.mockResolvedValue({
+      pending: [
+        hand({
+          capability: "flow.step:bound/change",
+          remember: {
+            flow: "bound",
+            step: "change",
+            repository: "/Users/dev/pam",
+            effect_digest: "0123456789ab",
+            effect_class: "destructive",
+            changed: "the step's command changed since it was approved",
+          },
+        }),
+      ],
+    });
+    renderApprovals();
+    await screen.findByText("1 request awaiting review");
+    const stepCard = card("flow.step:bound/change");
+    // Why the step asks again, in the daemon's words.
+    expect(
+      stepCard.getByText(
+        (_, element) =>
+          element?.tagName === "P" &&
+          element.textContent ===
+            "Asked again: the step's command changed since it was approved.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(stepCard.getByRole("checkbox", { name: "Remember this capability" }));
+    expect(
+      stepCard.getByText(/remembers it for this repository and this exact step/),
+    ).toBeInTheDocument();
+    expect(stepCard.queryByText(/grants it for every repository/)).toBeNull();
+    fireEvent.click(stepCard.getByRole("button", { name: "Approve" }));
+    const prompt = within(
+      stepCard.getByRole("group", { name: /remember this step for this repository/ }),
+    );
+    expect(prompt.getByText(/and this exact step/)).toBeInTheDocument();
   });
 
   it("cancelling the confirmation resolves nothing", async () => {

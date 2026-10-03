@@ -569,7 +569,7 @@ mod cross_process {
         async fn stop(mut self) {
             let started = Instant::now();
             assert!(
-                Command::new("kill")
+                Command::new("/bin/kill")
                     .args(["-TERM", &self.child.id().to_string()])
                     .status()
                     .unwrap()
@@ -615,7 +615,7 @@ mod cross_process {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
             }
-            let _ = Command::new("kill")
+            let _ = Command::new("/bin/kill")
                 .args(["-TERM", &self.child.id().to_string()])
                 .status();
             let until = Instant::now() + Duration::from_secs(3);

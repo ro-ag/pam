@@ -25,7 +25,9 @@
 //! and retried after a pause that doubles from 10 ms to one second, a peer that
 //! vanished or a signal at once ([`AcceptBackoff`]). A connection over the cap
 //! gets one non-blocking write of `error connection_capacity_exhausted` and is
-//! closed, so a client can tell a full daemon from a legacy one. Every served
+//! closed, so a client can tell a full daemon from a legacy one; the policy is
+//! told ([`Policy::connection_refused`]) so the refusal can be recorded
+//! ([`crate::refusal_log`]). Every served
 //! connection is a task holding its connection permit for its whole life. Stop
 //! closes the acceptor (which removes the socket or control file), signals the
 //! connection tasks, waits out the drain and aborts the rest.
@@ -622,6 +624,12 @@ pub trait Policy<S>: Send + Sync + 'static {
     /// The numbers this plane's listener enforces.
     fn limits(&self) -> Limits;
 
+    /// A connection over the cap was told `connection_capacity_exhausted` and
+    /// closed. A plane that keeps a record of its refusals
+    /// ([`crate::refusal_log`]) notes it here. Called from the accept loop:
+    /// it must not wait for anything.
+    fn connection_refused(&self, _peer: PeerIdentity) {}
+
     /// Serves one connection to its end. The connection permit is held until
     /// the returned future completes or is aborted by the drain. `stop` is
     /// set when the listener is stopping ([`stopped`]).
@@ -802,6 +810,7 @@ async fn accept_loop<A, P>(
                     }
                 };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    policy.connection_refused(peer);
                     // Never left without an answer: a client can tell a full
                     // daemon from a legacy one.
                     A::reject(stream, &busy).await;

@@ -4,11 +4,11 @@ name: Revision Sonar check
 description: Verify the historical gate and reported revision of an exact branch analysis, using a GUI-owned repository mapping.
 inputs:
   repository: { description: Exact HTTPS repository URL in the GUI mapping }
-  commit: { description: Full expected source commit }
+  commit: { type: sha, description: Full expected source commit }
   project: { description: Exact Sonar project key }
   ce_task: { description: Exact compute task ID }
-  branch: { description: Explicit analyzed branch }
-  page: { default: "1", description: Explicit analysis history page }
+  branch: { type: ref, description: Explicit analyzed branch }
+  page: { type: int, default: "1", description: Explicit analysis history page }
 correlation:
   repository: "${inputs.repository}"
   commit: "${inputs.commit}"

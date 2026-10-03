@@ -447,6 +447,90 @@ async fn wait_and_subscribe_cost_one_query_row_each_and_subscribe_prints_the_rep
     .expect("test within deadline");
 }
 
+/// `pam subscribe --json` against the compiled binary: stdout is machine output only — one JSON
+/// object per event, then the durable result, concatenated JSON values with nothing else between
+/// them — and nothing human-readable appears on either stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_json_keeps_stdout_to_json_only() {
+    warm_binary();
+    timeout(DEADLINE, async {
+        let daemon = TestDaemon::start().await;
+        let repo = temp_git_repo();
+        seed_repository_scope(&daemon, repo.path()).await;
+        let store = daemon.handle.store();
+        let started = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &[
+                "echo",
+                r#"{"delay_ms": 1500, "n": 7}"#,
+                "--no-wait",
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(started.code, 0, "{} {}", started.stdout, started.stderr);
+        let started: serde_json::Value = serde_json::from_str(&started.stdout).unwrap();
+        let ticket = started["ticket"].as_str().unwrap();
+        wait_for_row(&store, ticket, |row| row.state == RequestState::Running).await;
+
+        let subscribed = run_pam(
+            &daemon.base(),
+            repo.path(),
+            &["subscribe", ticket, "--json"],
+        )
+        .await;
+        assert_eq!(
+            subscribed.code, 0,
+            "{} {}",
+            subscribed.stdout, subscribed.stderr
+        );
+        assert!(
+            !subscribed.stdout.contains("[queued]") && !subscribed.stdout.contains("[done]"),
+            "no human event line on stdout: {}",
+            subscribed.stdout
+        );
+        assert!(
+            subscribed.stderr.is_empty(),
+            "nothing human-readable on stderr either: {}",
+            subscribed.stderr
+        );
+        // Every value on stdout parses; the events come first, then the durable result.
+        let values: Vec<serde_json::Value> = serde_json::Deserializer::from_str(&subscribed.stdout)
+            .into_iter::<serde_json::Value>()
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "stdout is JSON values only ({error}): {}",
+                    subscribed.stdout
+                )
+            });
+        let kinds: Vec<&str> = values
+            .iter()
+            .map(|value| value["kind"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(
+            &kinds[..3],
+            ["queued", "started", "done"],
+            "{}",
+            subscribed.stdout
+        );
+        let last = values.last().expect("the terminal response");
+        assert_eq!(last["kind"], "result");
+        assert_eq!(last["body"]["ticket"], ticket);
+        assert_eq!(last["body"]["state"], "done");
+        // The event lines are single-line objects.
+        for line in subscribed.stdout.lines().take(3) {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("event line {line:?} is JSON: {error}"));
+        }
+
+        daemon.stop().await;
+    })
+    .await
+    .expect("test within deadline");
+}
+
 /// A follow the daemon refuses is one line on stderr, or with `--json` one
 /// refusal object on stdout and nothing else anywhere; exit 3 either way.
 #[tokio::test(flavor = "multi_thread")]

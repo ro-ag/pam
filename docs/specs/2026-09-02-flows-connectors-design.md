@@ -64,6 +64,9 @@ inputs:                           # optional map (rendered sorted by name)
   repo:
     description: owner/name on GitHub
     default: ${repo.origin}       # defaults may use built-in variables
+  build:
+    description: Jenkins build number
+    type: int                     # string (default) | int | sha | ref | path | enum
 steps:
   - id: latest-failed             # [a-z0-9-]{1,64}, unique
     connector: github             # connector step: connector + call + with
@@ -83,7 +86,7 @@ steps:
     when: needs_succeeded         # needs_succeeded (default) | always | { succeeded: <step> } | { failed: <step> }
     retry: { attempts: 2, backoff: 500ms }   # attempts 1..5, backoff ≤ 60s, doubling, cap 60s
     approval: none                # none (default) | required; stateful ⇒ required is forced
-    env: { CARGO_TERM_COLOR: never }         # additions only; names [A-Z_][A-Z0-9_]*, secret-like values refused
+    env: { CARGO_TERM_COLOR: never }         # additions only; names [A-Z_][A-Z0-9_]*, secret-like values refused, reserved names refused
     note: |                       # optional free text ≤ 2 KiB, never a secret; the designer's tethered note
       Stale files hide real failures.
 ```
@@ -103,10 +106,46 @@ naming the YAML path):
 - `needs` and every `when` reference name an **earlier** step (steps
   execute in file order; the graph is the designer's, the order is the
   engine's). Duplicate ids rejected. The default `when` of a read-only step
-  with no `needs` depends on nothing. A **stateful** step with no `needs` and
-  the default `when` does not run after any earlier step failed (2026-10-02):
-  `needs` or an explicit `when` opts in. `Step::should_run` is the one
+  with no `needs` depends on nothing. A **stateful** step that is not the
+  first step must say what it depends on: with neither `needs` nor a `when`
+  other than the default it is refused at validation, at `steps[i]`, with "say what
+  it depends on": add `needs: [...]` or `when: always`. The runtime guard stays as a
+  second line: a stateful step with no `needs` and the default `when` never
+  runs after an earlier failure (2026-10-02). `Step::should_run` is the one
   definition the engine and the tests share.
+- **Typed inputs** (`pam_flow::input_type`). An input may declare
+  `type: string | int | sha | ref | path | enum`; `values:` lists the allowed
+  values of an `enum` and belongs to nothing else. `string` (the default) keeps
+  the old behaviour, with only the argument-option guard below. `int` is
+  decimal digits, no sign, no leading zero, at most 2^53 - 1. `sha` is exactly
+  40 or 64 lowercase hex digits, not all zero. `ref` follows `git
+  check-ref-format` implemented in Rust (no `..`, `@{`, control characters,
+  space, `~ ^ : ? * [ \`, leading `-`, leading, trailing or doubled `/`,
+  trailing `.`, a component starting with `.` or ending `.lock`, at most 255
+  bytes). `path` is relative and normalized: no leading `/` or `\`, no `:`,
+  no `.` or `..` or empty component, no component ending in `.` or a space, no
+  leading `-`, at most 1024 bytes. It is not checked against the filesystem;
+  the step runs inside the approved repository. A literal default is checked at
+  validation (`inputs.<name>.default`); one that reads `${repo.*}` is checked
+  at run time. `Input::check(name, value)` is the one check; a mismatch names
+  the input, the expected type and the rule, never the value. The CLI's
+  `key=value` parsing is unchanged. Typed and untyped inputs render
+  differently only when `type` or `values` is set, so an untyped flow keeps its
+  digest.
+- **Reserved environment names** (`pam_flow::reserved_env`). A step's `env:`
+  refuses, at validation (`steps[i].env.NAME`), the names that redirect a
+  toolchain, git or the loader, or that undo what containment sets: `PATH`,
+  `PATHEXT`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PWD`, `TMPDIR`/`TMP`/`TEMP`,
+  the Windows profile and system locations, every `GIT_*` name except
+  `GIT_AUTHOR_*`, `GIT_COMMITTER_*` and `GIT_OPTIONAL_LOCKS` (git adds
+  redirecting names over time, so the family is deny by default), `LD_*`,
+  `DYLD_*`, `XDG_*`, `SSH_ASKPASS`, `SSH_AUTH_SOCK`, `CARGO`, `CARGO_HOME`,
+  `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_RUSTC*`,
+  `CARGO_TARGET_*`, `CARGO_ALIAS_*`, `CARGO_REGISTR*`, `RUSTUP_HOME`,
+  `RUSTUP_TOOLCHAIN`, `RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`,
+  `RUSTDOC`, `PAM_ARTIFACTS`, and the interpreter hooks (`NODE_OPTIONS`,
+  `PYTHONPATH`, `BASH_ENV`, `JAVA_TOOL_OPTIONS`, …). `RUSTFLAGS`,
+  `CARGO_TERM_COLOR`, `CI` and the like stay settable.
 - `effect: stateful` forces `approval: required`; `role` defaults to
   `observe` for read-only and `change` for stateful; `role: verify` is
   read-only only.
@@ -431,7 +470,7 @@ grandchildren are not chased in this plan.
 | --- | --- | --- |
 | `admin.flows.list` | — | `{ flows: [ { id, name, description, source, path?, valid, error?, digest, steps, inputs } ] }` |
 | `admin.flows.get` | `{ id }` | `{ id, source, path?, yaml, normalized_yaml, digest, valid, error?, flow: <Flow as JSON> }` |
-| `admin.flows.save` | `{ id, yaml }` | the list entry plus `grants_revoked` (the `flow.step:` capabilities whose remembered approval was removed) and `reapproval_required`; refusals `flow_invalid` (message + path), `id_mismatch`, `library_unwritable`. The audit row carries `digest`, `previous_digest` and `grants_revoked` |
+| `admin.flows.save` | `{ id, yaml, create_only?, allow_builtin_override?, expected_digest? }`; `expected_digest` pins the save to the flow the GUI opened, and a flow that has another digest now (saved in between, deleted, no longer parsing) refuses `flow_changed` and writes nothing | the list entry plus `grants_revoked` (the `flow.step:` capabilities whose remembered approval was removed) and `reapproval_required`; refusals `flow_invalid` (message + path), `id_mismatch`, `library_unwritable`. The audit row carries `digest`, `previous_digest` and `grants_revoked` |
 | `admin.flows.delete` | `{ id }` | `{ id, revealed_builtin: bool, grants_revoked, reapproval_required }`; `not_found` for a builtin without a shadow |
 | `admin.flows.run` | `{ id, repo, inputs, expected_digest? }` | `{ ticket, position }` — builds a `flow.run` envelope with caller `{ agent: "pam-gui", repo }`, `wait: false`, and submits it through the pipeline ingress (gate, lanes, audit all apply); the GUI follows the ticket's events |
 | `admin.flows.settings.get` / `.set` | — / `{ allowed_programs?, extra_path?, artifacts_root?, read_cache_roots? }` | `{ allowed_programs, extra_path, artifacts_root, read_cache_roots }`; shells refused with `program_not_allowed`, a relative `artifacts_root` with `artifacts_root_invalid`, `artifacts_root: null` clears it |

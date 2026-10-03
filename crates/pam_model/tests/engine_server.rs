@@ -304,7 +304,7 @@ async fn a_server_that_dies_after_loading_is_noticed_and_can_be_loaded_again() {
     let loaded = server.load("fake/model", model, &options).await.unwrap();
     assert!(server.model().is_some());
 
-    let status = std::process::Command::new("kill")
+    let status = std::process::Command::new("/bin/kill")
         .args(["-9", &loaded.pid.to_string()])
         .status()
         .unwrap();

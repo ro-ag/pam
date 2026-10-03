@@ -10,14 +10,20 @@
 //! with the same shape the daemon would give. The webview is a full-admin root, so the ops that
 //! **expand what agents may do** ([`required_confirmation`]: switching to the relaxed profile, adding
 //! a grant, approving with "remember", routing connector traffic through a proxy or a CA bundle)
-//! additionally need a typed confirmation that the bridge
-//! checks in Rust before the op reaches the socket. Tauri's dialog plugin is not part of this
-//! binary and no dependency may be added, so the prompt itself is drawn by the frontend; a webview
-//! that is already compromised could supply the phrase itself, which is why this is a second wall
-//! against mistakes and blind one-click flows, not against a hostile frontend.
+//! additionally pass two checks before the op reaches the socket. First the typed phrase the
+//! frontend's in-page prompt collects, checked here in Rust: a wall against misclicks and blind
+//! one-click flows, which a compromised webview could still type. Then the security step: the
+//! bridge itself asks the human in a native dialog ([`crate::confirm`]) whose sentence it builds
+//! from the op's own arguments, and sends the op only on Allow; a Cancel is refused
+//! `confirmation_declined`. The webview holds no dialog permission and never reaches the socket
+//! around it.
 //! **[`daemon_status`] never errors on an unreachable
 //! daemon** — it answers `{ connected: false }` and lazily starts the daemon via `send_request`
-//! (status is read-only, not an admin op). `send_request` refuses `admin.*` structurally, so the
+//! (status is read-only, not an admin op) — until the human presses Stop: [`daemon_stop`] then
+//! raises [`HumanStop`], and while it is up every poll and admin call of this process uses a
+//! non-starting probe (`pam_client::client::send_request_if_running`), so the daemon stays down
+//! until the human presses Start ([`daemon_start`]) or the GUI is restarted. The reply says
+//! `stopped_by_you` so the beacon and Settings can say so. `send_request` refuses `admin.*` structurally, so the
 //! GUI sends no other public capability: cancelling a run is the admin op `admin.requests.cancel`,
 //! on the private channel like every other human act.
 //! The GUI's own status polls publish no events (the daemon keeps none for control requests), so
@@ -25,7 +31,8 @@
 //! Daemon refusals pass through verbatim; client-side errors are mapped onto the same shape here.
 //! The envelope carries the GUI process's own advisory (not authenticated) caller identity.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pam_client::client::{self, ClientError, RequestError};
@@ -45,6 +52,9 @@ use pam_daemon::admin_retention::RETENTION_ADMIN_OPS;
 use pam_daemon::lifecycle::{LOG_DIR, LOG_FILE};
 use pam_proto::Response;
 use serde::Serialize;
+use tauri::{AppHandle, Runtime};
+
+use crate::confirm::{Confirmer, NativeConfirmer};
 
 /// Deadline for the status poll: small so the beacon flips fast.
 const STATUS_DEADLINE_MS: u64 = 5_000;
@@ -389,7 +399,44 @@ pub struct DaemonStatusReply {
     /// The base directory the bridge resolved (`$PAM_BASE_DIR` or
     /// `~/.pam`), so the GUI shows the live value instead of the rule.
     pub base_dir: String,
+    /// True when the daemon is down because the human pressed Stop in this window and has not
+    /// pressed Start since: the polls do not restart it, and the GUI says "stopped by you".
+    /// Always false while the daemon answers.
+    pub stopped_by_you: bool,
 }
+
+/// Whether the human stopped the daemon from this window. A flag of the GUI process, not of the
+/// daemon: it is raised by [`daemon_stop`], lowered by [`daemon_start`], and gone when the GUI
+/// restarts. While it is up the bridge never starts the daemon.
+#[derive(Debug, Default)]
+pub struct HumanStop(AtomicBool);
+
+impl HumanStop {
+    /// A flag that is down.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Raises the flag: the human wants the daemon down.
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Lowers the flag: the human wants the daemon back.
+    pub fn lower(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the human's stop is in force.
+    #[must_use]
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// The process-wide flag the Tauri commands share.
+static HUMAN_STOP: HumanStop = HumanStop::new();
 
 /// Daemon health for the beacon and the status views: ensures the daemon
 /// (lazy start) and asks the ordinary read-only `status` capability.
@@ -399,35 +446,76 @@ pub struct DaemonStatusReply {
 #[tauri::command]
 pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
     let base = resolve_base_dir()?;
-    let sent = tokio::time::timeout(
-        STATUS_CLIENT_TIMEOUT,
-        client::send_request(
-            &base,
-            "status",
-            serde_json::json!({}),
-            true,
-            STATUS_DEADLINE_MS,
-            None,
-        ),
-    )
+    poll_status(&base, &HUMAN_STOP).await
+}
+
+/// One status poll. Starts the daemon lazily unless `stop` is raised, in which case it only
+/// looks: a daemon that is down answers `connected: false` with `stopped_by_you`, and one the
+/// human (or an agent's lazy start) brought back is read as usual.
+///
+/// # Errors
+///
+/// A refusal from the daemon, or a client-side failure that is not "nobody is answering".
+pub async fn poll_status(base: &Path, stop: &HumanStop) -> Result<DaemonStatusReply, BridgeError> {
+    let stopped = stop.is_raised();
+    let sent = tokio::time::timeout(STATUS_CLIENT_TIMEOUT, async {
+        if stopped {
+            client::send_request_if_running(
+                base,
+                "status",
+                serde_json::json!({}),
+                true,
+                STATUS_DEADLINE_MS,
+            )
+            .await
+        } else {
+            client::send_request(
+                base,
+                "status",
+                serde_json::json!({}),
+                true,
+                STATUS_DEADLINE_MS,
+                None,
+            )
+            .await
+            .map(Some)
+        }
+    })
     .await
     .unwrap_or(Err(RequestError::ReplyTimeout {
         waited: STATUS_CLIENT_TIMEOUT,
     }));
     let base_dir = base.display().to_string();
     match sent {
-        Ok(response) => Ok(DaemonStatusReply {
+        Ok(Some(response)) => Ok(DaemonStatusReply {
             connected: true,
             status: Some(expect_result(response)?),
             base_dir,
+            stopped_by_you: false,
+        }),
+        Ok(None) => Ok(DaemonStatusReply {
+            connected: false,
+            status: None,
+            base_dir,
+            stopped_by_you: true,
         }),
         Err(err) if is_disconnect(&err) => Ok(DaemonStatusReply {
             connected: false,
             status: None,
             base_dir,
+            stopped_by_you: stopped,
         }),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Starts the daemon the human stopped: lowers the stop flag and polls status, which starts the
+/// daemon lazily as it always did. Answers like [`daemon_status`].
+#[tauri::command]
+pub async fn daemon_start() -> Result<DaemonStatusReply, BridgeError> {
+    let base = resolve_base_dir()?;
+    HUMAN_STOP.lower();
+    poll_status(&base, &HUMAN_STOP).await
 }
 
 /// What the human must type to authorise `op` with `args`, or `None` when the op does not expand
@@ -506,10 +594,28 @@ pub fn check_confirmation(
 /// One generic admin command wrapping `pam_client::client::send_admin`:
 /// the op must be on the [`ADMIN_OPS`] allowlist, and an op that expands
 /// what agents may do needs its typed `confirmation` ([`required_confirmation`])
-/// — both checked before anything touches the socket. Returns the op's
-/// result body; refusals surface as [`BridgeError`].
+/// and then the human's Allow in the native dialog ([`NativeConfirmer`]) —
+/// all before anything is sent. Returns the op's result body; refusals
+/// surface as [`BridgeError`].
 #[tauri::command]
-pub async fn admin_call(
+pub async fn admin_call<R: Runtime>(
+    app: AppHandle<R>,
+    op: String,
+    args: serde_json::Value,
+    confirmation: Option<String>,
+) -> Result<serde_json::Value, BridgeError> {
+    admin_call_with(&NativeConfirmer::new(app), op, args, confirmation).await
+}
+
+/// [`admin_call`] with the dialog injected: the allowlist, the typed phrase, the base directory,
+/// then [`guarded_admin`]. A missing or wrong phrase is refused before any dialog opens.
+///
+/// # Errors
+///
+/// `unknown_admin_op`, `confirmation_required`, `no_home`, `confirmation_declined`, or whatever
+/// the exchange failed with.
+pub async fn admin_call_with(
+    confirmer: &impl Confirmer,
     op: String,
     args: serde_json::Value,
     confirmation: Option<String>,
@@ -523,9 +629,92 @@ pub async fn admin_call(
     }
     check_confirmation(&op, &args, confirmation.as_deref())?;
     let base = resolve_base_dir()?;
-    let response = client::send_admin(&base, &op, args, deadline_for(&op))
+    guarded_admin(&base, &HUMAN_STOP, confirmer, &op, args).await
+}
+
+/// Sends `op` after the native confirmation when [`required_confirmation`] guards it: the
+/// sentence is built by the bridge ([`crate::confirm::prompt_for`]) from the arguments that will
+/// be sent and, for an approval with "remember", from the daemon's own pending entry; the op goes
+/// out only when `confirmer` answers Allow. Unguarded ops are forwarded as they are.
+///
+/// # Errors
+///
+/// `confirmation_declined` on Cancel (nothing is sent), or whatever [`forward_admin`] fails with.
+pub async fn guarded_admin(
+    base: &Path,
+    stop: &HumanStop,
+    confirmer: &impl Confirmer,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, BridgeError> {
+    if required_confirmation(op, &args).is_some() {
+        let pending = if op == OP_APPROVALS_RESOLVE {
+            pending_entry(base, stop, &args).await
+        } else {
+            None
+        };
+        let prompt = crate::confirm::prompt_for(op, &args, pending.as_ref());
+        if !confirmer.confirm(&prompt).await {
+            return Err(crate::confirm::declined(op));
+        }
+    }
+    forward_admin(base, stop, op, args).await
+}
+
+/// The daemon's pending entry for the request an approval names, so the dialog says what
+/// remembering it grants in the daemon's words, not the webview's. `None` when the daemon does
+/// not list it (the resolve is then refused by the daemon anyway) or cannot be asked.
+async fn pending_entry(
+    base: &Path,
+    stop: &HumanStop,
+    args: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let request_id = args.get("request_id")?.as_str()?;
+    let listed = forward_admin(base, stop, OP_APPROVALS_PENDING, serde_json::json!({}))
         .await
-        .map_err(BridgeError::from)?;
+        .ok()?;
+    find_pending(&listed, request_id).cloned()
+}
+
+/// The entry of `admin.approvals.pending`'s answer whose `request_id` is `request_id`.
+#[must_use]
+pub fn find_pending<'a>(
+    listed: &'a serde_json::Value,
+    request_id: &str,
+) -> Option<&'a serde_json::Value> {
+    listed.get("pending")?.as_array()?.iter().find(|entry| {
+        entry.get("request_id").and_then(serde_json::Value::as_str) == Some(request_id)
+    })
+}
+
+/// Sends one allowlisted, confirmed admin op. While the human's stop is in force the daemon is
+/// not started for it: a daemon that is down answers `daemon_stopped_by_you`, naming Start.
+///
+/// # Errors
+///
+/// `daemon_stopped_by_you`, or whatever the exchange failed with.
+pub async fn forward_admin(
+    base: &Path,
+    stop: &HumanStop,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, BridgeError> {
+    let response = if stop.is_raised() {
+        client::send_admin_if_running(base, op, args, deadline_for(op))
+            .await
+            .map_err(BridgeError::from)?
+            .ok_or_else(|| {
+                BridgeError::new(
+                    "daemon_stopped_by_you",
+                    format!("{op} needs the daemon, and you stopped it from this window"),
+                    "Press Start in Settings › Daemon (or in the toolbar), then try again.",
+                )
+            })?
+    } else {
+        client::send_admin(base, op, args, deadline_for(op))
+            .await
+            .map_err(BridgeError::from)?
+    };
     expect_result(response)
 }
 
@@ -539,11 +728,25 @@ pub struct DaemonStopReply {
 }
 
 /// Stops the daemon: SIGTERM to the lock holder, bounded wait for the
-/// drain (shared mechanics with `pam daemon stop`). The next
-/// [`daemon_status`] poll lazily restarts it.
+/// drain (shared mechanics with `pam daemon stop`). The human's stop stays in
+/// force ([`HumanStop`]) until [`daemon_start`] or a restart of the GUI: the
+/// polls look but never start. A stop that could not be sent leaves the flag
+/// down, since the daemon is still running.
 #[tauri::command]
 pub async fn daemon_stop() -> Result<DaemonStopReply, BridgeError> {
     let base = resolve_base_dir()?;
+    // Raised before the signal, so no poll between the signal and the drain's end starts a
+    // successor.
+    HUMAN_STOP.raise();
+    let stopped = stop_daemon_for_human(base).await;
+    if stopped.is_err() {
+        HUMAN_STOP.lower();
+    }
+    stopped
+}
+
+/// The stop itself, off the async workers.
+async fn stop_daemon_for_human(base: PathBuf) -> Result<DaemonStopReply, BridgeError> {
     // stop_daemon blocks (signal + lock-poll wait); keep it off the
     // async workers.
     let stopped =

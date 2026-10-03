@@ -184,7 +184,7 @@ impl Drop for LiveDaemon {
 /// only stop available, so the daemon is terminated rather than drained.
 fn signal_term(child: &Child) {
     #[cfg(unix)]
-    let _ = Command::new("kill")
+    let _ = Command::new("/bin/kill")
         .arg("-TERM")
         .arg(child.id().to_string())
         .status();

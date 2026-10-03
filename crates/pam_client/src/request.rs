@@ -2,7 +2,7 @@
 //!
 //! Every subcommand funnels through [`build_envelope`]: a fresh
 //! `req_<ulid>` id, the advisory caller identity from
-//! [`crate::caller::detect_caller`], and this binary's build version (kept
+//! [`crate::caller::cached_caller`], and this binary's build version (kept
 //! on the envelope for the stored row; the daemon's version rule reads the
 //! connection's hello). Capability arguments arrive as JSON
 //! text on the command line and are validated by [`parse_args_object`] —
@@ -11,7 +11,7 @@
 use pam_proto::{Envelope, PROTOCOL_VERSION};
 use thiserror::Error;
 
-use crate::caller::detect_caller;
+use crate::caller::cached_caller;
 
 /// Default `deadline_ms` when a subcommand does not override it.
 pub const DEFAULT_DEADLINE_MS: u64 = 60_000;
@@ -107,7 +107,7 @@ pub fn build_envelope_with_id(
         id,
         capability: capability.to_owned(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
-        caller: detect_caller(),
+        caller: cached_caller(),
         args,
         idempotency_key,
         deadline_ms,

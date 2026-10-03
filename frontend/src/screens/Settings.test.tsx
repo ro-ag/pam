@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => ({
   subscribeEvents: vi.fn(),
   daemonStatus: vi.fn(),
   daemonStop: vi.fn(),
+  daemonStart: vi.fn(),
   approvalsPending: vi.fn(),
   profileGet: vi.fn(),
   profileSet: vi.fn(),
@@ -132,6 +133,12 @@ beforeEach(() => {
     base_dir: "/Users/me/.pam",
   });
   mocks.daemonStop.mockResolvedValue({ outcome: "stopped", pid: 42 });
+  mocks.daemonStart.mockResolvedValue({
+    connected: true,
+    status: { daemon_version: "0.10.1", protocol: 1, uptime_s: 1, active_requests: 0 },
+    base_dir: "/Users/me/.pam",
+    stopped_by_you: false,
+  });
   mocks.serviceStatus.mockResolvedValue({
     platform: "macos",
     exe: "/Applications/pam.app/Contents/MacOS/pam",
@@ -452,6 +459,8 @@ describe("profile", () => {
       screen.getByRole("group", { name: "Switch to the relaxed profile?" }),
     );
     expect(prompt.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    // The in-page step says the security step comes next, outside the page.
+    expect(prompt.getByText(/system then asks you to confirm in a PAM dialog/)).toBeVisible();
     const confirm = prompt.getByRole("button", { name: "Switch to relaxed" });
     expect(confirm).toBeDisabled();
     fireEvent.change(prompt.getByRole("textbox", { name: "type relaxed to confirm" }), {
@@ -735,10 +744,42 @@ describe("daemon", () => {
     expect(mocks.daemonStop).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "stop it?" }));
     await waitFor(() => expect(mocks.daemonStop).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText(/stopped · pid 42/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/stopped · pid 42 · stays down until you press Start/),
+    ).toBeInTheDocument();
+    // Stop is not a restart: nothing starts the daemon again behind the human's back.
+    expect(mocks.daemonStart).not.toHaveBeenCalled();
   });
 
-  it("restarts only after the two-tap confirm, and says what stop answered", async () => {
+  it("shows a stopped daemon as stopped by you and starts it only when asked", async () => {
+    mocks.daemonStatus.mockResolvedValue({
+      connected: false,
+      status: null,
+      base_dir: "/x",
+      stopped_by_you: true,
+    });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("stopped by you")).toBeInTheDocument();
+    expect(card.queryByText("unreachable")).not.toBeInTheDocument();
+    expect(card.getByText(/It stays stopped until you press Start/)).toBeInTheDocument();
+    expect(card.queryByText(/the next status poll starts it lazily/)).not.toBeInTheDocument();
+    expect(mocks.daemonStart).not.toHaveBeenCalled();
+
+    fireEvent.click(card.getByRole("button", { name: "Start daemon" }));
+    await waitFor(() => expect(mocks.daemonStart).toHaveBeenCalledTimes(1));
+    expect(await card.findByText("started")).toBeInTheDocument();
+  });
+
+  it("does not offer Start for a daemon that is merely unreachable", async () => {
+    mocks.daemonStatus.mockResolvedValue({ connected: false, status: null, base_dir: "/x" });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("unreachable")).toBeInTheDocument();
+    expect(card.queryByRole("button", { name: "Start daemon" })).not.toBeInTheDocument();
+  });
+
+  it("restarts only after the two-tap confirm: stop, then start", async () => {
     renderSettings("daemon");
     const restart = await screen.findByRole("button", { name: "Restart" });
     await waitFor(() => expect(restart).toBeEnabled());
@@ -746,13 +787,23 @@ describe("daemon", () => {
     expect(mocks.daemonStop).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
     await waitFor(() => expect(mocks.daemonStop).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mocks.daemonStart).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/restarted · was pid 42/)).toBeInTheDocument();
+    // The sentence under the buttons says what each of the two is.
     expect(
-      await screen.findByText(/stopped · pid 42 · the next status poll starts it again/),
+      screen.getByText(/Stop keeps the daemon down until you press Start. Restart stops it/),
     ).toBeInTheDocument();
-    // The sentence under the buttons says what a restart is.
-    expect(
-      screen.getByText(/Restart stops the daemon; the next status poll/),
-    ).toBeInTheDocument();
+  });
+
+  it("does not start a daemon that is still draining", async () => {
+    mocks.daemonStop.mockResolvedValue({ outcome: "still_draining", pid: 42 });
+    renderSettings("daemon");
+    const restart = await screen.findByRole("button", { name: "Restart" });
+    await waitFor(() => expect(restart).toBeEnabled());
+    fireEvent.click(restart);
+    fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
+    expect(await screen.findByText(/still draining · pid 42/)).toBeInTheDocument();
+    expect(mocks.daemonStart).not.toHaveBeenCalled();
   });
 
   it("keeps Stop and Restart closed while the daemon is unreachable", async () => {
@@ -812,7 +863,7 @@ describe("daemon", () => {
   });
 
   it.each([
-    ["not_running", null, /was not running/],
+    ["not_running", null, /was not running · stays down until you press Start/],
     ["still_draining", 42, /still draining · pid 42 · finishing in-flight work/],
   ] as const)("reports a %s stop outcome in words", async (outcome, pid, expected) => {
     mocks.daemonStop.mockResolvedValue({ outcome, pid });
@@ -831,9 +882,8 @@ describe("daemon", () => {
     await waitFor(() => expect(restart).toBeEnabled());
     fireEvent.click(restart);
     fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
-    expect(
-      await screen.findByText(/was not running · the next status poll starts it/),
-    ).toBeInTheDocument();
+    await waitFor(() => expect(mocks.daemonStart).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/restarted/)).toBeInTheDocument();
   });
 
   it("renders the daemon's refusal when removing the login unit fails", async () => {
@@ -1319,6 +1369,32 @@ describe("managed policy in Settings", () => {
       expect(screen.queryByText("active")).toBeNull();
       // Revoke stays: the row is the human's, and revoking is never refused.
       expect(screen.getByRole("button", { name: "Revoke" })).toBeInTheDocument();
+    });
+
+    it("shows what a flow step grant is bound to, and a legacy one as unbound", async () => {
+      mocks.grantsList.mockResolvedValue({
+        grants: [
+          grant({
+            id: 1,
+            capability: "flow.step:bound/change",
+            scope: "repository",
+            binding: {
+              state: "bound",
+              flow: "bound",
+              step: "change",
+              repository: "/Users/dev/pam",
+              effect_digest: "0123456789ab",
+              effect_class: "destructive",
+              bound_ts: nowSec - 30,
+            },
+          }),
+          grant({ id: 2, capability: "flow.step:bound/push", binding: { state: "legacy" } }),
+        ],
+      });
+      renderSettings("security");
+      expect(await screen.findByText("/Users/dev/pam")).toBeInTheDocument();
+      expect(screen.getByText("0123456789ab")).toBeInTheDocument();
+      expect(screen.getByText(/binds to the step on its next run/)).toBeInTheDocument();
     });
 
     it("lists what the policy never allows", async () => {

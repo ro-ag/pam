@@ -85,7 +85,11 @@ async fn polls_reuse_snapshot_and_completed_cursor_preserves_committed_progress(
     };
     for poll in 1..=2 {
         recovery
-            .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+            .prepare(
+                &store,
+                "r",
+                &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+            )
             .await
             .unwrap();
         state.polls = poll;
@@ -106,7 +110,11 @@ async fn polls_reuse_snapshot_and_completed_cursor_preserves_committed_progress(
             .is_err()
     );
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     recovery.settle(&store, "r", &snapshot, true).await.unwrap();
@@ -198,7 +206,11 @@ async fn substituted_run_is_committed_as_conflict_without_replacing_valid_pins()
         last_evidence: "ev_conflict".into(),
     };
     recovery
-        .prepare(&store, "r", &flow.steps[0], Prepare::Run)
+        .prepare(
+            &store,
+            "r",
+            &crate::flow_intent::EffectIntent::attempt(&flow.steps[0], Prepare::Run),
+        )
         .await
         .unwrap();
     recovery
@@ -533,7 +545,11 @@ impl Fixture {
         let (profile_stamp, authorization_revision) = state.watch_stamp().await.unwrap();
         state
             .recovery
-            .prepare(&self.store, "watch", step, Prepare::Run)
+            .prepare(
+                &self.store,
+                "watch",
+                &crate::flow_intent::EffectIntent::attempt(step, Prepare::Run),
+            )
             .await
             .unwrap();
         state
@@ -591,7 +607,11 @@ impl Fixture {
         let step = &self.flow.steps[0];
         state
             .recovery
-            .prepare(&self.store, "watch", step, Prepare::Run)
+            .prepare(
+                &self.store,
+                "watch",
+                &crate::flow_intent::EffectIntent::attempt(step, Prepare::Run),
+            )
             .await
             .unwrap();
         state.advance_watch(step).await
@@ -749,7 +769,7 @@ async fn a_retry_after_beyond_the_request_deadline_blocks_after_committing_the_p
 }
 
 #[tokio::test]
-async fn an_unrelated_revocation_keeps_the_watch_stamp_and_a_flow_grant_revocation_voids_it() {
+async fn an_unrelated_revocation_keeps_the_watch_stamp_and_its_own_flows_revocation_voids_it() {
     let fx = Fixture::new(Answer::Pending, budget(Duration::from_secs(3600), 128)).await;
     let state = fx.state().await;
     let (profile, revision) = state.watch_stamp().await.unwrap();
@@ -764,8 +784,23 @@ async fn an_unrelated_revocation_keeps_the_watch_stamp_and_a_flow_grant_revocati
         state.watch_stamp().await.unwrap(),
         (profile.clone(), revision)
     );
-    // Revoking a flow step grant voids the ticket's admission: fail closed.
+    // Another flow's step grant is no more this run's than `echo` is: its
+    // revocation leaves the parked ticket and its stamp alone.
     fx.store.insert_grant("flow.step:other/step").await.unwrap();
     fx.store.revoke_grant("flow.step:other/step").await.unwrap();
+    assert_eq!(
+        state.watch_stamp().await.unwrap(),
+        (profile.clone(), revision)
+    );
+    // Revoking one of this flow's step grants voids the ticket's admission:
+    // fail closed.
+    fx.store
+        .insert_grant("flow.step:watched/wait")
+        .await
+        .unwrap();
+    fx.store
+        .revoke_grant("flow.step:watched/wait")
+        .await
+        .unwrap();
     assert!(state.watch_stamp().await.is_err());
 }

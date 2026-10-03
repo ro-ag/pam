@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::duration::format_duration;
+pub use crate::input_type::InputType;
 
 /// The only schema version this crate understands.
 pub const SCHEMA_VERSION: u16 = 1;
@@ -276,6 +277,12 @@ pub struct Input {
     pub description: String,
     /// The value used when the caller passes none. May reference `repo.*`.
     pub default: Option<String>,
+    /// What a value must look like; `string` (any text) unless declared.
+    #[serde(rename = "type", skip_serializing_if = "InputType::is_string")]
+    pub kind: InputType,
+    /// The allowed values of an `enum` input; empty for every other type.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
 }
 
 /// One step of a flow.
@@ -430,6 +437,10 @@ pub(crate) struct RawInput {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) default: Option<String>,
+    #[serde(default, rename = "type")]
+    pub(crate) kind: InputType,
+    #[serde(default)]
+    pub(crate) values: Vec<String>,
 }
 
 /// One step exactly as YAML spells it: every field optional but `id`, so

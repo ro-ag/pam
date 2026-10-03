@@ -19,6 +19,14 @@ Run these from the approved repository. A ticket is a reference, not authority.
 Run refuses inputs the flow does not declare (`input_unknown`) and input
 values that are not scalars (`input_invalid`) before a ticket exists; a
 declared input with neither a value nor a default refuses as `input_missing`.
+An input may declare a `type` (`string`, `int`, `sha`, `ref`, `path`, `enum`);
+`flow inspect` lists it with each input. A value that does not fit its type
+refuses as `input_invalid`, naming the input, the type and the rule (never the
+value). Typing is applied to the finished value, so the CLI's `key=value` form
+is unchanged. A library flow that sets a reserved environment name (`PATH`,
+`HOME`, `GIT_*`, `LD_*`, `DYLD_*`, `CARGO_HOME`, …) or has a stateful step after
+the first with neither `needs` nor `when` does not validate: `flow inspect` shows
+the message and `flow run` refuses it as `flow_invalid`.
 `pam flow run <id> --digest <sha256>` (`expected_digest` on the wire) pins the run
 to the digest `flow.inspect` returned: when the library's flow has changed, the run
 refuses `flow_changed` before any work, with a recovery line to inspect again, and
@@ -151,6 +159,13 @@ and `pam subscribe` both take it), it is instead a `kind: refusal` object on
 stdout — the same shape as every other refusal — whose `id` is the ticket;
 an observation timeout uses cause `follow_timeout`. Exit codes are the same
 either way. Client-side failures (no daemon, transport) stay on stderr.
+
+`pam subscribe --json` keeps stdout machine-only: one compact JSON object per
+event on its own line as it arrives (`{"kind":"queued"}`,
+`{"kind":"progress","pct":40,"note":"…"}`, `{"kind":"done"}`), then the durable
+terminal response exactly as `pam wait --json` prints it. stdout is a stream of
+concatenated JSON values (`jq` reads it directly); the human `[queued]` lines
+are not printed at all with `--json`.
 
 See [agent workflow](agent-workflow-contract.md), [evidence retrieval](evidence-retrieval.md)
 and [admission budgets](scoped-admission-and-budgets.md). Embedded

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use pam_client::client;
 use pam_daemon::policy::CAUSE_UNKNOWN_CAPABILITY;
-use pam_gui::bridge::{expect_result, is_disconnect, is_known_admin_op};
+use pam_gui::bridge::{HumanStop, expect_result, is_disconnect, is_known_admin_op, poll_status};
 use pam_gui::events::{AdminConnect, EventPayload, EventSink, PayloadEvent, pump};
 use pam_proto::wire::Ingress;
 use pam_proto::{Event, Response};
@@ -57,6 +57,41 @@ async fn daemon_status_call_answers_the_status_body() {
     daemon.stop().await;
 }
 
+/// The human's Stop against a real daemon: while it runs the poll reads it as usual (a raised
+/// flag only forbids starting), and once it has stopped the poll reports "stopped by you" and
+/// leaves it stopped — the instance lock stays free, no successor appears.
+#[tokio::test]
+async fn a_stopped_daemon_stays_stopped_while_the_gui_polls() {
+    let daemon = TestDaemon::spawn().await;
+    let base = daemon.base_dir();
+    let stop = HumanStop::new();
+    stop.raise();
+
+    let reply = with_deadline(poll_status(&base, &stop))
+        .await
+        .expect("a live daemon answers the poll");
+    assert!(
+        reply.connected,
+        "a raised flag does not hide a running daemon"
+    );
+    assert!(!reply.stopped_by_you);
+
+    let tmp = daemon.stop().await;
+    for _ in 0..3 {
+        let reply = with_deadline(poll_status(&base, &stop))
+            .await
+            .expect("a stopped daemon is an answer");
+        assert!(!reply.connected);
+        assert!(reply.stopped_by_you);
+        assert_eq!(
+            client::probe_daemon(&base).expect("probe"),
+            client::DaemonStatus::NotRunning,
+            "the poll did not start a successor"
+        );
+    }
+    drop(tmp);
+}
+
 /// `admin_call`'s happy path: a whitelisted op goes through
 /// `send_admin` and unwraps to its result body.
 #[tokio::test]
@@ -75,6 +110,107 @@ async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
         body.get("profile").is_some(),
         "profile.get body must carry the active profile: {body}"
     );
+    daemon.stop().await;
+}
+
+/// The native dialog's stand-in for the guarded path: answers Allow or Cancel, counts the asks.
+#[cfg(any(target_os = "macos", windows))]
+struct FakeDialog {
+    allow: bool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl pam_gui::confirm::Confirmer for FakeDialog {
+    fn confirm(
+        &self,
+        prompt: &pam_gui::confirm::Prompt,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        assert_eq!(prompt.title, pam_gui::confirm::PROMPT_TITLE);
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::ready(self.allow)
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+async fn profile_of(base: &std::path::Path) -> String {
+    let response = with_deadline(client::send_admin(
+        base,
+        "admin.profile.get",
+        json!({}),
+        ADMIN_DEADLINE_MS,
+    ))
+    .await
+    .expect("profile.get answers");
+    expect_result(response).expect("a result")["profile"]
+        .as_str()
+        .expect("a profile name")
+        .to_owned()
+}
+
+/// Against a real daemon: relaxing the profile through the bridge's guarded path changes nothing
+/// on Cancel and relaxes it on Allow; narrowing back is one click, with no dialog.
+#[tokio::test]
+#[cfg(any(target_os = "macos", windows))]
+async fn the_native_confirmation_gates_the_op_at_a_real_daemon() {
+    use pam_gui::bridge::guarded_admin;
+    let daemon = TestDaemon::spawn().await;
+    let base = daemon.base_dir();
+    let stop = HumanStop::new();
+    let no_dialog = FakeDialog {
+        allow: false,
+        asked: 0.into(),
+    };
+
+    // The harness seeds relaxed; narrowing needs no dialog.
+    with_deadline(guarded_admin(
+        &base,
+        &stop,
+        &no_dialog,
+        "admin.profile.set",
+        json!({"profile": "standard"}),
+    ))
+    .await
+    .expect("narrowing is one click");
+    assert_eq!(no_dialog.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(profile_of(&base).await, "standard");
+
+    let cancel = FakeDialog {
+        allow: false,
+        asked: 0.into(),
+    };
+    let error = with_deadline(guarded_admin(
+        &base,
+        &stop,
+        &cancel,
+        "admin.profile.set",
+        json!({"profile": "relaxed"}),
+    ))
+    .await
+    .expect_err("Cancel refuses");
+    assert_eq!(error.cause, "confirmation_declined");
+    assert_eq!(cancel.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        profile_of(&base).await,
+        "standard",
+        "Cancel changed nothing"
+    );
+
+    let allow = FakeDialog {
+        allow: true,
+        asked: 0.into(),
+    };
+    with_deadline(guarded_admin(
+        &base,
+        &stop,
+        &allow,
+        "admin.profile.set",
+        json!({"profile": "relaxed"}),
+    ))
+    .await
+    .expect("Allow sends the op");
+    assert_eq!(allow.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(profile_of(&base).await, "relaxed");
     daemon.stop().await;
 }
 

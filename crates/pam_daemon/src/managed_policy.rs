@@ -371,6 +371,10 @@ pub enum Key {
     LandingMaxPermissions,
     /// `landing.allowed_github_servers`.
     LandingAllowedGithubServers,
+    /// `landing.git_path`: the Git the landing broker runs.
+    LandingGitPath,
+    /// `landing.merge_method`: how a landing merges.
+    LandingMergeMethod,
     /// `models.engine_source`.
     ModelsEngineSource,
     /// `models.allowed_sources`.
@@ -417,7 +421,7 @@ pub const SECTIONS: [&str; 9] = [
 impl Key {
     /// Every key, in declaration order. A compile-time assertion below
     /// keeps its length equal to the number of variants.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 35] = [
         Self::Revision,
         Self::Organization,
         Self::Contact,
@@ -437,6 +441,8 @@ impl Key {
         Self::FlowsArtifactsRoot,
         Self::LandingMaxPermissions,
         Self::LandingAllowedGithubServers,
+        Self::LandingGitPath,
+        Self::LandingMergeMethod,
         Self::ModelsEngineSource,
         Self::ModelsAllowedSources,
         Self::ModelsAllowedCurators,
@@ -482,6 +488,8 @@ impl Key {
             Self::FlowsArtifactsRoot => "flows.artifacts_root",
             Self::LandingMaxPermissions => "landing.max_permissions",
             Self::LandingAllowedGithubServers => "landing.allowed_github_servers",
+            Self::LandingGitPath => "landing.git_path",
+            Self::LandingMergeMethod => "landing.merge_method",
             Self::ModelsEngineSource => "models.engine_source",
             Self::ModelsAllowedSources => "models.allowed_sources",
             Self::ModelsAllowedCurators => "models.allowed_curators",
@@ -523,6 +531,8 @@ impl Key {
             | Self::FlowsReadCacheRoots
             | Self::LandingMaxPermissions
             | Self::LandingAllowedGithubServers
+            | Self::LandingGitPath
+            | Self::LandingMergeMethod
             | Self::ModelsAllowedSources
             | Self::ModelsAllowedCurators
             | Self::RetentionEvidenceDays
@@ -554,6 +564,8 @@ impl Key {
             | Self::FlowsExtraPath
             | Self::FlowsReadCacheRoots
             | Self::FlowsArtifactsRoot
+            | Self::LandingGitPath
+            | Self::LandingMergeMethod
             | Self::ModelsDir
             | Self::ModelsIdleUnloadMin
             | Self::RetentionEvidenceDays
@@ -597,6 +609,8 @@ impl Key {
             Self::SecurityProfile => PROFILE,
             Self::FlowsPrograms | Self::FlowsExtraPath | Self::FlowsReadCacheRoots => LIST,
             Self::FlowsArtifactsRoot
+            | Self::LandingGitPath
+            | Self::LandingMergeMethod
             | Self::ModelsDir
             | Self::NetworkNoProxy
             | Self::NetworkEngineMirror
@@ -1064,6 +1078,8 @@ pub struct Policy {
     pub artifacts_root: Option<ValueLeaf<String>>,
     pub max_permissions: Option<LandingCeiling>,
     pub allowed_github_servers: Option<HostList>,
+    pub landing_git_path: Option<ValueLeaf<String>>,
+    pub landing_merge_method: Option<ValueLeaf<String>>,
     pub engine_source: Option<EngineSource>,
     pub allowed_sources: Option<Vec<ModelSource>>,
     pub allowed_curators: Option<Vec<AgentId>>,
@@ -1114,6 +1130,10 @@ impl Policy {
             Key::LandingAllowedGithubServers => self
                 .allowed_github_servers
                 .clone_from(&source.allowed_github_servers),
+            Key::LandingGitPath => self.landing_git_path.clone_from(&source.landing_git_path),
+            Key::LandingMergeMethod => self
+                .landing_merge_method
+                .clone_from(&source.landing_merge_method),
             Key::ModelsEngineSource => self.engine_source = source.engine_source,
             Key::ModelsAllowedSources => self.allowed_sources.clone_from(&source.allowed_sources),
             Key::ModelsAllowedCurators => {
@@ -1146,6 +1166,9 @@ impl Policy {
                 .as_ref()
                 .and_then(|l| l.reason.as_ref()),
             Key::FlowsArtifactsRoot => self.artifacts_root.as_ref().and_then(|l| l.reason.as_ref()),
+            Key::LandingGitPath | Key::LandingMergeMethod => {
+                self.string_leaf(key).and_then(|l| l.reason.as_ref())
+            }
             Key::ModelsDir => self.models_dir.as_ref().and_then(|l| l.reason.as_ref()),
             Key::ModelsIdleUnloadMin => self
                 .idle_unload_min
@@ -1179,6 +1202,8 @@ impl Policy {
     fn string_leaf(&self, key: Key) -> Option<&ValueLeaf<String>> {
         match key {
             Key::FlowsArtifactsRoot => self.artifacts_root.as_ref(),
+            Key::LandingGitPath => self.landing_git_path.as_ref(),
+            Key::LandingMergeMethod => self.landing_merge_method.as_ref(),
             Key::ModelsDir => self.models_dir.as_ref(),
             _ => None,
         }
@@ -1972,6 +1997,12 @@ impl Builder {
             Key::LandingAllowedGithubServers => {
                 policy.allowed_github_servers = Some(parse_hosts(key, value)?);
             }
+            Key::LandingGitPath => {
+                policy.landing_git_path = Some(parse_string_leaf(key, value, platform, false)?);
+            }
+            Key::LandingMergeMethod => {
+                policy.landing_merge_method = Some(parse_merge_method(key, value)?);
+            }
             Key::ModelsEngineSource => {
                 policy.engine_source = Some(parse_engine_source(key, value)?);
             }
@@ -2522,6 +2553,28 @@ fn parse_ceiling(key: Key, value: &Value) -> Result<LandingCeiling, Rejection> {
     Ok(ceiling)
 }
 
+/// `landing.merge_method`: a mode object whose values are `squash`,
+/// `merge` or `rebase`.
+fn parse_merge_method(key: Key, value: &Value) -> Result<ValueLeaf<String>, Rejection> {
+    let modes = Modes::parse(key, value)?;
+    let word = |value: &Value| -> Result<String, Rejection> {
+        let word = text(key, value)?;
+        pam_connectors::github_landing::MergeMethod::parse(word)
+            .map(|method| method.as_str().to_owned())
+            .ok_or_else(|| {
+                reject(
+                    CODE_VALUE_INVALID,
+                    format!("{key} must be \"squash\", \"merge\" or \"rebase\""),
+                )
+            })
+    };
+    Ok(ValueLeaf {
+        locked: modes.get(Mode::Locked).map(word).transpose()?,
+        default: modes.get(Mode::Default).map(word).transpose()?,
+        reason: modes.reason,
+    })
+}
+
 fn parse_engine_source(key: Key, value: &Value) -> Result<EngineSource, Rejection> {
     match text(key, value)? {
         "download" => Ok(EngineSource::Download),
@@ -2992,9 +3045,10 @@ impl PolicyView {
             Key::FlowsExtraPath | Key::FlowsReadCacheRoots => {
                 policy.path_list(key).is_some_and(|l| l.locked.is_some())
             }
-            Key::FlowsArtifactsRoot | Key::ModelsDir => {
-                policy.string_leaf(key).is_some_and(|l| l.locked.is_some())
-            }
+            Key::FlowsArtifactsRoot
+            | Key::LandingGitPath
+            | Key::LandingMergeMethod
+            | Key::ModelsDir => policy.string_leaf(key).is_some_and(|l| l.locked.is_some()),
             Key::ModelsIdleUnloadMin | Key::RetentionEvidenceDays | Key::RetentionAuditDays => {
                 policy.bounded(key).is_some_and(|l| l.locked.is_some())
             }
@@ -3392,7 +3446,8 @@ impl PolicyView {
     }
 
     /// The effective value of a `locked`/`default` string key
-    /// (`flows.artifacts_root`, `models.dir`): `locked`, else the user's,
+    /// (`flows.artifacts_root`, `landing.git_path`, `landing.merge_method`,
+    /// `models.dir`): `locked`, else the user's,
     /// else the policy `default`, else `None` (the consumer's builtin).
     #[must_use]
     pub fn effective_string(

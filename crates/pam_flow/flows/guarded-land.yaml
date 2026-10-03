@@ -11,6 +11,7 @@ inputs:
   repository:
     description: Exact HTTPS source repository identity configured in landing policy.
   commit:
+    type: sha
     description: Full source commit expected when the branch is frozen.
 correlation:
   repository: "${inputs.repository}"

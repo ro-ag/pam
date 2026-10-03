@@ -74,6 +74,8 @@ impl<'a> From<&'a Flow> for NormalFlow<'a> {
                         name.as_str(),
                         NormalInput {
                             description: &input.description,
+                            kind: input.kind,
+                            values: &input.values,
                             default: input.default.as_deref(),
                         },
                     )
@@ -89,6 +91,10 @@ impl<'a> From<&'a Flow> for NormalFlow<'a> {
 struct NormalInput<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     description: &'a str,
+    #[serde(rename = "type", skip_serializing_if = "crate::InputType::is_string")]
+    kind: crate::InputType,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    values: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     default: Option<&'a str>,
 }

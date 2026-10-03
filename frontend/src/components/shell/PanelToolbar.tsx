@@ -10,7 +10,7 @@ import {
 } from "../../lib/theme";
 import { Button } from "../ui/Button";
 import { Beacon } from "./Beacon";
-import { useDaemonStatus } from "./useDaemonStatus";
+import { useDaemonStatus, useStartDaemon } from "./useDaemonStatus";
 import { CommandPalette } from "./CommandPalette";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 
@@ -29,6 +29,7 @@ import { WorkspaceMenu } from "./WorkspaceMenu";
  */
 export function PanelToolbar() {
   const daemon = useDaemonStatus();
+  const start = useStartDaemon();
   // The shared theme store keeps this toolbar and Settings > Appearance in
   // agreement: whichever changes the combination, both re-render.
   const { theme, mode } = useSyncExternalStore(subscribeTheme, themeSnapshot);
@@ -50,6 +51,16 @@ export function PanelToolbar() {
       <span data-tauri-drag-region="" className="flex items-center pr-1">
         <Beacon state={daemon} />
       </span>
+      {daemon === "stopped" && (
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={start.isPending}
+          onClick={() => start.mutate()}
+        >
+          Start
+        </Button>
+      )}
       <Button
         variant="ghost"
         size="sm"

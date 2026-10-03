@@ -8,13 +8,16 @@ import { Button } from "../components/ui/Button";
 import { FailureNote } from "../components/ui/FailureNote";
 import { cn, cva } from "../lib/cn";
 import { PageHeader } from "../components/ui/PageHeader";
+import { SafeText } from "../components/ui/SafeText";
 import {
   activityList,
   auditRequest,
   callersList,
+  isRefusal,
   toBridgeFailure,
   type ActivityRow,
   type AuditRow,
+  type RefusalEntry,
 } from "../lib/ipc";
 import { outcomeLabel } from "../lib/outcome";
 import { repoTail } from "../lib/repo";
@@ -38,6 +41,10 @@ import {
  * Plain list, no virtualization: the daemon clamps replies to 100 rows (v0 volumes) and the panel
  * already scrolls.
  * An expanded row shows the request's audit trail (`admin.audit.request`) under its evidence.
+ * Refusals the daemon decided before a request row existed (capacity, rate, a malformed or
+ * oversized frame, a refused hello, the connection cap…) have no row and no audit trail, so they
+ * are their own section above the lanes: cause, how many attempts, who knocked. Every string in
+ * one is something the client chose, and goes through `SafeText`.
  */
 
 /** Rows requested per fetch; the store clamps to the same bound. */
@@ -382,6 +389,203 @@ function AuditTrail({ requestId }: { requestId: string }) {
   );
 }
 
+// --- refused before admission ----------------------------------------------
+
+/** Refusals shown before "show all"; the daemon keeps and lists many more. */
+const REFUSAL_ROWS_SHOWN = 6;
+
+/** The last path segment of an executable path, for either separator. */
+function exeName(path: string): string {
+  const segments = path.split(/[\\/]/).filter((segment) => segment !== "");
+  return segments[segments.length - 1] ?? path;
+}
+
+/**
+ * Who knocked, in the order the daemon is sure of it: the process the kernel reported (its
+ * executable and pid), else the label the client claimed, else nothing known (Windows reports no
+ * peer for the public plane). A claim is shown as a claim.
+ */
+function refusalWho(entry: RefusalEntry): { text: string; claimed: boolean } {
+  if (entry.peer_pid !== null) {
+    const exe = entry.peer_exe !== null ? exeName(entry.peer_exe) : "pid";
+    const pid = entry.peer_exe !== null ? ` (pid ${entry.peer_pid})` : ` ${entry.peer_pid}`;
+    return { text: `${exe}${pid}`, claimed: false };
+  }
+  if (entry.agent !== null && entry.agent !== "") return { text: entry.agent, claimed: true };
+  return { text: "unknown peer", claimed: false };
+}
+
+/** `1000` → `×1,000`. */
+function timesLabel(count: number): string {
+  return `×${count.toLocaleString("en-US")}`;
+}
+
+function RefusalRowView({
+  entry,
+  now,
+  expanded,
+  onToggle,
+}: {
+  entry: RefusalEntry;
+  now: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const who = refusalWho(entry);
+  const repeated = entry.count > 1;
+  return (
+    <li>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={onToggle}
+        className="group flex h-9 w-full items-center gap-2 rounded-control px-2 text-left transition-colors duration-100 hover:bg-accent-soft/40"
+      >
+        <ChevronRight
+          aria-hidden="true"
+          className={cn(
+            "size-3.5 shrink-0 text-ink-faint transition-transform duration-100",
+            expanded && "rotate-90",
+          )}
+        />
+        <span aria-hidden="true" className={stateDot({ state: "refused" })} />
+        <span className="min-w-0 flex-1 truncate font-data text-sm text-ink">
+          <SafeText value={outcomeLabel(entry.cause)} />
+          {entry.capability !== null && entry.capability !== "" && (
+            <span className="text-ink-faint">
+              {" · "}
+              <SafeText value={entry.capability} />
+            </span>
+          )}
+        </span>
+        <span
+          className="w-40 shrink-0 truncate font-data text-xs text-ink-faint"
+          title={who.claimed ? "claimed by the client; not verified" : undefined}
+        >
+          <SafeText value={who.text} />
+          {who.claimed && " (claimed)"}
+        </span>
+        <Badge tone={repeated ? "warning" : "danger"} className="shrink-0">
+          {repeated ? timesLabel(entry.count) : "refused"}
+        </Badge>
+        <time
+          dateTime={new Date(entry.updated_ts * 1000).toISOString()}
+          title={exactTime(entry.updated_ts)}
+          className="w-16 shrink-0 text-right font-data text-xs tabular-nums text-ink-faint"
+        >
+          {relativeTime(entry.updated_ts, now)}
+        </time>
+      </button>
+      {expanded && <RefusalDetail entry={entry} />}
+    </li>
+  );
+}
+
+function RefusalDetail({ entry }: { entry: RefusalEntry }) {
+  const facts: Array<[string, string]> = [
+    ["cause", entry.cause],
+    ["detail", entry.detail],
+    ["attempts", entry.count.toLocaleString("en-US")],
+    ["first", exactTime(entry.created_ts)],
+    ["last", exactTime(entry.updated_ts)],
+    ["plane", entry.ingress],
+  ];
+  if (entry.peer_pid !== null) facts.push(["peer pid", String(entry.peer_pid)]);
+  if (entry.peer_uid !== null) facts.push(["peer uid", String(entry.peer_uid)]);
+  if (entry.peer_exe !== null) facts.push(["peer executable", entry.peer_exe]);
+  const claims: Array<[string, string | null]> = [
+    ["agent", entry.agent],
+    ["repo", entry.repo],
+    ["capability", entry.capability],
+    ["request id", entry.request_id],
+  ];
+  return (
+    <div className="mt-1 mb-3 ml-9 space-y-2 border-l border-line pl-4">
+      <p className="font-data text-xs text-ink-faint">
+        no request row exists: the daemon refused this before admitting it, so there is no audit
+        trail either
+      </p>
+      <dl
+        aria-label="refusal details"
+        className="refusal-details flex flex-wrap gap-x-6 gap-y-1 font-data text-xs text-ink-muted"
+      >
+        {facts.map(([name, value]) => (
+          <div key={name} className="flex gap-1.5">
+            <dt className="text-ink-faint">{name}</dt>
+            <dd>
+              <SafeText value={value} />
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <dl
+        aria-label="claimed by the client"
+        className="refusal-claims flex flex-wrap gap-x-6 gap-y-1 font-data text-xs text-ink-muted"
+      >
+        {claims.map(([name, value]) => (
+          <div key={name} className="flex gap-1.5">
+            <dt className="text-ink-faint">claimed {name}</dt>
+            <dd>{value !== null && value !== "" ? <SafeText value={value} /> : "—"}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+/**
+ * The refusals the daemon decided before a request row existed, newest first. A run of identical
+ * attempts is one row with its count; the section says how many rows it holds.
+ */
+function RefusedBeforeAdmission({
+  entries,
+  now,
+  expandedId,
+  onToggle,
+}: {
+  entries: RefusalEntry[];
+  now: number;
+  expandedId: string | null;
+  onToggle: (id: string) => void;
+}) {
+  const [all, setAll] = useState(false);
+  const shown = all ? entries : entries.slice(0, REFUSAL_ROWS_SHOWN);
+  const attempts = entries.reduce((sum, entry) => sum + entry.count, 0);
+  return (
+    <section
+      aria-label="Refused before admission"
+      className="mb-4 rounded-card border border-danger/40 bg-surface-raised p-2"
+    >
+      <header className="flex items-baseline gap-2 px-2 pb-2">
+        <h2 className="font-sans text-sm font-semibold text-ink">Refused before admission</h2>
+        <span className="font-data text-xs text-ink-faint">
+          {entries.length} refusal{entries.length === 1 ? "" : "s"} ·{" "}
+          {attempts.toLocaleString("en-US")} attempt{attempts === 1 ? "" : "s"} · no request
+          row, no audit trail
+        </span>
+      </header>
+      <ul className="divide-y divide-line">
+        {shown.map((entry) => (
+          <RefusalRowView
+            key={entry.id}
+            entry={entry}
+            now={now}
+            expanded={expandedId === entry.id}
+            onToggle={() => onToggle(entry.id)}
+          />
+        ))}
+      </ul>
+      {entries.length > REFUSAL_ROWS_SHOWN && (
+        <div className="px-2 pt-2">
+          <Button variant="ghost" size="sm" onClick={() => setAll(!all)}>
+            {all ? "Show fewer" : `Show all ${entries.length}`}
+          </Button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 // --- lanes -----------------------------------------------------------------
 
 /** At most this many rows per lane; the daemon clamps the tide to 100. */
@@ -488,6 +692,9 @@ export function ActivityScreen() {
         // watching itself and the real lanes wash out. The store keeps
         // `admin.log.compress` rows — a human asked for those.
         hide_probes: true,
+        // Refusals decided before a request row existed are the ones the
+        // ledger could not hold; the human is owed them in this list.
+        include_refusals: true,
       }),
     // Keep the previous tide on screen while a narrower lens loads.
     placeholderData: (previous) => previous,
@@ -499,10 +706,23 @@ export function ActivityScreen() {
   // refetch of both queries and never cancels one in flight. No per-row surgery.
   useEventRefresh(ACTIVITY_KEYS);
 
-  const requests = activity.data?.requests;
+  const entries = activity.data?.requests;
   const rows = useMemo(
-    () => (requests ?? []).filter((row) => matchesStateFilter(row.state, stateFilter)),
-    [requests, stateFilter],
+    () =>
+      (entries ?? []).filter(
+        (entry): entry is ActivityRow =>
+          !isRefusal(entry) && matchesStateFilter(entry.state, stateFilter),
+      ),
+    [entries, stateFilter],
+  );
+  // A refusal is a refused request that never got a row: only the lenses
+  // that can contain a refusal show one (`all`, and `refused` itself).
+  const refusals = useMemo(
+    () =>
+      stateFilter === "all" || stateFilter === "refused"
+        ? (entries ?? []).filter(isRefusal)
+        : [],
+    [entries, stateFilter],
   );
   const lanes = useMemo(() => toLanes(rows), [rows]);
 
@@ -510,19 +730,19 @@ export function ActivityScreen() {
     () =>
       chipOptions(
         (callers.data?.callers ?? []).map((caller) => caller.repo),
-        rows.map((row) => row.repo),
+        [...rows.map((row) => row.repo), ...refusals.flatMap((entry) => entry.repo ?? [])],
         search.repo,
       ),
-    [callers.data, rows, search.repo],
+    [callers.data, rows, refusals, search.repo],
   );
   const agentOptions = useMemo(
     () =>
       chipOptions(
         (callers.data?.callers ?? []).map((caller) => caller.agent),
-        rows.map((row) => row.agent),
+        [...rows.map((row) => row.agent), ...refusals.flatMap((entry) => entry.agent ?? [])],
         search.agent,
       ),
-    [callers.data, rows, search.agent],
+    [callers.data, rows, refusals, search.agent],
   );
 
   const setFilters = (patch: {
@@ -582,7 +802,16 @@ export function ActivityScreen() {
 
         {!failure && activity.isPending && <TideSkeleton />}
 
-        {!failure && !activity.isPending && rows.length === 0 && (
+        {!failure && refusals.length > 0 && (
+          <RefusedBeforeAdmission
+            entries={refusals}
+            now={now}
+            expandedId={expandedId}
+            onToggle={(id) => setExpandedId(expandedId === id ? null : id)}
+          />
+        )}
+
+        {!failure && !activity.isPending && rows.length === 0 && refusals.length === 0 && (
           <PamMoment
             aside={
               filtered && (

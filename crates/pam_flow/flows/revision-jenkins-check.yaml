@@ -9,10 +9,12 @@ inputs:
   repository:
     description: exact HTTPS source clone URL, including its .git suffix when present
   commit:
+    type: sha
     description: full 40 or 64 hexadecimal source commit
   job:
     description: explicit Jenkins job path, including folders
   build:
+    type: int
     description: explicit positive build number; never latest
 correlation:
   repository: "${inputs.repository}"

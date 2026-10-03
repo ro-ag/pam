@@ -3,8 +3,8 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -855,6 +855,8 @@ pub(crate) struct Holding {
     limits: Limits,
     pub(crate) started: AtomicUsize,
     pub(crate) released: Arc<AtomicUsize>,
+    /// Connections over the cap the listener told the policy about.
+    pub(crate) refused: Mutex<Vec<PeerIdentity>>,
     /// One permit lets one `h` connection return.
     pub(crate) gate: Semaphore,
 }
@@ -868,6 +870,7 @@ impl Holding {
             },
             started: AtomicUsize::new(0),
             released: Arc::new(AtomicUsize::new(0)),
+            refused: Mutex::new(Vec::new()),
             gate: Semaphore::new(0),
         })
     }
@@ -880,6 +883,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Policy<S> for Holding {
 
     fn limits(&self) -> Limits {
         self.limits
+    }
+
+    fn connection_refused(&self, peer: PeerIdentity) {
+        self.refused.lock().unwrap().push(peer);
     }
 
     async fn serve(
@@ -936,6 +943,9 @@ async fn a_connection_over_the_cap_is_told_and_every_exit_returns_its_permit() {
         refused.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty(), "closed after the one frame");
         assert_eq!(policy.started.load(Ordering::SeqCst), 2);
+        // The policy was told, once, with the peer the acceptor reported:
+        // that is what lets a plane record the refusal.
+        assert_eq!(policy.refused.lock().unwrap().len(), 1);
 
         // A handler that returns frees its permit.
         policy.gate.add_permits(1);

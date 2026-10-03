@@ -7,8 +7,10 @@ import { TextField } from "./Fields";
  * global grant). One click is not enough: the human types the phrase the bridge will demand
  * (`pam_gui::bridge::required_confirmation`), so the decision is read, not reflexed. Cancel is the
  * focused control — Enter on a freshly opened prompt never confirms — and Confirm stays disabled
- * until the phrase matches. The bridge re-checks the phrase in Rust before the op reaches the
- * daemon; this prompt is the in-app wall (the binary ships no native dialog plugin).
+ * until the phrase matches. The bridge re-checks the phrase in Rust, then asks again in a native
+ * system dialog it draws itself ("Confirm in PAM", `pam_gui::confirm`) and sends the op only on
+ * Allow. This prompt is the in-page wall against misclicks; the system dialog is the security
+ * step, which the page cannot answer for the human.
  */
 export function TypedConfirm({
   phrase,
@@ -61,6 +63,9 @@ export function TypedConfirm({
           }}
         />
       </label>
+      <p className="font-sans text-xs text-ink-muted">
+        Your system then asks you to confirm in a PAM dialog; choose Allow there to go ahead.
+      </p>
       <div className="flex items-center gap-2">
         <Button size="sm" variant="secondary" autoFocus onClick={onCancel}>
           Cancel

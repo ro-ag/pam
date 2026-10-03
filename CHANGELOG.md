@@ -382,6 +382,16 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Security
 
+- The GUI's authority-expanding admin operations (relaxing the profile, adding
+  a grant, approving with Remember, setting a proxy, its password or a CA
+  bundle) now need a native confirmation drawn by the bridge in Rust after the
+  typed phrase: a "Confirm in PAM" dialog whose sentence the bridge builds from
+  the operation's own arguments and the daemon's pending entry, sent only on
+  Allow and refused `confirmation_declined` on Cancel. The webview is granted
+  no dialog permission, so a compromised page can neither skip it nor draw a
+  look-alike. New dependency: `tauri-plugin-dialog` 2.7.3 (owner-approved), with
+  `tauri-plugin-fs` and `rfd` under it. See
+  [the administration boundary](docs/admin-boundary.md#confirmation-in-the-gui-bridge).
 - The credentialed landing Git is no longer resolved through `PATH` and the
   flow search path. It is the explicitly configured Git path (Settings → Flows →
   Landing, or the managed policy's `landing.git_path`) or the first qualifying

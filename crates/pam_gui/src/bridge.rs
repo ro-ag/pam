@@ -10,11 +10,13 @@
 //! with the same shape the daemon would give. The webview is a full-admin root, so the ops that
 //! **expand what agents may do** ([`required_confirmation`]: switching to the relaxed profile, adding
 //! a grant, approving with "remember", routing connector traffic through a proxy or a CA bundle)
-//! additionally need a typed confirmation that the bridge
-//! checks in Rust before the op reaches the socket. Tauri's dialog plugin is not part of this
-//! binary and no dependency may be added, so the prompt itself is drawn by the frontend; a webview
-//! that is already compromised could supply the phrase itself, which is why this is a second wall
-//! against mistakes and blind one-click flows, not against a hostile frontend.
+//! additionally pass two checks before the op reaches the socket. First the typed phrase the
+//! frontend's in-page prompt collects, checked here in Rust: a wall against misclicks and blind
+//! one-click flows, which a compromised webview could still type. Then the security step: the
+//! bridge itself asks the human in a native dialog ([`crate::confirm`]) whose sentence it builds
+//! from the op's own arguments, and sends the op only on Allow; a Cancel is refused
+//! `confirmation_declined`. The webview holds no dialog permission and never reaches the socket
+//! around it.
 //! **[`daemon_status`] never errors on an unreachable
 //! daemon** — it answers `{ connected: false }` and lazily starts the daemon via `send_request`
 //! (status is read-only, not an admin op) — until the human presses Stop: [`daemon_stop`] then
@@ -50,6 +52,9 @@ use pam_daemon::admin_retention::RETENTION_ADMIN_OPS;
 use pam_daemon::lifecycle::{LOG_DIR, LOG_FILE};
 use pam_proto::Response;
 use serde::Serialize;
+use tauri::{AppHandle, Runtime};
+
+use crate::confirm::{Confirmer, NativeConfirmer};
 
 /// Deadline for the status poll: small so the beacon flips fast.
 const STATUS_DEADLINE_MS: u64 = 5_000;
@@ -589,10 +594,28 @@ pub fn check_confirmation(
 /// One generic admin command wrapping `pam_client::client::send_admin`:
 /// the op must be on the [`ADMIN_OPS`] allowlist, and an op that expands
 /// what agents may do needs its typed `confirmation` ([`required_confirmation`])
-/// — both checked before anything touches the socket. Returns the op's
-/// result body; refusals surface as [`BridgeError`].
+/// and then the human's Allow in the native dialog ([`NativeConfirmer`]) —
+/// all before anything is sent. Returns the op's result body; refusals
+/// surface as [`BridgeError`].
 #[tauri::command]
-pub async fn admin_call(
+pub async fn admin_call<R: Runtime>(
+    app: AppHandle<R>,
+    op: String,
+    args: serde_json::Value,
+    confirmation: Option<String>,
+) -> Result<serde_json::Value, BridgeError> {
+    admin_call_with(&NativeConfirmer::new(app), op, args, confirmation).await
+}
+
+/// [`admin_call`] with the dialog injected: the allowlist, the typed phrase, the base directory,
+/// then [`guarded_admin`]. A missing or wrong phrase is refused before any dialog opens.
+///
+/// # Errors
+///
+/// `unknown_admin_op`, `confirmation_required`, `no_home`, `confirmation_declined`, or whatever
+/// the exchange failed with.
+pub async fn admin_call_with(
+    confirmer: &impl Confirmer,
     op: String,
     args: serde_json::Value,
     confirmation: Option<String>,
@@ -606,7 +629,62 @@ pub async fn admin_call(
     }
     check_confirmation(&op, &args, confirmation.as_deref())?;
     let base = resolve_base_dir()?;
-    forward_admin(&base, &HUMAN_STOP, &op, args).await
+    guarded_admin(&base, &HUMAN_STOP, confirmer, &op, args).await
+}
+
+/// Sends `op` after the native confirmation when [`required_confirmation`] guards it: the
+/// sentence is built by the bridge ([`crate::confirm::prompt_for`]) from the arguments that will
+/// be sent and, for an approval with "remember", from the daemon's own pending entry; the op goes
+/// out only when `confirmer` answers Allow. Unguarded ops are forwarded as they are.
+///
+/// # Errors
+///
+/// `confirmation_declined` on Cancel (nothing is sent), or whatever [`forward_admin`] fails with.
+pub async fn guarded_admin(
+    base: &Path,
+    stop: &HumanStop,
+    confirmer: &impl Confirmer,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, BridgeError> {
+    if required_confirmation(op, &args).is_some() {
+        let pending = if op == OP_APPROVALS_RESOLVE {
+            pending_entry(base, stop, &args).await
+        } else {
+            None
+        };
+        let prompt = crate::confirm::prompt_for(op, &args, pending.as_ref());
+        if !confirmer.confirm(&prompt).await {
+            return Err(crate::confirm::declined(op));
+        }
+    }
+    forward_admin(base, stop, op, args).await
+}
+
+/// The daemon's pending entry for the request an approval names, so the dialog says what
+/// remembering it grants in the daemon's words, not the webview's. `None` when the daemon does
+/// not list it (the resolve is then refused by the daemon anyway) or cannot be asked.
+async fn pending_entry(
+    base: &Path,
+    stop: &HumanStop,
+    args: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let request_id = args.get("request_id")?.as_str()?;
+    let listed = forward_admin(base, stop, OP_APPROVALS_PENDING, serde_json::json!({}))
+        .await
+        .ok()?;
+    find_pending(&listed, request_id).cloned()
+}
+
+/// The entry of `admin.approvals.pending`'s answer whose `request_id` is `request_id`.
+#[must_use]
+pub fn find_pending<'a>(
+    listed: &'a serde_json::Value,
+    request_id: &str,
+) -> Option<&'a serde_json::Value> {
+    listed.get("pending")?.as_array()?.iter().find(|entry| {
+        entry.get("request_id").and_then(serde_json::Value::as_str) == Some(request_id)
+    })
 }
 
 /// Sends one allowlisted, confirmed admin op. While the human's stop is in force the daemon is

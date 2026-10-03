@@ -133,7 +133,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 6 | Medium | Lazy start runs the daemon as a plain child of the caller: environment, directory, process group | `client.rs:279-288`, `main.rs:857` | fixed: environment allowlist, `/` as the directory, own process group, reaper thread (the Windows creation flags are untested) |
 | 7 | Medium | The Activity view hides forged admin attempts | `store.rs:1440-1446` | fixed (store) |
 | 8 | Medium | The approval card shows the submitted args, not what will run, and trusts unauthenticated strings | `Approvals.tsx:147-160` | fixed: resolved-command snapshot pinned by digest, one token per argument, hidden characters escaped |
-| 9 | Medium | The webview is a full-admin root: `admin_call` and `request_capability` are generic passthroughs | `bridge.rs:355-372` | partly fixed: a typed confirmation checked in Rust for relaxed, grant and remember, and `request_capability` removed; a compromised webview can still supply the phrase, and a native dialog is an owner decision |
+| 9 | Medium | The webview is a full-admin root: `admin_call` and `request_capability` are generic passthroughs | `bridge.rs:355-372` | fixed: a typed confirmation checked in Rust for relaxed, grant, remember and the network proxy and CA bundle, `request_capability` removed, and (2026-10-03, ptrack task 226) a native "Confirm in PAM" dialog the bridge draws from Rust with a sentence built from the op's own arguments, the op sent only on Allow; the webview holds no dialog permission. A same-user process with UI automation could still press Allow; the sandbox must exclude it |
 | 10 | Medium | `pam service install` pins whatever binary and environment the caller has, and `status` cannot detect a stale pin | `main.rs:134-510` | fixed: refusals for temp, build and writable binaries, explicit `--base-dir`, `pinned_exe` and `stale` in the report |
 | 11 | Medium | Session relay: an accept error kills the relay; no connection bounds; chmod and bind follow symlinks | `relay.rs:168-211` | fixed: accept errors retried, 64 connections per socket, bounded dial, and `prepare` refuses a symlinked or foreign directory, a symlinked, foreign or non-socket `pam.sock` entry and replaces only a stale socket it owns (the same-user check-then-bind race is narrowed, not closed: std has no `bindat`; documented in the relay doc) |
 | 12 | Medium | A synchronous request that times out leaves work running with no request id printed | `main.rs:598`, `701` | fixed: the id and the `pam wait` recovery are printed; a random idempotency key was rejected on purpose because it would defeat the daemon's shape dedupe |
@@ -251,8 +251,15 @@ From the fix reports:
   change in framing drops the "qualified" badge.
 - Whether the AWS adapter stays, is contained, or is deleted.
 - A native confirmation dialog for authority-expanding admin operations (the
-  bridge's typed phrase does not stop a compromised webview). Still open; on a
-  managed machine the policy narrows it: a key the policy locks or bounds (a
+  bridge's typed phrase does not stop a compromised webview). **Done 2026-10-03
+  (ptrack task 226)**: the owner approved `tauri-plugin-dialog`; the bridge
+  shows a native "Confirm in PAM" dialog from Rust, with a sentence it builds
+  from the op's arguments, after the typed phrase, and sends the op only on
+  Allow (`confirmation_declined` on Cancel); the webview is granted no dialog
+  permission. A same-user process that can drive the user interface could still
+  press Allow, which the sandbox must exclude; see
+  [the administration boundary](../admin-boundary.md#confirmation-in-the-gui-bridge).
+  Before that, on a managed machine the policy already narrowed it: a key the policy locks or bounds (a
   `strict` profile, `grants.manual: deny`, `grants.remember: deny`, never-grant
   rules) is refused by the daemon whatever the webview sends, so a compromised
   webview cannot widen it (2026-10-03, plan 54). Whether Stop daemon should stay a

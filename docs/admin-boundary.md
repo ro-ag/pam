@@ -364,16 +364,49 @@ fragments and does not deliver them.
 
 ## Confirmation in the GUI bridge
 
-The bridge forwards only the admin operations the frontend names. Three of them
-expand what agents may do, and the bridge refuses them with
-`confirmation_required` unless the call carries a typed phrase that Rust
-checks before the operation reaches the socket: `relaxed` for
-`admin.profile.set` to anything but `standard` or `strict`, and `grant` for
-`admin.grants.add` and for `admin.approvals.resolve` with `remember` on an
-approval. A compromised webview can supply the phrase itself, so this is a
-second wall against blind one-click flows and mistakes, not against a hostile
-frontend; a wall against that would need a native dialog drawn by Rust, which
-this binary does not have. Approving a flow step is also pinned to the
+The bridge forwards only the admin operations the frontend names. Four of them
+can expand what agents may do, and each passes two checks in Rust before the
+operation reaches the socket:
+
+| Operation | When it is guarded | Typed phrase | What the native dialog says |
+| --- | --- | --- | --- |
+| `admin.profile.set` | any target but `standard` or `strict` (an unreadable one too) | `relaxed` | "Relax the security profile to relaxed. Safe capabilities will then grant themselves the first time an agent uses them, without asking you." |
+| `admin.grants.add` | always | `grant` | "Grant “fs.write” to every agent in every repository. Agents can then use it without asking you, until you revoke it in Settings." (or "in the repository “…”" when the op names one) |
+| `admin.approvals.resolve` | `remember` on anything but a denial | `grant` | "Approve this request and remember the answer. …" naming the capability, or the flow step and repository, from the daemon's own pending entry |
+| `admin.network.set` | a proxy, a proxy password or a CA bundle is set (clearing one, the no-proxy list and the mirrors are one click) | `network` | "Send PAM's connector and download traffic through the proxy “…”" / "Save the proxy password you entered" / "Trust every certificate signed by the CA bundle “…”", then who could read the credentials PAM sends |
+
+1. **The typed phrase.** The in-page prompt asks the human to type the phrase,
+   and the bridge refuses `confirmation_required` without it. It stops
+   misclicks and blind one-click flows; a compromised webview can type it too.
+2. **The native confirmation.** The bridge itself then shows a native modal
+   dialog, drawn by the operating system through Tauri's dialog plugin from
+   Rust: title "Confirm in PAM", one or two sentences naming the effect,
+   buttons Allow and Cancel. The operation is sent only on Allow; Cancel (or a
+   dialog that could not be shown) is refused `confirmation_declined` and
+   nothing is sent. The sentence is built by the bridge from the arguments
+   that will be sent and, for an approval, from the daemon's
+   `admin.approvals.pending` entry for that request, never from display text
+   the webview supplies; quoted values have hidden characters escaped and are
+   cut at 120 characters, and a password is never shown. The window's
+   capability grants the webview no `dialog:` permission (a test reads the
+   capability files), so Tauri refuses every `plugin:dialog|…` call from the
+   page: the webview can neither answer the bridge's dialog nor draw a
+   look-alike of its own.
+
+What the native confirmation establishes: a compromised webview cannot relax
+the profile, add a grant, remember an approval or reroute connector traffic
+without a human pressing Allow on a dialog whose text the webview did not
+write. What it does not establish: a process of the same user that can drive
+the user interface (Accessibility or other UI automation on macOS, UI
+Automation or synthesized input on Windows) can press Allow itself. That is the
+same-user boundary the rest of this document draws, and the agent sandbox must
+exclude it, as it excludes the admin socket. On a managed machine the policy
+narrows it further: a key the policy locks or bounds is refused by the daemon
+whatever the human allows. The real dialog is not exercised in CI; the bridge's
+tests drive the same path through an injected stand-in that answers Allow or
+Cancel.
+
+Approving a flow step is also pinned to the
 resolved command shown on the card (`expected_digest`); a flow edited while the
 approval waited refuses as `flow_changed` and the approval stays pending.
 

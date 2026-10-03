@@ -113,6 +113,107 @@ async fn admin_call_forwards_a_whitelisted_op_to_the_daemon() {
     daemon.stop().await;
 }
 
+/// The native dialog's stand-in for the guarded path: answers Allow or Cancel, counts the asks.
+#[cfg(any(target_os = "macos", windows))]
+struct FakeDialog {
+    allow: bool,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl pam_gui::confirm::Confirmer for FakeDialog {
+    fn confirm(
+        &self,
+        prompt: &pam_gui::confirm::Prompt,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        assert_eq!(prompt.title, pam_gui::confirm::PROMPT_TITLE);
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::ready(self.allow)
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+async fn profile_of(base: &std::path::Path) -> String {
+    let response = with_deadline(client::send_admin(
+        base,
+        "admin.profile.get",
+        json!({}),
+        ADMIN_DEADLINE_MS,
+    ))
+    .await
+    .expect("profile.get answers");
+    expect_result(response).expect("a result")["profile"]
+        .as_str()
+        .expect("a profile name")
+        .to_owned()
+}
+
+/// Against a real daemon: relaxing the profile through the bridge's guarded path changes nothing
+/// on Cancel and relaxes it on Allow; narrowing back is one click, with no dialog.
+#[tokio::test]
+#[cfg(any(target_os = "macos", windows))]
+async fn the_native_confirmation_gates_the_op_at_a_real_daemon() {
+    use pam_gui::bridge::guarded_admin;
+    let daemon = TestDaemon::spawn().await;
+    let base = daemon.base_dir();
+    let stop = HumanStop::new();
+    let no_dialog = FakeDialog {
+        allow: false,
+        asked: 0.into(),
+    };
+
+    // The harness seeds relaxed; narrowing needs no dialog.
+    with_deadline(guarded_admin(
+        &base,
+        &stop,
+        &no_dialog,
+        "admin.profile.set",
+        json!({"profile": "standard"}),
+    ))
+    .await
+    .expect("narrowing is one click");
+    assert_eq!(no_dialog.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(profile_of(&base).await, "standard");
+
+    let cancel = FakeDialog {
+        allow: false,
+        asked: 0.into(),
+    };
+    let error = with_deadline(guarded_admin(
+        &base,
+        &stop,
+        &cancel,
+        "admin.profile.set",
+        json!({"profile": "relaxed"}),
+    ))
+    .await
+    .expect_err("Cancel refuses");
+    assert_eq!(error.cause, "confirmation_declined");
+    assert_eq!(cancel.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        profile_of(&base).await,
+        "standard",
+        "Cancel changed nothing"
+    );
+
+    let allow = FakeDialog {
+        allow: true,
+        asked: 0.into(),
+    };
+    with_deadline(guarded_admin(
+        &base,
+        &stop,
+        &allow,
+        "admin.profile.set",
+        json!({"profile": "relaxed"}),
+    ))
+    .await
+    .expect("Allow sends the op");
+    assert_eq!(allow.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(profile_of(&base).await, "relaxed");
+    daemon.stop().await;
+}
+
 /// The Models screen's own poll: `admin.models.status` through the
 /// bridge whitelist against a live daemon answers the block the runtime
 /// card reads, with an empty runtime on a fresh base dir.

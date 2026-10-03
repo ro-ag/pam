@@ -459,6 +459,8 @@ describe("profile", () => {
       screen.getByRole("group", { name: "Switch to the relaxed profile?" }),
     );
     expect(prompt.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    // The in-page step says the security step comes next, outside the page.
+    expect(prompt.getByText(/system then asks you to confirm in a PAM dialog/)).toBeVisible();
     const confirm = prompt.getByRole("button", { name: "Switch to relaxed" });
     expect(confirm).toBeDisabled();
     fireEvent.change(prompt.getByRole("textbox", { name: "type relaxed to confirm" }), {

@@ -576,7 +576,8 @@ export type AdminOp =
 /**
  * One generic admin call; prefer the typed wrappers below. `confirmation` is the phrase the
  * human typed for an op that expands what agents may do: the bridge checks it in Rust
- * (`required_confirmation`) and refuses with `confirmation_required` without it.
+ * (`required_confirmation`) and refuses with `confirmation_required` without it, then shows its
+ * own native dialog and refuses with `confirmation_declined` when the human presses Cancel there.
  */
 export function adminCall<T>(
   op: AdminOp,

@@ -16,6 +16,7 @@
 //! too — accepted trade-off, revisit only if build times become a real problem.
 
 pub mod bridge;
+pub mod confirm;
 pub mod events;
 pub mod frontend;
 pub mod logs;
@@ -23,6 +24,8 @@ pub mod service;
 
 #[cfg(test)]
 mod bridge_test;
+#[cfg(test)]
+mod confirm_test;
 #[cfg(test)]
 mod events_test;
 #[cfg(test)]
@@ -57,6 +60,9 @@ pub fn run(context: tauri::Context) -> tauri::Result<()> {
         ))
     })?;
     tauri::Builder::default()
+        // Drawn from Rust only, by the bridge's native confirmation (`confirm`); the window's
+        // capability grants the webview no `dialog:` permission, so its commands are refused.
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             bridge::daemon_status,
             bridge::admin_call,

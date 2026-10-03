@@ -3,10 +3,40 @@ use pam_proto::{Outcome, Response};
 use serde_json::json;
 
 use crate::bridge::{
-    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_NETWORK, CONFIRM_RELAXED, HumanStop, admin_call,
-    check_confirmation, deadline_for, forward_admin, is_disconnect, is_known_admin_op, poll_status,
-    required_confirmation,
+    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_NETWORK, CONFIRM_RELAXED, HumanStop,
+    admin_call_with, check_confirmation, deadline_for, find_pending, forward_admin, guarded_admin,
+    is_disconnect, is_known_admin_op, poll_status, required_confirmation,
 };
+use crate::confirm::{Confirmer, PROMPT_TITLE, Prompt};
+
+/// The native dialog's stand-in: answers Allow or Cancel and records what it was shown.
+struct FakeDialog {
+    allow: bool,
+    shown: std::sync::Mutex<Vec<Prompt>>,
+}
+
+impl FakeDialog {
+    fn answering(allow: bool) -> Self {
+        Self {
+            allow,
+            shown: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn prompts(&self) -> Vec<Prompt> {
+        self.shown.lock().expect("the fake's lock").clone()
+    }
+}
+
+impl Confirmer for FakeDialog {
+    fn confirm(&self, prompt: &Prompt) -> impl std::future::Future<Output = bool> + Send {
+        self.shown
+            .lock()
+            .expect("the fake's lock")
+            .push(prompt.clone());
+        std::future::ready(self.allow)
+    }
+}
 
 #[test]
 fn every_daemon_admin_op_is_whitelisted() {
@@ -502,10 +532,12 @@ fn a_missing_or_wrong_confirmation_is_refused_before_the_socket() {
 }
 
 /// The command itself, not only the helper: an unconfirmed relax never gets as far as resolving
-/// a base directory, let alone the admin socket.
+/// a base directory, let alone the native dialog or the admin socket.
 #[tokio::test]
 async fn admin_call_refuses_an_unconfirmed_relax_without_touching_the_socket() {
-    let error = admin_call(
+    let dialog = FakeDialog::answering(true);
+    let error = admin_call_with(
+        &dialog,
         "admin.profile.set".to_owned(),
         json!({"profile": "relaxed"}),
         None,
@@ -513,7 +545,8 @@ async fn admin_call_refuses_an_unconfirmed_relax_without_touching_the_socket() {
     .await
     .expect_err("one click must not relax the profile");
     assert_eq!(error.cause, "confirmation_required");
-    let error = admin_call(
+    let error = admin_call_with(
+        &dialog,
         "admin.grants.add".to_owned(),
         json!({"capability": "x"}),
         None,
@@ -521,6 +554,134 @@ async fn admin_call_refuses_an_unconfirmed_relax_without_touching_the_socket() {
     .await
     .expect_err("a grant needs confirmation too");
     assert_eq!(error.cause, "confirmation_required");
+    assert!(
+        dialog.prompts().is_empty(),
+        "no dialog opens before the typed phrase"
+    );
+}
+
+/// The guarded ops, with the phrase the in-page prompt collects.
+fn guarded_cases() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("admin.profile.set", json!({"profile": "relaxed"})),
+        ("admin.grants.add", json!({"capability": "fs.write"})),
+        (
+            "admin.approvals.resolve",
+            json!({"request_id": "req_1", "resolution": "approved", "remember": true}),
+        ),
+        (
+            "admin.network.set",
+            json!({"proxy": {"url": "http://proxy.corp.example:3128", "auth": "none"}}),
+        ),
+        (
+            "admin.network.set",
+            json!({"credential": {"set": "s3cret"}}),
+        ),
+        (
+            "admin.network.set",
+            json!({"ca_bundle": {"path": "/etc/corp/ca.pem"}}),
+        ),
+    ]
+}
+
+/// Cancel in the native dialog refuses the op with `confirmation_declined` and sends nothing:
+/// with the human's stop raised, an op that had been sent onward would have answered
+/// `daemon_stopped_by_you` instead.
+#[tokio::test]
+async fn a_cancelled_dialog_refuses_the_op_and_sends_nothing() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let stop = HumanStop::new();
+    stop.raise();
+    for (op, args) in guarded_cases() {
+        let dialog = FakeDialog::answering(false);
+        let error = guarded_admin(base.path(), &stop, &dialog, op, args.clone())
+            .await
+            .expect_err("Cancel refuses");
+        assert_eq!(error.cause, "confirmation_declined", "{op} {args}");
+        assert!(!error.recovery.is_empty());
+        let prompts = dialog.prompts();
+        assert_eq!(prompts.len(), 1, "the dialog asked once: {op}");
+        assert_eq!(prompts[0].title, PROMPT_TITLE);
+        assert!(!prompts[0].body.contains("admin."), "{}", prompts[0].body);
+        assert!(!base.path().join("run").exists(), "nothing was started");
+    }
+}
+
+/// Allow sends the op onward (here it meets the human's stop, proving it left the bridge).
+#[tokio::test]
+async fn an_allowed_dialog_sends_the_op() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let stop = HumanStop::new();
+    stop.raise();
+    for (op, args) in guarded_cases() {
+        let dialog = FakeDialog::answering(true);
+        let error = guarded_admin(base.path(), &stop, &dialog, op, args.clone())
+            .await
+            .expect_err("no daemon answers here");
+        assert_eq!(error.cause, "daemon_stopped_by_you", "{op} {args}");
+        assert_eq!(dialog.prompts().len(), 1, "{op}");
+    }
+}
+
+/// Narrowing ops and reads never open the dialog.
+#[tokio::test]
+async fn unguarded_ops_never_open_the_dialog() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let stop = HumanStop::new();
+    stop.raise();
+    let dialog = FakeDialog::answering(false);
+    for (op, args) in [
+        ("admin.profile.set", json!({"profile": "standard"})),
+        ("admin.grants.revoke", json!({"capability": "fs.write"})),
+        (
+            "admin.approvals.resolve",
+            json!({"request_id": "r", "resolution": "approved"}),
+        ),
+        ("admin.network.set", json!({"proxy": null})),
+        ("admin.grants.list", json!({})),
+    ] {
+        let error = guarded_admin(base.path(), &stop, &dialog, op, args)
+            .await
+            .expect_err("no daemon answers here");
+        assert_eq!(error.cause, "daemon_stopped_by_you", "{op}");
+    }
+    assert!(dialog.prompts().is_empty());
+}
+
+/// The dialog's sentence never takes display text from the webview: extra fields the webview adds
+/// to the args do not reach it.
+#[tokio::test]
+async fn the_dialog_sentence_ignores_display_text_the_webview_adds() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let stop = HumanStop::new();
+    stop.raise();
+    let dialog = FakeDialog::answering(false);
+    let args = json!({
+        "capability": "fs.write",
+        "title": "Harmless refresh",
+        "message": "Press Allow to refresh",
+        "detail": "nothing will change",
+    });
+    let _ = guarded_admin(base.path(), &stop, &dialog, "admin.grants.add", args).await;
+    let body = &dialog.prompts()[0].body;
+    for planted in ["Harmless", "refresh", "nothing will change"] {
+        assert!(!body.contains(planted), "{body}");
+    }
+    assert!(body.contains("fs.write"), "{body}");
+}
+
+#[test]
+fn the_pending_entry_is_found_by_request_id() {
+    let listed = json!({"pending": [
+        {"request_id": "a", "capability": "x"},
+        {"request_id": "b", "capability": "y"},
+    ]});
+    assert_eq!(
+        find_pending(&listed, "b").and_then(|entry| entry["capability"].as_str()),
+        Some("y")
+    );
+    assert!(find_pending(&listed, "c").is_none());
+    assert!(find_pending(&json!({}), "a").is_none());
 }
 
 #[tokio::test]
@@ -529,8 +690,9 @@ async fn cancel_goes_through_the_private_admin_op_and_nothing_goes_public() {
     assert!(is_known_admin_op("admin.requests.cancel"));
     assert_eq!(deadline_for("admin.requests.cancel"), 30_000);
     // The public-socket capabilities are not reachable through admin_call.
+    let dialog = FakeDialog::answering(true);
     for name in ["cancel", "echo", "flow.run", "status", "query", ""] {
-        let error = admin_call(name.to_owned(), json!({"ticket": "t"}), None)
+        let error = admin_call_with(&dialog, name.to_owned(), json!({"ticket": "t"}), None)
             .await
             .expect_err("a public capability is not an admin op");
         assert_eq!(error.cause, "unknown_admin_op", "{name}");

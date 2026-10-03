@@ -75,6 +75,14 @@ tracing-appender = "0.2"
 # An accepted exception, as bundled SQLite is (see `rusqlite` above).
 tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-build = { version = "2", default-features = false, features = ["config-json"] }
+# Native confirmation for the admin ops that widen what agents may do
+# (`pam_gui::bridge::NativeConfirmer`): owner-approved 2026-10-03 (ptrack
+# task 226). Used from Rust only; the webview is granted no `dialog:`
+# permission. Default features off: `gtk3` is the Linux backend and Linux
+# is not a target. rfd underneath speaks AppKit through objc2 and Win32
+# through windows-sys, no C compile step. Pinned below 2.8, which needs
+# tauri 2.12.
+tauri-plugin-dialog = { version = ">=2.7.3, <2.8", default-features = false }
 
 # model integrity: SHA-256 over downloaded and installed weights. RustCrypto,
 # pure Rust (the optional `asm` C backend stays off).

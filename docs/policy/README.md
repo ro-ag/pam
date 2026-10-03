@@ -16,7 +16,7 @@ the PAM GUI, and add constraints only an organization can state:
 | `scopes` | The repository roots PAM may work in; whether a connector may be granted across every repository. |
 | `connectors` | The hosts a connector may send a credential to; connectors that are switched off. |
 | `flows` | The programs flow steps may run, extra `PATH` entries and read-cache mounts (`locked` or an `allow` set), the artifacts folder. |
-| `landing` | The most a landing may do (push, create a pull request, merge, sync) and the GitHub servers it may talk to. |
+| `landing` | The most a landing may do (push, create a pull request, merge, sync), the GitHub servers it may talk to, the Git it runs (`git_path`) and how it merges (`merge_method`), the last two `locked` or a `default`. |
 | `models` | Where the engine comes from (`download`, `mirror_only`, `import_only`), which model sources and curators are allowed, the models folder, idle unload. |
 | `retention` | Evidence and audit windows (`locked`, `default`, `min`, `max`). |
 | `network` | The proxy, the no-proxy list, a pinned CA bundle (macOS), and the engine and model mirrors with the hosts they may use. |

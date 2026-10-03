@@ -8,11 +8,14 @@ import { cn } from "../lib/cn";
 import { toBridgeFailure, type BridgeFailure } from "../lib/ipc";
 import { ManagedNote, PolicyDropNotice, entryList, isLocked } from "./ManagedField";
 import {
+  MERGE_METHODS,
   emptyLandingRepository,
   landingGet,
   landingSet,
   type LandingCheck,
+  type LandingMergeMethod,
   type LandingRepository,
+  type LandingRequiredCheck,
 } from "../lib/landing";
 
 const key = ["landing-policy"];
@@ -28,6 +31,35 @@ export function parseTimeout(text: string): number | null {
   if (!/^\d+$/.test(text.trim())) return null;
   const seconds = Number(text.trim());
   return seconds >= TIMEOUT_MIN_S && seconds <= TIMEOUT_MAX_S ? seconds : null;
+}
+
+/** One required-check line: `name`, or `name @<app id>` pinned to the GitHub App reporting it. */
+export function parseRequiredCheck(line: string): LandingRequiredCheck {
+  const pinned = /^(.*\S)\s+@(\d+)$/.exec(line);
+  if (pinned && Number(pinned[2]) > 0) return { name: pinned[1], app_id: Number(pinned[2]) };
+  return line;
+}
+
+/** The line a required check is edited as; the inverse of `parseRequiredCheck`. */
+export function formatRequiredCheck(check: LandingRequiredCheck): string {
+  return typeof check === "string" ? check : `${check.name} @${check.app_id}`;
+}
+
+/** Required checks a same-named check from any app could satisfy. */
+export function unpinnedChecks(repository: LandingRepository): string[] {
+  const names = [...repository.required_checks, ...repository.main_checks]
+    .filter((check): check is string => typeof check === "string" && check.trim() !== "")
+    .map((check) => check.trim());
+  return [...new Set(names)];
+}
+
+/** Trimmed, with empty entries dropped, for the save. */
+function cleanChecks(checks: LandingRequiredCheck[]): LandingRequiredCheck[] {
+  return checks
+    .map((check) =>
+      typeof check === "string" ? check.trim() : { ...check, name: check.name.trim() },
+    )
+    .filter((check) => (typeof check === "string" ? check : check.name) !== "");
 }
 
 function LabeledField({
@@ -152,12 +184,15 @@ function RepositoryEditor({
   repository,
   index,
   forbidden,
+  lockedMethod,
   onChange,
   onRemove,
 }: {
   repository: LandingRepository;
   index: number;
   forbidden: Permission[];
+  /** The merge method the policy locks every recipe to, if it does. */
+  lockedMethod: LandingMergeMethod | null;
   onChange: (repository: LandingRepository) => void;
   onRemove: () => void;
 }) {
@@ -173,9 +208,12 @@ function RepositoryEditor({
   const lists = [
     ["branches", "allowed branches"],
     ["read_cache_roots", "read-only cache directories (maximum 8)"],
-    ["required_checks", "required PR contexts"],
-    ["main_checks", "required main contexts"],
   ] as const;
+  const checkLists = [
+    ["required_checks", "required PR checks"],
+    ["main_checks", "required main checks"],
+  ] as const;
+  const unpinned = unpinnedChecks(repository);
   return (
     <div className="space-y-3 rounded-control border border-line p-3">
       <h4 className="text-sm font-medium text-ink">
@@ -200,9 +238,57 @@ function RepositoryEditor({
           onChange={(value) => onChange({ ...repository, [name]: value.split("\n") })}
         />
       ))}
+      {checkLists.map(([name, label]) => (
+        <LabeledField
+          key={name}
+          label={`${prefix} ${label} (one per line)`}
+          value={repository[name].map(formatRequiredCheck).join("\n")}
+          multiline
+          onChange={(value) =>
+            onChange({ ...repository, [name]: value.split("\n").map(parseRequiredCheck) })
+          }
+        />
+      ))}
       <p className="text-xs text-ink-muted">
-        Every listed context must report success for the exact commit. Missing, unknown or
-        cancelled checks cannot pass.
+        Every listed check must report success for the exact commit. Missing, unknown or
+        cancelled checks cannot pass. Write <span className="font-data">name @app-id</span> to
+        pin a check to the GitHub App that reports it (GitHub Actions is app 15368); a pinned
+        check is never satisfied by a same-named check from another app.
+      </p>
+      {unpinned.length > 0 && (
+        <p
+          aria-label={`${prefix} unpinned checks`}
+          className="select-text text-xs text-warning"
+        >
+          Unpinned app: {unpinned.join(", ")}. Any app that reports a check with this name can
+          satisfy it; pin each to its GitHub App with @app-id.
+        </p>
+      )}
+      <label className="block space-y-1 text-xs text-ink-muted">
+        <span>{prefix} merge method</span>
+        <select
+          className={field}
+          value={lockedMethod ?? repository.merge_method ?? "squash"}
+          disabled={lockedMethod !== null}
+          title={
+            lockedMethod !== null
+              ? "Your organization's policy sets the merge method"
+              : undefined
+          }
+          onChange={(e) =>
+            onChange({ ...repository, merge_method: e.target.value as LandingMergeMethod })
+          }
+        >
+          {MERGE_METHODS.map((method) => (
+            <option key={method} value={method}>
+              {method}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="text-xs text-ink-muted">
+        GitHub must allow this method on the repository; the landing refuses before merging when
+        it reports that it does not.
       </p>
       <p className="text-xs text-ink-muted">
         Cache access is optional and read-only. List at most eight existing canonical cache
@@ -251,7 +337,7 @@ function RepositoryEditor({
           [
             ["push", "Push branch"],
             ["create_pr", "Create pull request"],
-            ["merge", "Squash merge"],
+            ["merge", "Merge pull request"],
             ["sync", "Sync local base branch"],
           ] as const
         ).map(([permission, label]) => (
@@ -298,6 +384,7 @@ export function LandingSettings() {
   const query = useQuery({ queryKey: key, queryFn: landingGet });
   const [draft, setDraft] = useState<{
     revision: string;
+    gitPath: string;
     repositories: LandingRepository[];
   } | null>(null);
   const [failure, setFailure] = useState<BridgeFailure | null>(null);
@@ -305,8 +392,17 @@ export function LandingSettings() {
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const current = draft?.repositories ?? query.data?.repositories ?? [];
+  const gitPath = draft?.gitPath ?? query.data?.git_path ?? "";
   const ceilingEntry = query.data?.effective?.max_permissions;
   const serversEntry = query.data?.effective?.allowed_github_servers;
+  const gitEntry = query.data?.effective?.git_path;
+  const methodEntry = query.data?.effective?.merge_method;
+  const gitLocked = isLocked(gitEntry);
+  const lockedMethod =
+    isLocked(methodEntry) && MERGE_METHODS.includes(methodEntry?.value as LandingMergeMethod)
+      ? (methodEntry?.value as LandingMergeMethod)
+      : null;
+  const effectiveGit = typeof gitEntry?.value === "string" ? gitEntry.value : null;
   const forbidden = forbiddenPermissions(ceilingEntry?.value);
   const policyLocked = isLocked(ceilingEntry) || isLocked(serversEntry);
   const allowedServers = entryList(serversEntry, []);
@@ -314,9 +410,13 @@ export function LandingSettings() {
   const cacheOverflow = current.some(
     (repo) => (repo.read_cache_roots ?? []).filter((path) => path.trim()).length > 8,
   );
-  function edit(repositories: LandingRepository[]) {
+  function edit(repositories: LandingRepository[], nextGitPath: string = gitPath) {
     if (pendingRef.current || !query.data || stale) return;
-    setDraft({ revision: draft?.revision ?? query.data.revision, repositories });
+    setDraft({
+      revision: draft?.revision ?? query.data.revision,
+      gitPath: nextGitPath,
+      repositories,
+    });
     setFailure(null);
   }
   async function save() {
@@ -328,11 +428,15 @@ export function LandingSettings() {
       ...repo,
       read_cache_roots: (repo.read_cache_roots ?? []).map((s) => s.trim()).filter(Boolean),
       branches: repo.branches.map((s) => s.trim()).filter(Boolean),
-      required_checks: repo.required_checks.map((s) => s.trim()).filter(Boolean),
-      main_checks: repo.main_checks.map((s) => s.trim()).filter(Boolean),
+      required_checks: cleanChecks(repo.required_checks),
+      main_checks: cleanChecks(repo.main_checks),
     }));
     try {
-      const saved = await landingSet(draft.revision, repositories);
+      const saved = await landingSet(
+        draft.revision,
+        repositories,
+        draft.gitPath.trim() || null,
+      );
       queryClient.setQueryData(key, saved);
       setDraft(null);
     } catch (error) {
@@ -412,12 +516,33 @@ export function LandingSettings() {
         disabled={pending || !query.data || stale || policyLocked}
         className="space-y-3"
       >
+        <div className="space-y-1">
+          <ManagedNote entry={gitEntry} />
+          <label className="block space-y-1 text-xs text-ink-muted">
+            <span>Git for landing (absolute path; empty uses a trusted installation)</span>
+            <TextField
+              appearance="plain"
+              className={field}
+              value={gitLocked ? (effectiveGit ?? "") : gitPath}
+              disabled={gitLocked}
+              onChange={(e) => edit(current, e.target.value)}
+            />
+          </label>
+          <p className="text-xs text-ink-muted">
+            Landing never looks Git up on PATH. Empty uses the first trusted installation that
+            only root or you can change: Apple&apos;s developer tools, then Homebrew, on macOS;
+            Git for Windows under Program Files on Windows. A Git in a directory a group or
+            other users can write is refused.
+          </p>
+        </div>
+        <ManagedNote entry={methodEntry} />
         {current.map((repo, index) => (
           <RepositoryEditor
             key={index}
             repository={repo}
             index={index}
             forbidden={forbidden}
+            lockedMethod={lockedMethod}
             onChange={(next) => edit(current.map((old, i) => (i === index ? next : old)))}
             onRemove={() => edit(current.filter((_, i) => i !== index))}
           />

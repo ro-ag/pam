@@ -10,6 +10,13 @@ it("uses only GUI admin operations with the exact expected revision", async () =
   await landingSet("r", []);
   expect(admin).toHaveBeenLastCalledWith("admin.flows.landing.set", {
     expected_revision: "r",
+    git_path: null,
+    repositories: [],
+  });
+  await landingSet("r", [], "/Library/Developer/CommandLineTools/usr/bin/git");
+  expect(admin).toHaveBeenLastCalledWith("admin.flows.landing.set", {
+    expected_revision: "r",
+    git_path: "/Library/Developer/CommandLineTools/usr/bin/git",
     repositories: [],
   });
 });

@@ -1056,3 +1056,202 @@ fn sync_writes_refuse_git_directories_swapped_for_symlinks() {
         "no reflog through a symlink"
     );
 }
+
+/// A fixture Git: `<root>/<dir>/git`, executable, with `mode` on the file.
+#[cfg(unix)]
+fn fixture_git(root: &Path, dir: &str, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join(dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let git = dir.join("git");
+    fs::write(&git, "#!/bin/sh\necho 'git version 2.99.0'\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(mode)).unwrap();
+    git
+}
+
+#[cfg(unix)]
+fn fixture_trust(root: &Path) -> GitTrust {
+    use std::os::unix::fs::MetadataExt;
+    let uid = fs::metadata(root).unwrap().uid();
+    GitTrust::owned_by(if uid == 0 { vec![0] } else { vec![0, uid] })
+}
+
+/// The broker's Git resolution, allow and refuse: an executable owned by a
+/// trusted user in non-writable directories passes; a group- or
+/// world-writable file or directory, a foreign owner, a missing file, a
+/// non-executable file, a relative path and a symlink kept in a writable
+/// directory are each refused with the reason named.
+#[cfg(unix)]
+#[test]
+fn broker_git_resolution_allows_only_trusted_installations() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let trust = fixture_trust(&root);
+    let good = fixture_git(&root, "good", 0o755);
+    assert_eq!(check_git(&good, &trust).unwrap(), good);
+    let cases: Vec<(PathBuf, &str)> = vec![
+        (
+            fixture_git(&root, "group-file", 0o775),
+            "writable by its group",
+        ),
+        (
+            fixture_git(&root, "world-file", 0o757),
+            "writable by other users",
+        ),
+        (fixture_git(&root, "plain", 0o644), "not executable"),
+        (root.join("absent/git"), "does not exist"),
+        (PathBuf::from("bin/git"), "not absolute"),
+    ];
+    let group_dir = fixture_git(&root, "group-dir", 0o755);
+    fs::set_permissions(
+        group_dir.parent().unwrap(),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+    let link_dir = root.join("links");
+    fs::create_dir(&link_dir).unwrap();
+    fs::set_permissions(&link_dir, fs::Permissions::from_mode(0o775)).unwrap();
+    let link = link_dir.join("git");
+    std::os::unix::fs::symlink(&good, &link).unwrap();
+    for (path, reason) in cases.into_iter().chain([
+        (group_dir, "writable by its group"),
+        (link, "writable by its group"),
+    ]) {
+        let refused = check_git(&path, &trust).unwrap_err();
+        assert!(refused.contains(reason), "{}: {refused}", path.display());
+    }
+    // A symlink in a trusted directory resolves to its trusted target.
+    let trusted_link = root.join("good/git-link");
+    std::os::unix::fs::symlink(&good, &trusted_link).unwrap();
+    assert_eq!(check_git(&trusted_link, &trust).unwrap(), good);
+    // An owner outside the trusted set is refused even with safe modes.
+    let root_only = GitTrust::owned_by(vec![0]);
+    let foreign = check_git(&good, &root_only).unwrap_err();
+    assert!(
+        foreign.contains("neither root nor the daemon's user"),
+        "{foreign}"
+    );
+}
+
+/// The allowlist takes the first candidate that qualifies and names every
+/// one it passed over; a configured path is used or refused, never replaced
+/// by an allowlisted one; the xcrun shim is followed through its link, never
+/// run.
+#[cfg(unix)]
+#[test]
+fn broker_git_allowlist_order_configured_path_and_shim() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let trust = fixture_trust(&root);
+    let writable = fixture_git(&root, "brew", 0o775);
+    let good = fixture_git(&root, "clt/usr/bin", 0o755);
+    let candidates = [
+        GitCandidate::Path(root.join("missing/git")),
+        GitCandidate::Path(writable.clone()),
+        GitCandidate::Path(good.clone()),
+    ];
+    let chosen = resolve_git_from(None, &candidates, &trust).unwrap();
+    assert_eq!(
+        chosen,
+        BrokerGit {
+            path: good.clone(),
+            source: GitSource::Allowlist
+        }
+    );
+    let none = resolve_git_from(None, &candidates[..2], &trust).unwrap_err();
+    assert_eq!(none.cause, CAUSE_GIT_UNTRUSTED);
+    assert!(
+        none.detail.contains("missing/git: it does not exist"),
+        "{}",
+        none.detail
+    );
+    assert!(
+        none.detail.contains("writable by its group"),
+        "{}",
+        none.detail
+    );
+    assert!(
+        none.detail.contains("PATH is never searched"),
+        "{}",
+        none.detail
+    );
+    // A configured Git that fails is refused although the allowlist holds a
+    // good one; the recovery names who configured it.
+    for (source, recovery) in [
+        (GitSource::Settings, RECOVERY_GIT_SETTINGS),
+        (GitSource::Policy, crate::managed_policy::RECOVERY_MANAGED),
+    ] {
+        let refused = resolve_git_from(Some((&writable, source)), &candidates, &trust).unwrap_err();
+        assert_eq!(refused.cause, CAUSE_GIT_UNTRUSTED);
+        assert_eq!(refused.recovery, recovery);
+        assert!(
+            refused.detail.contains("never falls back"),
+            "{}",
+            refused.detail
+        );
+    }
+    let configured = resolve_git_from(Some((&good, GitSource::Policy)), &[], &trust).unwrap();
+    assert_eq!(configured.source, GitSource::Policy);
+    // The shim: a link to a developer directory whose usr/bin/git is good.
+    let link = root.join("xcode_select_link");
+    std::os::unix::fs::symlink(root.join("clt"), &link).unwrap();
+    let shim = [GitCandidate::XcodeShim { link: link.clone() }];
+    assert_eq!(resolve_git_from(None, &shim, &trust).unwrap().path, good);
+    // A link kept in a writable directory is not followed.
+    let open = root.join("open");
+    fs::create_dir(&open).unwrap();
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+    let loose = open.join("xcode_select_link");
+    std::os::unix::fs::symlink(root.join("clt"), &loose).unwrap();
+    let refused =
+        resolve_git_from(None, &[GitCandidate::XcodeShim { link: loose }], &trust).unwrap_err();
+    assert!(refused.detail.contains("xcrun shim"), "{}", refused.detail);
+    assert!(
+        refused.detail.contains("writable by other users"),
+        "{}",
+        refused.detail
+    );
+}
+
+#[test]
+fn git_version_output_is_one_bounded_line() {
+    assert_eq!(
+        parse_version(true, b"git version 2.39.5 (Apple Git-154)\n").unwrap(),
+        "git version 2.39.5 (Apple Git-154)"
+    );
+    for (success, output) in [
+        (false, &b"git version 2.39.5\n"[..]),
+        (true, b"hub version 2\n"),
+        (true, b"git version 2\x1b[0m\n"),
+        (true, b""),
+    ] {
+        assert!(parse_version(success, output).is_err());
+    }
+}
+
+/// The real broker Git on this machine, when one qualifies, reports its
+/// version through the bounded probe.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_installed_trusted_git_reports_its_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let Ok(git) = resolve_broker_git(None, &home) else {
+        return;
+    };
+    let budget = RequestBudget::new(Instant::now() + std::time::Duration::from_secs(20));
+    let (_sender, mut cancel) = watch::channel(false);
+    let version = git_version(
+        &git.path,
+        &home,
+        budget,
+        &mut cancel,
+        Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert!(version.starts_with("git version "), "{version}");
+}

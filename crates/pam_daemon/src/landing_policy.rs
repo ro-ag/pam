@@ -10,6 +10,13 @@
 //! revision a landing session froze are unchanged by a policy; the policy is
 //! re-applied at every check instead. `Snapshot::load` reads the stored
 //! document as saved, for the admin edit path and the workspace sweep.
+//!
+//! `landing.git_path` and `landing.merge_method` are `locked`/`default` keys
+//! over the document's `git_path` (the Git the landing broker runs) and each
+//! recipe's `merge_method` (`squash` when unset). Both fields are omitted
+//! from the stored JSON while unset, and a name-only required check is a
+//! plain string, so a document saved before them keeps its revision.
+use pam_connectors::github_landing::{MergeMethod, RequiredCheck};
 use pam_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,15 +65,54 @@ pub(crate) struct Repository {
     #[serde(default)]
     pub read_cache_roots: Vec<PathBuf>,
     pub checks: Vec<Check>,
-    pub required_checks: Vec<String>,
-    pub main_checks: Vec<String>,
+    /// Required PR checks, each a name or `{ name, app_id }`.
+    pub required_checks: Vec<RequiredCheck>,
+    /// Required main checks, each a name or `{ name, app_id }`.
+    pub main_checks: Vec<RequiredCheck>,
     pub permissions: Permissions,
+    /// How the landing merges; `None` is the default, squash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_method: Option<MergeMethod>,
+    /// The effective `git_path` (document or managed policy); never stored
+    /// per recipe.
+    #[serde(skip)]
+    pub git_path: Option<PathBuf>,
+    /// Whether the managed policy, not the human, chose `git_path`.
+    #[serde(skip)]
+    pub git_path_managed: bool,
+    /// Whether the managed policy locks `merge_method`.
+    #[serde(skip)]
+    pub merge_method_locked: bool,
+}
+
+impl Repository {
+    /// The effective merge method.
+    pub fn merge_method(&self) -> MergeMethod {
+        self.merge_method.unwrap_or_default()
+    }
+
+    /// The configured Git and who chose it, for the broker's resolution.
+    pub fn configured_git(&self) -> Option<(&Path, crate::landing_git::GitSource)> {
+        self.git_path.as_deref().map(|path| {
+            (
+                path,
+                if self.git_path_managed {
+                    crate::landing_git::GitSource::Policy
+                } else {
+                    crate::landing_git::GitSource::Settings
+                },
+            )
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     version: u8,
+    /// The Git the landing broker runs instead of the trusted allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_path: Option<PathBuf>,
     repositories: Vec<Repository>,
 }
 
@@ -126,6 +172,21 @@ fn names(values: &[String], maximum: usize) -> bool {
         && values.iter().collect::<BTreeSet<_>>().len() == values.len()
 }
 
+/// Required check names: the same bounds as `names`, unique by name.
+fn required(values: &[RequiredCheck]) -> bool {
+    let names: Vec<String> = values.iter().map(|check| check.name.clone()).collect();
+    self::names(&names, 32) && values.iter().all(|check| check.app_id != Some(0))
+}
+
+/// A `git_path` the document may hold: absolute, bounded, printable. Its
+/// trust is checked at save and at every use, not here.
+fn git_path_shape(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|text| text.len() <= 1024 && !text.chars().any(char::is_control))
+}
+
 fn directory(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() || !path.is_dir() || path.canonicalize().map_err(|_| invalid())? != path
     {
@@ -167,8 +228,8 @@ impl Repository {
                 .branches
                 .iter()
                 .any(|branch| !valid_ref(branch) || branch == &self.base)
-            || !names(&self.required_checks, 32)
-            || !names(&self.main_checks, 32)
+            || !required(&self.required_checks)
+            || !required(&self.main_checks)
             || self.checks.is_empty()
             || self.checks.len() > 8
         {
@@ -322,9 +383,20 @@ fn server_allowed(view: &PolicyView, server: &str) -> bool {
 }
 
 impl Snapshot {
-    fn normalize(document: Document, raw: Option<String>) -> Result<Self, Error> {
-        if document.version != 1 || document.repositories.len() > 32 {
+    fn normalize(mut document: Document, raw: Option<String>) -> Result<Self, Error> {
+        if document.version != 1
+            || document.repositories.len() > 32
+            || document
+                .git_path
+                .as_deref()
+                .is_some_and(|path| !git_path_shape(path))
+        {
             return Err(invalid());
+        }
+        for repository in &mut document.repositories {
+            repository.git_path.clone_from(&document.git_path);
+            repository.git_path_managed = false;
+            repository.merge_method_locked = false;
         }
         let mut roots = BTreeSet::new();
         for repo in &document.repositories {
@@ -365,6 +437,15 @@ impl Snapshot {
     #[must_use]
     pub fn managed(mut self, view: &PolicyView) -> Self {
         let ceiling = view.landing_ceiling();
+        let human_git = self
+            .document
+            .git_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let (git_path, git_entry) = view.effective_string(Key::LandingGitPath, human_git);
+        let git_path = git_path.map(PathBuf::from);
+        let git_managed = matches!(git_entry.source, crate::network_service::Source::Policy);
+        let method_locked = view.is_locked(Key::LandingMergeMethod);
         let mut dropped = Vec::new();
         self.document.repositories.retain_mut(|repository| {
             if !server_allowed(view, &repository.github_server) {
@@ -381,6 +462,14 @@ impl Snapshot {
             permissions.create_pr &= ceiling.create_pr;
             permissions.merge &= ceiling.merge;
             permissions.sync &= ceiling.sync;
+            repository.git_path.clone_from(&git_path);
+            repository.git_path_managed = git_managed;
+            let human = repository
+                .merge_method
+                .map(|method| method.as_str().to_owned());
+            let (method, _) = view.effective_string(Key::LandingMergeMethod, human);
+            repository.merge_method = method.as_deref().and_then(MergeMethod::parse);
+            repository.merge_method_locked = method_locked;
             true
         });
         self.ceiling = ceiling;
@@ -406,6 +495,22 @@ impl Snapshot {
         if !self.narrows(current) {
             view.guard_held(Key::LandingMaxPermissions)?;
             view.guard_held(Key::LandingAllowedGithubServers)?;
+        }
+        if self.document.git_path != current.document.git_path {
+            view.guard_locked(Key::LandingGitPath)?;
+        }
+        let method_changed = self.document.repositories.iter().any(|repository| {
+            current
+                .document
+                .repositories
+                .iter()
+                .find(|before| before.root == repository.root)
+                .map_or(repository.merge_method.is_some(), |before| {
+                    before.merge_method != repository.merge_method
+                })
+        });
+        if method_changed {
+            view.guard_locked(Key::LandingMergeMethod)?;
         }
         let ceiling = view.landing_ceiling();
         for repository in &self.document.repositories {
@@ -459,6 +564,7 @@ impl Snapshot {
             Some(raw) => serde_json::from_str(raw).map_err(|_| invalid())?,
             None => Document {
                 version: 1,
+                git_path: None,
                 repositories: Vec::new(),
             },
         };
@@ -487,7 +593,11 @@ impl Snapshot {
     }
 
     pub fn response(&self) -> Value {
-        json!({"revision": self.revision, "repositories": self.document.repositories})
+        json!({
+            "revision": self.revision,
+            "git_path": self.document.git_path,
+            "repositories": self.document.repositories,
+        })
     }
 
     /// The `admin.flows.landing.get` reply: the stored document (`self`, what
@@ -539,10 +649,23 @@ impl Snapshot {
         });
         let mut github_servers = github_servers.to_json();
         github_servers["value"] = json!(servers.values().next());
+        let human_git = self
+            .document
+            .git_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let (git_value, git_entry) = view.effective_string(Key::LandingGitPath, human_git);
+        let mut git_path = git_entry.to_json();
+        git_path["value"] = json!(git_value);
+        let (method_value, method_entry) = view.effective_string(Key::LandingMergeMethod, None);
+        let mut merge_method = method_entry.to_json();
+        merge_method["value"] = json!(method_value);
         let mut body = self.response();
         body["effective"] = json!({
             "max_permissions": max_permissions,
             "allowed_github_servers": github_servers,
+            "git_path": git_path,
+            "merge_method": merge_method,
             "repositories": effective.document.repositories,
         });
         body["landing_policy_dropped"] = json!(
@@ -575,6 +698,8 @@ impl Snapshot {
         #[serde(deny_unknown_fields)]
         struct Update {
             expected_revision: String,
+            #[serde(default)]
+            git_path: Option<PathBuf>,
             repositories: Vec<Repository>,
         }
         if serde_json::to_vec(args).map_err(|_| invalid())?.len() > MAX_BYTES {
@@ -588,6 +713,7 @@ impl Snapshot {
         let next = Self::normalize(
             Document {
                 version: 1,
+                git_path: update.git_path,
                 repositories: update.repositories,
             },
             None,
@@ -596,6 +722,19 @@ impl Snapshot {
             .map_err(SaveRefusal::Managed)?;
         for repo in &next.document.repositories {
             repo.authorize_workspace(protected_base)?;
+        }
+        if let Some(path) = &next.document.git_path
+            && crate::landing_git::resolve_broker_git(
+                Some((path, crate::landing_git::GitSource::Settings)),
+                protected_base,
+            )
+            .is_err()
+        {
+            return Err(Error {
+                cause: "landing_git_untrusted",
+                detail: "The Git path must name an existing executable that only root or you can change: neither it nor any directory above it may be writable by a group or by others.",
+            }
+            .into());
         }
         if !store
             .compare_exchange_setting(KEY, current.raw.as_deref(), &next.canonical)

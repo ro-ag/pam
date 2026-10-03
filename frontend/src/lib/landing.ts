@@ -5,6 +5,14 @@ export interface LandingCheck {
   argv: string[];
   timeout_seconds: number;
 }
+/** How a landing merges its pull request; `squash` when unset. */
+export type LandingMergeMethod = "squash" | "merge" | "rebase";
+export const MERGE_METHODS: LandingMergeMethod[] = ["squash", "merge", "rebase"];
+/**
+ * A required check: a bare name (legacy, matched from any app) or the name pinned to the GitHub
+ * App that reports it, so a same-named check from another app cannot satisfy it.
+ */
+export type LandingRequiredCheck = string | { name: string; app_id: number };
 export interface LandingRepository {
   root: string;
   repository: string;
@@ -15,12 +23,15 @@ export interface LandingRepository {
   workspace_root: string;
   read_cache_roots?: string[];
   checks: LandingCheck[];
-  required_checks: string[];
-  main_checks: string[];
+  required_checks: LandingRequiredCheck[];
+  main_checks: LandingRequiredCheck[];
   permissions: { push: boolean; create_pr: boolean; merge: boolean; sync: boolean };
+  merge_method?: LandingMergeMethod;
 }
 export interface LandingPolicy {
   revision: string;
+  /** The Git the landing broker runs; null uses the first trusted installation. */
+  git_path?: string | null;
   /** What the human saved; the editor shows and sends these. */
   repositories: LandingRepository[];
   /**
@@ -28,7 +39,9 @@ export interface LandingPolicy {
    * its `value`, `allowed_github_servers` the allowed servers (or null), `repositories` the
    * recipes in force.
    */
-  effective?: EffectiveBlock<"max_permissions" | "allowed_github_servers" | "repositories">;
+  effective?: EffectiveBlock<
+    "max_permissions" | "allowed_github_servers" | "git_path" | "merge_method" | "repositories"
+  >;
   /** Recipes the managed policy stops using: kept, reported, never used. */
   landing_policy_dropped?: PolicyDrop[];
 }
@@ -38,8 +51,9 @@ export function landingGet(): Promise<LandingPolicy> {
 export function landingSet(
   expected_revision: string,
   repositories: LandingRepository[],
+  git_path: string | null = null,
 ): Promise<LandingPolicy> {
-  return adminCall("admin.flows.landing.set", { expected_revision, repositories });
+  return adminCall("admin.flows.landing.set", { expected_revision, git_path, repositories });
 }
 export function emptyLandingRepository(): LandingRepository {
   return {

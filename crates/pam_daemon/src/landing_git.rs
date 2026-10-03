@@ -2,6 +2,13 @@
 //! The caller prepares a durable effect receipt and rechecks GUI permissions
 //! before push. No mutation retries; remote observation is a separate operation.
 //! Raw Git diagnostics are discarded because a server can echo credentials.
+//!
+//! The Git the broker runs is never found on `PATH`: [`resolve_broker_git`]
+//! takes the explicitly configured path (the managed policy's
+//! `landing.git_path`, else the GUI's) or the first qualifying entry of a
+//! fixed allowlist of trusted installations, and every candidate must be
+//! owned by root or the daemon's user with neither it nor any directory above
+//! it writable by a group or by others.
 use crate::{
     landing_checkout::{
         self, CANCELLED, CheckoutError, CheckoutReceipt, CheckoutRequest, Workspace, valid_oid,
@@ -201,7 +208,457 @@ fn validate_installation(
     if !helper.starts_with(&config.git_exec_path) {
         return Err(invalid("HTTPS Git helper escapes its trusted installation"));
     }
-    trusted_path(&helper, request, false)
+    trusted_path(&helper, request, false)?;
+    // The executable, its helper directory and the helper are owned like
+    // the broker's Git itself, all the way up.
+    let trust = GitTrust::for_daemon(&request.protected_base)
+        .map_err(|_| invalid("the daemon's own user could not be established"))?;
+    for path in [&request.git_program, &config.git_exec_path, &helper] {
+        check_chain(path, &trust).map_err(|_| {
+            invalid(
+                "Git installation is not owned by root or the daemon's user, or it or a directory above it is writable by others",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Who chose the Git the landing broker runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GitSource {
+    /// `landing.git_path` in the managed policy.
+    Policy,
+    /// The Git path in Settings → Flows → Landing.
+    Settings,
+    /// The first qualifying fixed trusted installation.
+    Allowlist,
+}
+
+/// One place the broker may find Git.
+#[derive(Debug, Clone)]
+pub(crate) enum GitCandidate {
+    /// An absolute path to a Git executable.
+    Path(PathBuf),
+    /// Apple's `/usr/bin/git` is an `xcrun` shim: it is never run (it
+    /// writes caches and dispatches on environment). The developer
+    /// directory the root-owned `link` names, which is what `xcode-select
+    /// -p` reports, is followed to its real `usr/bin/git` instead, the way
+    /// the rest of the codebase pins the toolchain binary.
+    XcodeShim {
+        /// `/var/db/xcode_select_link` in production.
+        link: PathBuf,
+    },
+}
+
+/// The fixed trusted installations, in preference order.
+pub(crate) fn broker_git_candidates() -> Vec<GitCandidate> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            GitCandidate::XcodeShim {
+                link: "/var/db/xcode_select_link".into(),
+            },
+            GitCandidate::Path("/Library/Developer/CommandLineTools/usr/bin/git".into()),
+            GitCandidate::Path("/opt/homebrew/bin/git".into()),
+        ]
+    }
+    // Git for Windows' `cmd\git.exe` is a launcher for the real binary; the
+    // real one is preferred, as on macOS.
+    #[cfg(windows)]
+    {
+        vec![
+            GitCandidate::Path(r"C:\Program Files\Git\mingw64\bin\git.exe".into()),
+            GitCandidate::Path(r"C:\Program Files\Git\cmd\git.exe".into()),
+        ]
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Vec::new()
+    }
+}
+
+/// The Git the broker will run and who chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrokerGit {
+    /// Canonical path of the executable.
+    pub path: PathBuf,
+    /// Who chose it.
+    pub source: GitSource,
+}
+
+/// Why no Git qualifies, with the recovery for whoever chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitRefusal {
+    pub cause: &'static str,
+    pub detail: String,
+    pub recovery: &'static str,
+}
+
+/// No configured or allowlisted Git passes the trust check.
+pub(crate) const CAUSE_GIT_UNTRUSTED: &str = "landing_git_untrusted";
+
+/// Who may own a trusted Git and the directories above it: root, or the
+/// daemon's own user (the owner of its private base directory).
+pub(crate) struct GitTrust {
+    #[cfg(unix)]
+    owners: Vec<u32>,
+}
+
+impl GitTrust {
+    /// Root and the user that owns `protected_base`.
+    pub(crate) fn for_daemon(protected_base: &Path) -> Result<Self, GitRefusal> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let uid = fs::metadata(protected_base)
+                .map_err(|_| GitRefusal {
+                    cause: CAUSE_GIT_UNTRUSTED,
+                    detail: "The daemon's private directory could not be inspected to establish its user.".into(),
+                    recovery: "Restart PAM; its private directory must exist.",
+                })?
+                .uid();
+            let mut owners = vec![0];
+            if uid != 0 {
+                owners.push(uid);
+            }
+            Ok(Self { owners })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = protected_base;
+            Ok(Self {})
+        }
+    }
+
+    /// A rule for a fixture tree owned by `owners`.
+    #[cfg(all(test, unix))]
+    pub(crate) fn owned_by(owners: Vec<u32>) -> Self {
+        Self { owners }
+    }
+}
+
+/// [`resolve_git_from`] over the platform allowlist, trusting root and the
+/// daemon's user.
+pub(crate) fn resolve_broker_git(
+    configured: Option<(&Path, GitSource)>,
+    protected_base: &Path,
+) -> Result<BrokerGit, GitRefusal> {
+    let trust = GitTrust::for_daemon(protected_base)?;
+    resolve_git_from(configured, &broker_git_candidates(), &trust)
+}
+
+const RECOVERY_GIT_SETTINGS: &str = "Set the Git path in Settings → Flows → Landing to a Git that only root or you can change, or clear it to use a trusted installation.";
+#[cfg(not(windows))]
+const RECOVERY_GIT_ALLOWLIST: &str = "Install Git with Apple's Command Line Tools (xcode-select --install), or set an explicit Git path in Settings → Flows → Landing. A Git in a directory a group or other users can write, such as Homebrew's default prefix, is not trusted.";
+#[cfg(windows)]
+const RECOVERY_GIT_ALLOWLIST: &str = "Install Git for Windows under C:\\Program Files\\Git for all users, or set an explicit Git path in Settings → Flows → Landing.";
+
+/// An explicitly configured Git is used or refused, never replaced by an
+/// allowlist entry; otherwise the first candidate that passes
+/// [`check_git`]. A refusal names every candidate and why it failed.
+pub(crate) fn resolve_git_from(
+    configured: Option<(&Path, GitSource)>,
+    candidates: &[GitCandidate],
+    trust: &GitTrust,
+) -> Result<BrokerGit, GitRefusal> {
+    if let Some((path, source)) = configured {
+        return check_git(path, trust)
+            .map(|path| BrokerGit { path, source })
+            .map_err(|reason| {
+                let (who, recovery) = match source {
+                    GitSource::Policy => (
+                        "your organization's policy names (landing.git_path)",
+                        crate::managed_policy::RECOVERY_MANAGED,
+                    ),
+                    _ => ("Settings → Flows → Landing names", RECOVERY_GIT_SETTINGS),
+                };
+                GitRefusal {
+                    cause: CAUSE_GIT_UNTRUSTED,
+                    detail: format!(
+                        "The Git {who} is not trusted for landing: {} ({reason}). PAM never falls back to another Git.",
+                        path.display()
+                    ),
+                    recovery,
+                }
+            });
+    }
+    let mut reasons = Vec::new();
+    for candidate in candidates {
+        let (label, outcome) = match candidate {
+            GitCandidate::Path(path) => (path.display().to_string(), check_git(path, trust)),
+            GitCandidate::XcodeShim { link } => match developer_git(link, trust) {
+                Ok(git) => (
+                    format!("/usr/bin/git (xcrun shim, followed to {})", git.display()),
+                    check_git(&git, trust),
+                ),
+                Err(reason) => ("/usr/bin/git (xcrun shim)".to_owned(), Err(reason)),
+            },
+        };
+        match outcome {
+            Ok(path) => {
+                return Ok(BrokerGit {
+                    path,
+                    source: GitSource::Allowlist,
+                });
+            }
+            Err(reason) => reasons.push(format!("{label}: {reason}")),
+        }
+    }
+    Err(GitRefusal {
+        cause: CAUSE_GIT_UNTRUSTED,
+        detail: if reasons.is_empty() {
+            "No trusted Git installation is known on this platform for landing.".to_owned()
+        } else {
+            format!(
+                "No trusted Git qualifies for landing; PATH is never searched. {}.",
+                reasons.join("; ")
+            )
+        },
+        recovery: RECOVERY_GIT_ALLOWLIST,
+    })
+}
+
+/// The real Git under the developer directory a root-owned
+/// `xcode_select_link` names.
+fn developer_git(link: &Path, trust: &GitTrust) -> Result<PathBuf, String> {
+    let meta = fs::symlink_metadata(link).map_err(|_| {
+        format!(
+            "no active developer directory ({} is absent)",
+            link.display()
+        )
+    })?;
+    if !meta.file_type().is_symlink() {
+        return Err(format!("{} is not a symbolic link", link.display()));
+    }
+    check_chain(link, trust)?;
+    let directory =
+        fs::read_link(link).map_err(|_| format!("{} cannot be read", link.display()))?;
+    if !directory.is_absolute() {
+        return Err(format!(
+            "{} does not name an absolute directory",
+            link.display()
+        ));
+    }
+    Ok(directory.join("usr/bin/git"))
+}
+
+/// Checks one Git: an absolute path to an existing regular executable,
+/// where the spelled path and its canonical target, and every directory
+/// above each, are owned by root or the daemon's user and writable by
+/// neither a group nor others (on Windows: no link or junction anywhere,
+/// and this account holds no right to change the file or any folder above
+/// it). Returns the canonical path.
+pub(crate) fn check_git(path: &Path, trust: &GitTrust) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("the path is not absolute".into());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("it does not exist".into());
+        }
+        Err(_) => return Err("it cannot be inspected".into()),
+    }
+    check_chain(path, trust)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "it does not resolve to a file".to_owned())?;
+    if canonical != path {
+        check_chain(&canonical, trust)?;
+    }
+    let meta = fs::metadata(&canonical).map_err(|_| "it cannot be inspected".to_owned())?;
+    if !meta.is_file() {
+        return Err("it is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err("it is not executable".into());
+        }
+    }
+    Ok(canonical)
+}
+
+/// Every component of `path`, leaf first: owned by a trusted user and, unless
+/// it is a symbolic link (whose own mode means nothing), writable by neither
+/// its group nor others.
+#[cfg(unix)]
+fn check_chain(path: &Path, trust: &GitTrust) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    for part in path.ancestors() {
+        let meta = fs::symlink_metadata(part)
+            .map_err(|_| format!("{} cannot be inspected", part.display()))?;
+        if !trust.owners.contains(&meta.uid()) {
+            return Err(format!(
+                "{} is owned by uid {}, neither root nor the daemon's user",
+                part.display(),
+                meta.uid()
+            ));
+        }
+        if !meta.file_type().is_symlink() && meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is writable by {}",
+                part.display(),
+                if meta.mode() & 0o002 != 0 {
+                    "other users"
+                } else {
+                    "its group"
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every component of `path`: no link or junction, and this account can
+/// neither change the file nor delete, re-permission or re-own any folder
+/// above it (the managed-policy trust check's token probes, applied to an
+/// executable).
+#[cfg(windows)]
+fn check_chain(path: &Path, _trust: &GitTrust) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_WRITE_DATA: u32 = 0x0002;
+    const FILE_APPEND_DATA: u32 = 0x0004;
+    const FILE_DELETE_CHILD: u32 = 0x0040;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const FILE_RIGHTS: [(u32, &str); 5] = [
+        (FILE_WRITE_DATA, "write"),
+        (FILE_APPEND_DATA, "append"),
+        (DELETE, "delete"),
+        (WRITE_DAC, "change permissions"),
+        (WRITE_OWNER, "take ownership"),
+    ];
+    const FOLDER_RIGHTS: [(u32, &str); 4] = [
+        (FILE_DELETE_CHILD, "delete its entries"),
+        (DELETE, "delete"),
+        (WRITE_DAC, "change permissions"),
+        (WRITE_OWNER, "take ownership"),
+    ];
+    for part in path.ancestors() {
+        if part.parent().is_none() {
+            break;
+        }
+        let meta = fs::symlink_metadata(part)
+            .map_err(|_| format!("{} cannot be inspected", part.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("{} is a link or junction", part.display()));
+        }
+        let rights: &[(u32, &str)] = if meta.is_dir() {
+            &FOLDER_RIGHTS
+        } else {
+            &FILE_RIGHTS
+        };
+        for (right, name) in rights {
+            match fs::OpenOptions::new()
+                .access_mode(*right)
+                .share_mode(0x7)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(part)
+            {
+                Ok(_) => return Err(format!("this account may {name} {}", part.display())),
+                Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {}
+                Err(_) => return Err(format!("{} cannot be probed", part.display())),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn check_chain(path: &Path, _trust: &GitTrust) -> Result<(), String> {
+    Err(format!(
+        "{} cannot be judged on this platform",
+        path.display()
+    ))
+}
+
+/// `git --version` of the broker's Git, for the landing session's record:
+/// one bounded process with a cleared environment, no repository and no
+/// network.
+pub(crate) async fn git_version(
+    git: &Path,
+    home: &Path,
+    budget: Arc<RequestBudget>,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<String, CheckoutError> {
+    active(cancel, deadline)?;
+    budget
+        .attempt_persisted()
+        .await
+        .map_err(|e| error(e.cause, e.resource))?;
+    let reservation = budget
+        .command_persisted(1024)
+        .await
+        .map_err(|e| error(e.cause, e.resource))?;
+    let mut child = tokio::process::Command::new(git)
+        .arg("--version")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("LC_ALL", "C")
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| invalid("trusted Git could not start to report its version"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("Git version output unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| invalid("Git version diagnostics unavailable"))?;
+    let collect = async {
+        let (output, diagnostics) =
+            tokio::try_join!(bounded_pipe(stdout, 512), bounded_pipe(stderr, 512))
+                .map_err(|_| invalid("Git version output exceeds its limit"))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| invalid("Git version did not complete"))?;
+        Ok::<_, CheckoutError>((status.success(), output, diagnostics))
+    };
+    let (success, output, diagnostics) = tokio::select! {
+        biased;
+        () = crate::flow_exec::cancelled(cancel) => return Err(error(CANCELLED, "Git version cancelled")),
+        () = tokio::time::sleep_until(deadline.into()) => return Err(error("deadline_exceeded", "Git version deadline elapsed")),
+        result = collect => result?,
+    };
+    reservation
+        .finish_persisted((output.len() + diagnostics.len()) as u64)
+        .await
+        .map_err(|e| error(e.cause, e.resource))?;
+    parse_version(success, &output)
+}
+
+/// The single `git version …` line, printable and bounded.
+pub(crate) fn parse_version(success: bool, output: &[u8]) -> Result<String, CheckoutError> {
+    std::str::from_utf8(output)
+        .ok()
+        .filter(|_| success)
+        .map(|text| text.trim_end_matches(['\r', '\n']))
+        .filter(|line| {
+            line.starts_with("git version ")
+                && line.len() <= 200
+                && line.chars().all(|ch| ch.is_ascii_graphic() || ch == ' ')
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("Git did not report a usable version"))
 }
 /// The `Basic` credential GitHub accepts for Git over HTTPS with a token.
 pub(crate) fn basic_token(token: &str) -> String {

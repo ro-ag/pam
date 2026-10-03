@@ -104,6 +104,10 @@ pub(super) struct GitGuard {
     branch: String,
     source_branch: String,
     workspace: std::path::PathBuf,
+    /// The Git the target runs; it must be the broker Git the effective
+    /// policy resolves to at every authorization.
+    git_program: std::path::PathBuf,
+    protected_base: std::path::PathBuf,
     role: GitRole,
 }
 impl GitGuard {
@@ -149,8 +153,31 @@ impl GitGuard {
             branch: target.branch.clone(),
             source_branch: source_branch.to_owned(),
             workspace: target.request.checkouts_root.clone(),
+            git_program: target.request.git_program.clone(),
+            protected_base: target.request.protected_base.clone(),
             role,
         })
+    }
+    /// [`Self::authorize_row`], then the Git the target runs: the broker
+    /// never runs a Git the caller chose, only the one the configured path
+    /// or the trusted allowlist resolves to right now. Every role that runs
+    /// Git passes through here before it starts the process.
+    pub(super) async fn authorize_git(&self) -> Result<Option<ConnectorRow>, InvokeError> {
+        let row = self.authorize_row().await?;
+        let snapshot =
+            crate::landing_policy::Snapshot::load_effective(&self.store, &self.policy.view())
+                .await
+                .map_err(|_| denied())?;
+        let policy = snapshot.repository(&self.repo).map_err(|_| denied())?;
+        if crate::landing_git::resolve_broker_git(policy.configured_git(), &self.protected_base)
+            .map_or(true, |git| git.path != self.git_program)
+        {
+            return Err(InvokeError::Connector(ConnectorError::Policy {
+                cause: crate::landing_git::CAUSE_GIT_UNTRUSTED,
+                detail: "The landing Git is not the trusted Git the current landing settings resolve to.".into(),
+            }));
+        }
+        Ok(row)
     }
     pub(super) async fn authorize_row(&self) -> Result<Option<ConnectorRow>, InvokeError> {
         // One snapshot of the managed policy for the landing recipe and the
@@ -223,7 +250,7 @@ impl GitGuard {
 impl GitAuthorization for GitGuard {
     fn authorize(&self) -> Pin<Box<dyn Future<Output = Result<(), CheckoutError>> + Send + '_>> {
         Box::pin(async move {
-            self.authorize_row()
+            self.authorize_git()
                 .await
                 .map(|_| ())
                 .map_err(|_| CheckoutError {
@@ -434,12 +461,12 @@ impl ConnectorService {
             target,
             role,
         )?);
-        guard.authorize_row().await?;
+        guard.authorize_git().await?;
         let transport =
             GitTransport::resolve(&target.request, Arc::clone(&budget), cancel, deadline)
                 .await
                 .map_err(git_error)?;
-        let row = guard.authorize_row().await?;
+        let row = guard.authorize_git().await?;
         check_live(cancel, deadline, &budget)?;
         let connection = self.connection(ConnectorId::Github, row.as_ref()).await?;
         let secret = connection.secret.ok_or(InvokeError::CredentialMissing)?;

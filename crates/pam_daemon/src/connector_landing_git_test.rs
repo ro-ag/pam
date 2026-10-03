@@ -61,9 +61,11 @@ async fn fixture() -> (tempfile::TempDir, Arc<Store>, GitTarget, String) {
         .unwrap();
     let request = CheckoutRequest {
         repository: repo.clone(),
-        protected_base: protected,
+        protected_base: protected.clone(),
         checkouts_root: workspace,
-        git_program: PathBuf::from("/usr/bin/git"),
+        // The broker only accepts the Git the allowlist resolves to.
+        git_program: crate::landing_git::resolve_broker_git(None, &protected)
+            .map_or_else(|_| PathBuf::from("/usr/bin/git"), |git| git.path),
         expected_commit: "a".repeat(40),
         base_ref: "refs/heads/main".into(),
         remote_url: "https://github.com/org/repo".into(),
@@ -112,11 +114,37 @@ async fn owned_network_guard_rechecks_grants_without_capturing_service_or_secret
     let (_temp, store, target, revision) = fixture().await;
     let authorization: Arc<dyn GitAuthorization> =
         Arc::new(guard(store.clone(), &target, &revision, GitRole::Push));
-    authorization.authorize().await.unwrap();
+    // The authorization also pins the trusted Git; a host with none (or a
+    // Windows runner, where an elevated account can write Program Files)
+    // refuses already, which the revocation check below still covers.
+    if crate::landing_git::resolve_broker_git(None, &target.request.protected_base).is_ok() {
+        authorization.authorize().await.unwrap();
+    }
     store.insert_grant("flow.run").await.unwrap();
     store.revoke_grant("flow.run").await.unwrap();
     let error = authorization.authorize().await.unwrap_err();
     assert_eq!(error.cause, "landing_git_denied");
+}
+/// The guard never authorizes a Git the caller chose: a target naming any
+/// executable other than the resolved broker Git is refused before network
+/// work.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_target_naming_another_git_is_refused_at_the_guard() {
+    let (_temp, store, mut target, revision) = fixture().await;
+    if crate::landing_git::resolve_broker_git(None, &target.request.protected_base).is_err() {
+        return;
+    }
+    guard(store.clone(), &target, &revision, GitRole::Push)
+        .authorize_git()
+        .await
+        .unwrap();
+    target.request.git_program = PathBuf::from("/usr/bin/git");
+    let error = guard(store, &target, &revision, GitRole::Push)
+        .authorize_git()
+        .await
+        .unwrap_err();
+    assert_eq!(error.cause(), crate::landing_git::CAUSE_GIT_UNTRUSTED);
 }
 #[tokio::test]
 async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {

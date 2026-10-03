@@ -80,6 +80,19 @@ pub enum ConnectorError {
     /// The service answered, but not with what the call needs.
     #[error("{0}")]
     BadResponse(String),
+    /// The service received a state-changing request and definitely
+    /// refused it: it answered with a validation or conflict status, so
+    /// nothing changed. Only typed mutations (the landing pull request and
+    /// merge calls) produce it; a lost or ambiguous answer never does.
+    #[error("{detail}")]
+    Rejected {
+        /// Stable cause naming why the service refused.
+        cause: &'static str,
+        /// Fixed sentence; never the service's own error body.
+        detail: &'static str,
+        /// The concrete next step.
+        recovery: &'static str,
+    },
 }
 
 /// The `RateLimited` sentence, with the wait when the service named one.
@@ -102,7 +115,7 @@ impl ConnectorError {
     #[must_use]
     pub fn cause(&self) -> &'static str {
         match self {
-            Self::Policy { cause, .. } => cause,
+            Self::Policy { cause, .. } | Self::Rejected { cause, .. } => cause,
             Self::Auth => "connector_auth",
             Self::Forbidden => "connector_forbidden",
             Self::NotFound => "connector_not_found",
@@ -161,6 +174,7 @@ impl ConnectorError {
                     .to_owned()
             }
             Self::BadArgs(_) => "fix the step's `with:` arguments in the flow file".to_owned(),
+            Self::Rejected { recovery, .. } => (*recovery).to_owned(),
         }
     }
 

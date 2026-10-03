@@ -1,6 +1,7 @@
 use super::landing_runtime::{
-    EffectPhase, attempted, broker_error, checkout_error, effect_verdict, inspect_policy,
-    landing_workspace, release_workspace,
+    EffectPhase, POLL_CAP, POLL_FIRST, POLL_HEADROOM, POLL_MIN, attempted, broker_error,
+    checkout_error, effect_verdict, inspect_policy, landing_workspace, mutation_refused,
+    poll_delay, release_workspace,
 };
 use super::{Attempt, CapabilityFailure, StepStatus};
 use crate::flow_recovery::{Prepare, Recovery};
@@ -829,9 +830,12 @@ mod seeded {
         assert!(fx.session().await["receipts"].get("verify_pr").is_none());
     }
 
+    /// The fixed twenty-poll budget is gone: a landing that has already
+    /// polled twenty times polls again while the request has time, and only
+    /// the request deadline ends it.
     #[tokio::test]
-    async fn an_exhausted_persisted_poll_budget_refuses_before_polling_again() {
-        let fx = Fixture::new("in_progress", "open", 128).await;
+    async fn twenty_polls_no_longer_end_the_landing_only_the_deadline_does() {
+        let mut fx = Fixture::new("in_progress", "open", 128).await;
         let evidence = fx.published_progress().await;
         fx.seed_session(Fixture::receipts("ensure_pr"), |document| {
             document["poll"] = json!({"step":"verify-pr","polls":20,"next_poll_ms":0,
@@ -839,16 +843,31 @@ mod seeded {
                 "last_digest":"g".repeat(64),"last_evidence":evidence});
         })
         .await;
+        // Less than the headroom plus the shortest wait remains.
+        fx.ctx.budget = RequestBudget::with_limits(
+            Instant::now() + super::POLL_HEADROOM + super::POLL_MIN / 2,
+            Limits::default(),
+        );
         let report = blocked(fx.run(4).await);
         let error = report.error.unwrap();
-        assert_eq!(error.cause, "landing_poll_budget_exhausted");
-        assert!(error.detail.contains("polling budget"), "{}", error.detail);
+        assert_eq!(error.cause, "request_deadline_exhausted");
+        assert!(error.detail.contains("after 21 polls"), "{}", error.detail);
         assert!(
-            fx.requests().is_empty(),
-            "the twenty-first poll is never sent"
+            error.recovery.contains("new landing ticket"),
+            "{}",
+            error.recovery
         );
-        assert_eq!(report.evidence, ["ev_progress"], "the last sample is cited");
-        assert_eq!(fx.session().await["poll"]["polls"], 20);
+        let requests = fx.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the twenty-first poll is sent: {requests:?}"
+        );
+        assert_eq!(
+            fx.session().await["poll"]["polls"],
+            20,
+            "nothing new was parked"
+        );
     }
 
     #[tokio::test]
@@ -953,4 +972,109 @@ async fn a_landing_operation_above_the_policy_ceiling_is_refused_with_the_policy
     inspect_policy(&store, &unmanaged, &repo, Op::Merge)
         .await
         .unwrap();
+}
+
+/// The poll schedule on a simulated clock: five seconds doubling to the
+/// sixty-second cap, each wait jittered down by at most a fifth, polling
+/// until the request deadline and never past it, with the number of polls
+/// bounded by the deadline.
+#[test]
+fn required_check_polls_back_off_to_the_cap_and_stop_only_at_the_deadline() {
+    use std::time::Duration;
+    let roomy = Duration::from_hours(1);
+    let expected = [5u64, 10, 20, 40, 60, 60, 60];
+    for (index, base) in expected.iter().enumerate() {
+        let polls = u32::try_from(index + 1).unwrap();
+        let wait = poll_delay(polls, "ticket/verify-pr", roomy).unwrap();
+        let base = Duration::from_secs(*base);
+        assert!(
+            wait <= base && wait >= base * 4 / 5,
+            "poll {polls}: {wait:?}"
+        );
+    }
+    assert!(poll_delay(1, "t/s", roomy).unwrap() <= POLL_FIRST);
+    assert!(poll_delay(400, "t/s", roomy).unwrap() <= POLL_CAP);
+    // Jitter differs by seed and is deterministic for one.
+    let one = poll_delay(6, "ticket-a/verify-pr", roomy).unwrap();
+    assert_eq!(one, poll_delay(6, "ticket-a/verify-pr", roomy).unwrap());
+    assert!(
+        (0..16).any(|n| poll_delay(6, &format!("ticket-{n}/verify-pr"), roomy).unwrap() != one),
+        "jitter spreads tickets"
+    );
+    // Near the deadline the wait shrinks to what is left; then it stops.
+    let tight = POLL_HEADROOM + Duration::from_secs(3);
+    assert_eq!(poll_delay(5, "t/s", tight), Some(Duration::from_secs(3)));
+    assert_eq!(poll_delay(1, "t/s", POLL_HEADROOM + POLL_MIN / 2), None);
+    assert_eq!(poll_delay(1, "t/s", Duration::ZERO), None);
+    // A whole request on the simulated clock: it keeps polling until the
+    // deadline (never giving up while a poll fits) and the count is bounded
+    // by the deadline, not by a fixed budget.
+    for deadline in [
+        Duration::from_secs(90),
+        Duration::from_mins(30),
+        Duration::from_hours(1),
+    ] {
+        let mut elapsed = Duration::ZERO;
+        let mut polls = 0u32;
+        let left = |elapsed: Duration| deadline.saturating_sub(elapsed);
+        while let Some(wait) = poll_delay(polls + 1, "ticket/verify-pr", left(elapsed)) {
+            elapsed += wait;
+            polls += 1;
+            assert!(
+                elapsed + POLL_HEADROOM <= deadline,
+                "never past the deadline"
+            );
+        }
+        assert!(
+            left(elapsed) < POLL_HEADROOM + POLL_MIN,
+            "stopped with time left: {:?} of {deadline:?}",
+            left(elapsed)
+        );
+        let bound = u32::try_from(deadline.as_secs() / 4 + 2).unwrap();
+        assert!(polls <= bound, "{polls} polls in {deadline:?}");
+        if deadline == Duration::from_hours(1) {
+            assert!(
+                polls > 20,
+                "an hour admits more than the old twenty polls: {polls}"
+            );
+            assert!(
+                polls < 80,
+                "the cap keeps an hour to a bounded count: {polls}"
+            );
+        }
+    }
+}
+
+/// Which failed GitHub mutations are definite: a typed GitHub refusal and
+/// anything refused before the request left; a lost answer or a server
+/// error stays uncertain.
+#[test]
+fn only_a_lost_or_ambiguous_mutation_answer_stays_uncertain() {
+    use crate::connector_service::InvokeError;
+    use pam_connectors::ConnectorError;
+    for definite in [
+        InvokeError::Connector(ConnectorError::Rejected {
+            cause: "landing_merge_conflict",
+            detail: "conflict",
+            recovery: "resolve",
+        }),
+        InvokeError::Connector(ConnectorError::Forbidden),
+        InvokeError::Connector(ConnectorError::NotFound),
+        InvokeError::CredentialMissing,
+        InvokeError::Disabled,
+    ] {
+        assert!(mutation_refused(&definite), "{definite:?}");
+    }
+    for uncertain in [
+        InvokeError::Connector(ConnectorError::Network("reset".into())),
+        InvokeError::Connector(ConnectorError::Timeout),
+        InvokeError::Connector(ConnectorError::Remote { status: 502 }),
+        InvokeError::Connector(ConnectorError::BadResponse("odd".into())),
+        InvokeError::Connector(ConnectorError::Policy {
+            cause: "mutation_redirect_refused",
+            detail: "redirect".into(),
+        }),
+    ] {
+        assert!(!mutation_refused(&uncertain), "{uncertain:?}");
+    }
 }

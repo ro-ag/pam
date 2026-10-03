@@ -6,7 +6,7 @@ use super::{
 };
 use pam_connectors::{
     Method,
-    github_landing::{self, Target},
+    github_landing::{self, MergeMethod, RequiredCheck, Target},
 };
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,11 +16,13 @@ pub(crate) enum LandingGithubOp {
     FindPr(Target),
     ReadPr(Target, u64),
     CreatePr(Target, String),
-    MergePr(Target, u64),
+    /// The merge methods the repository allows (one GET of the repository).
+    MergeMethods(String),
+    MergePr(Target, u64, MergeMethod),
     Checks {
         repository: String,
         sha: String,
-        required: Vec<String>,
+        required: Vec<RequiredCheck>,
     },
 }
 fn denied() -> InvokeError {
@@ -35,10 +37,11 @@ fn full_sha(value: &str) -> bool {
 impl LandingGithubOp {
     fn repository(&self) -> &str {
         match self {
-            Self::FindPr(t) | Self::ReadPr(t, _) | Self::CreatePr(t, _) | Self::MergePr(t, _) => {
-                &t.repository
-            }
-            Self::Checks { repository, .. } => repository,
+            Self::FindPr(t)
+            | Self::ReadPr(t, _)
+            | Self::CreatePr(t, _)
+            | Self::MergePr(t, _, _) => &t.repository,
+            Self::Checks { repository, .. } | Self::MergeMethods(repository) => repository,
         }
     }
     fn authorize(&self, policy: &crate::landing_policy::Repository) -> Result<(), InvokeError> {
@@ -54,7 +57,11 @@ impl LandingGithubOp {
                     return Err(denied());
                 }
             }
-            Self::FindPr(t) | Self::ReadPr(t, _) | Self::CreatePr(t, _) | Self::MergePr(t, _) => {
+            Self::MergeMethods(_) => {}
+            Self::FindPr(t)
+            | Self::ReadPr(t, _)
+            | Self::CreatePr(t, _)
+            | Self::MergePr(t, _, _) => {
                 if t.base != policy.base
                     || !policy.branches.contains(&t.head)
                     || !full_sha(&t.head_sha)
@@ -72,7 +79,13 @@ impl LandingGithubOp {
             {
                 Err(denied())
             }
-            Self::MergePr(_, number) if !policy.permissions.merge || *number == 0 => Err(denied()),
+            Self::MergePr(_, number, method)
+                if !policy.permissions.merge
+                    || *number == 0
+                    || *method != policy.merge_method() =>
+            {
+                Err(denied())
+            }
             Self::ReadPr(_, 0) => Err(denied()),
             _ => Ok(()),
         }
@@ -95,9 +108,12 @@ impl LandingGithubOp {
                 github_landing::create_pull_request(connection, target, title, transport, deadline)
                     .await?,
             ),
-            Self::MergePr(target, number) => serde_json::to_value(
+            Self::MergeMethods(repository) => serde_json::to_value(
+                github_landing::merge_methods(connection, repository, transport, deadline).await?,
+            ),
+            Self::MergePr(target, number, method) => serde_json::to_value(
                 github_landing::merge_pull_request(
-                    connection, target, *number, transport, deadline,
+                    connection, target, *number, *method, transport, deadline,
                 )
                 .await?,
             ),
@@ -253,26 +269,31 @@ fn expected_requests(
             Method::Post,
             Some(json!({"head":t.head,"base":t.base,"title":title,"maintainer_can_modify":false})),
         )?],
-        LandingGithubOp::MergePr(t, number) => vec![make(
+        LandingGithubOp::MergeMethods(_) => vec![make(&[], &[], Method::Get, None)?],
+        LandingGithubOp::MergePr(t, number, method) => vec![make(
             &["pulls", &number.to_string(), "merge"],
             &[],
             Method::Put,
-            Some(json!({"sha":t.head_sha,"merge_method":"squash"})),
+            Some(json!({"sha":t.head_sha,"merge_method":method.as_str()})),
         )?],
-        LandingGithubOp::Checks { sha, .. } => vec![
-            make(
+        LandingGithubOp::Checks { sha, required, .. } => {
+            let mut calls = vec![make(
                 &["commits", sha, "check-runs"],
                 &[("per_page", "100"), ("filter", "latest")],
                 Method::Get,
                 None,
-            )?,
-            make(
-                &["commits", sha, "status"],
-                &[("per_page", "100")],
-                Method::Get,
-                None,
-            )?,
-        ],
+            )?];
+            // A fully pinned list never reads commit statuses.
+            if github_landing::needs_statuses(required) {
+                calls.push(make(
+                    &["commits", sha, "status"],
+                    &[("per_page", "100")],
+                    Method::Get,
+                    None,
+                )?);
+            }
+            calls
+        }
     })
 }
 struct LandingTransport<'a> {

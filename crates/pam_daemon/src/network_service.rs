@@ -1129,8 +1129,9 @@ impl NetworkService {
     ///
     /// # Errors
     ///
-    /// `network_settings_invalid` for a corrupt document, or for a policy
-    /// that cannot be put in force (see [`Self::policy_closed`]).
+    /// `network_settings_invalid` for a corrupt document;
+    /// `network_policy_invalid` for a policy that cannot be put in force
+    /// (see [`Self::policy_closed`]).
     pub async fn mirrors(&self) -> Result<(Option<MirrorBase>, Option<MirrorBase>), NetFailure> {
         self.refuse_when_closed()?;
         let loaded = self
@@ -1153,12 +1154,12 @@ impl NetworkService {
 
     /// The refusal for [`Self::policy_closed`]. A direct connection would
     /// go around the proxy or the trust the organisation requires, so
-    /// nothing is sent. The sentence names the policy key, the code and who
-    /// can fix it; the failure is the settings-invalid one every consumer
-    /// already maps.
+    /// nothing is sent. The failure is `network_policy_invalid`: its
+    /// sentence names the policy key and the code, and its recovery sends
+    /// the human to the administrator, not to Settings.
     fn refuse_when_closed(&self) -> Result<(), NetFailure> {
         match self.managed.closed() {
-            Some(closed) => Err(NetFailure::SettingsInvalid(policy_closed_sentence(&closed))),
+            Some(closed) => Err(NetFailure::PolicyInvalid(policy_closed_sentence(&closed))),
             None => Ok(()),
         }
     }

@@ -206,7 +206,7 @@ impl ScopePolicy {
     pub fn managed(mut self, view: &PolicyView) -> Self {
         let mut dropped = Vec::new();
         self.repositories.retain_mut(|repository| {
-            if !view.repository_root_allowed(&policy_path(&repository.root)) {
+            if !view.repository_root_allowed(&repository.root) {
                 dropped.push(ScopeDrop {
                     root: repository.root.clone(),
                     connector: None,
@@ -272,7 +272,7 @@ impl ScopePolicy {
         }
         for repository in &self.repositories {
             let root = repository.root.display();
-            if !view.repository_root_allowed(&policy_path(&repository.root)) {
+            if !view.repository_root_allowed(&repository.root) {
                 return Err(view.refusal(
                     Key::ScopesAllowedRepositoryRoots,
                     CAUSE_POLICY_NOT_ALLOWED,
@@ -775,24 +775,6 @@ impl ScopePolicy {
     pub fn dropped_json(&self) -> serde_json::Value {
         serde_json::Value::Array(self.dropped.iter().map(ScopeDrop::to_json).collect())
     }
-}
-
-/// A canonical root in the form a policy writes it: Windows' verbatim
-/// prefix (`\\?\C:\…`, `\\?\UNC\server\share\…`), which `canonicalize`
-/// adds, is removed so `C:\Users` covers `\\?\C:\Users\x`. Any other path is
-/// returned as is.
-#[must_use]
-pub(crate) fn policy_path(root: &Path) -> PathBuf {
-    let text = root.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{rest}"));
-    }
-    if let Some(rest) = text.strip_prefix(r"\\?\")
-        && rest.as_bytes().get(1) == Some(&b':')
-    {
-        return PathBuf::from(rest);
-    }
-    root.to_path_buf()
 }
 
 /// Why the managed policy forbids `scope`, if it does: the key and the

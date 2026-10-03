@@ -42,6 +42,18 @@ struct Fixture {
     revision: String,
 }
 async fn fixture(store: Arc<Store>, transport: Arc<dyn HttpTransport>) -> Fixture {
+    fixture_under(
+        store,
+        transport,
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+}
+async fn fixture_under(
+    store: Arc<Store>,
+    transport: Arc<dyn HttpTransport>,
+    policy: Arc<crate::managed_policy_service::PolicyHandle>,
+) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().canonicalize().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -72,7 +84,7 @@ async fn fixture(store: Arc<Store>, transport: Arc<dyn HttpTransport>) -> Fixtur
         Arc::clone(&store),
         Arc::new(SecretStore::new(secrets.clone())),
         transport,
-        crate::managed_policy_service::PolicyHandle::none(),
+        policy,
     );
     service
         .configure(
@@ -230,4 +242,35 @@ async fn every_physical_request_rechecks_revocation_before_second_http() {
     };
     assert!(call(&f, &f.revision, &op).await.is_err());
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The connector re-checks the managed landing ceiling itself (defense in
+/// depth behind the flow's checks): a pull request the human's landing
+/// policy allows but the managed `landing.max_permissions` caps is refused
+/// before any credential read or HTTP request.
+#[tokio::test]
+async fn the_managed_landing_ceiling_is_rechecked_at_the_connector() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let source = crate::policy_test::SwitchablePolicy::new(Some(
+        &json!({
+            "version": 1,
+            "landing": { "max_permissions": { "create_pr": false } },
+        })
+        .to_string(),
+    ));
+    let policy = crate::policy_test::managed_handle(&store, &source).await;
+    let fake = Arc::new(FakeTransport::new());
+    let f = fixture_under(store, fake.clone(), policy).await;
+    assert!(
+        call(
+            &f,
+            &f.revision,
+            &LandingGithubOp::CreatePr(target(), "Title".into()),
+        )
+        .await
+        .is_err(),
+        "the ceiling refuses the pull request"
+    );
+    assert_eq!(f.secrets.reads.load(Ordering::SeqCst), 0);
+    assert!(fake.requests().is_empty());
 }

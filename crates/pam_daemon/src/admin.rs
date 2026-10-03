@@ -443,17 +443,22 @@ impl AdminService {
 
     /// Routes one (tripwire-cleared) envelope to its op.
     ///
-    /// The flow, model, log, connector, retention and network surfaces get
-    /// first refusal: [`Self::dispatch_flows`], [`Self::dispatch_models`],
+    /// The flow, model, log, connector, retention, network and policy surfaces get
+    /// first refusal: [`Self::dispatch_flows_for`], [`Self::dispatch_models`],
     /// [`Self::dispatch_logs`], [`Self::dispatch_connectors`],
-    /// [`Self::dispatch_retention`] and [`Self::dispatch_network`] answer
+    /// [`Self::dispatch_retention`], [`Self::dispatch_network`] and
+    /// [`Self::dispatch_policy`] answer
     /// `None` for anything that is not one of their ops, and the match below
-    /// takes over. The log, connector and network surfaces are handed the
-    /// envelope's id because a compress files its evidence, and a configure
-    /// its change, under this very request row.
+    /// takes over. Most surfaces are handed the envelope's id because a
+    /// compress files its evidence, a configure its change, and a managed-
+    /// policy refusal its `policy.locked_write` row under this very request
+    /// row.
     async fn dispatch(&self, envelope: &Envelope) -> Result<AdminOk, OwnedRefusal> {
         let args = &envelope.args;
-        if let Some(answer) = self.dispatch_flows(&envelope.capability, args).await {
+        if let Some(answer) = self
+            .dispatch_flows_for(&envelope.id, &envelope.capability, args)
+            .await
+        {
             return answer;
         }
         if let Some(answer) = self
@@ -482,6 +487,12 @@ impl AdminService {
         }
         if let Some(answer) = self
             .dispatch_network(&envelope.id, &envelope.capability, args)
+            .await
+        {
+            return answer.map_err(OwnedRefusal::from);
+        }
+        if let Some(answer) = self
+            .dispatch_policy(&envelope.id, &envelope.capability, args)
             .await
         {
             return answer.map_err(OwnedRefusal::from);

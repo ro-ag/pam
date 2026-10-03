@@ -158,41 +158,17 @@ const RECOVERY_UNWRITABLE: &str =
     "make ~/.pam/flows writable by the user the daemon runs as, then save again";
 
 impl AdminService {
-    /// Temporary: [`Self::dispatch_flows_for`] with no request id, so a
-    /// managed-policy refusal still refuses but writes no
-    /// `policy.locked_write` row. Kept only until `admin.rs` passes the
-    /// envelope id; remove then (scratchpad `policy/cross-T6.md` item 1).
-    pub(crate) async fn dispatch_flows(
-        &self,
-        op: &str,
-        args: &Value,
-    ) -> Option<Result<AdminOk, OwnedRefusal>> {
-        self.dispatch_flows_in(None, op, args).await
-    }
-
     /// Answers one `admin.flows.*` op, or `None` when the capability
     /// belongs to another part of the admin surface. `envelope_id` is the
     /// admin request's own id: a managed-policy refusal writes its
     /// `policy.locked_write` row on it.
-    #[allow(
-        dead_code,
-        reason = "admin.rs calls it once cross-T6 item 1 lands; the tests call it now"
-    )]
     pub(crate) async fn dispatch_flows_for(
         &self,
         envelope_id: &str,
         op: &str,
         args: &Value,
     ) -> Option<Result<AdminOk, OwnedRefusal>> {
-        self.dispatch_flows_in(Some(envelope_id), op, args).await
-    }
-
-    async fn dispatch_flows_in(
-        &self,
-        envelope_id: Option<&str>,
-        op: &str,
-        args: &Value,
-    ) -> Option<Result<AdminOk, OwnedRefusal>> {
+        let envelope_id = Some(envelope_id);
         Some(match op {
             OP_LANDING_GET | OP_LANDING_SET => self
                 .landing_settings(envelope_id, op, args)

@@ -785,7 +785,7 @@ fn scopes_policy(allowed_root: &Path) -> PolicyView {
         "revision": "scopes-1",
         "contact": "it@example.test",
         "scopes": {
-            "allowed_repository_roots": [crate::scope_policy::policy_path(allowed_root)],
+            "allowed_repository_roots": [crate::managed_policy::without_verbatim_prefix(&allowed_root.to_string_lossy())],
             "connector_wide": "deny"
         },
         "connectors": {
@@ -1054,23 +1054,5 @@ fn only_the_scope_module_and_the_admin_edit_path_name_the_raw_loader() {
     assert!(
         module.contains(&format!("pub(crate) async fn {needle}(")),
         "the raw loader stays crate-private"
-    );
-}
-
-#[test]
-fn a_verbatim_windows_root_is_compared_in_the_form_a_policy_writes() {
-    use crate::scope_policy::policy_path;
-    assert_eq!(
-        policy_path(Path::new(r"\\?\C:\Users\me")),
-        Path::new(r"C:\Users\me")
-    );
-    assert_eq!(
-        policy_path(Path::new(r"\\?\UNC\server\share\x")),
-        Path::new(r"\\server\share\x")
-    );
-    assert_eq!(policy_path(Path::new("/Users/me")), Path::new("/Users/me"));
-    assert_eq!(
-        policy_path(Path::new(r"\\?\Volume{x}\a")),
-        Path::new(r"\\?\Volume{x}\a")
     );
 }

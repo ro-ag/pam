@@ -672,6 +672,10 @@ fn network_recovery(cause: &str) -> &'static str {
             "Open Settings › Network, correct the setting named in the detail and save, then \
              download again."
         }
+        "network_policy_invalid" => {
+            "The managed policy's network setting is invalid: ask your administrator; nothing was \
+             downloaded."
+        }
         "network_ca_tampered" | "ca_bundle_unreadable" => {
             "Re-import the CA bundle in Settings › Network, then download again."
         }

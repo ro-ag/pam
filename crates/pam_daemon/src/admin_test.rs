@@ -1380,33 +1380,33 @@ const LOCKED_POLICY: &str = r#"{
 /// A file that cannot be used, with no last good copy: Tier A is held.
 const TRUNCATED_POLICY: &str = r#"{"version":"#;
 
-struct Managed {
-    store: Arc<Store>,
-    admin: AdminService,
+pub(crate) struct Managed {
+    pub(crate) store: Arc<Store>,
+    pub(crate) admin: AdminService,
     approvals: Arc<ApprovalService>,
     events: mpsc::Receiver<(String, Event)>,
-    source: Arc<crate::policy_test::SwitchablePolicy>,
-    handle: Arc<crate::managed_policy_service::PolicyHandle>,
+    pub(crate) source: Arc<crate::policy_test::SwitchablePolicy>,
+    pub(crate) handle: Arc<crate::managed_policy_service::PolicyHandle>,
 }
 
 impl Managed {
     /// Replaces the policy file and reloads it, as `admin.policy.reload`
     /// would.
-    async fn replace(&self, text: Option<&str>) {
+    pub(crate) async fn replace(&self, text: Option<&str>) {
         self.source.set(text);
         self.handle
             .reload(crate::managed_policy_service::Trigger::Reload { request_id: None })
             .await;
     }
 
-    async fn op(&self, id: &str, op: &str, args: serde_json::Value) -> Response {
+    pub(crate) async fn op(&self, id: &str, op: &str, args: serde_json::Value) -> Response {
         self.admin.handle(&admin_envelope(id, op, args)).await
     }
 }
 
 /// An admin service whose every component (the gate included, on the same
 /// store) reads the policy `text`, over a stored `profile`.
-async fn managed(text: Option<&str>, profile: Profile) -> Managed {
+pub(crate) async fn managed(text: Option<&str>, profile: Profile) -> Managed {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     store
         .set_setting(

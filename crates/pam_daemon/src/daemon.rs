@@ -695,6 +695,9 @@ pub async fn run_daemon_with(
     let gate = Arc::new(PolicyGate::new(Arc::clone(&store), Arc::clone(&policy)).await?);
     let models = ModelService::new(Arc::clone(&store), Arc::clone(&policy)).await?;
     models.set_engine_base(base.clone());
+    // A reload that moves the effective models directory unloads the model
+    // loaded from the previous one.
+    models.unload_when_the_policy_moves_the_models_dir();
     // A SIGKILLed daemon leaves its engine running; stop it now rather than
     // on the first model op (idempotent, and a no-op with no engine).
     let reaped = models.reap_orphan_engine().await;
@@ -714,12 +717,12 @@ pub async fn run_daemon_with(
     // One source of the network profile (proxy, no-proxy list, CA bundle)
     // for the connector transport, the downloads, the engine install and
     // the Network screen: the `net.settings` document plus the keychain.
-    // The managed policy is its overlay: a field the policy sets is pinned.
+    // The managed policy is its overlay: a locked field is pinned, a policy
+    // default stands until the human saves one, and a policy network leaf
+    // that cannot be applied closes the network.
     let network = Arc::new(
         NetworkService::new(Arc::clone(&store), Some(Arc::clone(&secrets)), base.clone())
-            .with_managed(
-                Arc::clone(&policy) as Arc<dyn crate::network_service::ManagedNetworkLayer>
-            ),
+            .with_policy(Arc::clone(&policy)),
     );
     {
         // A changed policy drops the cached profile so the next spawn reads
@@ -769,6 +772,7 @@ pub async fn run_daemon_with(
         phase.clone(),
         Arc::clone(&hub),
         Arc::clone(&image),
+        Arc::clone(&policy),
     )?;
 
     let approvals = Arc::new(ApprovalService::new(

@@ -927,3 +927,68 @@ fn a_program_outside_the_policy_is_forbidden_whatever_the_human_allows() {
         "cargo"
     ));
 }
+
+/// Inspection follows the gate's order: a managed never-grant rule refuses
+/// a step on every profile, granted or not, so inspection reports
+/// `policy_denied` where the gate would; without a rule the profile and the
+/// grant decide as before.
+#[test]
+fn inspection_reports_a_never_rule_as_policy_denied_on_every_profile() {
+    use crate::flow_service::inspect_admission;
+    use crate::managed_policy::{TargetPlatform, inspect_bytes};
+    use crate::policy::{CapabilityClass, Profile};
+    let view = inspect_bytes(
+        br#"{"version":1,"security":{"grants":{"never":["flow.step:managed/*"],"never_classes":["external"]}}}"#,
+        TargetPlatform::host(),
+    )
+    .result
+    .expect("the policy parses");
+    for profile in [Profile::Relaxed, Profile::Standard, Profile::Strict] {
+        for granted in [false, true] {
+            assert_eq!(
+                inspect_admission(
+                    &view,
+                    profile,
+                    "flow.step:managed/look",
+                    granted,
+                    CapabilityClass::Destructive
+                ),
+                "policy_denied",
+                "{profile:?} granted={granted}"
+            );
+            assert_eq!(
+                inspect_admission(
+                    &view,
+                    profile,
+                    "flow.step:other/call",
+                    granted,
+                    CapabilityClass::External
+                ),
+                "policy_denied",
+                "the class rule, {profile:?}"
+            );
+            assert_eq!(
+                inspect_admission(
+                    &view,
+                    profile,
+                    "flow.step:other/look",
+                    granted,
+                    CapabilityClass::Destructive
+                ),
+                crate::flow_contract::inspect_gate(profile, granted, CapabilityClass::Destructive),
+                "no rule matches"
+            );
+        }
+    }
+    let unmanaged = crate::managed_policy::PolicyView::unmanaged();
+    assert_eq!(
+        inspect_admission(
+            &unmanaged,
+            Profile::Relaxed,
+            "flow.step:managed/look",
+            true,
+            CapabilityClass::Destructive
+        ),
+        crate::flow_contract::inspect_gate(Profile::Relaxed, true, CapabilityClass::Destructive)
+    );
+}

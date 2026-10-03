@@ -458,3 +458,48 @@ async fn an_unusable_network_profile_refuses_the_request_closed() {
     assert_eq!(connector.cause(), "network_settings_invalid");
     assert!(!connector.retryable());
 }
+
+/// A source closed by the managed policy.
+struct PolicyClosedSource;
+
+impl NetworkSource for PolicyClosedSource {
+    fn settings(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<NetSettings>, NetFailure>> + Send + '_>> {
+        Box::pin(async {
+            Err(NetFailure::PolicyInvalid(
+                "network.proxy could not be put in force".to_owned(),
+            ))
+        })
+    }
+}
+
+/// A policy closure keeps its own cause through the connector transport,
+/// is never retried, and never falls back to a direct connection.
+#[tokio::test]
+async fn a_policy_closed_network_refuses_the_request_with_the_policy_cause() {
+    use crate::HttpTransport as _;
+    let Some(transport) = transport(Arc::new(PolicyClosedSource)) else {
+        return;
+    };
+    let error = transport
+        .send(
+            request(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::TransportError::Policy {
+                cause: "network_policy_invalid",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let connector = crate::ConnectorError::from(error);
+    assert_eq!(connector.cause(), "network_policy_invalid");
+    assert!(!connector.retryable());
+}

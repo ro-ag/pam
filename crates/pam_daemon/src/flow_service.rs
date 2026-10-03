@@ -862,18 +862,25 @@ impl FlowService {
             )
         })?;
         let mut blockers = Vec::new();
+        // The effective values, on one snapshot: inspection reports what a
+        // run would be held to, the managed policy included.
+        let view = self.policy.view();
         let run_granted = self
             .store
             .active_grant(CAP_FLOW_RUN)
             .await
             .map_err(|error| store_note(&error))?;
-        let run_admission = crate::flow_contract::inspect_gate(
+        let run_admission = inspect_admission(
+            &view,
             self.gate.profile(),
+            CAP_FLOW_RUN,
             run_granted,
             CapabilityClass::NonDestructive,
         );
-        if matches!(run_admission, "not_granted" | "approval_required") {
-            blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": run_admission, "recovery": "review flow.run in GUI Permissions"}));
+        match run_admission {
+            CAUSE_POLICY_DENIED => blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": CAUSE_POLICY_DENIED, "recovery": crate::policy::RECOVERY_POLICY_DENIED})),
+            "not_granted" | "approval_required" => blockers.push(json!({"capability": CAP_FLOW_RUN, "cause": run_admission, "recovery": "review flow.run in GUI Permissions"})),
+            _ => {}
         }
         let repo = PathBuf::from(&ctx.caller.repo);
         if let Err(error) = self.approved_repo(&repo).await {
@@ -902,9 +909,6 @@ impl FlowService {
                 }
             },
         };
-        // The effective values, on one snapshot: inspection reports what a
-        // run would be held to, the managed policy included.
-        let view = self.policy.view();
         let (allowed, artifacts_root) = self.inspect_settings(&view).await?;
         let (steps, step_blockers) = self
             .inspect_steps(flow, &vars, &repo, &allowed, artifacts_root, &view)
@@ -1021,6 +1025,38 @@ impl FlowService {
         }))
     }
 
+    /// The admission inspection reports for one gated step, in the gate's
+    /// own order (see [`inspect_admission`]), with its blocker.
+    async fn inspect_step_gate(
+        &self,
+        view: &PolicyView,
+        flow: &Flow,
+        step: &pam_flow::Step,
+        item: &mut Value,
+        blockers: &mut Vec<Value>,
+    ) -> Result<(), FlowRefusal> {
+        let capability = step_capability(&flow.id, &step.id);
+        let granted = self
+            .store
+            .active_grant(&capability)
+            .await
+            .map_err(|error| store_note(&error))?;
+        let class = if matches!(step.action, Action::Connector { .. }) {
+            CapabilityClass::External
+        } else {
+            CapabilityClass::Destructive
+        };
+        let admission = inspect_admission(view, self.gate.profile(), &capability, granted, class);
+        item["grant"] = json!(if granted { "present" } else { "missing" });
+        item["admission"] = json!(admission);
+        match admission {
+            CAUSE_POLICY_DENIED => blockers.push(json!({"step": step.id, "cause": CAUSE_POLICY_DENIED, "recovery": crate::policy::RECOVERY_POLICY_DENIED})),
+            "not_granted" | "approval_required" => blockers.push(json!({"step": step.id, "cause": admission, "recovery": "review this flow step in GUI Permissions"})),
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Read a recipe's step gates and local connector configuration without execution.
     async fn inspect_steps(
         &self,
@@ -1036,23 +1072,8 @@ impl FlowService {
         for step in &flow.steps {
             let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "watch": step.watch, "live": "unknown"});
             if step.gated() {
-                let granted = self
-                    .store
-                    .active_grant(&step_capability(&flow.id, &step.id))
-                    .await
-                    .map_err(|error| store_note(&error))?;
-                let class = if matches!(step.action, Action::Connector { .. }) {
-                    CapabilityClass::External
-                } else {
-                    CapabilityClass::Destructive
-                };
-                let admission =
-                    crate::flow_contract::inspect_gate(self.gate.profile(), granted, class);
-                item["grant"] = json!(if granted { "present" } else { "missing" });
-                item["admission"] = json!(admission);
-                if matches!(admission, "not_granted" | "approval_required") {
-                    blockers.push(json!({"step": step.id, "cause": admission, "recovery": "review this flow step in GUI Permissions"}));
-                }
+                self.inspect_step_gate(view, flow, step, &mut item, &mut blockers)
+                    .await?;
             }
             match &step.action {
                 Action::Landing { operation } => {
@@ -3557,4 +3578,22 @@ pub(crate) fn boundary_read_roots(
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// The admission inspection reports for `capability`: the gate's own order,
+/// so inspection never shows a step admissible that the gate refuses. A
+/// managed never-grant rule refuses first, on every profile and whether or
+/// not a grant exists (`policy_denied`, with no rule text); otherwise the
+/// profile and grant decide (`flow_contract::inspect_gate`).
+pub(crate) fn inspect_admission(
+    view: &PolicyView,
+    profile: crate::policy::Profile,
+    capability: &str,
+    granted: bool,
+    class: CapabilityClass,
+) -> &'static str {
+    if class != CapabilityClass::Control && view.never_match(capability, Some(class)).is_some() {
+        return CAUSE_POLICY_DENIED;
+    }
+    crate::flow_contract::inspect_gate(profile, granted, class)
 }

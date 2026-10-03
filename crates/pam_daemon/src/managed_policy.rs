@@ -146,6 +146,18 @@ pub const CODE_REASON_TOO_LONG: &str = "policy_reason_too_long";
 pub const CODE_RETENTION_PAIR: &str = "policy_retention_pair_invalid";
 /// Held: the key is managed but its value cannot be resolved.
 pub const CODE_FROZEN: &str = CAUSE_POLICY_FROZEN;
+/// Leaf, Windows only: `network.ca_bundle` pins a bundle file. On Windows
+/// curl's Schannel replaces the certificate store with a bundle file (public
+/// hosts stop verifying, and revocation fails without an http CRL), so the
+/// pin is rejected and has no effect: the network stays open on the store's
+/// trust. The same word as the human's refusal
+/// (`admin_network::CAUSE_CA_UNSUPPORTED_ON_WINDOWS`); it is not a
+/// `policy_` code, so it is not in [`ALL_CODES`].
+pub const CODE_CA_UNSUPPORTED_ON_WINDOWS: &str =
+    crate::admin_network::CAUSE_CA_UNSUPPORTED_ON_WINDOWS;
+/// What an administrator does instead of a pinned bundle on Windows.
+pub const RECOVERY_CA_ON_WINDOWS: &str = "install the CA in the Windows certificate store through MDM, and remove network.ca_bundle \
+     from the Windows policy";
 
 /// Every diagnostic code, file-level and leaf-level, for the tests that
 /// keep them stable and unique.
@@ -828,9 +840,15 @@ impl PathRule {
     /// absolute, is never covered.
     #[must_use]
     pub fn covers(&self, candidate: &str, home: Option<&Path>) -> bool {
+        // A Windows path from `canonicalize` carries the verbatim prefix;
+        // compared as written, `C:\Users` would never cover it.
+        let candidate = match self.platform {
+            TargetPlatform::Windows => without_verbatim_prefix(candidate),
+            TargetPlatform::Macos => std::borrow::Cow::Borrowed(candidate),
+        };
         let (Some(prefix), Some(candidate)) = (
             self.expanded(home),
-            path_components(candidate, self.platform, home, true),
+            path_components(&candidate, self.platform, home, true),
         ) else {
             return false;
         };
@@ -854,6 +872,23 @@ impl PathRule {
             }
         }
     }
+}
+
+/// A Windows path in the form a policy writes it: the verbatim prefix
+/// (`\\?\C:\…`, `\\?\UNC\server\share\…`) that `std::fs::canonicalize`
+/// adds is removed, so `C:\Users` covers `\\?\C:\Users\x`. Any other path
+/// (a verbatim volume GUID path included) is returned as is.
+#[must_use]
+pub fn without_verbatim_prefix(raw: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(raw)
 }
 
 /// The two prefixes `expand_home` in the flow service expands.
@@ -1399,6 +1434,12 @@ impl PolicyView {
             })
             .collect();
         for (key, code, detail) in rejected {
+            // A CA bundle pinned on Windows is refused for the platform, not
+            // for a typo: it has no effect, so it is neither held (which
+            // would close the network) nor taken from a last-good copy.
+            if code == CODE_CA_UNSUPPORTED_ON_WINDOWS {
+                continue;
+            }
             let good = last_good.and_then(|view| {
                 view.leaves
                     .get(&key)
@@ -2689,8 +2730,19 @@ fn parse_ca_bundle(
         }
         Ok(Some(CaBundlePin { path, sha256 }))
     };
+    let locked = modes.get(Mode::Locked).map(pin).transpose()?;
+    if platform == TargetPlatform::Windows && matches!(locked, Some(Some(_))) {
+        return Err(reject(
+            CODE_CA_UNSUPPORTED_ON_WINDOWS,
+            format!(
+                "{key} cannot pin a CA bundle file on Windows: curl's Schannel would replace the \
+                 Windows certificate store with it; the pin has no effect and the network uses \
+                 the store's trust. To trust the CA, {RECOVERY_CA_ON_WINDOWS}"
+            ),
+        ));
+    }
     Ok(ValueLeaf {
-        locked: modes.get(Mode::Locked).map(pin).transpose()?,
+        locked,
         default: None,
         reason: modes.reason,
     })

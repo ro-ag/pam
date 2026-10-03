@@ -40,6 +40,7 @@ use pam_daemon::admin_flows::FLOW_ADMIN_OPS;
 use pam_daemon::admin_logs::{LOG_ADMIN_OPS, OP_LOG_COMPRESS};
 use pam_daemon::admin_models::{MODEL_ADMIN_OPS, OP_MODELS_TRY};
 use pam_daemon::admin_network::{NETWORK_ADMIN_OPS, OP_NETWORK_SET, OP_NETWORK_TEST};
+use pam_daemon::admin_policy::POLICY_ADMIN_OPS;
 use pam_daemon::admin_retention::RETENTION_ADMIN_OPS;
 use pam_daemon::lifecycle::{LOG_DIR, LOG_FILE};
 use pam_proto::Response;
@@ -95,17 +96,18 @@ const CORE_ADMIN_OPS: [&str; 11] = [
 ];
 
 /// How many ops the whitelist carries: the core surface plus the model,
-/// log, flow, connector, retention and network surfaces, counted from the
-/// daemon's own lists.
+/// log, flow, connector, retention, network and managed-policy surfaces,
+/// counted from the daemon's own lists.
 const ADMIN_OPS_LEN: usize = CORE_ADMIN_OPS.len()
     + MODEL_ADMIN_OPS.len()
     + LOG_ADMIN_OPS.len()
     + FLOW_ADMIN_OPS.len()
     + CONNECTOR_ADMIN_OPS.len()
     + RETENTION_ADMIN_OPS.len()
-    + NETWORK_ADMIN_OPS.len();
+    + NETWORK_ADMIN_OPS.len()
+    + POLICY_ADMIN_OPS.len();
 
-/// Splices the seven daemon-owned lists into one array at compile time —
+/// Splices the eight daemon-owned lists into one array at compile time —
 /// no op name is retyped here, so the whitelist cannot drift from the
 /// daemon's dispatch.
 const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
@@ -150,6 +152,12 @@ const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
         ops[index + network] = NETWORK_ADMIN_OPS[network];
         network += 1;
     }
+    index += NETWORK_ADMIN_OPS.len();
+    let mut policy = 0;
+    while policy < POLICY_ADMIN_OPS.len() {
+        ops[index + policy] = POLICY_ADMIN_OPS[policy];
+        policy += 1;
+    }
     ops
 }
 
@@ -157,7 +165,8 @@ const fn compose_admin_ops() -> [&'static str; ADMIN_OPS_LEN] {
 /// touching the socket. Composed from `pam_daemon::admin`,
 /// `pam_daemon::admin_models`, `pam_daemon::admin_logs`,
 /// `pam_daemon::admin_flows`, `pam_daemon::admin_connectors`,
-/// `pam_daemon::admin_retention` and `pam_daemon::admin_network` — the
+/// `pam_daemon::admin_retention`, `pam_daemon::admin_network` and
+/// `pam_daemon::admin_policy` — the
 /// daemon would refuse an unknown op too, this just fails faster and keeps
 /// the GUI surface explicit.
 pub const ADMIN_OPS: [&str; ADMIN_OPS_LEN] = compose_admin_ops();

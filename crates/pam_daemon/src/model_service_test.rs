@@ -1917,3 +1917,81 @@ async fn a_generation_waiting_behind_a_stuck_one_is_cancelled_and_bounded() {
         "{error:?}"
     );
 }
+
+/// A policy reload that moves the effective `models.dir` unloads the model
+/// loaded from the previous directory (registry ids repeat across
+/// directories); a reload that leaves the directory alone keeps it loaded.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_policy_reload_that_moves_the_models_dir_unloads_the_loaded_model() {
+    use crate::managed_policy_service::Trigger;
+    let Some(fake) = fake_engine_binary() else {
+        eprintln!("pam-fake-llama-server not built; skipping");
+        return;
+    };
+    // Unix socket paths are capped at 104 bytes: keep the base short.
+    let dir = tempfile::Builder::new()
+        .prefix("pam-mp-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere_dir = elsewhere.path().canonicalize().unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let source = crate::policy_test::SwitchablePolicy::new(None);
+    let policy = crate::policy_test::managed_handle(&store, &source).await;
+    let service = ModelService::new(Arc::clone(&store), Arc::clone(&policy))
+        .await
+        .unwrap();
+    service.set_models_dir(dir.path()).await.unwrap();
+    service.set_engine_base(dir.path().join("base"));
+    service.unload_when_the_policy_moves_the_models_dir();
+    let path = touch_model(dir.path(), "qwen", "tiny.gguf");
+    verify_and_qualify(&service, &path);
+    service
+        .set_default(Tier::Light, Some("qwen/tiny"))
+        .await
+        .unwrap();
+    install_fake_engine(&service, &fake);
+    let request = || pam_model::runtime::GenerateRequest {
+        system: None,
+        prompt: "one".into(),
+        max_tokens: 4,
+        temperature: 0.0,
+        stop: Vec::new(),
+    };
+    service
+        .generate_bounded(Tier::Light, request(), 4096)
+        .await
+        .unwrap();
+    let loaded = |status: &serde_json::Value| status["engine"]["loaded"]["id"].clone();
+    assert_eq!(loaded(&service.status().await.unwrap()), "qwen/tiny");
+
+    // A change that leaves the directory alone keeps the model.
+    source.set(Some(
+        &json!({ "version": 1, "models": { "idle_unload_min": { "max": 30 } } }).to_string(),
+    ));
+    policy.reload(Trigger::Reload { request_id: None }).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(loaded(&service.status().await.unwrap()), "qwen/tiny");
+
+    // A lock on another directory moves it: the loaded model goes.
+    source.set(Some(
+        &json!({ "version": 1, "models": { "dir": { "locked": elsewhere_dir } } }).to_string(),
+    ));
+    policy.reload(Trigger::Reload { request_id: None }).await;
+    assert_eq!(service.models_dir(), elsewhere_dir);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = service.status().await.unwrap();
+        if status["engine"]["loaded"].is_null() {
+            assert_eq!(status["runtime"]["state"]["state"], "idle");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the model was not unloaded: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    service.unload_all().await.unwrap();
+}

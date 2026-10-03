@@ -67,7 +67,7 @@ use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
 
-use crate::managed_policy::{EffectiveEntry, Key};
+use crate::managed_policy::{EffectiveEntry, Key, PolicyView};
 use crate::managed_policy_service::PolicyHandle;
 use crate::network_service::Source;
 
@@ -643,6 +643,56 @@ impl ModelService {
         Some(built)
     }
 
+    /// Registers the managed-policy change hook that unloads a model a
+    /// reload strands: when a policy change moves the effective
+    /// `models.dir` (a lock or default added, changed or removed), the
+    /// model loaded from the previous directory is unloaded, as the human's
+    /// own `set_models_dir` does, because registry ids repeat across
+    /// directories. The old and the new directory are both computed over
+    /// the human's stored directory as it is at the change, so a human edit
+    /// in between is never mistaken for a policy move. Called once, after
+    /// boot; the hook holds the service weakly.
+    pub fn unload_when_the_policy_moves_the_models_dir(self: &Arc<Self>) {
+        let service = Arc::downgrade(self);
+        let previous = std::sync::Mutex::new(self.policy.view());
+        self.policy.on_change(move |_| {
+            let Some(service) = service.upgrade() else {
+                return;
+            };
+            let current = service.policy.view();
+            let before = std::mem::replace(
+                &mut *previous
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Arc::clone(&current),
+            );
+            if service.models_dir_entry_under(&before).0
+                == service.models_dir_entry_under(&current).0
+            {
+                return;
+            }
+            // Hooks run on the reloading task and must not block it; the
+            // unload takes the model lane's operation lock like any other
+            // directory switch.
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            runtime.spawn(async move {
+                let _operation = service.operation.lock().await;
+                if let Err(error) = service.unload_all().await {
+                    tracing::warn!(
+                        %error,
+                        "the model loaded from the previous models directory did not unload"
+                    );
+                } else {
+                    tracing::info!(
+                        "the managed policy moved the models directory; the loaded model was unloaded"
+                    );
+                }
+            });
+        });
+    }
+
     /// Unloads whatever holds weights: the engine process. The private copies stay (a
     /// reload must not cost a copy of the weights); only the ones no live verification
     /// references any more are swept, now that nothing maps them.
@@ -1131,15 +1181,19 @@ impl ModelService {
     /// block of the status and settings replies.
     #[must_use]
     pub fn models_dir_entry(&self) -> (PathBuf, EffectiveEntry) {
+        self.models_dir_entry_under(&self.policy.view())
+    }
+
+    /// [`Self::models_dir_entry`] under `view`, over the human's stored
+    /// directory as it is now.
+    fn models_dir_entry_under(&self, view: &PolicyView) -> (PathBuf, EffectiveEntry) {
         let stored = self
             .stored_models_dir
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let (value, entry) = self
-            .policy
-            .view()
-            .effective_string(Key::ModelsDir, stored.map(|dir| dir.display().to_string()));
+        let (value, entry) =
+            view.effective_string(Key::ModelsDir, stored.map(|dir| dir.display().to_string()));
         // A machine with no home directory has nowhere canonical to keep
         // weights; the relative path scans empty, which is the honest answer.
         let dir = value.map_or_else(

@@ -175,6 +175,7 @@ fn refusal_before_spawn(failure: NetFailure) -> TransportError {
         NetFailure::Spawn(detail) => TransportError::Spawn(detail),
         NetFailure::CurlTooOld { .. }
         | NetFailure::SettingsInvalid(_)
+        | NetFailure::PolicyInvalid(_)
         | NetFailure::CaBundleTampered
         | NetFailure::RequestInvalid { .. } => TransportError::Policy {
             cause: failure.cause(),
@@ -199,6 +200,7 @@ fn failure_refusal(failure: NetFailure, request: &HttpRequest) -> TransportError
         | NetFailure::Spawn(_)
         | NetFailure::CurlTooOld { .. }
         | NetFailure::SettingsInvalid(_)
+        | NetFailure::PolicyInvalid(_)
         | NetFailure::CaBundleTampered
         | NetFailure::RequestInvalid { .. } => refusal_before_spawn(failure),
         other if request.method != Method::Get => TransportError::Network(format!(

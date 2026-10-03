@@ -1158,7 +1158,7 @@ fn managed_document(allowed_root: &Path) -> serde_json::Value {
         "revision": "rev-9",
         "contact": "it@example.test",
         "flows": { "programs": { "allow": ["git", "make"] } },
-        "scopes": { "allowed_repository_roots": [crate::scope_policy::policy_path(allowed_root)] }
+        "scopes": { "allowed_repository_roots": [crate::managed_policy::without_verbatim_prefix(&allowed_root.to_string_lossy())] }
     })
 }
 
@@ -1468,5 +1468,42 @@ async fn a_landing_save_above_the_policy_ceiling_is_refused_with_its_audit_row()
             .unwrap()
             .is_none(),
         "nothing was written"
+    );
+}
+
+/// Through the admin plane's own dispatch (not the flow dispatcher called
+/// directly): a refused flow-settings write files its `policy.locked_write`
+/// row on the op's request, before the terminal `admin` refuse row.
+#[tokio::test]
+async fn the_admin_dispatch_files_the_flow_settings_refusal_on_the_ops_own_request() {
+    let (_dirs, inside, _outside) = roots();
+    let allowed = inside.parent().unwrap().to_path_buf();
+    let (_tmp, store, admin, _ingress) = managed_service(Some(managed_document(&allowed))).await;
+    match admin
+        .handle(&admin_envelope(
+            "req_dispatch_locked",
+            OP_FLOWS_SETTINGS_SET,
+            json!({ "allowed_programs": ["cargo"] }),
+        ))
+        .await
+    {
+        Response::Refusal { cause, .. } => {
+            assert_eq!(cause, crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let actions: Vec<String> = store
+        .audit_for_request("req_dispatch_locked")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.action)
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            crate::managed_policy_service::ACTION_POLICY_LOCKED_WRITE.to_owned(),
+            crate::admin::ACTION_ADMIN.to_owned(),
+        ]
     );
 }

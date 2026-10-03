@@ -43,7 +43,7 @@ async fn ticket(ctx: &ExecContext) -> Result<String, CapabilityFailure> {
 /// Return only selected durable metadata, never the protected verdict body.
 pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx).await?;
-    let (status, result) = authorized_metadata_under(
+    let (status, result) = authorized_metadata(
         &ctx.store,
         &ctx.flows.policy().view(),
         &ctx.caller.repo,
@@ -60,7 +60,7 @@ pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, Capabi
         Some(progress) => {
             let watch: Value = serde_json::from_str(&progress).map_err(|_| unavailable())?;
             // Progress may have been published after the first origin snapshot.
-            authorized_metadata_under(
+            authorized_metadata(
                 &ctx.store,
                 &ctx.flows.policy().view(),
                 &ctx.caller.repo,
@@ -77,7 +77,7 @@ pub(crate) async fn result(ctx: &ExecContext) -> Result<CapabilityOutput, Capabi
         .await
         .map_err(|_| unavailable())?
         .unwrap_or(Value::Null);
-    authorized_metadata_under(
+    authorized_metadata(
         &ctx.store,
         &ctx.flows.policy().view(),
         &ctx.caller.repo,
@@ -175,7 +175,7 @@ pub(crate) fn result_output(
 /// Scoped replacement for the former unrestricted status lookup.
 pub(crate) async fn scoped_query(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFailure> {
     let ticket = ticket(ctx).await?;
-    let (status, _) = authorized_metadata_under(
+    let (status, _) = authorized_metadata(
         &ctx.store,
         &ctx.flows.policy().view(),
         &ctx.caller.repo,
@@ -199,27 +199,9 @@ pub(crate) async fn scoped_query(ctx: &ExecContext) -> Result<CapabilityOutput, 
     )
 }
 
-/// Temporary: `authorized_metadata_under` with no managed policy, for the
-/// callers outside T6's files (`public_transport.rs`, and
-/// `daemon_repository_test.rs`) until they pass a policy view; remove then
-/// (scratchpad `policy/cross-T6.md` item 3).
-pub(crate) async fn authorized_metadata(
-    store: &Store,
-    caller_repo: &str,
-    ticket: &str,
-) -> Result<(RequestStatusMeta, Option<FlowResultMeta>), CapabilityFailure> {
-    authorized_metadata_under(
-        store,
-        &crate::managed_policy::PolicyView::unmanaged(),
-        caller_repo,
-        ticket,
-    )
-    .await
-}
-
 /// Authorization happens before exposing existence, including terminal status.
 /// The scopes are the effective ones under `view`, the managed policy.
-pub(crate) async fn authorized_metadata_under(
+pub(crate) async fn authorized_metadata(
     store: &Store,
     view: &crate::managed_policy::PolicyView,
     caller_repo: &str,

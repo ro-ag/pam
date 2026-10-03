@@ -13,6 +13,9 @@ pub mod admin_models;
 pub mod admin_network;
 #[cfg(test)]
 mod admin_network_test;
+pub mod admin_policy;
+#[cfg(test)]
+mod admin_policy_test;
 pub mod admin_retention;
 pub mod admin_transport;
 pub mod approval;

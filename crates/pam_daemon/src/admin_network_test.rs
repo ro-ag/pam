@@ -1589,10 +1589,15 @@ async fn a_failed_managed_ca_import_closes_the_network_and_the_screen_says_why()
         .await;
     assert_eq!(cause, CAUSE_SETTING_LOCKED);
 
-    let (cause, detail, _) = fixture.refuse(OP_NETWORK_TEST, json!({})).await;
-    assert_eq!(cause, CAUSE_NETWORK_INVALID);
+    // The policy's own cause, and a recovery that sends the human to the
+    // administrator, never to Settings.
+    let (cause, detail, recovery) = fixture.refuse(OP_NETWORK_TEST, json!({})).await;
+    assert_eq!(cause, "network_policy_invalid");
+    assert_ne!(cause, CAUSE_NETWORK_INVALID);
     assert!(detail.contains("network.ca_bundle"), "{detail}");
     assert!(detail.contains("writable_by_user"), "{detail}");
+    assert!(recovery.contains("ask your administrator"), "{recovery}");
+    assert!(!recovery.contains("Settings"), "{recovery}");
 
     // An unrelated field saves; the consumers stay closed until the policy
     // is fixed.

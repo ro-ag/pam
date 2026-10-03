@@ -354,6 +354,7 @@ fn every_failure_has_a_cause_a_sentence_and_a_recovery() {
             feature: "a proxy",
         },
         NetFailure::SettingsInvalid("proxy.url: no port".to_owned()),
+        NetFailure::PolicyInvalid("network.proxy: policy_value_invalid".to_owned()),
         NetFailure::CaBundleTampered,
         NetFailure::RequestInvalid {
             field: "header",
@@ -450,4 +451,25 @@ fn an_excerpt_is_one_bounded_line() {
     let long = excerpt(&"x".repeat(2000));
     assert_eq!(long.chars().count(), 513);
     assert!(long.ends_with('…'));
+}
+
+#[test]
+fn a_policy_closure_has_its_own_cause_and_sends_the_human_to_the_administrator() {
+    let failure = NetFailure::PolicyInvalid("network.ca_bundle (writable_by_user)".to_owned());
+    assert_eq!(failure.cause(), "network_policy_invalid");
+    assert!(
+        failure
+            .sentence()
+            .contains("network.ca_bundle (writable_by_user)"),
+        "{}",
+        failure.sentence()
+    );
+    let recovery = failure.recovery();
+    assert!(recovery.contains("ask your administrator"), "{recovery}");
+    assert!(!recovery.contains("Settings"), "{recovery}");
+    assert_ne!(
+        recovery,
+        NetFailure::SettingsInvalid(String::new()).recovery(),
+        "a policy closure must not send the human to Settings"
+    );
 }

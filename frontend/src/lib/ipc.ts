@@ -486,7 +486,9 @@ export type AdminOp =
   | "admin.network.test"
   | "admin.retention.get"
   | "admin.retention.set"
-  | "admin.retention.prune";
+  | "admin.retention.prune"
+  | "admin.policy.get"
+  | "admin.policy.reload";
 
 /**
  * One generic admin call; prefer the typed wrappers below. `confirmation` is the phrase the

@@ -12,14 +12,15 @@ use sha2::{Digest, Sha256};
 
 use crate::managed_policy::{
     ALL_CODES, CAUSE_POLICY_FROZEN, CAUSE_POLICY_NOT_ALLOWED, CAUSE_SETTING_LOCKED,
-    CODE_CONTROL_CHARACTER, CODE_DUPLICATE_KEY, CODE_LIST_TOO_LONG, CODE_MODE_CONFLICT,
-    CODE_MODE_MISSING, CODE_MODE_UNSUPPORTED, CODE_NOT_JSON, CODE_NOT_OBJECT, CODE_NOT_UTF8,
-    CODE_REASON_TOO_LONG, CODE_RETENTION_PAIR, CODE_STRING_TOO_LONG, CODE_TOO_DEEP, CODE_TOO_LARGE,
-    CODE_UNKNOWN_KEY, CODE_VALUE_INVALID, CODE_VERSION_MISSING, CODE_VERSION_UNSUPPORTED,
-    CODE_WRONG_TYPE, EngineSource, FileFailure, Inspection, Key, KeyRefusal, LandingCeiling,
-    LeafStatus, MAX_LIST_ENTRIES, MAX_POLICY_BYTES, MAX_REASON_CHARS, Mode, ModelSource,
-    PolicyView, RECOVERY_MANAGED, SECTIONS, TargetPlatform, Tier, Verdict, clamp_window,
-    inspect_bytes, intersect_exact, pattern_matches, stricter,
+    CODE_CA_UNSUPPORTED_ON_WINDOWS, CODE_CONTROL_CHARACTER, CODE_DUPLICATE_KEY, CODE_LIST_TOO_LONG,
+    CODE_MODE_CONFLICT, CODE_MODE_MISSING, CODE_MODE_UNSUPPORTED, CODE_NOT_JSON, CODE_NOT_OBJECT,
+    CODE_NOT_UTF8, CODE_REASON_TOO_LONG, CODE_RETENTION_PAIR, CODE_STRING_TOO_LONG, CODE_TOO_DEEP,
+    CODE_TOO_LARGE, CODE_UNKNOWN_KEY, CODE_VALUE_INVALID, CODE_VERSION_MISSING,
+    CODE_VERSION_UNSUPPORTED, CODE_WRONG_TYPE, EngineSource, FileFailure, Inspection, Key,
+    KeyRefusal, LandingCeiling, LeafStatus, MAX_LIST_ENTRIES, MAX_POLICY_BYTES, MAX_REASON_CHARS,
+    Mode, ModelSource, PolicyView, RECOVERY_MANAGED, SECTIONS, TargetPlatform, Tier, Verdict,
+    clamp_window, inspect_bytes, intersect_exact, pattern_matches, stricter,
+    without_verbatim_prefix,
 };
 use crate::network_service::Source;
 use crate::policy::{CapabilityClass, Profile};
@@ -1383,4 +1384,130 @@ fn inspection_verdicts() {
     assert_eq!(view.rejected_leaves(), 1);
     assert_eq!(view.diagnostics()[0].key, "service.require_login_unit");
     assert!(!view.require_login_unit());
+}
+
+/// Decision note 751: a CA bundle the policy pins on Windows is rejected
+/// for the platform, has no effect (not held, so the network is not closed;
+/// never taken from a last-good copy), and `inspect_bytes` reports it. The
+/// same pin is applied for macOS, and pinning "no bundle" stays valid on
+/// Windows.
+#[test]
+fn a_ca_bundle_pinned_on_windows_is_rejected_with_no_effect_and_reported() {
+    let pinned = |path: &str| {
+        doc(&json!({ "network": {
+            "proxy": { "locked": { "url": "http://proxy.example.com:8080", "auth": "none" } },
+            "ca_bundle": { "locked": { "path": path, "sha256": "ab".repeat(32) } },
+        } }))
+    };
+    let windows = pinned(r"C:\ProgramData\PAM\ca\corp-root.pem");
+    let inspection = inspect_for(&windows.to_string(), WIN);
+    assert_eq!(inspection.verdict(), Verdict::LeafProblems);
+    let parsed = inspection.result.expect("the document parses");
+    assert_eq!(
+        rejected_code(&parsed, Key::NetworkCaBundle),
+        CODE_CA_UNSUPPORTED_ON_WINDOWS
+    );
+    assert_eq!(
+        CODE_CA_UNSUPPORTED_ON_WINDOWS,
+        "network_ca_unsupported_on_windows"
+    );
+    let diagnostic = parsed
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.key == "network.ca_bundle")
+        .expect("reported");
+    assert_eq!(diagnostic.code, CODE_CA_UNSUPPORTED_ON_WINDOWS);
+    assert!(
+        diagnostic
+            .detail
+            .contains("Windows certificate store through MDM"),
+        "{}",
+        diagnostic.detail
+    );
+    assert!(parsed.policy().ca_bundle.is_none(), "no pin is in force");
+
+    // No effect: not held, so nothing closes, and no fallback brings a pin
+    // back; the proxy beside it still applies.
+    let fallen = parsed.clone().with_fallback(Some(&parsed));
+    let held = parsed.clone().with_fallback(None);
+    for view in [&fallen, &held] {
+        assert_eq!(
+            rejected_code(view, Key::NetworkCaBundle),
+            CODE_CA_UNSUPPORTED_ON_WINDOWS
+        );
+        assert!(!view.is_held(Key::NetworkCaBundle));
+        assert!(!view.is_locked(Key::NetworkCaBundle));
+        assert_eq!(view.network_closed(), None, "the network stays open");
+        assert!(applied(view, Key::NetworkProxy));
+        let managed = view.managed_network().expect("the proxy is managed");
+        assert_eq!(managed.ca_bundle, None);
+        assert!(managed.proxy.is_some());
+    }
+    let report = held
+        .key_reports()
+        .into_iter()
+        .find(|row| row.key == "network.ca_bundle")
+        .expect("a keys row");
+    assert_eq!(report.state, "rejected");
+
+    // The same pin is a macOS policy's to make.
+    let mac = view_for(
+        &pinned("/Library/Application Support/PAM/ca/corp-root.pem"),
+        MAC,
+    );
+    assert!(applied(&mac, Key::NetworkCaBundle));
+    // "No bundle" (the store's trust) is fine on Windows.
+    let none = view_for(
+        &doc(&json!({ "network": { "ca_bundle": { "locked": null } } })),
+        WIN,
+    );
+    assert!(applied(&none, Key::NetworkCaBundle));
+    assert!(none.diagnostics().is_empty());
+}
+
+/// The one place Windows' verbatim prefix is removed: the cover check. A
+/// canonical repository root (`\\?\C:\…`, as `canonicalize` returns it) is
+/// covered by the `C:\…` prefix an administrator writes; a verbatim UNC path
+/// by its `\\server\share` form; a volume GUID path stays as it is.
+#[test]
+fn a_verbatim_windows_path_is_covered_by_the_prefix_a_policy_writes() {
+    assert_eq!(without_verbatim_prefix(r"\\?\C:\Users\me"), r"C:\Users\me");
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\UNC\server\share\x"),
+        r"\\server\share\x"
+    );
+    assert_eq!(without_verbatim_prefix("/Users/me"), "/Users/me");
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\Volume{x}\a"),
+        r"\\?\Volume{x}\a"
+    );
+
+    let windows = view_for(
+        &doc(
+            &json!({ "scopes": { "allowed_repository_roots": [r"C:\Users", r"\\server\share"] } }),
+        ),
+        WIN,
+    );
+    for covered in [
+        r"\\?\C:\Users\me\repo",
+        r"C:\Users\me\repo",
+        r"\\?\UNC\server\share\repo",
+    ] {
+        assert!(
+            windows.repository_root_allowed(Path::new(covered)),
+            "{covered}"
+        );
+    }
+    for outside in [r"\\?\D:\Users\me", r"\\?\Volume{x}\Users"] {
+        assert!(
+            !windows.repository_root_allowed(Path::new(outside)),
+            "{outside}"
+        );
+    }
+    // macOS paths are compared as they are.
+    let mac = view(&doc(
+        &json!({ "scopes": { "allowed_repository_roots": ["/Users"] } }),
+    ));
+    assert!(mac.repository_root_allowed(Path::new("/Users/me/repo")));
+    assert!(!mac.repository_root_allowed(Path::new(r"\\?\C:\Users\me")));
 }

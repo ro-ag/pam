@@ -898,7 +898,7 @@ async fn a_closed_overlay_refuses_the_profile_and_the_mirrors_and_names_the_key_
     });
     // Within the cache window: the closure still applies at once.
     let failure = service.settings().await.expect_err("closed");
-    assert_eq!(failure.cause(), "network_settings_invalid");
+    assert_eq!(failure.cause(), "network_policy_invalid");
     let sentence = failure.sentence();
     for needle in [
         "organisation's policy",
@@ -910,7 +910,7 @@ async fn a_closed_overlay_refuses_the_profile_and_the_mirrors_and_names_the_key_
         assert!(sentence.contains(needle), "{needle}: {sentence}");
     }
     let mirrors = service.mirrors().await.expect_err("closed");
-    assert_eq!(mirrors.cause(), "network_settings_invalid");
+    assert_eq!(mirrors.cause(), "network_policy_invalid");
     assert!(mirrors.sentence().contains("network.ca_bundle"));
     assert!(
         service.load().await.unwrap().is_ok(),
@@ -1120,7 +1120,7 @@ async fn a_failed_ca_import_closes_connector_calls_and_downloads_with_the_cause(
     );
 
     let failure = service.settings().await.expect_err("closed");
-    assert_eq!(failure.cause(), "network_settings_invalid");
+    assert_eq!(failure.cause(), "network_policy_invalid");
     let sentence = failure.sentence();
     assert!(sentence.contains("network.ca_bundle"), "{sentence}");
     assert!(sentence.contains("writable_by_user"), "{sentence}");
@@ -1147,11 +1147,11 @@ async fn a_rejected_proxy_with_no_last_good_value_closes_the_network() {
     )
     .await;
     let failure = service.settings().await.expect_err("closed");
-    assert_eq!(failure.cause(), "network_settings_invalid");
+    assert_eq!(failure.cause(), "network_policy_invalid");
     assert!(failure.sentence().contains("network.proxy"), "{failure}");
     assert_eq!(
         service.mirrors().await.unwrap_err().cause(),
-        "network_settings_invalid"
+        "network_policy_invalid"
     );
 }
 

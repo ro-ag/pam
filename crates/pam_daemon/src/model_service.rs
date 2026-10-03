@@ -84,12 +84,12 @@ pub const KIND_DOWNLOAD: &str = "download";
 /// `model_job.kind` for a verification.
 pub const KIND_VERIFY: &str = "verify";
 
-/// `model_job.kind` an import is recorded under. The store's `kind` column
-/// admits only `download` and `verify` (migration 3's CHECK), and an import
-/// is a transfer into the models directory with the same progress, verdict
-/// and cancel; its `source` is the absolute path of the file, where a
-/// download's is an `https://` address, which is how the two are told apart.
-pub const KIND_IMPORT: &str = KIND_DOWNLOAD;
+/// `model_job.kind` for an import from a local file: a copy into the
+/// models directory with the same progress, verdict and cancel as a
+/// download. Its `source` is the absolute path of the file, where a
+/// download's is an `https://` address. The store admits the kind since
+/// schema version 15.
+pub const KIND_IMPORT: &str = "import";
 
 /// `model_job.state` for a job that finished cleanly.
 pub const JOB_DONE: &str = "done";

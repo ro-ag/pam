@@ -108,6 +108,146 @@ then `pam status` outside the sandbox.
   while the active task pane scrolls. Keyboard-accessible tabs separate flow
   editing and runs, activity compression, and model operations.
 
+## Local models and the inference engine
+
+PAM can summarize logs with a language model that runs on your own computer.
+This is optional and off until you turn it on in Models. It needs two things
+PAM does not ship in the app: the llama.cpp inference engine and the model
+weights. Neither is downloaded until you press a button, and the Models page
+says what the button will fetch, from where, and what it will be checked
+against before you press it.
+
+**What is fetched, and from where**
+
+| What | From | Checked against |
+| --- | --- | --- |
+| The llama.cpp engine, build b10938, one archive for your platform | `github.com/ggml-org/llama.cpp/releases/download/b10938/`, or the engine mirror you set in Settings › Network | the SHA-256 and size below, built into PAM |
+| A model you choose in Models › Downloads | `huggingface.co` (the exact address and host are shown before you confirm), or the models mirror you set | the size and SHA-256 listed in PAM's catalog |
+
+| Platform | Archive | Size | SHA-256 |
+| --- | --- | --- | --- |
+| macOS arm64 | `llama-b10938-bin-macos-arm64.tar.gz` | 11.1 MB | `69f236c8aa148eb32bfd76774a0a449e2f9b754c595e8f6d90b12cf7fecb8399` |
+| Windows x64 | `llama-b10938-bin-win-cpu-x64.zip` | 18.4 MB | `ba39502946f4c0e966e5e93393618953dc4c005a252fbaf8c9786c33a9f8b60d` |
+| Windows arm64 | `llama-b10938-bin-win-cpu-arm64.zip` | 12.0 MB | `85bc7b14a62092e17beca76295a0e1cbe88510f02623c3b18707ca470c06faeb` |
+
+A file whose size or SHA-256 differs is deleted and not installed, wherever it
+came from: GitHub, a mirror or a file on disk. After unpacking, PAM runs the
+server once with `--version` and requires it to report build 10938. Only
+`https://` addresses are fetched, for the engine, for catalog models and for
+pasted model addresses alike. The installed engine's card shows the archive,
+its digest, where it came from and the server's version line.
+
+**What runs on your machine.** The engine is an ordinary program started by
+the PAM daemon under your user account, only while a model is loaded. It is
+installed under `~/.pam/engine` (`%USERPROFILE%\.pam\engine` on Windows). PAM
+talks to it over a private socket (a loopback port protected by a per-load key
+on Windows), starts it with a model path and an almost empty environment, and
+does not give it your connector credentials or any network setting. Models are
+stored under the models directory you choose in Settings › Models, not in the
+engine folder.
+
+**Model downloads and imports.** Download on a catalog model opens a
+confirmation naming the file, its size, the host and address it will be
+fetched from (your mirror, or the catalog source), its SHA-256, where it will
+be saved and its licence; the transfer starts only when you confirm, and a
+transfer that stops resumes where it was. A pasted address has no expected
+SHA-256: the file is kept as an unverified, test-only model until you verify
+it. Models › Downloads › "Import weights from a file" copies a `.gguf` you
+already have into the models directory and hashes it as it copies. A file
+whose size matches a catalog model is held to that model's SHA-256 and
+recorded as verified; any other file is imported unverified unless you give
+its SHA-256, and must pass Verify before it can serve jobs. The original file
+is never changed, moved or deleted.
+
+**Corporate networks.** See [Network settings](#network-settings) below:
+a proxy, a no-proxy list, a CA bundle and internal mirrors for the engine and
+for models, all set in the GUI and applied to connector requests and to
+downloads alike.
+
+**No network at all.** On another machine, download the archive for your
+platform from the address above (and any model files you want), check the
+SHA-256 against the table, and copy them to this one. Then use Models ›
+Inference engine › "Install from a file" with the path of the archive, or of a
+folder that contains it under its exact name, and Models › Downloads › "Import
+weights from a file" for each model. PAM copies the files, checks them against
+the same SHA-256 values, and never changes the originals. An unpacked engine
+tree is refused: PAM pins the archive's digest, so only the archive can be
+checked. Nothing in these steps uses the network or starts curl.
+
+**Removing it.** Models › Inference engine › Remove engine (refused while a
+model is loaded; unload it first), or stop the daemon and delete the `engine`
+folder named above. That removes the engine, its manifest and the private
+verified copies of model weights, so a model shows as needing Verify again.
+Model files are deleted from Models; they are not in the engine folder.
+
+### Network settings
+
+Settings › Network is how PAM reaches connector services and download hosts.
+Nothing is read from environment variables: `HTTPS_PROXY`, `HTTP_PROXY`,
+`ALL_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and
+their lowercase spellings are ignored by the daemon and by every curl it
+starts, and the page lists which of them are present so you know they do
+nothing. Only what you save on the page is used, and it is read again for
+every request, so a change applies to the next one. Saving a proxy address, a
+proxy password or a CA bundle asks for the typed word `network`, because a
+proxy that inspects TLS can read the credentials PAM sends to connectors.
+
+- **Proxy.** An `http://` or `https://` address with an explicit port, for
+  example `http://proxy.corp.example:3128`. SOCKS, PAC and WPAD are not
+  supported; a user name or password inside the address is refused. Sign-in
+  is `none`, `basic`, or `anyauth` (curl picks Basic, Digest or NTLM from the
+  proxy's challenge; NTLM takes `DOMAIN\user` as the user name). The user
+  name is stored in the settings; the password goes into the operating
+  system's keychain and is never written to the settings, a log line, an
+  audit row, a reply or a command line. It reaches curl only on its standard
+  input, for one request at a time. With an `http://` proxy and Basic
+  sign-in the password crosses your network to the proxy unencrypted; the page
+  says so beside the field.
+- **No-proxy list.** Host names (matching the host and its subdomains, with or
+  without a leading dot), IP addresses, and CIDR ranges such as `10.0.0.0/8`
+  when the system curl is 7.86 or newer. No ports, no wildcards inside names.
+  Loopback targets never go through the proxy, whatever the list says.
+- **CA bundle.** Leave it empty when the root your organisation uses is
+  already trusted by this computer (an MDM profile on macOS; Group Policy or
+  Intune on Windows). Otherwise give the path of a PEM file: PAM reads it
+  once, keeps only its certificate blocks (a file holding a private key is
+  refused whole), writes a private copy under `~/.pam/net`, records the
+  copy's SHA-256 and checks it again before every request; a copy that no
+  longer matches refuses the request rather than running without it. On
+  macOS the source file must be owned by you or by root and not writable by
+  other users, and so must its directory; on Windows those ownership checks
+  are not made and the private copy is what protects the setting. The bundle
+  is handed to curl as its `cacert`, so for PAM's requests it stands in for
+  the system trust: include every root the services and download hosts need.
+  What has been measured: on macOS, a private test issuer is untrusted until
+  its root is imported and trusted afterwards. What has not: whether the
+  system roots still apply beside the bundle on macOS, and any of this on
+  Windows, where curl uses Schannel and revocation checking stays on, so a
+  private CA with no reachable CRL fails as `tls_revocation_unavailable`. PAM
+  offers no "do not verify" option anywhere, and never writes to the
+  operating system's certificate store.
+- **Mirrors.** The engine mirror is a directory address; PAM appends the
+  archive name from the table above unchanged. The models mirror replaces the
+  `https://huggingface.co/` prefix of a catalog address and keeps the rest;
+  a pasted address is never rewritten. Mirrors must be `https://`, may use a
+  host name or an internal IP address with a port, and may not be loopback,
+  link-local or `localhost`. The bytes a mirror serves are checked against
+  the same sizes and digests as the originals.
+- **Test network settings.** Sends a credential-free `HEAD` to each place PAM
+  actually goes — every enabled connector's base address, the engine archive
+  address when the engine is not installed or a mirror is set, and the models
+  host when a models mirror is set or a model is not installed — at most
+  twelve targets, four at a time, within twenty seconds. Any HTTP status
+  means the path works; a failure says the route (`direct`, `bypass`, or
+  `proxy`), the stage it reached (`connect`, `proxy`, `tunnel`, `tls`,
+  `http`) and a cause with a recovery line: the proxy name did not resolve,
+  the proxy wants a sign-in (naming the schemes it offers), the certificate
+  issuer is not trusted (naming it where this curl prints it), the name did
+  not resolve, and so on. It never takes a free-form address.
+
+Administration of all of this stays in the GUI; there is no CLI command for
+network settings, mirrors, imports or the engine.
+
 ## Start at login
 
 ```sh

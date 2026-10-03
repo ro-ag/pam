@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 14);
+    assert_eq!(store.schema_version().await.unwrap(), 15);
 }
 
 #[tokio::test]
@@ -67,7 +67,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 14
+            supported: 15
         }
     ));
     let message = err.to_string();
@@ -91,7 +91,7 @@ async fn v1_database_upgrades_to_v2() {
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 14);
+    assert_eq!(store.schema_version().await.unwrap(), 15);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -119,7 +119,7 @@ async fn v3_database_gains_meta_json() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 14);
+    assert_eq!(store.schema_version().await.unwrap(), 15);
     assert!(
         evidence_columns(&store)
             .await
@@ -155,7 +155,7 @@ async fn v4_database_upgrades_to_v5() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 14);
+    assert_eq!(store.schema_version().await.unwrap(), 15);
 
     let count: i64 = store
         .raw_scalar(
@@ -292,7 +292,7 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     build_v11_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 14);
+    assert_eq!(store.schema_version().await.unwrap(), 15);
 
     // Revocations are numbered in order; the two that share a second share
     // the higher number, so a request admitted between them is voided
@@ -422,7 +422,7 @@ async fn v12_database_gains_the_request_origin_columns() {
     build_v12_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 14);
+    assert_eq!(store.schema_version().await.unwrap(), 15);
 
     for id in ["old_queued", "old_done", "old_admin"] {
         let row = store.get_request(id).await.unwrap().unwrap();
@@ -493,7 +493,8 @@ async fn v12_database_gains_the_request_origin_columns() {
 /// into it; handed a database stamped past them it refuses before it reads a
 /// row. The boundary migration's version (14) is above every version a
 /// binary on the previous engine knows (11 in release 0.4.3, 13 in the last
-/// development build), so such a binary is the "older binary" of this test.
+/// development build), so such a binary is the "older binary" of this test;
+/// the database it is handed is at the latest version (15).
 #[tokio::test]
 async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
     let dir = tempfile::tempdir().unwrap();
@@ -510,24 +511,156 @@ async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
         assert!(
             matches!(
                 error,
-                StoreError::VersionTooNew { found: 14, supported } if supported == i64::try_from(known).unwrap()
+                StoreError::VersionTooNew { found: 15, supported } if supported == i64::try_from(known).unwrap()
             ),
             "{error:?}"
         );
         assert_eq!(
             error.to_string(),
             format!(
-                "database schema version 14 is newer than this binary supports (max {known}); \
+                "database schema version 15 is newer than this binary supports (max {known}); \
                  upgrade pam instead of downgrading the database"
             )
         );
     }
     // Refusing changed nothing.
-    assert_eq!(migrations::current_version(&conn).unwrap(), 14);
+    assert_eq!(migrations::current_version(&conn).unwrap(), 15);
     let kept: String = conn
         .query_row("SELECT value FROM setting WHERE key = 'kept'", (), |row| {
             row.get(0)
         })
         .unwrap();
     assert_eq!(kept, "yes");
+}
+
+fn build_v14_database(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    for migration in migrations::MIGRATIONS.iter().filter(|m| m.version <= 14) {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.execute_batch("PRAGMA user_version = 14").unwrap();
+    for (id, kind, model_id, source, state, done, total, detail) in [
+        (
+            "job_dl",
+            "download",
+            "qwen/one",
+            Some("https://huggingface.co/qwen/one.gguf"),
+            "done",
+            12,
+            Some(12),
+            Some(r#"{"sha256":"ab"}"#),
+        ),
+        (
+            "job_vf",
+            "verify",
+            "qwen/two",
+            None,
+            "failed",
+            3,
+            None,
+            Some(r#"{"cause":"digest_mismatch"}"#),
+        ),
+        (
+            "job_run",
+            "download",
+            "qwen/three",
+            None,
+            "running",
+            0,
+            Some(99),
+            None,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO model_job (id, kind, model_id, source, state, bytes_done, bytes_total,
+                 detail, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 7, 8)",
+            params![id, kind, model_id, source, state, done, total, detail],
+        )
+        .unwrap();
+    }
+    drop(conn);
+}
+
+/// The upgrade from the previous version: `model_job` is rebuilt so its
+/// `kind` admits `import`, every row survives with every column, the state
+/// index comes back, and the constraint still refuses any other kind.
+#[tokio::test]
+async fn v14_database_admits_import_jobs_and_keeps_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    build_v14_database(&path);
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), 15);
+
+    let jobs = store.list_model_jobs(10).await.unwrap();
+    let by_id = |id: &str| jobs.iter().find(|job| job.id == id).expect(id).clone();
+    let download = by_id("job_dl");
+    assert_eq!(download.kind, "download");
+    assert_eq!(download.model_id, "qwen/one");
+    assert_eq!(
+        download.source.as_deref(),
+        Some("https://huggingface.co/qwen/one.gguf")
+    );
+    assert_eq!(download.state, "done");
+    assert_eq!(download.bytes_done, 12);
+    assert_eq!(download.bytes_total, Some(12));
+    assert_eq!(download.detail.as_deref(), Some(r#"{"sha256":"ab"}"#));
+    assert_eq!(download.created_ts, 7);
+    assert_eq!(download.updated_ts, 8);
+    let verify = by_id("job_vf");
+    assert_eq!(verify.kind, "verify");
+    assert_eq!(verify.state, "failed");
+    assert_eq!(verify.bytes_total, None);
+    assert_eq!(by_id("job_run").state, "running");
+    assert_eq!(jobs.len(), 3);
+
+    // The new kind is accepted and reads back; the index is in place.
+    store
+        .insert_model_job(
+            "job_imp",
+            "import",
+            "imported/local",
+            Some("/srv/local.gguf"),
+            Some(5),
+        )
+        .await
+        .unwrap();
+    let imported = store
+        .list_model_jobs(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|job| job.id == "job_imp")
+        .unwrap();
+    assert_eq!(imported.kind, "import");
+    assert_eq!(imported.source.as_deref(), Some("/srv/local.gguf"));
+    let index: i64 = store
+        .raw_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'model_job_state_idx'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(index, 1);
+    let leftovers: i64 = store
+        .raw_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'model_job_v15'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        leftovers, 0,
+        "the scratch table was renamed, not left behind"
+    );
+
+    // The constraint came with the rebuild: a kind outside the three is refused.
+    assert!(
+        store
+            .insert_model_job("job_bad", "upload", "x/y", None, None)
+            .await
+            .is_err()
+    );
 }

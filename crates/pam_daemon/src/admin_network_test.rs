@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use pam_connectors::testing::FakeTransport;
+use pam_net::NetFailure;
 use pam_net::testing::{FakeProxy, Origin, OriginMode, ProxyMode, TlsCert, TlsOrigin, base64};
 use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::{ConnectorPatch, RequestState, Store};
@@ -916,6 +917,86 @@ async fn test_refuses_what_it_cannot_probe_and_names_targets_only_from_configura
         assert_eq!(cause, CAUSE_INVALID_ADMIN_ARGS, "{args}: {detail}");
         assert!(detail.contains(needle), "{args}: {detail}");
     }
+}
+
+/// A target that nothing listens on. With no proxy the first connection
+/// is to the target itself, so the stage is `connect`, never `proxy`; the
+/// same holds for a loopback target that bypasses a configured proxy.
+#[tokio::test]
+async fn a_refused_first_connection_is_reported_at_the_connect_stage() {
+    let Some(_) = pam_net::testing::trusted_curl_or_skip() else {
+        return;
+    };
+    let fixture = fixture().await;
+    // A port the kernel just handed out and that nothing listens on now.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    fixture
+        .plant_connector("jenkins", &format!("http://127.0.0.1:{closed}/"))
+        .await;
+
+    let (_, response) = fixture
+        .run(OP_NETWORK_TEST, json!({ "target": "jenkins" }))
+        .await;
+    let results = body_of(response, Outcome::Verified)["results"].clone();
+    assert_eq!(results[0]["ok"], false, "{results}");
+    assert_eq!(results[0]["route"], "direct", "{results}");
+    assert_eq!(results[0]["stage"], "connect", "{results}");
+    assert_eq!(results[0]["cause"], "connect_failed", "{results}");
+    assert_eq!(results[0]["host"], "127.0.0.1");
+
+    // A proxy is configured, but loopback never goes through it.
+    fixture
+        .set(json!({ "proxy": { "url": PROXY_URL, "auth": "none", "username": null } }))
+        .await;
+    let (_, response) = fixture
+        .run(OP_NETWORK_TEST, json!({ "target": "jenkins" }))
+        .await;
+    let results = body_of(response, Outcome::Verified)["results"].clone();
+    assert_eq!(results[0]["ok"], false, "{results}");
+    assert_eq!(results[0]["route"], "bypass", "{results}");
+    assert_eq!(results[0]["stage"], "connect", "{results}");
+    assert_eq!(results[0]["cause"], "connect_failed", "{results}");
+}
+
+/// The stage of a failure that happens before any connection is the first
+/// stage the route has; target-side resolution and connection failures are
+/// `connect` whatever the route says.
+#[test]
+fn failure_stage_names_the_first_stage_of_the_route() {
+    use crate::admin_network::failure_stage;
+    use pam_net::Route;
+
+    let proxied = Route::Proxy {
+        host: "proxy.corp.example".to_owned(),
+        port: 3128,
+    };
+    let before_any_connection = NetFailure::CurlUnavailable;
+    assert_eq!(
+        failure_stage(&before_any_connection, &Route::Direct),
+        "connect"
+    );
+    assert_eq!(
+        failure_stage(&before_any_connection, &Route::Bypass),
+        "connect"
+    );
+    assert_eq!(failure_stage(&before_any_connection, &proxied), "proxy");
+
+    let target_unresolved = NetFailure::DnsFailed {
+        host: "jenkins.corp.example".to_owned(),
+    };
+    assert_eq!(failure_stage(&target_unresolved, &Route::Direct), "connect");
+    assert_eq!(failure_stage(&target_unresolved, &proxied), "connect");
+    let proxy_unresolved = NetFailure::ProxyDnsFailed {
+        proxy: "proxy.corp.example:3128".to_owned(),
+    };
+    assert_eq!(failure_stage(&proxy_unresolved, &proxied), "proxy");
+    let handshake = NetFailure::CaBundleTampered;
+    assert_eq!(failure_stage(&handshake, &Route::Direct), "tls");
+    assert_eq!(failure_stage(&NetFailure::Timeout, &proxied), "http");
 }
 
 /// The real trusted curl against the fixtures: a direct origin, the fake

@@ -47,6 +47,41 @@ All notable changes to pam are documented in this file. The format follows
   channel, with the ticket's capability, repository, agent label and the real
   progress note. Settings › Daemon explains a window and a daemon of different
   builds, and Models readiness says what a qualification covers.
+- Settings › Network: an HTTPS proxy (`http://` or `https://` with an explicit
+  port; `none`, `basic` or `anyauth` sign-in; the password kept in the OS
+  keychain), a no-proxy list, a CA bundle imported as a private digest-checked
+  copy, and mirror addresses for the engine and for models. "Test network
+  settings" probes every enabled connector and the download hosts PAM would
+  use and reports, per target, the route, the stage reached, a cause and a
+  recovery line. Daemon ops `admin.network.get`, `admin.network.set` and
+  `admin.network.test` (GUI-only), audit action `network.configure` with field
+  names only, and the typed word `network` for a proxy, password or CA change.
+  Fields a managed policy pins are reported locked and refuse the whole patch
+  (`setting_locked`); the policy layer itself is a trait with a stub.
+- The engine card says, before the click, exactly what Install does:
+  `admin.models.engine.status` discloses the asset, its size and SHA-256, the
+  URL and host it would be fetched from, whether a mirror is in use, the
+  install location, the installed engine's source, whether a model is loaded
+  and whether the engine can be removed. Install uses the configured engine
+  mirror when one is set. `admin.models.engine.import { path, confirm }`
+  installs the pinned archive from a file, or a folder holding it by its
+  exact name, copying and hashing in one pass with the original untouched;
+  `admin.models.engine.remove { confirm }` deletes the engine directory and
+  is refused while a model is loaded. The manifest records its `source`
+  (`download`, `mirror` or `import`).
+- Models: a download confirmation names the file, its size, the host and
+  address, the SHA-256, the destination and the licence before a transfer
+  starts, and says when a pasted address has no expected digest. "Import
+  weights from a file" (`admin.models.import { path, confirm, vendor?,
+  expected_sha256? }`) copies a GGUF into the models directory as a job of
+  kind `import`; a file whose size matches a catalog model is held to that
+  model's SHA-256 and recorded verified, any other file is unverified unless
+  a digest is given. Catalog presets carry `fetch`, the exact address and
+  host a download would use.
+- The README gains "Local models and the inference engine": what is fetched
+  and from where, the pinned archive table (held equal to the build's
+  constants by a test), what runs on the machine, the mirror and
+  install-from-file paths, the network settings, and how to remove it.
 
 ### Changed
 
@@ -150,8 +185,28 @@ All notable changes to pam are documented in this file. The format follows
 - Connector credentials are trimmed when saved, and a value containing a line
   break is refused. Connector paths containing `.` or `..` are refused. A log
   redirect may only go to a public host on port 443.
-- Model downloads run curl with a cleared environment that keeps only the
-  proxy and certificate variables.
+- Connector requests, model downloads and the engine archive all go through
+  one hardened curl launcher (`pam_net`) over the trusted system curl: a
+  constant argument vector `-q --config -`, every value on standard input, a
+  cleared environment, a fixed working directory, `https://` only. Model
+  downloads no longer honour `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR` or any other
+  variable; the proxy and CA bundle come only from Settings › Network. Plain
+  `http://` download addresses, pasted ones included, are refused.
+- Network failures carry a cause (`proxy_dns_failed`, `proxy_unreachable`,
+  `proxy_auth_required` with the schemes offered, `proxy_denied`,
+  `dns_failed`, `connect_failed`, `tls_untrusted_issuer` naming the issuer
+  where curl prints it, `tls_hostname_mismatch`, `tls_expired`,
+  `tls_revocation_unavailable`, `ca_bundle_unreadable`, …) with a sentence and
+  a recovery, the same in connector refusals, download failures and the
+  network test. A download that cannot start because the network settings are
+  unusable is refused by that cause instead of `internal_error`; corrupt
+  settings never fall back to a direct connection.
+- Catalog downloads use the models mirror when one is set; pasted addresses
+  are never rewritten.
+- Store schema 15: `model_job.kind` admits `import`. The upgrade rebuilds the
+  table in place and, like every schema upgrade, keeps a `pre-v15` copy of
+  the database first.
 - A stateful flow step can no longer write Git hooks or Git configuration in
   the repository it runs in, so `git config`, `git remote add`, a tracking
   `git checkout -b`, `git submodule add` and `git init` fail in such steps.
@@ -169,6 +224,24 @@ All notable changes to pam are documented in this file. The format follows
 - The GUI asks for a typed confirmation, checked in Rust, before switching to
   the relaxed profile, adding a grant or approving with Remember. Approval
   cards show each argument as its own token and escape hidden characters.
+
+### Security
+
+- The curl launcher cannot render any option that weakens TLS verification:
+  no `insecure`, `proxy-insecure`, `ssl-no-revoke`, `ssl-revoke-best-effort`
+  or an outside `capath`, for a target or for a proxy, in production or in
+  the test; a test scans the crate's source for those spellings.
+- The proxy password never leaves the keychain except on curl's standard
+  input for one request. It is absent from the command line, the environment,
+  the settings document, log lines, audit rows and replies, and a failed
+  proxied call never shows it. The CA bundle's private copy is re-hashed
+  before every use; a copy that no longer matches its recorded digest refuses
+  the request (`network_ca_tampered`) rather than running without it.
+- The pinned engine digest, size, tag and build cannot be changed by any
+  setting, argument or file: the install and import entry points build the
+  pinned release themselves (`install_release` is test-only), the engine and
+  import ops refuse unknown arguments, and a mirror or a file that serves
+  other bytes is refused before anything is unpacked.
 
 ### Removed
 

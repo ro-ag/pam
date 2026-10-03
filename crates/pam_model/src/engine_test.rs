@@ -19,6 +19,61 @@ async fn install_fake(
     install_release_over_plain_http_for_tests(base, release, cancel, direct(), mirror).await
 }
 
+/// The README's engine table is what an administrator reads to fetch the
+/// archive on another machine and check it by hand, so it must say exactly
+/// what this build pins: one row per supported asset with the archive
+/// name, its size and its SHA-256, the release address and the build
+/// number, and no row for a target this build does not know.
+#[test]
+fn the_readme_engine_table_matches_the_pinned_assets() {
+    let readme = include_str!("../../../README.md");
+    let table_rows: Vec<&str> = readme
+        .lines()
+        .filter(|line| line.starts_with('|') && line.contains("`llama-"))
+        .collect();
+    assert_eq!(
+        table_rows.len(),
+        ENGINE_ASSETS.len(),
+        "one README table row per pinned asset; found {table_rows:?}"
+    );
+    for asset in &ENGINE_ASSETS {
+        let row = table_rows
+            .iter()
+            .find(|line| line.contains(&format!("`{}`", asset.name)))
+            .unwrap_or_else(|| panic!("README has no table row for {}", asset.name));
+        assert!(
+            row.contains(&format!("`{}`", asset.sha256)),
+            "README row for {} does not carry its SHA-256: {row}",
+            asset.name
+        );
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a size in the tens of megabytes"
+        )]
+        let megabytes = format!("{:.1} MB", asset.bytes as f64 / 1_000_000.0);
+        assert!(
+            row.contains(&megabytes),
+            "README row for {} does not say {megabytes}: {row}",
+            asset.name
+        );
+    }
+    let release_address = ENGINE_RELEASE_BASE
+        .strip_prefix("https://")
+        .expect("an https release base");
+    assert!(
+        readme.contains(release_address),
+        "README does not name the release address {release_address}"
+    );
+    assert!(
+        readme.contains(&format!("build {ENGINE_TAG}")),
+        "README does not name the pinned tag {ENGINE_TAG}"
+    );
+    assert!(
+        readme.contains(&format!("report build {ENGINE_BUILD}")),
+        "README does not say the server must report build {ENGINE_BUILD}"
+    );
+}
+
 #[test]
 fn every_ci_runner_maps_to_exactly_one_pinned_asset() {
     let mut names: Vec<&str> = ENGINE_ASSETS.iter().map(|a| a.name).collect();

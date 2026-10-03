@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pam_connectors::ConnectorId;
-use pam_net::{Method, NetFailure, NetSettings, ProxyAuth, ProxyPassword, TrustedCurl, Url};
+use pam_net::{Method, NetFailure, NetSettings, ProxyAuth, ProxyPassword, Route, TrustedCurl, Url};
 use pam_proto::Outcome;
 use pam_store::{Actor, Decision};
 use serde_json::{Value, json};
@@ -398,7 +398,7 @@ impl AdminService {
                 .cloned();
             answered.push(found.unwrap_or_else(|| {
                 let failure = NetFailure::Deadline;
-                result_json(name, url, settings.route_for(url).as_str(), Err(&failure))
+                result_json(name, url, &settings.route_for(url), Err(&failure))
             }));
         }
         let failed: Vec<String> = answered
@@ -572,27 +572,29 @@ async fn probe(
     let _ = plain_http;
     let outcome = request.run(PROBE_LIMIT).await;
     match &outcome {
-        Ok(output) => result_json(name, url, route.as_str(), Ok(output.http_code)),
-        Err(failure) => result_json(name, url, route.as_str(), Err(failure)),
+        Ok(output) => result_json(name, url, &route, Ok(output.http_code)),
+        Err(failure) => result_json(name, url, &route, Err(failure)),
     }
 }
 
 /// One result row as the GUI reads it. `stage` is where the probe got to:
 /// `http` when a status came back; on a failure, the stage the failure
-/// belongs to — `proxy` for reaching the proxy or making the first
-/// connection, `tls` for the handshake, `http` for anything after it.
+/// belongs to — `proxy` for reaching or satisfying the proxy, `connect`
+/// for the first connection to the target itself on a route with no proxy,
+/// `tls` for the handshake, `http` for anything after it.
 fn result_json(
     name: &str,
     url: &Url,
-    route: &str,
+    route: &Route,
     outcome: Result<Option<u16>, &NetFailure>,
 ) -> Value {
     let host = url.host_str().unwrap_or_default();
+    let route_name = route.as_str();
     match outcome {
         Ok(status) => json!({
             "target": name,
             "host": host,
-            "route": route,
+            "route": route_name,
             "stage": "http",
             "ok": true,
             "http_status": status,
@@ -600,8 +602,8 @@ fn result_json(
         Err(failure) => json!({
             "target": name,
             "host": host,
-            "route": route,
-            "stage": failure_stage(failure),
+            "route": route_name,
+            "stage": failure_stage(failure, route),
             "ok": false,
             "http_status": match failure { NetFailure::HttpStatus { status } => *status, _ => None },
             "cause": failure.cause(),
@@ -612,8 +614,27 @@ fn result_json(
 }
 
 /// The stage a failure belongs to (see [`result_json`]).
-fn failure_stage(failure: &NetFailure) -> &'static str {
+///
+/// A failure to resolve or reach the target is `connect`: on a direct or
+/// bypassed route the first connection is to the target, and the word
+/// `proxy` would name something the route does not have. A failure before
+/// any connection (no usable curl, unusable settings, a spawn error) is
+/// reported at the first stage the route has: `proxy` when one is
+/// configured for this target, `connect` otherwise.
+pub(crate) fn failure_stage(failure: &NetFailure, route: &Route) -> &'static str {
+    let first = match route {
+        Route::Proxy { .. } => "proxy",
+        Route::Direct | Route::Bypass => "connect",
+    };
     match failure {
+        NetFailure::ProxyDnsFailed { .. }
+        | NetFailure::ProxyUnreachable { .. }
+        | NetFailure::ProxyAuthRequired { .. }
+        | NetFailure::ProxyAuthRejected { .. }
+        | NetFailure::ProxyDenied { .. } => "proxy",
+        NetFailure::DnsFailed { .. }
+        | NetFailure::ConnectFailed { .. }
+        | NetFailure::ConnectTimeout { .. } => "connect",
         NetFailure::TlsUntrustedIssuer { .. }
         | NetFailure::TlsHostnameMismatch { .. }
         | NetFailure::TlsExpired { .. }
@@ -629,7 +650,7 @@ fn failure_stage(failure: &NetFailure) -> &'static str {
         | NetFailure::TransferInterrupted { .. }
         | NetFailure::ResumeUnsupported
         | NetFailure::Other { .. } => "http",
-        _ => "proxy",
+        _ => first,
     }
 }
 

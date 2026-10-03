@@ -1,12 +1,85 @@
 # Enterprise network settings and engine delivery — design and implementation plan
 
-Status: design for review, 2026-10-02. Implements the owner directive of
+Status: implemented, 2026-10-02, on `feat/enterprise-network` (tasks T1–T7
+below); Windows evidence pending (T8). What was built where it differs from
+the design is in [As built](#as-built). Implements the owner directive of
 2026-10-02 ("do what is best for the product and make it easy for enterprise
 environments") and closes the design review's deferred items "two curl
 launchers with divergent policy" and "proxy and certificate settings need an
 owner decision" ([review, model 9](../reviews/design-review-2026-10-02.md)).
 Companion to [the llama.cpp engine spec](2026-09-13-llama-cpp-engine.md) and
 [command containment](../command-containment.md).
+
+## As built
+
+The design above the fold is the contract; these are the places the
+implementation settled differently, each recorded by the task that made the
+call, and the items still open.
+
+Contract differences:
+
+- **The local engine archive is its own op.** `admin.models.engine.import
+  { path, confirm }` (120 s bridge deadline), not `install { source: { kind:
+  "local" } }`. `install { confirm }` keeps its shape and uses the configured
+  mirror when one is set; both refuse any key they do not list.
+- **Weights import** is `admin.models.import { path, confirm, vendor?,
+  expected_sha256? }`. The catalog preset is chosen by the file's size (no
+  `preset_id`); a size match holds the copy to that preset's SHA-256 and
+  records it verified; otherwise the file lands under `vendor` (default
+  `imported`) and is verified only when `expected_sha256` was given and
+  matched. A cancelled import is deleted, not resumed. The job row is kind
+  `import` (store schema 15; it was `download` until that migration).
+- **Disclosure fields are flat** on the `admin.models.engine.status` body
+  (`expected_asset`, `expected_size`, `expected_sha256`, `download_url`,
+  `download_host`, `mirror_in_use`, `mirror_host`, `upstream_host`,
+  `engine_dir`, `install_dir`, `source`, `loaded`, `removable`,
+  `network_issue`) rather than a `plan` object, and catalog presets carry
+  `fetch { url, host, source }`. Neither carries `route` or `proxy`: that
+  would need a keychain-backed profile resolution on every status poll, and
+  the route is what the Network tab's Test shows. The engine card and the
+  download confirmation therefore have no "Route:" line.
+- **Manifest source kinds** are `download | mirror | import` (not `upstream |
+  mirror | local_archive`), with `host` for a download, `host` and `url` for a
+  mirror, `path` and `imported_at_ms` for an import.
+- **No engine cancel op.** Install and import stay synchronous under the
+  bridge deadline, as decided; dropping the deadline cancels the transfer or
+  the copy, and the card shows the two-minute resume note instead of a Cancel
+  button.
+- **`stage` gains `connect`.** A failed first connection on a direct or
+  bypassed route (target DNS, connect, connect timeout) is reported at stage
+  `connect`; `proxy` is only for proxy-side failures; a failure before any
+  connection (no usable curl, unusable settings) reports the first stage the
+  route has. The reply carries `route` as specified and no `proxy` field.
+- **`EngineRelease` fields stay public.** What is gated is the entry point:
+  `install(base, cancel, net, mirror)` and `import(base, path, cancel)` build
+  `EngineRelease::pinned` themselves; `install_release` and `import_release`
+  exist only under `cfg(any(test, feature = "testing"))`.
+- **`engine_busy`.** Install, import and remove are refused while a model is
+  loaded, under the operation lock, so a load cannot slip in.
+- **The managed layer** ships as the `ManagedNetworkLayer` trait with a fixed
+  stub (`FixedManagedNetwork`); `mirror_allowed_hosts` is policy-only and is
+  enforced on the resolved value; the policy file is a later plan.
+- **`ignored_env`** lists eleven names (the proxy variables in both cases,
+  `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`); the page prints them.
+- **`tools/check.sh`** does not yet export `PAM_REQUIRE_TLS_FIXTURE=1`; that
+  one-line edit is T8's. T7 ran the gate with the variable in the environment.
+
+Open:
+
+- Windows evidence (T8, in the Parallels VM): `curl --version` and backend;
+  whether `write-out` prints on a failed transfer; what `cacert` does on
+  Schannel; the exact stderr for an untrusted issuer, a name mismatch, a
+  proxy 407 and a refused proxy; the revocation failure text for a private
+  CA; whether an issuer is printed; "Test network settings" against the
+  fixtures. Also: the wording when an import source is held with exclusive
+  sharing (reported as `engine_import_source_missing`), and a full volume off
+  macOS, where `platform_free_bytes` is `None` and the engine copy reports
+  `engine_io_failed` with the OS text rather than `engine_no_space`.
+- macOS: the fixtures prove that a private issuer is untrusted until its root
+  is imported and trusted afterwards; whether `cacert` replaces or extends
+  the keychain's trust for the same request is not measured.
+- The two owner questions below (Windows revocation, proxy single sign-on)
+  are unchanged, and the landing git broker stays proxy-disabled as scoped.
 
 Supported platforms for this work (owner scope change, 2026-10-02): macOS arm64
 and Windows amd64/arm64. Linux and Intel macOS are not supported and nothing here

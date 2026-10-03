@@ -73,6 +73,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: ENGINE_BOUNDARY,
         sql: SCHEMA_V14,
     },
+    Migration {
+        version: 15,
+        sql: SCHEMA_V15,
+    },
 ];
 
 /// The schema version at which the store's engine changed. Every database
@@ -83,6 +87,36 @@ pub(crate) const ENGINE_BOUNDARY: i64 = 14;
 
 /// `PAM1`, the application id migration 14 stamps into the database header.
 pub(crate) const APPLICATION_ID: i64 = 0x5041_4D31;
+
+/// Migration 15: `model_job.kind` admits `import`.
+///
+/// A model imported from a local file is a job like a download — a copy
+/// into the models directory with progress, a verdict and a cancel — and
+/// the GUI tells the two apart by the kind. SQLite cannot alter a CHECK
+/// constraint, so the table is rebuilt the way its documentation prescribes
+/// (a new table, the rows copied, the old one dropped, the new one renamed,
+/// the index recreated), all inside the migration's transaction. Nothing
+/// references `model_job` (no foreign key, trigger or view), so the rename
+/// touches nothing else. Rows keep their ids and every column.
+const SCHEMA_V15: &str = r"
+CREATE TABLE model_job_v15 (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK (kind IN ('download','verify','import')),
+    model_id    TEXT NOT NULL,
+    source      TEXT,
+    state       TEXT NOT NULL CHECK (state IN ('running','done','failed','cancelled')),
+    bytes_done  INTEGER NOT NULL DEFAULT 0,
+    bytes_total INTEGER,
+    detail      TEXT,
+    created_ts  INTEGER NOT NULL,
+    updated_ts  INTEGER NOT NULL
+);
+INSERT INTO model_job_v15 (id, kind, model_id, source, state, bytes_done, bytes_total, detail, created_ts, updated_ts)
+    SELECT id, kind, model_id, source, state, bytes_done, bytes_total, detail, created_ts, updated_ts FROM model_job;
+DROP TABLE model_job;
+ALTER TABLE model_job_v15 RENAME TO model_job;
+CREATE INDEX model_job_state_idx ON model_job (state);
+";
 
 /// Migration 14: the engine boundary. No table changes.
 ///

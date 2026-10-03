@@ -265,10 +265,12 @@ pub(crate) fn broker_git_candidates() -> Vec<GitCandidate> {
         ]
     }
     // Git for Windows' `cmd\git.exe` is a launcher for the real binary; the
-    // real one is preferred, as on macOS.
+    // real one is preferred, as on macOS. The ARM64 build installs it under
+    // `clangarm64`, the x64 build under `mingw64`; only one exists on a host.
     #[cfg(windows)]
     {
         vec![
+            GitCandidate::Path(r"C:\Program Files\Git\clangarm64\bin\git.exe".into()),
             GitCandidate::Path(r"C:\Program Files\Git\mingw64\bin\git.exe".into()),
             GitCandidate::Path(r"C:\Program Files\Git\cmd\git.exe".into()),
         ]

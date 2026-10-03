@@ -46,7 +46,8 @@ active developer directory's Git (Apple's `/usr/bin/git` is an `xcrun` shim and
 is never run; PAM reads the root-owned `/var/db/xcode_select_link`, which is what
 `xcode-select -p` reports, and takes `<developer dir>/usr/bin/git`), then
 `/Library/Developer/CommandLineTools/usr/bin/git`, then `/opt/homebrew/bin/git`;
-on Windows `C:\Program Files\Git\mingw64\bin\git.exe`, then
+on Windows `C:\Program Files\Git\clangarm64\bin\git.exe` (ARM64) or
+`C:\Program Files\Git\mingw64\bin\git.exe` (x64), then
 `C:\Program Files\Git\cmd\git.exe` (the launcher for it). A candidate qualifies
 when it is an existing executable regular file and the spelled path, its
 canonical target and every directory above each are owned by root or the

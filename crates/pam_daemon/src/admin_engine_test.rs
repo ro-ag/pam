@@ -86,6 +86,7 @@ impl NetworkSource for RefusingSource {
 
 struct Fixture {
     store: Arc<Store>,
+    policy: Arc<crate::managed_policy_service::PolicyHandle>,
     models: Arc<ModelService>,
     admin: AdminService,
     network: Option<Arc<NetworkService>>,
@@ -101,6 +102,16 @@ async fn fixture(
     managed: Option<ManagedNetwork>,
     source: Option<Arc<dyn NetworkSource>>,
 ) -> Fixture {
+    fixture_with(None, managed, source).await
+}
+
+/// [`fixture`] under the managed policy file `policy` (a trusted, scripted
+/// one) that the daemon's services read.
+async fn fixture_with(
+    policy: Option<&str>,
+    managed: Option<ManagedNetwork>,
+    source: Option<Arc<dyn NetworkSource>>,
+) -> Fixture {
     let mut base = tempfile::Builder::new();
     base.prefix("pam-eng-");
     // Windows has no such socket path to fit, and no `/tmp`.
@@ -110,19 +121,17 @@ async fn fixture(
     let base = base.tempdir().expect("tempdir");
     let models_dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let policy = crate::admin_models_test::policy_handle(&store, policy).await;
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     ));
-    let models = ModelService::new(
-        Arc::clone(&store),
-        crate::managed_policy_service::PolicyHandle::none(),
-    )
-    .await
-    .unwrap();
+    let models = ModelService::new(Arc::clone(&store), Arc::clone(&policy))
+        .await
+        .unwrap();
     models.set_models_dir(models_dir.path()).await.unwrap();
     models.set_engine_base(base.path().to_path_buf());
     let network = if let Some(source) = source {
@@ -141,7 +150,7 @@ async fn fixture(
         Arc::clone(&store),
         None,
         None,
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     ));
     let flows = crate::flow_service_test::flows_for_tests(
         Path::new("pam-tests-have-no-flow-library"),
@@ -159,13 +168,14 @@ async fn fixture(
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     );
     if let Some(network) = &network {
         admin = admin.with_network(Arc::clone(network));
     }
     Fixture {
         store,
+        policy,
         models,
         admin,
         network,
@@ -176,6 +186,38 @@ async fn fixture(
 }
 
 impl Fixture {
+    /// The id of the request the last [`Self::run`] used.
+    fn last_request_id(&self) -> String {
+        let index = self.next.load(Ordering::Relaxed) - 1;
+        format!("req_engine_{index:03}")
+    }
+
+    /// The last op's request carries the terminal `admin`/`refuse` row and
+    /// the policy's `policy.locked_write` row, naming the op, the key, the
+    /// cause and the full digest.
+    async fn assert_refused_by_policy(&self, op: &str, cause: &str, key: &str) {
+        let rows = self
+            .store
+            .audit_for_request(&self.last_request_id())
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.action == crate::admin::ACTION_ADMIN
+                    && row.decision == pam_store::Decision::Refuse),
+            "{rows:?}"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.action == "policy.locked_write")
+            .unwrap_or_else(|| panic!("no policy.locked_write row in {rows:?}"));
+        let detail: Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["op"], op);
+        assert_eq!(detail["cause"], cause);
+        assert_eq!(detail["keys"], json!([key]));
+        assert_eq!(detail["digest"].as_str(), self.policy.view().digest());
+    }
+
     async fn run(&self, op: &str, args: Value) -> Response {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         let envelope = Envelope {
@@ -830,6 +872,201 @@ async fn no_import_or_manifest_runs_a_server_that_is_not_the_pinned_build() {
             Outcome::Changed,
         );
         assert_eq!(fx.status().await["installed"], false);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+// ---------------------------------------------------------------- managed policy
+
+/// A release pinned for the test whose archive lives on `origin`, a plain
+/// loopback server that records every request it gets.
+fn release_on(origin: &pam_model::testing::TestServer) -> EngineRelease {
+    EngineRelease {
+        tag: ENGINE_TAG.to_owned(),
+        build: ENGINE_BUILD,
+        url_base: origin.url(""),
+        target: Target::current().expect("a supported host"),
+        asset_name: "llama-policy-test.tar.gz".to_owned(),
+        sha256: "0".repeat(64),
+        bytes: 16,
+    }
+}
+
+#[tokio::test]
+async fn mirror_only_without_a_mirror_refuses_the_install_and_the_origin_sees_nothing() {
+    timeout(DEADLINE, async {
+        let origin = pam_model::testing::serve(vec![0; 16], "\"etag-e\"").await;
+        let source = Arc::new(RefusingSource::default());
+        let fx = fixture_with(
+            Some(
+                r#"{ "version": 1, "revision": "rev-e", "contact": "it@example.test",
+                     "models": { "engine_source": "mirror_only" } }"#,
+            ),
+            None,
+            Some(Arc::clone(&source) as Arc<dyn NetworkSource>),
+        )
+        .await;
+        fx.models.pin_engine_release_for_tests(release_on(&origin));
+
+        let detail = expect_refusal(
+            fx.run(OP_ENGINE_INSTALL, json!({ "confirm": true })).await,
+            "policy_not_allowed",
+        );
+        assert!(detail.contains("models.engine_source"), "{detail}");
+        assert!(detail.contains("it@example.test"), "{detail}");
+        assert!(detail.contains("rev rev-e"), "{detail}");
+        fx.assert_refused_by_policy(
+            OP_ENGINE_INSTALL,
+            "policy_not_allowed",
+            "models.engine_source",
+        )
+        .await;
+        // Not a request, not a profile resolution, not a file.
+        assert!(origin.requests().is_empty(), "{:?}", origin.requests());
+        assert_eq!(
+            source.asked.load(Ordering::SeqCst),
+            0,
+            "no network profile was asked for"
+        );
+        assert!(!fx.base.path().join("engine").exists());
+
+        // The status says why, before the click.
+        let body = fx.status().await;
+        assert_eq!(body["source_policy"]["engine_source"], "mirror_only");
+        assert_eq!(body["source_policy"]["install_allowed"], false);
+        assert_eq!(body["source_policy"]["install_blocked"], "mirror_missing");
+        assert_eq!(body["source_policy"]["effective"]["source"], "policy");
+        assert_eq!(body["source_policy"]["effective"]["state"], "applied");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn mirror_only_with_a_mirror_in_force_lets_the_install_through_to_that_mirror() {
+    timeout(DEADLINE, async {
+        let fx = fixture_with(
+            Some(r#"{ "version": 1, "models": { "engine_source": "mirror_only" } }"#),
+            None,
+            None,
+        )
+        .await;
+        fx.save_engine_mirror(MIRROR).await;
+        let body = fx.status().await;
+        assert_eq!(body["source_policy"]["install_allowed"], true);
+        assert_eq!(body["source_policy"]["install_blocked"], Value::Null);
+        assert_eq!(body["mirror_in_use"], true);
+        assert_eq!(
+            body["download_url"],
+            format!("{MIRROR}{}", pinned().name),
+            "the disclosure shows the mirror, never upstream"
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn import_only_refuses_install_and_leaves_import_open() {
+    timeout(DEADLINE, async {
+        let origin = pam_model::testing::serve(vec![0; 16], "\"etag-i\"").await;
+        let fx = fixture_with(
+            Some(r#"{ "version": 1, "models": { "engine_source": "import_only" } }"#),
+            None,
+            None,
+        )
+        .await;
+        fx.models.pin_engine_release_for_tests(release_on(&origin));
+        expect_refusal(
+            fx.run(OP_ENGINE_INSTALL, json!({ "confirm": true })).await,
+            "policy_not_allowed",
+        );
+        fx.assert_refused_by_policy(
+            OP_ENGINE_INSTALL,
+            "policy_not_allowed",
+            "models.engine_source",
+        )
+        .await;
+        assert!(origin.requests().is_empty());
+        let body = fx.status().await;
+        assert_eq!(body["source_policy"]["install_allowed"], false);
+        assert_eq!(body["source_policy"]["install_blocked"], "import_only");
+        assert_eq!(body["source_policy"]["import_allowed"], true);
+
+        // Import is past the policy: it fails on the path, not on the policy.
+        let missing = fx.base.path().join("no-such-archive.tar.gz");
+        expect_refusal(
+            fx.run(
+                OP_ENGINE_IMPORT,
+                json!({ "confirm": true, "path": missing.display().to_string() }),
+            )
+            .await,
+            "engine_import_source_missing",
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// The control for the two tests above: with the policy absent the same
+/// install does reach the origin, so "zero requests" proves the refusal.
+#[tokio::test]
+async fn without_a_source_policy_the_same_install_does_reach_the_origin() {
+    if pam_model::download::curl_path().is_err() {
+        return;
+    }
+    timeout(DEADLINE, async {
+        let origin = pam_model::testing::serve(vec![0; 16], "\"etag-c\"").await;
+        let fx = fixture(None, None).await;
+        fx.models.pin_engine_release_for_tests(release_on(&origin));
+        let body = fx.status().await;
+        assert_eq!(
+            body["source_policy"]["effective"],
+            json!({ "source": "default", "locked": false })
+        );
+        assert_eq!(body["source_policy"]["install_allowed"], true);
+        // The archive is not the pinned bytes, so the install fails, but only
+        // after it asked the origin for them.
+        let _ = fx.run(OP_ENGINE_INSTALL, json!({ "confirm": true })).await;
+        assert!(!origin.requests().is_empty(), "the origin was contacted");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn an_engine_import_needs_import_among_the_allowed_sources() {
+    timeout(DEADLINE, async {
+        let fx = fixture_with(
+            Some(r#"{ "version": 1, "models": { "allowed_sources": ["catalog"] } }"#),
+            None,
+            None,
+        )
+        .await;
+        let archive = fx.base.path().join("archive.tar.gz");
+        std::fs::write(&archive, b"x").unwrap();
+        let detail = expect_refusal(
+            fx.run(
+                OP_ENGINE_IMPORT,
+                json!({ "confirm": true, "path": archive.display().to_string() }),
+            )
+            .await,
+            "policy_not_allowed",
+        );
+        assert!(detail.contains("models.allowed_sources"), "{detail}");
+        fx.assert_refused_by_policy(
+            OP_ENGINE_IMPORT,
+            "policy_not_allowed",
+            "models.allowed_sources",
+        )
+        .await;
+        assert!(
+            !fx.base.path().join("engine").exists(),
+            "nothing was copied"
+        );
+        let body = fx.status().await;
+        assert_eq!(body["source_policy"]["import_allowed"], false);
     })
     .await
     .expect("test within deadline");

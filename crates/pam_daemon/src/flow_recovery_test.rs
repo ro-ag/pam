@@ -280,7 +280,15 @@ async fn foreign_or_unpublished_evidence_and_unlisted_report_refs_refuse_restore
     for id in ["foreign", "unpublished", "missing"] {
         snapshot.evidence = vec![id.to_owned()];
         assert!(
-            snapshot.authorize(&store, "r", repo.path()).await.is_err(),
+            snapshot
+                .authorize(
+                    &store,
+                    &crate::managed_policy::PolicyView::unmanaged(),
+                    "r",
+                    repo.path()
+                )
+                .await
+                .is_err(),
             "{id}"
         );
     }

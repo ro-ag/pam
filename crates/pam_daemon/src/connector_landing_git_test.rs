@@ -98,6 +98,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Store>, GitTarget, String) {
 fn guard(store: Arc<Store>, target: &GitTarget, revision: &str, role: GitRole) -> GitGuard {
     GitGuard::new(
         store,
+        crate::managed_policy_service::PolicyHandle::none(),
         &target.request.repository,
         "r",
         revision,
@@ -153,6 +154,7 @@ async fn exact_remote_base_workspace_and_branch_scope_cannot_be_rebound() {
     assert!(
         GitGuard::new(
             store.clone(),
+            crate::managed_policy_service::PolicyHandle::none(),
             &base.request.repository,
             "r",
             &revision,

@@ -82,10 +82,13 @@ impl Snapshot {
     pub async fn authorize(
         &self,
         store: &Store,
+        view: &crate::managed_policy::PolicyView,
         ticket: &str,
         repo: &Path,
     ) -> Result<(), CapabilityFailure> {
-        let policy = ScopePolicy::load(store).await.map_err(|_| failure())?;
+        let policy = ScopePolicy::load_effective(store, view)
+            .await
+            .map_err(|_| failure())?;
         let repo = policy
             .authorize_repo_blocking(repo)
             .await
@@ -220,8 +223,35 @@ pub(crate) enum Prepare {
 }
 
 impl Recovery {
+    /// [`Self::open_with_policy`] with no managed policy, for the tests of
+    /// modules that drive a journal directly. Test-only, so no production
+    /// path can authorize a resumed run's scopes without the policy.
+    #[cfg(test)]
     pub async fn open(
         store: &Store,
+        ticket: &str,
+        flow: &Flow,
+        repo: &Path,
+        initial: &Vars,
+    ) -> Result<(Self, Snapshot), CapabilityFailure> {
+        Self::open_with_policy(
+            store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+            ticket,
+            flow,
+            repo,
+            initial,
+        )
+        .await
+    }
+
+    /// Opens (or resumes) the journal of `ticket`. A resumed run's
+    /// repository and recorded connector targets are re-authorized against
+    /// the effective scopes under `view`, the managed policy the flow
+    /// service holds.
+    pub async fn open_with_policy(
+        store: &Store,
+        view: &crate::managed_policy::PolicyView,
         ticket: &str,
         flow: &Flow,
         repo: &Path,
@@ -292,8 +322,10 @@ impl Recovery {
         if snapshot.reports.len() != cursor.next_step {
             return Err(failure());
         }
-        snapshot.authorize(store, ticket, repo).await?;
-        cursor.authorize_watch(store, ticket, repo, flow).await?;
+        snapshot.authorize(store, view, ticket, repo).await?;
+        cursor
+            .authorize_watch(store, view, ticket, repo, flow)
+            .await?;
         Ok((
             Self {
                 fingerprint,
@@ -481,6 +513,7 @@ impl Cursor {
     async fn authorize_watch(
         &self,
         store: &Store,
+        view: &crate::managed_policy::PolicyView,
         ticket: &str,
         repo: &Path,
         flow: &Flow,
@@ -495,7 +528,9 @@ impl Cursor {
             {
                 return Err(failure());
             }
-            let policy = ScopePolicy::load(store).await.map_err(|_| failure())?;
+            let policy = ScopePolicy::load_effective(store, view)
+                .await
+                .map_err(|_| failure())?;
             authorize_origin(
                 store,
                 &policy,

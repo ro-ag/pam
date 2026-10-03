@@ -4,6 +4,15 @@
 //! how long a request's audit record lives. Both default to forever (a store never told a window
 //! loses nothing) and are stored as JSON in the `setting` table (`null` = forever), so unset and
 //! deliberate "keep everything" read the same.
+//! - **Managed policy**: the windows the human saved are bounded at read time by the organisation's
+//!   `retention.evidence_days` / `retention.audit_days` ([`PolicyView::effective_retention`]):
+//!   `locked` forces a value, `min` lengthens a shorter window, `max` is a ceiling that also turns
+//!   "forever" (a stored `null`, or nothing stored) into the ceiling, and `default` applies until
+//!   the human stores a value of their own. [`RetentionService::settings`] is that clamped pair, so
+//!   the scheduler, [`RetentionService::run_pass`] and the GUI all read it; the stored rows are never
+//!   rewritten, so removing the policy restores what the human had. A save outside the bounds is
+//!   refused ([`RetentionRefusal::Policy`]) before anything is written, and the clock-jump guard below
+//!   applies to a policy-forced window exactly as to a chosen one.
 //! - **Evidence first, audit last**: a pass prunes evidence before records, and never removes a
 //!   request's [`KEEP_KIND`] row while the request is still there (the verdict makes activity
 //!   history readable). The verdict leaves — with its request, audit rows, and approval — only when
@@ -50,6 +59,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use crate::managed_policy::{EffectiveEntry, Key, PolicyView, WriteRefusal};
 use crate::managed_policy_service::PolicyHandle;
 
 /// Setting key: how many days evidence blobs are kept, JSON `null` for
@@ -320,6 +330,15 @@ pub enum RetentionRefusal {
         /// Human-readable reason, naming the two windows.
         detail: String,
     },
+    /// The managed policy refuses the change (a locked window, a value
+    /// outside the policy's bounds, a held key). `view` is the snapshot the
+    /// refusal was decided on, so the audit row names the digest that refused.
+    Policy {
+        /// What the policy refused, with its cause and recovery line.
+        refusal: WriteRefusal,
+        /// The policy in force when the save was checked.
+        view: Arc<PolicyView>,
+    },
     /// The settings could not be read or written.
     Store(String),
 }
@@ -379,21 +398,30 @@ impl RetentionService {
         self
     }
 
-    /// Both windows as they stand. An unset — or unreadable — key reads
-    /// as forever, never as a window: a garbled setting must not start
-    /// deleting things.
+    /// Both windows as they are in force: what the human stored, bounded
+    /// by the managed policy ([`PolicyView::effective_retention`]). The
+    /// scheduler, [`Self::run_pass`] and the GUI all read this pair, so a
+    /// policy ceiling clamps a stored "forever" before anything is pruned.
+    ///
+    /// With no policy this is the stored pair, and an unset — or unreadable
+    /// — key reads as forever, never as a window: a garbled setting must
+    /// not start deleting things.
     pub async fn settings(&self) -> Result<RetentionSettings, StoreError> {
-        Ok(RetentionSettings {
-            evidence_days: self.window(SETTING_EVIDENCE_DAYS).await?,
-            audit_days: self.window(SETTING_AUDIT_DAYS).await?,
-        })
+        Ok(self.effective().await?.0)
     }
 
-    /// One window setting, or `None` when it is unset, unreadable, or out
-    /// of range. A save can only store `1..=MAX_DAYS`, so anything else got
-    /// there some other way; a stored `0` in particular would make every
-    /// finished record "older than the window" and delete it at once.
-    async fn window(&self, key: &str) -> Result<Option<u32>, StoreError> {
+    /// The windows in force with, per window, where each came from (the
+    /// `effective` entries of `admin.retention.get`).
+    pub async fn effective(&self) -> Result<(RetentionSettings, [EffectiveEntry; 2]), StoreError> {
+        let evidence = self.stored_window(SETTING_EVIDENCE_DAYS).await?;
+        let audit = self.stored_window(SETTING_AUDIT_DAYS).await?;
+        Ok(self.policy.view().effective_retention(evidence, audit))
+    }
+
+    /// What the human stored, before any policy bound: `None` for a key
+    /// with no stored value (so a policy `default` can apply), `Some(None)`
+    /// for forever.
+    async fn stored_window(&self, key: &str) -> Result<Option<Option<u32>>, StoreError> {
         let Some(raw) = self.store.get_setting(key).await? else {
             return Ok(None);
         };
@@ -404,48 +432,87 @@ impl RetentionService {
                     days,
                     "the stored retention window is out of range; treating it as forever"
                 );
-                Ok(None)
+                Ok(Some(None))
             }
-            Ok(days) => Ok(days),
+            Ok(days) => Ok(Some(days)),
             Err(error) => {
                 tracing::warn!(
                     setting = key,
                     %error,
                     "the stored retention window is unreadable; treating it as forever"
                 );
-                Ok(None)
+                Ok(Some(None))
             }
         }
     }
 
-    /// Applies `patch` and answers the windows as they now stand.
+    /// Applies `patch` and answers the windows as they now stand in force.
     ///
-    /// The merged pair is validated before anything is written, so a
-    /// refusal leaves the stored settings exactly as they were. Both
-    /// windows are then written in one transaction, the untouched one
-    /// included: the stored pair is always one that passed [`validate`]
-    /// as a whole, even when two saves race or the daemon stops mid-save.
+    /// The named windows are checked against the managed policy (locked,
+    /// outside its bounds, held) and the merged stored pair is validated
+    /// before anything is written, so a refusal leaves the stored settings
+    /// exactly as they were. The stored windows are then written in one
+    /// transaction, the untouched one included when the human had set it:
+    /// the stored pair is always one that passed [`validate`] as a whole,
+    /// even when two saves race or the daemon stops mid-save.
     pub async fn set_settings(
         &self,
         patch: RetentionPatch,
     ) -> Result<RetentionSettings, RetentionRefusal> {
-        let current = self
-            .settings()
+        let view = self.policy.view();
+        for (key, requested) in [
+            (Key::RetentionEvidenceDays, patch.evidence_days),
+            (Key::RetentionAuditDays, patch.audit_days),
+        ] {
+            let checked = match requested {
+                Some(days) => view.check_window(key, days.map(u64::from)),
+                // A window the save does not name is not the save's to
+                // refuse: the policy still bounds it when it is read.
+                None => Ok(()),
+            };
+            checked.map_err(|refusal| RetentionRefusal::Policy {
+                refusal,
+                view: Arc::clone(&view),
+            })?;
+        }
+        // The stored pair: what the human saved, which is what a patch
+        // edits and what the pair rule applies to.
+        let stored_evidence = self
+            .stored_window(SETTING_EVIDENCE_DAYS)
+            .await
+            .map_err(|error| store_refusal(&error))?;
+        let stored_audit = self
+            .stored_window(SETTING_AUDIT_DAYS)
             .await
             .map_err(|error| store_refusal(&error))?;
         let merged = RetentionSettings {
-            evidence_days: patch.evidence_days.unwrap_or(current.evidence_days),
-            audit_days: patch.audit_days.unwrap_or(current.audit_days),
+            evidence_days: patch.evidence_days.unwrap_or(stored_evidence.flatten()),
+            audit_days: patch.audit_days.unwrap_or(stored_audit.flatten()),
         };
         validate(merged).map_err(|detail| RetentionRefusal::Invalid { detail })?;
+        // The untouched window is written as the value the validation saw,
+        // except a window the human never set that the policy manages: it
+        // stays unset, so the policy's `default` keeps applying to it.
+        let evidence_row = (patch.evidence_days.is_some()
+            || stored_evidence.is_some()
+            || view.status(Key::RetentionEvidenceDays).is_none())
+        .then(|| encode(merged.evidence_days));
+        let audit_row = (patch.audit_days.is_some()
+            || stored_audit.is_some()
+            || view.status(Key::RetentionAuditDays).is_none())
+        .then(|| encode(merged.audit_days));
+        let mut rows: Vec<(&str, &str)> = Vec::with_capacity(2);
+        if let Some(row) = &evidence_row {
+            rows.push((SETTING_EVIDENCE_DAYS, row));
+        }
+        if let Some(row) = &audit_row {
+            rows.push((SETTING_AUDIT_DAYS, row));
+        }
         self.store
-            .set_settings(&[
-                (SETTING_EVIDENCE_DAYS, &encode(merged.evidence_days)),
-                (SETTING_AUDIT_DAYS, &encode(merged.audit_days)),
-            ])
+            .set_settings(&rows)
             .await
             .map_err(|error| store_refusal(&error))?;
-        Ok(merged)
+        self.settings().await.map_err(|error| store_refusal(&error))
     }
 
     /// Runs one pass as `trigger` asked for it, behind the clock-jump guard.

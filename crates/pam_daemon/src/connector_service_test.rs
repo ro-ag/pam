@@ -950,9 +950,12 @@ async fn a_legacy_aws_scope_approval_is_dropped_without_voiding_the_policy() {
         )
         .await
         .unwrap();
-    let policy = crate::scope_policy::ScopePolicy::load(&store)
-        .await
-        .expect("a policy naming the removed connector still loads");
+    let policy = crate::scope_policy::ScopePolicy::load_effective(
+        &store,
+        &crate::managed_policy::PolicyView::unmanaged(),
+    )
+    .await
+    .expect("a policy naming the removed connector still loads");
     assert_eq!(policy.repositories[0].connectors.len(), 1);
     assert_eq!(
         policy.repositories[0].connectors[0].connector,
@@ -981,10 +984,13 @@ async fn a_legacy_aws_scope_approval_is_dropped_without_voiding_the_policy() {
         .await
         .unwrap();
     assert_eq!(
-        crate::scope_policy::ScopePolicy::load(&store)
-            .await
-            .unwrap_err()
-            .cause(),
+        crate::scope_policy::ScopePolicy::load_effective(
+            &store,
+            &crate::managed_policy::PolicyView::unmanaged(),
+        )
+        .await
+        .unwrap_err()
+        .cause(),
         crate::scope_policy::CAUSE_SCOPE_INVALID
     );
 }
@@ -1152,4 +1158,367 @@ async fn a_proxy_password_never_reaches_a_verdict_row_a_refusal_or_a_log_line() 
         "nothing passed the proxy: {:?}",
         origin.requests()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The managed policy: connectors.allowed_base_hosts and connectors.disabled.
+// ---------------------------------------------------------------------------
+
+/// A policy that allows only `github.test` as a base host and disables
+/// Jenkins.
+const MANAGED: &str = r#"{
+    "version": 1,
+    "revision": "rev-7",
+    "contact": "it@example.test",
+    "connectors": { "allowed_base_hosts": ["github.test"], "disabled": ["jenkins"] }
+}"#;
+
+/// A fixture whose service reads `policy` (a trusted, scripted file), after
+/// the human has saved GitHub and Jenkins as `before` the policy says.
+async fn managed_fixture(policy: &str, transport: FakeTransport) -> Fixture {
+    let mut fixture = fixture_with(transport).await;
+    fixture.configure_github().await;
+    fixture
+        .service
+        .configure(
+            ConnectorId::Jenkins,
+            ConfigurePatch {
+                enabled: Some(true),
+                base_url: Some(Some("https://ci.example.test/".to_owned())),
+                username: Some(Some("builder".to_owned())),
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    TOKEN.to_owned(),
+                ))),
+            },
+        )
+        .await
+        .expect("saved before the policy");
+    let handle = crate::managed_policy_service::PolicyHandle::load(
+        Arc::clone(&fixture.store),
+        Arc::new(crate::daemon_test::ScriptedPolicy::new(Some(policy))),
+        std::path::Path::new("pam-tests-have-no-base"),
+    )
+    .await;
+    assert!(
+        matches!(handle.status().state.as_str(), "active" | "degraded"),
+        "{:?}",
+        handle.status()
+    );
+    fixture.service = ConnectorService::new(
+        Arc::clone(&fixture.store),
+        Arc::new(SecretStore::new(Arc::clone(&fixture.backend) as Arc<_>)),
+        Arc::clone(&fixture.transport) as Arc<_>,
+        handle,
+    );
+    fixture
+}
+
+fn runs_args() -> BTreeMap<String, ArgValue> {
+    BTreeMap::from([("repo".to_owned(), ArgValue::Text("octo/repo".to_owned()))])
+}
+
+#[tokio::test]
+async fn a_connector_the_policy_disables_refuses_a_call_a_test_and_a_save() {
+    let fixture = managed_fixture(MANAGED, FakeTransport::new()).await;
+    let repo = fixture.repo.path();
+
+    let error = fixture
+        .service
+        .invoke(
+            repo,
+            ConnectorId::Jenkins,
+            "jobs",
+            &BTreeMap::new(),
+            deadline(),
+        )
+        .await
+        .expect_err("a disabled connector is not called");
+    assert_eq!(error.cause(), CAUSE_CONNECTOR_DISABLED);
+    assert_eq!(
+        error.recovery(ConnectorId::Jenkins),
+        crate::managed_policy::RECOVERY_MANAGED
+    );
+    // An agent reads this text through a flow refusal: nothing names the key or the contact.
+    let detail = error.detail();
+    assert!(!detail.contains("connectors."), "{detail}");
+    assert!(!detail.contains("it@example.test"), "{detail}");
+
+    let error = fixture
+        .service
+        .test(ConnectorId::Jenkins)
+        .await
+        .expect_err("a test would send the credential");
+    assert_eq!(error.cause(), CAUSE_CONNECTOR_DISABLED);
+
+    let (refusal, view) = fixture
+        .service
+        .check_configure(
+            ConnectorId::Jenkins,
+            &ConfigurePatch {
+                enabled: Some(true),
+                ..ConfigurePatch::default()
+            },
+        )
+        .expect_err("enabling it is refused");
+    assert_eq!(refusal.cause, crate::managed_policy::CAUSE_SETTING_LOCKED);
+    assert!(
+        refusal.detail.contains("connectors.disabled"),
+        "{}",
+        refusal.detail
+    );
+    assert!(
+        refusal.detail.contains("it@example.test"),
+        "{}",
+        refusal.detail
+    );
+    assert!(refusal.detail.contains("rev rev-7"), "{}", refusal.detail);
+    assert_eq!(refusal.recovery, crate::managed_policy::RECOVERY_MANAGED);
+    assert_eq!(view.digest12(), fixture.service.policy().view().digest12());
+
+    // The service enforces it too, for any caller, and writes nothing.
+    let before = fixture.store.get_connector("jenkins").await.unwrap();
+    let error = fixture
+        .service
+        .configure(
+            ConnectorId::Jenkins,
+            ConfigurePatch {
+                credential: Some(CredentialAction::Set(crate::secrets::Secret::new(
+                    "another".to_owned(),
+                ))),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .expect_err("a save is refused");
+    assert_eq!(error.cause(), crate::managed_policy::CAUSE_SETTING_LOCKED);
+    assert_eq!(
+        fixture.store.get_connector("jenkins").await.unwrap(),
+        before
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .get(&account_for("jenkins"))
+            .unwrap()
+            .as_deref(),
+        Some(TOKEN),
+        "the credential was not replaced"
+    );
+    assert!(fixture.transport.requests().is_empty());
+
+    // Switching it off, or clearing what is saved, only ever tightens.
+    fixture
+        .service
+        .configure(
+            ConnectorId::Jenkins,
+            ConfigurePatch {
+                enabled: Some(false),
+                credential: Some(CredentialAction::Clear),
+                ..ConfigurePatch::default()
+            },
+        )
+        .await
+        .expect("less configured is allowed");
+}
+
+#[tokio::test]
+async fn the_summary_says_what_the_policy_did_and_the_row_is_untouched() {
+    let fixture = managed_fixture(MANAGED, FakeTransport::new()).await;
+    let summaries = fixture.service.list().await.unwrap();
+
+    let jenkins = Fixture::summary_of(&summaries, ConnectorId::Jenkins);
+    assert!(!jenkins.enabled, "a flow step may not call it");
+    assert_eq!(jenkins.effective["enabled"]["source"], "policy");
+    assert_eq!(jenkins.effective["enabled"]["locked"], true);
+    assert_eq!(jenkins.effective["enabled"]["state"], "applied");
+    assert!(
+        fixture
+            .store
+            .get_connector("jenkins")
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "the human's row keeps what they saved"
+    );
+    // Jenkins's saved host is outside the allowlist too.
+    assert_eq!(jenkins.effective["base_url"]["source"], "policy");
+    assert_eq!(
+        jenkins.effective["base_url"]["constraint"],
+        serde_json::json!({ "allow": ["github.test"] })
+    );
+
+    let github = Fixture::summary_of(&summaries, ConnectorId::Github);
+    assert!(github.enabled);
+    assert_eq!(github.effective["enabled"]["source"], "user");
+    assert_eq!(github.effective["enabled"]["locked"], false);
+    assert_eq!(github.effective["base_url"]["source"], "user");
+    assert_eq!(github.effective["base_url"]["locked"], false);
+
+    // An untouched service: exactly `{ source, locked }`.
+    let plain = fixture_without_policy_summary().await;
+    assert_eq!(
+        plain.effective["enabled"],
+        serde_json::json!({ "source": "user", "locked": false })
+    );
+}
+
+async fn fixture_without_policy_summary() -> ConnectorSummary {
+    let fixture = fixture().await;
+    fixture.configure_github().await;
+    fixture.service.get(ConnectorId::Github).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_base_url_outside_the_allowed_hosts_cannot_be_saved_or_used() {
+    let fixture = managed_fixture(MANAGED, FakeTransport::new()).await;
+    let repo = fixture.repo.path();
+
+    // Saving: refused with the policy cause, before the credential store is touched.
+    let outside = ConfigurePatch {
+        base_url: Some(Some("https://evil.example.org/".to_owned())),
+        ..ConfigurePatch::default()
+    };
+    let (refusal, _) = fixture
+        .service
+        .check_configure(ConnectorId::Github, &outside)
+        .expect_err("the host is not allowed");
+    assert_eq!(
+        refusal.cause,
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    assert!(
+        refusal.detail.contains("evil.example.org"),
+        "{}",
+        refusal.detail
+    );
+    let before = fixture.store.get_connector("github").await.unwrap();
+    let error = fixture
+        .service
+        .configure(ConnectorId::Github, outside)
+        .await
+        .expect_err("saving is refused");
+    assert_eq!(
+        error.cause(),
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    assert_eq!(fixture.store.get_connector("github").await.unwrap(), before);
+
+    // A subdomain of an allowed host is inside the rule, and an invalid
+    // address is the save's own bad_url, not a policy refusal.
+    fixture
+        .service
+        .check_configure(
+            ConnectorId::Github,
+            &ConfigurePatch {
+                base_url: Some(Some("https://api.github.test/".to_owned())),
+                ..ConfigurePatch::default()
+            },
+        )
+        .expect("inside the allowlist");
+    fixture
+        .service
+        .check_configure(
+            ConnectorId::Github,
+            &ConfigurePatch {
+                base_url: Some(Some("not a url".to_owned())),
+                ..ConfigurePatch::default()
+            },
+        )
+        .expect("the save reports a bad url itself");
+
+    // Using: a row saved before the policy existed is not called either.
+    fixture
+        .store
+        .upsert_connector(
+            "github",
+            pam_store::ConnectorPatch {
+                base_url: Some(Some("https://evil.example.org/")),
+                ..pam_store::ConnectorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let error = fixture
+        .service
+        .invoke(repo, ConnectorId::Github, "runs", &runs_args(), deadline())
+        .await
+        .expect_err("outside the allowlist");
+    assert_eq!(
+        error.cause(),
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    assert_eq!(
+        error.recovery(ConnectorId::Github),
+        crate::managed_policy::RECOVERY_MANAGED
+    );
+    let error = fixture
+        .service
+        .test(ConnectorId::Github)
+        .await
+        .expect_err("the credential does not go there");
+    assert_eq!(
+        error.cause(),
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    assert!(fixture.transport.requests().is_empty(), "nothing was sent");
+}
+
+#[tokio::test]
+async fn a_connector_inside_the_policy_still_works_and_removing_it_restores_everything() {
+    let fixture = managed_fixture(
+        MANAGED,
+        FakeTransport::new().json(200, r#"{"workflow_runs":[]}"#),
+    )
+    .await;
+    let repo = fixture.repo.path();
+    fixture
+        .service
+        .invoke(repo, ConnectorId::Github, "runs", &runs_args(), deadline())
+        .await
+        .expect("github.test is allowed");
+
+    // The policy goes away: Jenkins reads as the human saved it.
+    let plain = ConnectorService::new(
+        Arc::clone(&fixture.store),
+        Arc::new(SecretStore::new(Arc::clone(&fixture.backend) as Arc<_>)),
+        Arc::clone(&fixture.transport) as Arc<_>,
+        crate::managed_policy_service::PolicyHandle::none(),
+    );
+    let jenkins = plain.get(ConnectorId::Jenkins).await.unwrap();
+    assert!(jenkins.enabled);
+    assert_eq!(
+        jenkins.base_url.as_deref(),
+        Some("https://ci.example.test/")
+    );
+}
+
+#[tokio::test]
+async fn a_policy_that_cannot_be_read_pauses_the_save_and_never_the_call() {
+    // `connectors.disabled` of the wrong type: the leaf is rejected, and with
+    // no last-known-good copy a Tier A key is held.
+    let bad = r#"{ "version": 1, "connectors": { "disabled": "jenkins" } }"#;
+    let fixture = managed_fixture(
+        bad,
+        FakeTransport::new().json(200, r#"{"workflow_runs":[]}"#),
+    )
+    .await;
+    let repo = fixture.repo.path();
+    let (refusal, _) = fixture
+        .service
+        .check_configure(
+            ConnectorId::Github,
+            &ConfigurePatch {
+                enabled: Some(true),
+                ..ConfigurePatch::default()
+            },
+        )
+        .expect_err("held key");
+    assert_eq!(refusal.cause, crate::managed_policy::CAUSE_POLICY_FROZEN);
+
+    fixture
+        .service
+        .invoke(repo, ConnectorId::Github, "runs", &runs_args(), deadline())
+        .await
+        .expect("a held policy never stops a call");
 }

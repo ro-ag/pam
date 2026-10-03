@@ -94,6 +94,8 @@ pub(super) fn upload_pack_url(remote_url: &str) -> Result<Url, InvokeError> {
 }
 pub(super) struct GitGuard {
     store: Arc<Store>,
+    /// The managed policy; every authorization takes a fresh view.
+    policy: Arc<crate::managed_policy_service::PolicyHandle>,
     repo: std::path::PathBuf,
     ticket: String,
     revision: String,
@@ -107,6 +109,7 @@ pub(super) struct GitGuard {
 impl GitGuard {
     pub(super) fn new(
         store: Arc<Store>,
+        policy: Arc<crate::managed_policy_service::PolicyHandle>,
         repo: &Path,
         ticket: &str,
         revision: &str,
@@ -137,6 +140,7 @@ impl GitGuard {
         }
         Ok(Self {
             store,
+            policy,
             repo: repo.into(),
             ticket: ticket.into(),
             revision: revision.into(),
@@ -149,7 +153,11 @@ impl GitGuard {
         })
     }
     pub(super) async fn authorize_row(&self) -> Result<Option<ConnectorRow>, InvokeError> {
-        let snapshot = crate::landing_policy::Snapshot::load(&self.store)
+        // One snapshot of the managed policy for the landing recipe and the
+        // scopes alike: the ceiling, the allowed servers and the allowed
+        // repository roots apply to every network spawn.
+        let view = self.policy.view();
+        let snapshot = crate::landing_policy::Snapshot::load_effective(&self.store, &view)
             .await
             .map_err(|_| denied())?;
         if snapshot.revision != self.revision {
@@ -191,7 +199,7 @@ impl GitGuard {
         {
             return Err(denied());
         }
-        let scope = ScopePolicy::load(&self.store).await?;
+        let scope = ScopePolicy::load_effective(&self.store, &view).await?;
         let canonical = scope.authorize_repo_blocking(&self.repo).await?;
         let row = self
             .store
@@ -301,6 +309,7 @@ impl ConnectorService {
         } = call;
         let guard = GitGuard::new(
             Arc::clone(&self.store),
+            Arc::clone(self.policy()),
             identity.repo,
             identity.ticket,
             identity.policy_revision,
@@ -418,6 +427,7 @@ impl ConnectorService {
     ) -> Result<(GitTransport, CallSecret, Arc<dyn GitAuthorization>), InvokeError> {
         let guard = Arc::new(GitGuard::new(
             Arc::clone(&self.store),
+            Arc::clone(self.policy()),
             identity.repo,
             identity.ticket,
             identity.policy_revision,

@@ -4,9 +4,17 @@ use std::time::Duration;
 use pam_store::{Actor, Decision, Store};
 use tokio::time::timeout;
 
+use crate::managed_policy::{
+    CAUSE_POLICY_DENIED, CAUSE_POLICY_FROZEN, CAUSE_POLICY_NOT_ALLOWED, CAUSE_SETTING_LOCKED, Key,
+};
+use crate::managed_policy_service::{
+    ABSENCE_CONFIRM_AFTER, ACTION_POLICY_DENIED, Fingerprint, PolicyHandle, PolicySource,
+    SourceRead, Trigger,
+};
 use crate::policy::{
     AdmissionPool, CAUSE_NOT_GRANTED, CAUSE_UNKNOWN_CAPABILITY, CapabilityClass, GateDecision,
-    PROFILE_SETTING_KEY, PolicyError, PolicyGate, Profile, admission_pool, classify,
+    PROFILE_SETTING_KEY, PolicyError, PolicyGate, Profile, RECOVERY_POLICY_DENIED, SetProfileError,
+    admission_pool, classify,
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -455,4 +463,429 @@ fn doctor_report_is_control_class_in_the_control_pool() {
         admission_pool(crate::boundary::CAP_DOCTOR_REPORT),
         AdmissionPool::Control
     );
+}
+
+// --- The managed policy over the gate ---------------------------------------
+
+/// A policy file the test replaces at will: every change bumps the stat,
+/// the way a real replace does, so the poll notices it. Shared with the
+/// admin and approval tests.
+#[derive(Default)]
+pub(crate) struct SwitchablePolicy {
+    file: std::sync::Mutex<(u64, Option<Vec<u8>>)>,
+}
+
+impl SwitchablePolicy {
+    pub(crate) fn new(text: Option<&str>) -> Arc<Self> {
+        let source = Arc::new(Self::default());
+        source.set(text);
+        source
+    }
+
+    /// Replaces the file (`None` deletes it).
+    pub(crate) fn set(&self, text: Option<&str>) {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.0 += 1;
+        file.1 = text.map(|text| text.as_bytes().to_vec());
+    }
+}
+
+impl PolicySource for SwitchablePolicy {
+    fn origin(&self) -> String {
+        "switchable".to_owned()
+    }
+
+    fn read(&self) -> SourceRead {
+        let file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &file.1 {
+            Some(bytes) => SourceRead::Trusted(bytes.clone()),
+            None => SourceRead::Absent,
+        }
+    }
+
+    fn fingerprint(&self) -> Option<Fingerprint> {
+        let file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.1.as_ref().map(|_| Fingerprint {
+            len: file.0,
+            modified: None,
+            identity: None,
+        })
+    }
+
+    fn read_referenced(&self, _path: &std::path::Path, _max_bytes: u64) -> SourceRead {
+        SourceRead::Absent
+    }
+}
+
+/// The handle a daemon would boot with over `source` (no CA is pinned, so
+/// the base directory is never written).
+pub(crate) async fn managed_handle(
+    store: &Arc<Store>,
+    source: &Arc<SwitchablePolicy>,
+) -> Arc<PolicyHandle> {
+    PolicyHandle::load(
+        Arc::clone(store),
+        Arc::clone(source) as Arc<dyn PolicySource>,
+        std::path::Path::new("pam-tests-write-no-ca-copy"),
+    )
+    .await
+}
+
+/// Removes the policy file and lets the handle confirm the absence: one
+/// observation, then a poll at least [`ABSENCE_CONFIRM_AFTER`] later. Needs
+/// a paused clock.
+pub(crate) async fn remove_policy(source: &SwitchablePolicy, handle: &PolicyHandle) {
+    source.set(None);
+    handle.poll_once().await;
+    tokio::time::advance(ABSENCE_CONFIRM_AFTER + Duration::from_secs(1)).await;
+    handle.poll_once().await;
+    assert!(!handle.view().is_managed(), "the absence is confirmed");
+}
+
+/// A gate over the stored `profile`, under the policy `text`, with the
+/// request row `req_1`.
+async fn managed_gate(
+    profile: Profile,
+    text: Option<&str>,
+) -> (
+    Arc<Store>,
+    Arc<SwitchablePolicy>,
+    Arc<PolicyHandle>,
+    PolicyGate,
+) {
+    let store = fresh_store().await;
+    store
+        .set_setting(
+            PROFILE_SETTING_KEY,
+            &serde_json::to_string(&profile).unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", None)
+        .await
+        .unwrap();
+    let source = SwitchablePolicy::new(text);
+    let handle = managed_handle(&store, &source).await;
+    let gate = PolicyGate::new(Arc::clone(&store), Arc::clone(&handle))
+        .await
+        .unwrap();
+    (store, source, handle, gate)
+}
+
+fn profile_policy(mode: &str, profile: Profile) -> String {
+    serde_json::json!({
+        "version": 1,
+        "revision": "r1",
+        "contact": "it@example.com",
+        "security": { "profile": { mode: profile.as_str(), "reason": "SEC-114" } },
+    })
+    .to_string()
+}
+
+const ALL_PROFILES: [Profile; 3] = [Profile::Relaxed, Profile::Standard, Profile::Strict];
+
+async fn stored(store: &Store) -> Option<String> {
+    store.get_setting(PROFILE_SETTING_KEY).await.unwrap()
+}
+
+fn refusal_cause(result: Result<Profile, SetProfileError>) -> &'static str {
+    match result {
+        Err(SetProfileError::Policy { refusal, .. }) => refusal.cause,
+        other => panic!("expected a policy refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_locked_profile_is_enforced_without_rewriting_the_stored_choice() {
+    let text = profile_policy("locked", Profile::Strict);
+    let (store, source, handle, gate) = managed_gate(Profile::Relaxed, Some(&text)).await;
+    assert_eq!(gate.profile(), Profile::Strict);
+    assert_eq!(gate.stored_profile(), Profile::Relaxed);
+    assert_eq!(stored(&store).await.as_deref(), Some("\"relaxed\""));
+    let (_, entry) = gate.effective_profile();
+    assert_eq!(
+        entry.to_json(),
+        serde_json::json!({
+            "source": "policy", "locked": true, "mode": "locked",
+            "reason": "SEC-114", "state": "applied",
+        })
+    );
+    // Locked means the field is not the human's: the locked value too.
+    for requested in ALL_PROFILES {
+        assert_eq!(
+            refusal_cause(gate.set_profile(requested).await),
+            CAUSE_SETTING_LOCKED
+        );
+    }
+    assert_eq!(stored(&store).await.as_deref(), Some("\"relaxed\""));
+    // The gate enforces it: an ungranted echo is refused, not auto-granted.
+    assert!(matches!(
+        gate.evaluate("req_1", "echo").await.unwrap(),
+        GateDecision::Refuse { ref cause, .. } if cause == CAUSE_NOT_GRANTED
+    ));
+
+    // A trusted relaxed lock (a loosening file) is honoured just the same.
+    source.set(Some(&profile_policy("locked", Profile::Relaxed)));
+    handle.reload(Trigger::Reload { request_id: None }).await;
+    assert_eq!(gate.profile(), Profile::Relaxed);
+    drop(handle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn removing_the_policy_restores_the_stored_profile() {
+    let text = profile_policy("locked", Profile::Strict);
+    let (_store, source, handle, gate) = managed_gate(Profile::Relaxed, Some(&text)).await;
+    assert_eq!(gate.profile(), Profile::Strict);
+    remove_policy(&source, &handle).await;
+    assert_eq!(gate.profile(), Profile::Relaxed);
+    assert_eq!(
+        gate.set_profile(Profile::Standard).await.unwrap(),
+        Profile::Relaxed
+    );
+}
+
+#[tokio::test]
+async fn a_floor_clamps_every_pair_and_refuses_only_looser_choices() {
+    for floor in ALL_PROFILES {
+        for user in ALL_PROFILES {
+            let text = profile_policy("floor", floor);
+            let (store, _source, _handle, gate) = managed_gate(user, Some(&text)).await;
+            let expected = crate::managed_policy::stricter(user, floor);
+            assert_eq!(gate.profile(), expected, "user {user:?} floor {floor:?}");
+            let (_, entry) = gate.effective_profile();
+            let entry = entry.to_json();
+            assert_eq!(entry["locked"], false);
+            assert_eq!(entry["constraint"]["floor"], floor.as_str());
+            if expected == user {
+                assert_eq!(entry["source"], "user", "{entry}");
+            } else {
+                assert_eq!(entry["source"], "policy", "{entry}");
+                assert_eq!(entry["clamped"], true, "{entry}");
+            }
+            // The stored choice is never rewritten by the clamp.
+            assert_eq!(
+                stored(&store).await,
+                Some(serde_json::to_string(&user).unwrap())
+            );
+        }
+        for requested in ALL_PROFILES {
+            let text = profile_policy("floor", floor);
+            let (store, _source, _handle, gate) = managed_gate(Profile::Strict, Some(&text)).await;
+            let allowed = crate::managed_policy::stricter(requested, floor) == requested;
+            let result = gate.set_profile(requested).await;
+            if allowed {
+                assert!(result.is_ok(), "{requested:?} within floor {floor:?}");
+                assert_eq!(gate.profile(), requested);
+            } else {
+                assert_eq!(refusal_cause(result), CAUSE_POLICY_NOT_ALLOWED);
+                assert_eq!(stored(&store).await.as_deref(), Some("\"strict\""));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_first_boot_seeds_the_policy_default_and_later_boots_keep_the_row() {
+    let text = profile_policy("default", Profile::Strict);
+    let store = fresh_store().await;
+    let source = SwitchablePolicy::new(Some(&text));
+    let handle = managed_handle(&store, &source).await;
+    let gate = PolicyGate::new(Arc::clone(&store), Arc::clone(&handle))
+        .await
+        .unwrap();
+    assert_eq!(gate.profile(), Profile::Strict);
+    assert_eq!(stored(&store).await.as_deref(), Some("\"strict\""));
+    // A default is not a lock: the human may move off it.
+    gate.set_profile(Profile::Relaxed).await.unwrap();
+
+    // A later default never moves an existing install.
+    source.set(Some(&profile_policy("default", Profile::Standard)));
+    handle.reload(Trigger::Reload { request_id: None }).await;
+    let rebuilt = PolicyGate::new(Arc::clone(&store), Arc::clone(&handle))
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.profile(), Profile::Relaxed);
+    assert_eq!(stored(&store).await.as_deref(), Some("\"relaxed\""));
+
+    // Without a policy default the platform default is seeded, as before.
+    let bare = fresh_store().await;
+    let unmanaged = SwitchablePolicy::new(Some(&profile_policy("floor", Profile::Relaxed)));
+    let handle = managed_handle(&bare, &unmanaged).await;
+    PolicyGate::new(Arc::clone(&bare), handle).await.unwrap();
+    assert_eq!(
+        stored(&bare).await,
+        Some(serde_json::to_string(&Profile::platform_default()).unwrap())
+    );
+}
+
+#[tokio::test]
+async fn a_frozen_profile_lets_only_a_tightening_through() {
+    // A file that cannot be used, and no last good copy: the key is held.
+    let (store, _source, handle, gate) =
+        managed_gate(Profile::Relaxed, Some(r#"{"version":"#)).await;
+    assert!(handle.view().is_held(Key::SecurityProfile));
+    assert_eq!(
+        gate.profile(),
+        Profile::Relaxed,
+        "a held key reads the user's value"
+    );
+
+    // The same value loosens nothing either.
+    assert_eq!(
+        gate.set_profile(Profile::Relaxed).await.unwrap(),
+        Profile::Relaxed
+    );
+    assert_eq!(
+        gate.set_profile(Profile::Standard).await.unwrap(),
+        Profile::Relaxed
+    );
+    assert_eq!(
+        gate.set_profile(Profile::Strict).await.unwrap(),
+        Profile::Standard
+    );
+    assert_eq!(
+        refusal_cause(gate.set_profile(Profile::Standard).await),
+        CAUSE_POLICY_FROZEN
+    );
+    assert_eq!(stored(&store).await.as_deref(), Some("\"strict\""));
+    assert_eq!(gate.profile(), Profile::Strict);
+}
+
+/// The policy denying `echo` by name.
+const NEVER_ECHO: &str = r#"{
+  "version": 1,
+  "revision": "never-echo",
+  "security": { "grants": { "never": ["echo"] } }
+}"#;
+
+#[tokio::test(start_paused = true)]
+async fn a_grant_stops_authorizing_under_a_never_rule_and_authorizes_again_without_it() {
+    let (store, source, handle, gate) = managed_gate(Profile::Standard, None).await;
+    store.insert_grant("echo").await.unwrap();
+    assert_eq!(
+        gate.evaluate("req_1", "echo").await.unwrap(),
+        GateDecision::Allow {
+            auto_granted: false
+        }
+    );
+
+    source.set(Some(NEVER_ECHO));
+    handle.reload(Trigger::Reload { request_id: None }).await;
+    let decision = gate.evaluate("req_1", "echo").await.unwrap();
+    let GateDecision::Refuse {
+        cause,
+        detail,
+        recovery,
+    } = decision
+    else {
+        panic!("a never rule refuses: {decision:?}");
+    };
+    assert_eq!(cause, CAUSE_POLICY_DENIED);
+    assert_eq!(recovery, RECOVERY_POLICY_DENIED);
+    assert!(
+        !detail.contains("never") && !detail.contains("rule"),
+        "{detail}"
+    );
+    // The rule is in the audit row, with the policy's full digest.
+    let denied: Vec<_> = store
+        .audit_for_request("req_1")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.action == ACTION_POLICY_DENIED)
+        .collect();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].decision, Decision::Refuse);
+    assert_eq!(denied[0].actor, Actor::Policy);
+    let row: serde_json::Value =
+        serde_json::from_str(denied[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        row,
+        serde_json::json!({
+            "capability": "echo",
+            "rule": "echo",
+            "digest": crate::network_service::sha256_hex(NEVER_ECHO.as_bytes()),
+        })
+    );
+    // The grant is the human's and stays.
+    assert!(store.active_grant("echo").await.unwrap());
+
+    remove_policy(&source, &handle).await;
+    assert_eq!(
+        gate.evaluate("req_1", "echo").await.unwrap(),
+        GateDecision::Allow {
+            auto_granted: false
+        }
+    );
+}
+
+#[tokio::test]
+async fn never_rules_refuse_on_every_profile_but_spare_the_control_plane() {
+    let text = r#"{"version":1,"security":{"grants":{"never":["*"]}}}"#;
+    for profile in ALL_PROFILES {
+        let (store, _source, _handle, gate) = managed_gate(profile, Some(text)).await;
+        store.insert_grant("echo").await.unwrap();
+        for capability in ["echo", "flow.list"] {
+            assert!(
+                matches!(
+                    gate.evaluate("req_1", capability).await.unwrap(),
+                    GateDecision::Refuse { ref cause, .. } if cause == CAUSE_POLICY_DENIED
+                ),
+                "{capability} under {profile:?}"
+            );
+        }
+        for capability in ["status", "query", "cancel"] {
+            assert_eq!(
+                gate.evaluate("req_1", capability).await.unwrap(),
+                GateDecision::Allow {
+                    auto_granted: false
+                },
+                "{capability} under {profile:?}"
+            );
+        }
+        // Nothing was auto-granted for a denied capability.
+        assert!(!store.active_grant("flow.list").await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn never_classes_refuse_a_flow_step_of_that_class_only() {
+    let text = r#"{"version":1,"security":{"grants":{"never_classes":["external"]}}}"#;
+    let (store, _source, _handle, gate) = managed_gate(Profile::Relaxed, Some(text)).await;
+    store.insert_grant("flow.step:f/call").await.unwrap();
+    store.insert_grant("flow.step:f/merge").await.unwrap();
+    assert!(matches!(
+        gate.evaluate_classified("req_1", "flow.step:f/call", CapabilityClass::External)
+            .await
+            .unwrap(),
+        GateDecision::Refuse { ref cause, .. } if cause == CAUSE_POLICY_DENIED
+    ));
+    assert_eq!(
+        gate.evaluate_classified("req_1", "flow.step:f/merge", CapabilityClass::Destructive)
+            .await
+            .unwrap(),
+        GateDecision::Allow {
+            auto_granted: false
+        }
+    );
+    let rules: Vec<serde_json::Value> = store
+        .audit_for_request("req_1")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.action == ACTION_POLICY_DENIED)
+        .map(|row| serde_json::from_str(row.detail.as_deref().unwrap()).unwrap())
+        .collect();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["rule"], "class:external");
 }

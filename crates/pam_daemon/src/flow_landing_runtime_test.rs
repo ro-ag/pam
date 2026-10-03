@@ -1,6 +1,6 @@
 use super::landing_runtime::{
-    EffectPhase, attempted, broker_error, checkout_error, effect_verdict, landing_workspace,
-    release_workspace,
+    EffectPhase, attempted, broker_error, checkout_error, effect_verdict, inspect_policy,
+    landing_workspace, release_workspace,
 };
 use super::{Attempt, CapabilityFailure, StepStatus};
 use crate::flow_recovery::{Prepare, Recovery};
@@ -915,4 +915,42 @@ mod seeded {
         assert!(session["receipts"].get("validate").is_none());
         assert!(session["intent"].is_null());
     }
+}
+
+/// A landing step the managed ceiling caps off is refused before it runs
+/// with the policy's cause and recovery; one the human withheld keeps the
+/// landing refusal.
+#[tokio::test]
+async fn a_landing_operation_above_the_policy_ceiling_is_refused_with_the_policy_cause() {
+    let store = Store::open_in_memory().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let (repo, workspace) = (root.join("repo"), root.join("work"));
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&workspace).unwrap();
+    store.set_setting("flows.landing_policy",&json!({"version":1,"repositories":[{"root":repo,"repository":"https://github.com/org/repo","github_server":"https://api.github.com/","github_repository":"org/repo","base":"main","branches":["feature/work"],"workspace_root":workspace,"checks":[{"name":"test","argv":["cargo","test"],"timeout_seconds":300}],"required_checks":["ci"],"main_checks":["ci"],"permissions":{"push":true,"create_pr":true,"merge":true,"sync":false}}]}).to_string()).await.unwrap();
+    let view = crate::scope_policy_test::view(&json!({
+        "version": 1, "landing": { "max_permissions": { "merge": false } }
+    }));
+    let refusal = inspect_policy(&store, &view, &repo, Op::Merge)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.cause, crate::managed_policy::CAUSE_POLICY_DENIED);
+    assert_eq!(refusal.recovery, crate::managed_policy::RECOVERY_MANAGED);
+    assert!(
+        refusal.detail.contains("landing.max_permissions"),
+        "{}",
+        refusal.detail
+    );
+    inspect_policy(&store, &view, &repo, Op::Push)
+        .await
+        .unwrap();
+    let withheld = inspect_policy(&store, &view, &repo, Op::Sync)
+        .await
+        .unwrap_err();
+    assert_eq!(withheld.cause, "landing_permission_missing");
+    let unmanaged = crate::managed_policy::PolicyView::unmanaged();
+    inspect_policy(&store, &unmanaged, &repo, Op::Merge)
+        .await
+        .unwrap();
 }

@@ -27,31 +27,46 @@ const LONG_TIMEOUT: Duration = Duration::from_mins(10);
 /// whole service (row, tripwire, deadline, audit).
 struct Fixture {
     store: Arc<Store>,
+    policy: Arc<crate::managed_policy_service::PolicyHandle>,
     admin: AdminService,
     next: AtomicU32,
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(None).await
+}
+
+/// The same, with the managed policy file `policy` (a trusted, scripted one)
+/// read by the daemon's services.
+async fn fixture_with(policy: Option<&str>) -> Fixture {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let policy = match policy {
+        Some(text) => {
+            crate::managed_policy_service::PolicyHandle::load(
+                Arc::clone(&store),
+                Arc::new(crate::daemon_test::ScriptedPolicy::new(Some(text))),
+                std::path::Path::new("pam-tests-have-no-base"),
+            )
+            .await
+        }
+        None => crate::managed_policy_service::PolicyHandle::none(),
+    };
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     ));
-    let models = ModelService::new(
-        Arc::clone(&store),
-        crate::managed_policy_service::PolicyHandle::none(),
-    )
-    .await
-    .unwrap();
+    let models = ModelService::new(Arc::clone(&store), Arc::clone(&policy))
+        .await
+        .unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let connectors = Arc::new(ConnectorService::from_parts(
         Arc::clone(&store),
         None,
         None,
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
@@ -69,10 +84,11 @@ async fn fixture() -> Fixture {
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     );
     Fixture {
         store,
+        policy,
         admin,
         next: AtomicU32::new(0),
     }
@@ -165,7 +181,16 @@ async fn get_on_a_fresh_store_is_forever_and_never_pruned() {
     let body = body_of(f.admin.handle(&envelope).await, Outcome::Verified);
     assert_eq!(
         body,
-        json!({ "evidence_days": null, "audit_days": null, "last_run": null, "clock_guard": null })
+        json!({
+            "evidence_days": null,
+            "audit_days": null,
+            "effective": {
+                "evidence_days": { "source": "default", "locked": false },
+                "audit_days": { "source": "default", "locked": false },
+            },
+            "last_run": null,
+            "clock_guard": null
+        })
     );
     f.assert_audited(&envelope.id).await;
 }
@@ -206,6 +231,10 @@ async fn set_persists_prunes_at_once_and_round_trips() {
         json!({
             "evidence_days": null,
             "audit_days": 365,
+            "effective": {
+                "evidence_days": { "source": "user", "locked": false },
+                "audit_days": { "source": "user", "locked": false },
+            },
             "last_run": body["last_run"],
             "clock_guard": null
         })
@@ -402,4 +431,151 @@ async fn a_forward_jump_that_would_remove_little_is_not_held_back() {
         "{body}"
     );
     assert!(f.store.get_request("lonely").await.unwrap().is_none());
+}
+
+// ---- the managed policy -------------------------------------------------
+
+const CEILING: &str = r#"{
+    "version": 1, "revision": "r9", "contact": "it@example.test",
+    "retention": { "evidence_days": { "max": 30 }, "audit_days": { "max": 90 } }
+}"#;
+
+impl Fixture {
+    /// The op's request carries the terminal `admin`/`refuse` row and the
+    /// policy's `policy.locked_write` row, whose detail names the op, the
+    /// key, the cause and the full digest of the policy that refused.
+    async fn assert_refused_by_policy(&self, id: &str, op: &str, cause: &str, key: &str) {
+        let rows = self.store.audit_for_request(id).await.unwrap();
+        assert!(
+            rows.iter().any(
+                |row| row.action == ACTION_ADMIN && row.decision == pam_store::Decision::Refuse
+            ),
+            "{rows:?}"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.action == "policy.locked_write")
+            .unwrap_or_else(|| panic!("no policy.locked_write row in {rows:?}"));
+        assert_eq!(row.decision, pam_store::Decision::Refuse);
+        assert_eq!(row.actor, pam_store::Actor::Policy);
+        let detail: Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["op"], op);
+        assert_eq!(detail["cause"], cause);
+        assert_eq!(detail["keys"], json!([key]));
+        assert_eq!(detail["revision"], "r9");
+        let digest = detail["digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(Some(digest), self.policy.view().digest());
+    }
+}
+
+#[tokio::test]
+async fn get_reports_the_windows_in_force_and_where_they_came_from() {
+    let f = fixture_with(Some(CEILING)).await;
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_GET, json!({})))
+            .await,
+        Outcome::Verified,
+    );
+    // Nothing stored reads as forever, which the ceiling turns into the ceiling.
+    assert_eq!(body["evidence_days"], 30);
+    assert_eq!(body["audit_days"], 90);
+    assert_eq!(body["effective"]["audit_days"]["source"], "policy");
+    assert_eq!(body["effective"]["audit_days"]["locked"], false);
+    assert_eq!(body["effective"]["audit_days"]["clamped"], true);
+    assert_eq!(
+        body["effective"]["audit_days"]["constraint"],
+        json!({ "max": 90 })
+    );
+    assert_eq!(body["effective"]["audit_days"]["state"], "applied");
+}
+
+#[tokio::test]
+async fn set_refuses_forever_under_a_ceiling_and_audits_the_refusal() {
+    let f = fixture_with(Some(CEILING)).await;
+    f.store
+        .set_setting("retention.audit_days", "60")
+        .await
+        .unwrap();
+    let envelope = f.envelope(OP_RETENTION_SET, json!({ "audit_days": null }));
+    match f.admin.handle(&envelope).await {
+        Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } => {
+            assert_eq!(cause, "policy_not_allowed");
+            assert!(detail.contains("retention.audit_days"), "{detail}");
+            assert!(detail.contains("it@example.test"), "{detail}");
+            assert!(detail.contains("rev r9"), "{detail}");
+            assert_eq!(recovery, crate::managed_policy::RECOVERY_MANAGED);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    f.assert_refused_by_policy(
+        &envelope.id,
+        OP_RETENTION_SET,
+        "policy_not_allowed",
+        "retention.audit_days",
+    )
+    .await;
+    // The row is byte-identical and no pass ran.
+    assert_eq!(
+        f.store
+            .get_setting("retention.audit_days")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("60")
+    );
+    assert_eq!(
+        f.store.get_setting("retention.last_run").await.unwrap(),
+        None
+    );
+
+    // Inside the bounds the save goes through.
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(
+                OP_RETENTION_SET,
+                json!({ "audit_days": 45, "evidence_days": 20 }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(body["audit_days"], 45);
+    assert_eq!(body["evidence_days"], 20);
+}
+
+#[tokio::test]
+async fn set_refuses_a_locked_window_with_setting_locked() {
+    let f = fixture_with(Some(
+        r#"{ "version": 1, "revision": "r9",
+             "retention": { "audit_days": { "locked": 365 } } }"#,
+    ))
+    .await;
+    let envelope = f.envelope(OP_RETENTION_SET, json!({ "audit_days": 400 }));
+    assert_eq!(cause_of(f.admin.handle(&envelope).await), "setting_locked");
+    f.assert_refused_by_policy(
+        &envelope.id,
+        OP_RETENTION_SET,
+        "setting_locked",
+        "retention.audit_days",
+    )
+    .await;
+    assert_eq!(
+        f.store.get_setting("retention.audit_days").await.unwrap(),
+        None
+    );
+    // The locked value is what get answers, and it is read-only for the GUI.
+    let body = body_of(
+        f.admin
+            .handle(&f.envelope(OP_RETENTION_GET, json!({})))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(body["audit_days"], 365);
+    assert_eq!(body["effective"]["audit_days"]["locked"], true);
 }

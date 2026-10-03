@@ -18,7 +18,7 @@ use pam_daemon::network_service::{PROXY_CREDENTIAL_ID, SETTING_KEY};
 use pam_daemon::secrets::{SecretBackend, account_for};
 use pam_net::testing::{FakeProxy, Origin, OriginMode, ProxyMode, base64, trusted_curl_or_skip};
 use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};
-use pam_testkit::{FakeSecretBackend, TestDaemon, with_deadline};
+use pam_testkit::{FakeSecretBackend, ScriptedPolicy, TestDaemon, with_deadline};
 
 const TOKEN: &str = "ghp_socket_secret_13572468";
 const PROXY_PASSWORD: &str = "pr0xy-s3cret-\"quoted\"";
@@ -234,4 +234,125 @@ fn assert_no_secret(text: &str) {
     assert!(!text.contains(&encoded), "{text}");
     assert!(!text.contains("s3cret"), "{text}");
     assert!(!text.contains(TOKEN), "{text}");
+}
+
+/// A proxy the managed policy locks is the one connector calls go through,
+/// whatever the human saves: the policy's proxy answers the call, the
+/// human's attempt to change it is refused, and the Network screen says the
+/// field is the policy's.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario: boot under a policy, refuse the edit, call, read back; splitting it hides the order"
+)]
+async fn a_policy_locked_proxy_is_the_one_connector_calls_go_through() {
+    if trusted_curl_or_skip().is_none() {
+        return;
+    }
+    with_deadline(async {
+        let origin = Origin::start(OriginMode::Json).await;
+        // The policy's proxy refuses every tunnel: its verdict, not the
+        // origin's answer, proves the call went through it.
+        let managed = FakeProxy::start(ProxyMode::Deny(403), origin.address()).await;
+        let human = FakeProxy::start(ProxyMode::Allow, origin.address()).await;
+        let policy = serde_json::json!({
+            "version": 1,
+            "revision": "net-1",
+            "network": { "proxy": {
+                "locked": { "url": managed.url(), "auth": "none" },
+                "reason": "NET-1",
+            } },
+        })
+        .to_string();
+        let daemon = TestDaemon::spawn_with(move |config| {
+            config.secret_backend =
+                Some(Arc::new(FakeSecretBackend::default()) as Arc<dyn SecretBackend>);
+            config.policy_source = Some(ScriptedPolicy::trusted(&policy));
+        })
+        .await;
+        let mut client = daemon.client().await;
+
+        body_of(
+            client
+                .request(&admin_envelope(
+                    "configure",
+                    OP_CONNECTORS_CONFIGURE,
+                    serde_json::json!({ "id": "github", "enabled": true, "base_url": BASE_URL,
+                        "credential": { "set": TOKEN } }),
+                ))
+                .await,
+            Outcome::Changed,
+        );
+        // The human cannot move the proxy, and the refusal names the policy.
+        match client
+            .request(&admin_envelope(
+                "network_set",
+                OP_NETWORK_SET,
+                serde_json::json!({ "proxy": { "url": human.url(), "auth": "none" } }),
+            ))
+            .await
+        {
+            Response::Refusal {
+                cause,
+                detail,
+                recovery,
+                ..
+            } => {
+                assert_eq!(cause, "setting_locked");
+                assert!(detail.contains("(network.proxy)"), "{detail}");
+                assert!(detail.contains("reason: NET-1"), "{detail}");
+                assert!(recovery.contains("administrator"), "{recovery}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let rows = daemon.audit_rows("network_set").await;
+        assert!(
+            rows.iter().any(|row| row.action == "policy.locked_write"),
+            "{rows:?}"
+        );
+
+        let tested = body_of(
+            client
+                .request(&admin_envelope(
+                    "connector_test",
+                    OP_CONNECTORS_TEST,
+                    serde_json::json!({ "id": "github" }),
+                ))
+                .await,
+            Outcome::Verified,
+        );
+        assert_eq!(tested["status"], "failed");
+        let detail = tested["detail"].as_str().unwrap();
+        assert!(detail.contains(&managed.address().to_string()), "{detail}");
+        assert_eq!(
+            managed.request_lines(),
+            vec!["CONNECT api.github.test:443 HTTP/1.1".to_owned()]
+        );
+        assert!(
+            human.request_lines().is_empty(),
+            "the human's proxy was never used"
+        );
+        assert!(origin.requests().is_empty());
+
+        let read = body_of(
+            client
+                .request(&admin_envelope(
+                    "network_get",
+                    OP_NETWORK_GET,
+                    serde_json::json!({}),
+                ))
+                .await,
+            Outcome::Verified,
+        );
+        assert_eq!(read["settings"]["proxy"]["url"], managed.url());
+        assert_eq!(
+            read["effective"]["proxy"],
+            serde_json::json!({
+                "source": "policy", "locked": true, "mode": "locked",
+                "reason": "NET-1", "state": "applied",
+            })
+        );
+        daemon.stop().await;
+    })
+    .await;
 }

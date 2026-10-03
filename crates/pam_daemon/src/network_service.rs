@@ -14,14 +14,23 @@
 //!
 //! What a consumer gets ([`NetworkService::settings`]) is the resolved
 //! profile: the user's document under the managed overlay
-//! ([`ManagedNetworkLayer`]; a field the policy sets is pinned and locked),
-//! re-validated, with the proxy password read from the keychain when the
-//! sign-in mode needs one, and the CA bundle's private copy
-//! (`<base>/net/ca-<sha12>.pem`) re-hashed and compared with the recorded
-//! digest — a mismatch is `network_ca_tampered`. The profile is cached for
-//! [`CACHE_TTL`] so a flow with many connector steps does not read the
-//! keychain per step; every save invalidates it, so a change applies to the
-//! next spawn.
+//! ([`ManagedNetworkLayer`]), re-validated, with the proxy password read
+//! from the keychain when the sign-in mode needs one, and the CA bundle's
+//! private copy (`<base>/net/ca-<sha12>.pem`) re-hashed and compared with
+//! the recorded digest — a mismatch is `network_ca_tampered`. The profile
+//! is cached for [`CACHE_TTL`] so a flow with many connector steps does not
+//! read the keychain per step; every save invalidates it, so a change
+//! applies to the next spawn.
+//!
+//! The overlay has three parts. A **locked** field (`current`) is the
+//! policy's value and the human cannot edit it. A **default**
+//! (`defaults`) applies only while the human has stored no value, and the
+//! field stays editable. A **closure** (`closed`) means the policy named a
+//! proxy, no-proxy list or CA bundle that could not be put in force: every
+//! connector call and download is refused, never sent around the proxy the
+//! organisation requires. The managed CA bundle is imported, trust-checked
+//! and digest-pinned by the policy loader (`PolicyHandle`); this module only
+//! re-hashes the loader's private copy and never imports a second time.
 //!
 //! The password is never in the document, an audit row, a reply or a log
 //! line: it lives in the keychain under connector id [`PROXY_CREDENTIAL_ID`]
@@ -41,6 +50,8 @@ use pam_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::managed_policy::{Key, LeafStatus};
+use crate::managed_policy_service::PolicyHandle;
 use crate::secrets::{Secret, SecretError, SecretStore};
 
 /// The `setting` row the document lives under.
@@ -259,8 +270,9 @@ fn validate_digest(sha256: &str) -> Result<(), SettingsError> {
 }
 
 /// The fields a managed policy may pin. Present means pinned and locked;
-/// absent means the user's value applies. `mirror_allowed_hosts` is
-/// policy-only: a list the same human could edit would not be a control.
+/// absent means the user's value applies (or a [`ManagedDefaults`] entry,
+/// while the user has none). `mirror_allowed_hosts` is policy-only: a list
+/// the same human could edit would not be a control.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManagedNetwork {
     /// A pinned proxy (`Some(None)` pins "direct").
@@ -279,12 +291,57 @@ pub struct ManagedNetwork {
     pub mirror_allowed_hosts: Vec<String>,
 }
 
-/// Where the managed overlay comes from. The default answers `None`; a
-/// later plan provides a policy file and decides how it is read and
-/// watched.
+/// The unlocked layer of the overlay: what applies while the human has
+/// stored no value for the field, and never replaces one. The proxy and the
+/// CA bundle take no default (the policy can only lock them).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedDefaults {
+    /// A default no-proxy list, used while the user's list is empty.
+    pub no_proxy: Option<Vec<String>>,
+    /// A default engine mirror (`Some(None)` names upstream).
+    pub engine_mirror: Option<Option<String>>,
+    /// A default models mirror.
+    pub models_mirror: Option<Option<String>>,
+}
+
+impl ManagedDefaults {
+    /// Whether no field has a default.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Why connector calls and downloads are refused under the policy: it named
+/// a proxy, no-proxy list or CA bundle that could not be put in force and
+/// there is no last-known-good value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyClosed {
+    /// The policy key (`network.ca_bundle`, ...).
+    pub key: String,
+    /// A stable code: the trust code, or the validation code.
+    pub code: String,
+    /// The sentence.
+    pub detail: String,
+}
+
+/// Where the managed overlay comes from. The default answers `None`, no
+/// defaults and no closure; the policy handle ([`PolicyNetwork`]) is the
+/// production layer.
 pub trait ManagedNetworkLayer: Send + Sync {
-    /// The current overlay, or `None` when nothing is managed.
+    /// The locked fields, or `None` when nothing is locked.
     fn current(&self) -> Option<ManagedNetwork>;
+
+    /// The unlocked defaults.
+    fn defaults(&self) -> ManagedDefaults {
+        ManagedDefaults::default()
+    }
+
+    /// Why every consumer must refuse, when the policy cannot be put in
+    /// force for a proxy, no-proxy list or CA bundle.
+    fn closed(&self) -> Option<PolicyClosed> {
+        None
+    }
 }
 
 /// No policy: every field is the user's.
@@ -299,22 +356,111 @@ impl ManagedNetworkLayer for NoManagedNetwork {
 
 /// A fixed overlay, for tests of the resolution and the lock.
 #[derive(Debug, Default)]
-pub struct FixedManagedNetwork(pub Mutex<Option<ManagedNetwork>>);
+pub struct FixedManagedNetwork {
+    /// The locked fields.
+    pub locked: Mutex<Option<ManagedNetwork>>,
+    /// The unlocked defaults.
+    pub defaults: Mutex<ManagedDefaults>,
+    /// The closure.
+    pub closed: Mutex<Option<PolicyClosed>>,
+}
 
 impl FixedManagedNetwork {
     /// An overlay that answers `managed` until changed.
     #[must_use]
     pub fn new(managed: Option<ManagedNetwork>) -> Self {
-        Self(Mutex::new(managed))
+        Self {
+            locked: Mutex::new(managed),
+            ..Self::default()
+        }
+    }
+
+    /// The same overlay with unlocked defaults.
+    #[must_use]
+    pub fn with_defaults(self, defaults: ManagedDefaults) -> Self {
+        *lock_ignoring_poison(&self.defaults) = defaults;
+        self
+    }
+
+    /// The same overlay, closed.
+    #[must_use]
+    pub fn with_closed(self, closed: PolicyClosed) -> Self {
+        *lock_ignoring_poison(&self.closed) = Some(closed);
+        self
     }
 }
 
 impl ManagedNetworkLayer for FixedManagedNetwork {
     fn current(&self) -> Option<ManagedNetwork> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        lock_ignoring_poison(&self.locked).clone()
+    }
+
+    fn defaults(&self) -> ManagedDefaults {
+        lock_ignoring_poison(&self.defaults).clone()
+    }
+
+    fn closed(&self) -> Option<PolicyClosed> {
+        lock_ignoring_poison(&self.closed).clone()
+    }
+}
+
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The managed policy as the overlay: the handle's locked fields (the CA
+/// record included, imported by the loader), the policy's defaults, and the
+/// handle's closure. The closure is `PolicyHandle::network_closed`, not the
+/// view's, because only the handle knows about a CA import that failed.
+#[derive(Debug, Clone)]
+pub struct PolicyNetwork(Arc<PolicyHandle>);
+
+impl PolicyNetwork {
+    /// The overlay over `policy`.
+    #[must_use]
+    pub fn new(policy: Arc<PolicyHandle>) -> Self {
+        Self(policy)
+    }
+}
+
+impl ManagedNetworkLayer for PolicyNetwork {
+    fn current(&self) -> Option<ManagedNetwork> {
+        self.0.managed_network()
+    }
+
+    fn defaults(&self) -> ManagedDefaults {
+        let view = self.0.view();
+        let policy = view.policy();
+        // A default applies only while its leaf is in force and not a lock
+        // (the modes exclude each other; a lock is `current`'s).
+        let in_force = |key: Key| view.status(key).is_some_and(LeafStatus::in_force);
+        ManagedDefaults {
+            no_proxy: policy
+                .no_proxy
+                .as_ref()
+                .filter(|_| in_force(Key::NetworkNoProxy))
+                .and_then(|leaf| leaf.default.clone()),
+            engine_mirror: policy
+                .engine_mirror
+                .as_ref()
+                .filter(|_| in_force(Key::NetworkEngineMirror))
+                .and_then(|leaf| leaf.default.clone()),
+            models_mirror: policy
+                .models_mirror
+                .as_ref()
+                .filter(|_| in_force(Key::NetworkModelsMirror))
+                .and_then(|leaf| leaf.default.clone()),
+        }
+    }
+
+    fn closed(&self) -> Option<PolicyClosed> {
+        self.0.network_closed().map(|closed| PolicyClosed {
+            key: closed.key.path().to_owned(),
+            code: closed.code.to_owned(),
+            detail: closed.detail,
+        })
     }
 }
 
@@ -325,7 +471,8 @@ pub enum Source {
     Default,
     /// The user's document.
     User,
-    /// The managed policy; the field is locked.
+    /// The managed policy: a locked value, or an unlocked default (see
+    /// [`Lock`]).
     Policy,
 }
 
@@ -340,10 +487,29 @@ impl Source {
         }
     }
 
-    /// Whether the policy owns the field.
+    /// Whether a value from this source is locked *unless the policy only
+    /// supplied a default*: true for [`Self::Policy`]. The authority on
+    /// whether the human may edit a field is [`Resolved::lock`].
     #[must_use]
     pub fn locked(self) -> bool {
         self == Self::Policy
+    }
+}
+
+/// Whether the human may edit a field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lock {
+    /// The human may change it.
+    Open,
+    /// The policy owns it.
+    Locked,
+}
+
+impl Lock {
+    /// Whether the policy owns the field.
+    #[must_use]
+    pub fn is_locked(self) -> bool {
+        self == Self::Locked
     }
 }
 
@@ -383,16 +549,28 @@ impl Field {
             Self::ModelsMirror => "models_mirror",
         }
     }
+
+    /// The policy key that governs the field.
+    #[must_use]
+    pub fn policy_key(self) -> Key {
+        match self {
+            Self::Proxy => Key::NetworkProxy,
+            Self::NoProxy => Key::NetworkNoProxy,
+            Self::CaBundle => Key::NetworkCaBundle,
+            Self::EngineMirror => Key::NetworkEngineMirror,
+            Self::ModelsMirror => Key::NetworkModelsMirror,
+        }
+    }
 }
 
 /// The user's document under the managed overlay: the effective values,
-/// and per field where each came from.
+/// and per field where each came from and whether the human may edit it.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     /// The effective document.
     pub document: NetworkDocument,
-    /// Where each field's value came from.
-    pub sources: [(Field, Source); 5],
+    /// Where each field's value came from, and whether it is locked.
+    pub sources: [(Field, Source, Lock); 5],
     /// The policy's mirror allowlist (empty: any host).
     pub mirror_allowed_hosts: Vec<String>,
 }
@@ -401,10 +579,30 @@ impl Resolved {
     /// Where `field` came from.
     #[must_use]
     pub fn source(&self, field: Field) -> Source {
+        self.entry(field).0
+    }
+
+    /// Whether the human may edit `field`.
+    #[must_use]
+    pub fn lock(&self, field: Field) -> Lock {
+        self.entry(field).1
+    }
+
+    /// Whether the policy owns `field`.
+    #[must_use]
+    pub fn is_locked(&self, field: Field) -> bool {
+        self.lock(field).is_locked()
+    }
+
+    /// `field`'s source and lock.
+    #[must_use]
+    pub fn entry(&self, field: Field) -> (Source, Lock) {
         self.sources
             .iter()
-            .find(|(candidate, _)| *candidate == field)
-            .map_or(Source::Default, |(_, source)| *source)
+            .find(|(candidate, _, _)| *candidate == field)
+            .map_or((Source::Default, Lock::Open), |(_, source, lock)| {
+                (*source, *lock)
+            })
     }
 
     /// The fields the policy owns, in document order.
@@ -412,45 +610,83 @@ impl Resolved {
     pub fn locked_fields(&self) -> Vec<Field> {
         self.sources
             .iter()
-            .filter(|(_, source)| source.locked())
-            .map(|(field, _)| *field)
+            .filter(|(_, _, lock)| lock.is_locked())
+            .map(|(field, _, _)| *field)
             .collect()
+    }
+
+    /// Whether the proxy password is the policy's to lock: the proxy is
+    /// locked and needs no password (`auth: none`, or a pinned direct
+    /// connection). With `basic` or `anyauth` the policy never carries the
+    /// secret, so the password stays the human's to type.
+    #[must_use]
+    pub fn credential_locked(&self) -> bool {
+        self.is_locked(Field::Proxy)
+            && self
+                .document
+                .proxy
+                .as_ref()
+                .is_none_or(|proxy| proxy.auth == ProxyAuth::None.as_str())
     }
 }
 
-/// `effective = managed.field.or(user.field).unwrap_or(default)`, per
-/// field, with its source.
+/// `effective = locked.or(user).or(default)`, per field, with its source
+/// and lock. No defaults: see [`resolve_layers`].
 #[must_use]
 pub fn resolve(user: &NetworkDocument, managed: Option<&ManagedNetwork>) -> Resolved {
-    fn pick<T: Clone + PartialEq>(
-        managed: Option<&Option<T>>,
+    resolve_layers(user, managed, &ManagedDefaults::default())
+}
+
+/// `effective = locked.or(user).or(default).unwrap_or(builtin)`, per
+/// field. A locked field is `(Policy, Locked)`; the user's value is
+/// `(User, Open)`; a policy default, used only while the user has none, is
+/// `(Policy, Open)`; otherwise `(Default, Open)`.
+#[must_use]
+pub fn resolve_layers(
+    user: &NetworkDocument,
+    managed: Option<&ManagedNetwork>,
+    defaults: &ManagedDefaults,
+) -> Resolved {
+    fn pick<T: Clone>(
+        locked: Option<&Option<T>>,
         user: Option<&T>,
-    ) -> (Option<T>, Source) {
-        match managed {
-            Some(pinned) => (pinned.clone(), Source::Policy),
-            None => match user {
-                Some(value) => (Some(value.clone()), Source::User),
-                None => (None, Source::Default),
-            },
+        default: Option<&Option<T>>,
+    ) -> (Option<T>, Source, Lock) {
+        match (locked, user, default) {
+            (Some(pinned), _, _) => (pinned.clone(), Source::Policy, Lock::Locked),
+            (None, Some(value), _) => (Some(value.clone()), Source::User, Lock::Open),
+            (None, None, Some(default)) => (default.clone(), Source::Policy, Lock::Open),
+            (None, None, None) => (None, Source::Default, Lock::Open),
         }
     }
-    let (proxy, proxy_source) = pick(managed.and_then(|m| m.proxy.as_ref()), user.proxy.as_ref());
-    let (no_proxy, no_proxy_source) = match managed.and_then(|m| m.no_proxy.as_ref()) {
-        Some(pinned) => (pinned.clone(), Source::Policy),
-        None if !user.no_proxy.is_empty() => (user.no_proxy.clone(), Source::User),
-        None => (Vec::new(), Source::Default),
+    let (proxy, proxy_source, proxy_lock) = pick(
+        managed.and_then(|m| m.proxy.as_ref()),
+        user.proxy.as_ref(),
+        None,
+    );
+    let (no_proxy, no_proxy_source, no_proxy_lock) = match managed.and_then(|m| m.no_proxy.as_ref())
+    {
+        Some(pinned) => (pinned.clone(), Source::Policy, Lock::Locked),
+        None if !user.no_proxy.is_empty() => (user.no_proxy.clone(), Source::User, Lock::Open),
+        None => match &defaults.no_proxy {
+            Some(default) => (default.clone(), Source::Policy, Lock::Open),
+            None => (Vec::new(), Source::Default, Lock::Open),
+        },
     };
-    let (ca_bundle, ca_source) = pick(
+    let (ca_bundle, ca_source, ca_lock) = pick(
         managed.and_then(|m| m.ca_bundle.as_ref()),
         user.ca_bundle.as_ref(),
+        None,
     );
-    let (engine_mirror, engine_source) = pick(
+    let (engine_mirror, engine_source, engine_lock) = pick(
         managed.and_then(|m| m.engine_mirror.as_ref()),
         user.engine_mirror.as_ref(),
+        defaults.engine_mirror.as_ref(),
     );
-    let (models_mirror, models_source) = pick(
+    let (models_mirror, models_source, models_lock) = pick(
         managed.and_then(|m| m.models_mirror.as_ref()),
         user.models_mirror.as_ref(),
+        defaults.models_mirror.as_ref(),
     );
     Resolved {
         document: NetworkDocument {
@@ -462,11 +698,11 @@ pub fn resolve(user: &NetworkDocument, managed: Option<&ManagedNetwork>) -> Reso
             models_mirror,
         },
         sources: [
-            (Field::Proxy, proxy_source),
-            (Field::NoProxy, no_proxy_source),
-            (Field::CaBundle, ca_source),
-            (Field::EngineMirror, engine_source),
-            (Field::ModelsMirror, models_source),
+            (Field::Proxy, proxy_source, proxy_lock),
+            (Field::NoProxy, no_proxy_source, no_proxy_lock),
+            (Field::CaBundle, ca_source, ca_lock),
+            (Field::EngineMirror, engine_source, engine_lock),
+            (Field::ModelsMirror, models_source, models_lock),
         ],
         mirror_allowed_hosts: managed
             .map(|m| m.mirror_allowed_hosts.clone())
@@ -578,6 +814,14 @@ impl NetworkService {
         self
     }
 
+    /// The same service under the managed policy: its locked fields, its
+    /// defaults, its closure, and the CA copy its loader imported. Same as
+    /// `with_managed(PolicyNetwork::new(policy))`.
+    #[must_use]
+    pub fn with_policy(self, policy: Arc<PolicyHandle>) -> Self {
+        self.with_managed(Arc::new(PolicyNetwork::new(policy)))
+    }
+
     /// Whether the keychain opened: what `credential.store_available` reports.
     #[must_use]
     pub fn store_available(&self) -> bool {
@@ -668,7 +912,7 @@ impl NetworkService {
     /// Resolves and validates a user document that already parsed.
     fn resolve_user(&self, raw: Option<String>, user: NetworkDocument) -> Result<Loaded, Invalid> {
         let managed = self.managed.current();
-        let resolved = resolve(&user, managed.as_ref());
+        let resolved = resolve_layers(&user, managed.as_ref(), &self.managed.defaults());
         let allowed = match parse_no_proxy(&resolved.mirror_allowed_hosts) {
             Ok(rules) => rules,
             Err(error) => {
@@ -785,9 +1029,19 @@ impl NetworkService {
     }
 
     /// Removes private copies no record names any more. `keep` is the
-    /// digest still in use.
+    /// digest still in use; the managed policy's copy, which the policy
+    /// loader wrote into the same directory, is always kept.
     pub fn prune_ca_copies(&self, keep: Option<&str>) {
-        let keep_path = keep.map(|sha256| self.copy_path(sha256));
+        let managed = self
+            .managed
+            .current()
+            .and_then(|managed| managed.ca_bundle)
+            .flatten();
+        let keep_paths: Vec<PathBuf> = keep
+            .into_iter()
+            .chain(managed.as_ref().map(|bundle| bundle.sha256.as_str()))
+            .map(|sha256| self.copy_path(sha256))
+            .collect();
         let Ok(entries) = std::fs::read_dir(self.net_dir()) else {
             return;
         };
@@ -798,7 +1052,7 @@ impl NetworkService {
             if !name.starts_with("ca-") || !name.ends_with(".pem") {
                 continue;
             }
-            if keep_path.as_ref().is_some_and(|kept| *kept == path) {
+            if keep_paths.contains(&path) {
                 continue;
             }
             if let Err(error) = std::fs::remove_file(&path) {
@@ -834,6 +1088,8 @@ impl NetworkService {
     ///
     /// A [`NetFailure`] naming the cause; never a direct fallback.
     pub async fn resolve_settings(&self) -> Result<Arc<NetSettings>, NetFailure> {
+        // Before the cache: a closure applies the moment the policy says so.
+        self.refuse_when_closed()?;
         if let Some(cached) = self.cached() {
             return Ok(cached);
         }
@@ -873,8 +1129,10 @@ impl NetworkService {
     ///
     /// # Errors
     ///
-    /// `network_settings_invalid` for a corrupt document.
+    /// `network_settings_invalid` for a corrupt document, or for a policy
+    /// that cannot be put in force (see [`Self::policy_closed`]).
     pub async fn mirrors(&self) -> Result<(Option<MirrorBase>, Option<MirrorBase>), NetFailure> {
+        self.refuse_when_closed()?;
         let loaded = self
             .load()
             .await
@@ -883,6 +1141,26 @@ impl NetworkService {
             })?
             .map_err(|invalid| NetFailure::SettingsInvalid(invalid.detail))?;
         Ok((loaded.valid.engine_mirror, loaded.valid.models_mirror))
+    }
+
+    /// Why the managed policy closes every consumer, when it does: it named
+    /// a proxy, no-proxy list or CA bundle that could not be put in force
+    /// and has no last-known-good value. `admin.network.get` reports it.
+    #[must_use]
+    pub fn policy_closed(&self) -> Option<PolicyClosed> {
+        self.managed.closed()
+    }
+
+    /// The refusal for [`Self::policy_closed`]. A direct connection would
+    /// go around the proxy or the trust the organisation requires, so
+    /// nothing is sent. The sentence names the policy key, the code and who
+    /// can fix it; the failure is the settings-invalid one every consumer
+    /// already maps.
+    fn refuse_when_closed(&self) -> Result<(), NetFailure> {
+        match self.managed.closed() {
+            Some(closed) => Err(NetFailure::SettingsInvalid(policy_closed_sentence(&closed))),
+            None => Ok(()),
+        }
     }
 
     fn cached(&self) -> Option<Arc<NetSettings>> {
@@ -956,6 +1234,17 @@ pub fn ignored_env() -> Vec<String> {
         .map(|name| (*name).to_owned())
         .collect();
     present.into_iter().collect()
+}
+
+/// The sentence a closed consumer is refused with.
+#[must_use]
+pub fn policy_closed_sentence(closed: &PolicyClosed) -> String {
+    format!(
+        "your organisation's policy ({}) could not be put in force ({}): {}; nothing was sent \
+         because it would bypass what your organisation requires. Ask your administrator to \
+         correct the policy file",
+        closed.key, closed.code, closed.detail
+    )
 }
 
 /// Lowercase hex SHA-256 of `bytes`.

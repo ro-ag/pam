@@ -15,6 +15,9 @@ use pam_store::{ConnectorPatch, Store};
 use serde_json::json;
 
 use crate::connector_service::ConnectorService;
+use crate::managed_policy::{
+    CAUSE_POLICY_FROZEN, CAUSE_POLICY_NOT_ALLOWED, Key, PolicyView, TargetPlatform, inspect_bytes,
+};
 use crate::scope_policy::{
     CAUSE_SCOPE_DENIED, CAUSE_SCOPE_INVALID, ConnectorScope, RepositoryScope, SETTING_SCOPE_POLICY,
     ScopeAccess, ScopePolicy,
@@ -35,6 +38,7 @@ fn policy(root: &Path, connector: ConnectorId, targets: &[&str]) -> ScopePolicy 
                 targets: targets.iter().map(|target| (*target).to_owned()).collect(),
             }],
         }],
+        ..ScopePolicy::default()
     }
     .normalize()
     .expect("valid policy")
@@ -49,7 +53,7 @@ async fn missing_and_malformed_policy_never_grant_scope() {
     let store = Store::open_in_memory().await.unwrap();
     let root = tempfile::tempdir().unwrap();
     assert_eq!(
-        ScopePolicy::load(&store)
+        ScopePolicy::load_effective(&store, &PolicyView::unmanaged())
             .await
             .unwrap()
             .authorize_repo(root.path())
@@ -65,7 +69,10 @@ async fn missing_and_malformed_policy_never_grant_scope() {
     ] {
         store.set_setting(SETTING_SCOPE_POLICY, raw).await.unwrap();
         assert_eq!(
-            ScopePolicy::load(&store).await.unwrap_err().cause(),
+            ScopePolicy::load_effective(&store, &PolicyView::unmanaged())
+                .await
+                .unwrap_err()
+                .cause(),
             CAUSE_SCOPE_INVALID
         );
         assert_eq!(
@@ -675,6 +682,7 @@ async fn the_blocking_twins_agree_with_the_synchronous_checks() {
             root: root.path().to_path_buf(),
             connectors: Vec::new(),
         }],
+        ..ScopePolicy::default()
     }
     .normalize_blocking()
     .await
@@ -716,5 +724,353 @@ async fn the_blocking_twins_agree_with_the_synchronous_checks() {
             .authorize_connector_at(&nested, ConnectorId::Github, BASE, "runs", &args)
             .is_err(),
         "a root that is not approved is refused even when handed in canonical form"
+    );
+}
+
+// --- The managed policy ------------------------------------------------------
+
+/// A trusted policy document's view, through the fallback chain with no
+/// last-good copy (a rejected Tier A leaf is held), as the handle builds it.
+pub(crate) fn view(document: &serde_json::Value) -> PolicyView {
+    inspect_bytes(document.to_string().as_bytes(), TargetPlatform::host())
+        .result
+        .expect("the test policy parses")
+        .with_fallback(None)
+}
+
+fn scope(connector: ConnectorId, access: ScopeAccess, targets: &[&str]) -> ConnectorScope {
+    ConnectorScope {
+        connector,
+        base_url: BASE.to_owned(),
+        access,
+        targets: targets.iter().map(|target| (*target).to_owned()).collect(),
+    }
+}
+
+/// Two approved repositories: `inside` with a GitHub target scope, a
+/// connector-wide `SonarQube` scope and a Jira scope, and `outside` with a
+/// GitHub scope; both normalized (canonical roots).
+fn two_repositories(inside: &Path, outside: &Path) -> ScopePolicy {
+    ScopePolicy {
+        version: 1,
+        repositories: vec![
+            RepositoryScope {
+                root: inside.to_path_buf(),
+                connectors: vec![
+                    scope(ConnectorId::Github, ScopeAccess::Targets, &["octo/repo"]),
+                    scope(ConnectorId::Sonarqube, ScopeAccess::ConnectorWide, &[]),
+                    scope(ConnectorId::Jira, ScopeAccess::Targets, &["PAM"]),
+                ],
+            },
+            RepositoryScope {
+                root: outside.to_path_buf(),
+                connectors: vec![scope(
+                    ConnectorId::Github,
+                    ScopeAccess::Targets,
+                    &["octo/repo"],
+                )],
+            },
+        ],
+        ..ScopePolicy::default()
+    }
+    .normalize()
+    .expect("valid policy")
+}
+
+/// The policy every managed-scope test reads: one allowed root, no
+/// connector-wide access, the test service host only, Jira disabled.
+fn scopes_policy(allowed_root: &Path) -> PolicyView {
+    view(&json!({
+        "version": 1,
+        "revision": "scopes-1",
+        "contact": "it@example.test",
+        "scopes": {
+            "allowed_repository_roots": [crate::scope_policy::policy_path(allowed_root)],
+            "connector_wide": "deny"
+        },
+        "connectors": {
+            "allowed_base_hosts": ["api.example.test"],
+            "disabled": ["jira"]
+        }
+    }))
+}
+
+#[tokio::test]
+async fn the_effective_scopes_drop_what_the_policy_forbids_and_leave_the_stored_row_alone() {
+    let allowed = tempfile::tempdir().unwrap();
+    let inside = allowed.path().canonicalize().unwrap().join("inside");
+    std::fs::create_dir(&inside).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().canonicalize().unwrap();
+    let stored = two_repositories(&inside, &outside);
+    let store = Store::open_in_memory().await.unwrap();
+    stored.save(&store).await.unwrap();
+    let raw = store.get_setting(SETTING_SCOPE_POLICY).await.unwrap();
+    let view = scopes_policy(&allowed.path().canonicalize().unwrap());
+
+    let effective = ScopePolicy::load_effective(&store, &view).await.unwrap();
+    assert_eq!(effective.repositories.len(), 1);
+    assert_eq!(effective.repositories[0].root, inside);
+    assert_eq!(
+        effective.repositories[0]
+            .connectors
+            .iter()
+            .map(|scope| scope.connector)
+            .collect::<Vec<_>>(),
+        vec![ConnectorId::Github]
+    );
+    let dropped: Vec<(Option<ConnectorId>, Key)> = effective
+        .dropped()
+        .iter()
+        .map(|entry| (entry.connector, entry.key))
+        .collect();
+    assert_eq!(
+        dropped,
+        vec![
+            (Some(ConnectorId::Sonarqube), Key::ScopesConnectorWide),
+            (Some(ConnectorId::Jira), Key::ConnectorsDisabled),
+            (None, Key::ScopesAllowedRepositoryRoots),
+        ]
+    );
+    assert_eq!(
+        effective.dropped_json()[2],
+        json!({
+            "root": outside,
+            "connector": null,
+            "key": "scopes.allowed_repository_roots",
+            "reason": "this repository is outside the repository roots your organisation's policy allows",
+        })
+    );
+
+    // A dropped entry is reported, never used: the refusal names the policy.
+    let error = effective.authorize_repo(&outside).unwrap_err();
+    assert_eq!(error.cause(), CAUSE_SCOPE_DENIED);
+    assert!(
+        error
+            .to_string()
+            .contains("(scopes.allowed_repository_roots)")
+            && error.to_string().contains("ask your administrator"),
+        "{error}"
+    );
+    let error = effective
+        .authorize_connector(
+            &inside,
+            ConnectorId::Jira,
+            BASE,
+            "issue",
+            &args("key", "PAM-1"),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("(connectors.disabled)"),
+        "{error}"
+    );
+    effective
+        .authorize_connector(
+            &inside,
+            ConnectorId::Github,
+            BASE,
+            "runs",
+            &args("repo", "octo/repo"),
+        )
+        .unwrap();
+
+    // The stored document is byte-identical, and without the policy it is
+    // exactly what the human saved.
+    assert_eq!(store.get_setting(SETTING_SCOPE_POLICY).await.unwrap(), raw);
+    let unmanaged = ScopePolicy::load_effective(&store, &PolicyView::unmanaged())
+        .await
+        .unwrap();
+    assert_eq!(unmanaged, stored);
+    assert!(unmanaged.dropped().is_empty());
+}
+
+#[test]
+fn a_service_host_outside_the_allowed_hosts_drops_the_connector_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let stored = policy(root.path(), ConnectorId::Github, &["octo/repo"]);
+    let view = view(&json!({
+        "version": 1,
+        "connectors": { "allowed_base_hosts": ["github.example.com"] }
+    }));
+    let effective = stored.clone().managed(&view);
+    assert!(effective.repositories[0].connectors.is_empty());
+    assert_eq!(effective.dropped()[0].key, Key::ConnectorsAllowedBaseHosts);
+    assert_eq!(effective.effective_json(&view)["clamped"], true);
+    assert_eq!(effective.effective_json(&view)["source"], "policy");
+    assert_eq!(
+        effective.effective_json(&view)["constraint"]["connectors.allowed_base_hosts"],
+        json!(["github.example.com"])
+    );
+    // No policy: the entry is exactly `{ source, locked }` plus the value.
+    let unmanaged = stored.managed(&PolicyView::unmanaged());
+    let entry = unmanaged.effective_json(&PolicyView::unmanaged());
+    assert_eq!(entry["source"], "user");
+    assert_eq!(entry["locked"], false);
+    assert!(entry.get("mode").is_none(), "{entry}");
+}
+
+#[test]
+fn a_scope_write_the_policy_forbids_is_refused_naming_the_key_and_the_policy() {
+    let allowed = tempfile::tempdir().unwrap();
+    let allowed_root = allowed.path().canonicalize().unwrap();
+    let inside = allowed_root.join("inside");
+    std::fs::create_dir(&inside).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let view = scopes_policy(&allowed_root);
+
+    let outside = policy(elsewhere.path(), ConnectorId::Github, &["octo/repo"]);
+    let refusal = outside.check_write(&view, None).unwrap_err();
+    assert_eq!(refusal.cause, CAUSE_POLICY_NOT_ALLOWED);
+    assert_eq!(refusal.key, Key::ScopesAllowedRepositoryRoots);
+    let digest12 = view.digest12().unwrap();
+    assert!(
+        refusal.detail.contains("(scopes.allowed_repository_roots)")
+            && refusal.detail.contains("contact it@example.test")
+            && refusal
+                .detail
+                .contains(&format!("(policy {digest12}, rev scopes-1)")),
+        "{}",
+        refusal.detail
+    );
+    assert_eq!(refusal.recovery, crate::managed_policy::RECOVERY_MANAGED);
+
+    let mut wide = policy(&inside, ConnectorId::Github, &["octo/repo"]);
+    wide.repositories[0].connectors = vec![scope(
+        ConnectorId::Sonarqube,
+        ScopeAccess::ConnectorWide,
+        &[],
+    )];
+    assert_eq!(
+        wide.check_write(&view, None).unwrap_err().key,
+        Key::ScopesConnectorWide
+    );
+
+    let mut foreign_host = policy(&inside, ConnectorId::Github, &["octo/repo"]);
+    foreign_host.repositories[0].connectors[0].base_url = "https://api.other.test/".to_owned();
+    assert_eq!(
+        foreign_host.check_write(&view, None).unwrap_err().key,
+        Key::ConnectorsAllowedBaseHosts
+    );
+
+    // Inside every bound, the write passes; a disabled connector's scope is
+    // saved (and reported as dropped on read), not refused.
+    let mut fine = policy(&inside, ConnectorId::Github, &["octo/repo"]);
+    fine.repositories[0]
+        .connectors
+        .push(scope(ConnectorId::Jira, ScopeAccess::Targets, &["PAM"]));
+    fine.check_write(&view, None).unwrap();
+    fine.check_write(&PolicyView::unmanaged(), None).unwrap();
+}
+
+#[test]
+fn a_held_scope_key_freezes_widening_writes_but_lets_a_narrowing_one_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    // A wrong type: the leaf is rejected, Tier A, no last-good copy: held.
+    let view = view(&json!({ "version": 1, "scopes": { "allowed_repository_roots": "/Users" } }));
+    assert!(view.is_held(Key::ScopesAllowedRepositoryRoots));
+
+    let current = policy(
+        root.path(),
+        ConnectorId::Github,
+        &["octo/repo", "octo/other"],
+    );
+    // Reads stay the human's while the key is held.
+    assert_eq!(current.clone().managed(&view), current);
+
+    let narrower = policy(root.path(), ConnectorId::Github, &["octo/repo"]);
+    narrower.check_write(&view, Some(&current)).unwrap();
+    let mut removed = current.clone();
+    removed.repositories.clear();
+    removed.check_write(&view, Some(&current)).unwrap();
+
+    let mut wider = current.clone();
+    wider
+        .repositories
+        .extend(policy(other.path(), ConnectorId::Github, &["octo/repo"]).repositories);
+    let refusal = wider.check_write(&view, Some(&current)).unwrap_err();
+    assert_eq!(refusal.cause, CAUSE_POLICY_FROZEN);
+    assert_eq!(refusal.key, Key::ScopesAllowedRepositoryRoots);
+    let more_targets = policy(
+        root.path(),
+        ConnectorId::Github,
+        &["octo/repo", "octo/third"],
+    );
+    assert_eq!(
+        more_targets
+            .check_write(&view, Some(&current))
+            .unwrap_err()
+            .cause,
+        CAUSE_POLICY_FROZEN
+    );
+    // With nothing saved to compare against, nothing counts as narrowing.
+    assert_eq!(
+        narrower.check_write(&view, None).unwrap_err().cause,
+        CAUSE_POLICY_FROZEN
+    );
+}
+
+/// The raw loader is named only where the human's saved document is edited
+/// (`admin_flows.rs`) and in the scope module itself: every other reader in
+/// the crate, its tests and its integration tests goes through
+/// `load_effective`, so no consumer can skip the managed policy.
+#[test]
+fn only_the_scope_module_and_the_admin_edit_path_name_the_raw_loader() {
+    fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the source tree reads") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    let needle = ["load", "_user"].concat();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk(&manifest.join("src"), &mut files);
+    walk(&manifest.join("tests"), &mut files);
+    assert!(files.len() > 100, "the walk found the sources");
+    let naming: Vec<String> = files
+        .iter()
+        .filter(|path| {
+            std::fs::read_to_string(path)
+                .expect("a source file reads")
+                .contains(&needle)
+        })
+        .map(|path| {
+            path.strip_prefix(manifest)
+                .expect("under the manifest")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    let mut naming = naming;
+    naming.sort();
+    assert_eq!(naming, vec!["src/admin_flows.rs", "src/scope_policy.rs"]);
+    let module = std::fs::read_to_string(manifest.join("src/scope_policy.rs")).unwrap();
+    assert!(
+        module.contains(&format!("pub(crate) async fn {needle}(")),
+        "the raw loader stays crate-private"
+    );
+}
+
+#[test]
+fn a_verbatim_windows_root_is_compared_in_the_form_a_policy_writes() {
+    use crate::scope_policy::policy_path;
+    assert_eq!(
+        policy_path(Path::new(r"\\?\C:\Users\me")),
+        Path::new(r"C:\Users\me")
+    );
+    assert_eq!(
+        policy_path(Path::new(r"\\?\UNC\server\share\x")),
+        Path::new(r"\\server\share\x")
+    );
+    assert_eq!(policy_path(Path::new("/Users/me")), Path::new("/Users/me"));
+    assert_eq!(
+        policy_path(Path::new(r"\\?\Volume{x}\a")),
+        Path::new(r"\\?\Volume{x}\a")
     );
 }

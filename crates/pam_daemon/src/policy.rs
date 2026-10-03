@@ -18,11 +18,27 @@
 //!   differs by platform ([`Profile::platform_default`]). The active profile persists in the
 //!   `setting` table under [`PROFILE_SETTING_KEY`] as a JSON string; changing it is GUI-only.
 //! - **One source of truth for the profile**: the gate reads the setting once, at construction,
-//!   and from then on the profile it holds is what every part of the daemon enforces, reports and
-//!   stamps (`admin.profile.get`, the flow step gate, the watch/landing authorization stamp).
+//!   and from then on [`PolicyGate::profile`] is what every part of the daemon enforces, reports
+//!   and stamps (`admin.profile.get`, the flow step gate, the watch/landing authorization stamp).
 //!   [`PolicyGate::set_profile`] is the only way to change it: it persists the setting and then
 //!   swaps the live value, so a change made in the GUI governs from the next evaluation — there
 //!   is no window in which the stored profile refuses work the live one still admits.
+//! - **Managed policy over the human's choice**: the gate holds the human's stored profile, and
+//!   [`PolicyGate::profile`] is the *effective* one, computed at every read from the managed
+//!   policy in force ([`crate::managed_policy::PolicyView::effective_profile`]): a `locked`
+//!   profile forces, a `floor` clamps a more permissive choice, and the stored row is never
+//!   rewritten, so removing the policy restores what the human had. A policy change therefore
+//!   needs no hook: the next evaluation reads the new view. [`PolicyGate::set_profile`] refuses
+//!   a locked value and one more permissive than the floor; while the key is held (the policy
+//!   cannot be read and its intent is unknown) it lets only a tightening through. The first
+//!   boot seeds the row from the policy's `default` when it has one.
+//! - **Never-grant rules**: a capability matching the policy's `security.grants.never` name
+//!   globs or `never_classes` is refused [`CAUSE_POLICY_DENIED`] before anything else is looked
+//!   at — on every profile, with or without an active grant (the grant row stays the human's and
+//!   authorizes again once the policy no longer denies it). The refusal names nothing about the
+//!   rule; the rule goes into a `policy.denied` audit row on the request, which the gate writes
+//!   itself like the auto-grant row. Control capabilities (`status`, `query`, `cancel`, the
+//!   doctor report) are the daemon's own bookkeeping, not work, and are never denied.
 //! - **Classes and admission pools**: [`classify`] is the one registry. [`CapabilityClass::Control`]
 //!   names the daemon's own bookkeeping requests (`status`, `query`, `cancel`); [`admission_pool`]
 //!   derives the dispatcher pool from the class, so no other module matches capability names to
@@ -34,7 +50,8 @@ use pam_store::{Actor, AuditEntry, Decision, GrantChange, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::managed_policy_service::PolicyHandle;
+use crate::managed_policy::{CAUSE_POLICY_DENIED, EffectiveEntry, Key, PolicyView, WriteRefusal};
+use crate::managed_policy_service::{ACTION_POLICY_DENIED, PolicyHandle, denied_detail};
 
 /// `setting` key holding the active [`Profile`] as a JSON string.
 pub const PROFILE_SETTING_KEY: &str = "policy.profile";
@@ -54,6 +71,11 @@ const RECOVERY_UNKNOWN_CAPABILITY: &str = "Open the PAM GUI to see available cap
 /// GUI recovery line for [`CAUSE_NOT_GRANTED`] refusals.
 const RECOVERY_NOT_GRANTED: &str =
     "Grant this capability in the PAM GUI (Security > Capabilities).";
+
+/// Recovery line for a capability the managed policy never allows. It says
+/// nothing about the rule: an agent learns that, not why.
+pub const RECOVERY_POLICY_DENIED: &str =
+    "This capability is not available on this machine; ask your administrator.";
 
 /// Approval strictness profile. One engine for every platform; only the
 /// default differs ([`Profile::platform_default`]).
@@ -213,7 +235,7 @@ pub enum GateDecision {
     /// The request must be refused; nothing is enqueued.
     Refuse {
         /// Machine-readable cause ([`CAUSE_UNKNOWN_CAPABILITY`],
-        /// [`CAUSE_NOT_GRANTED`]).
+        /// [`CAUSE_NOT_GRANTED`], [`CAUSE_POLICY_DENIED`]).
         cause: String,
         /// Human-readable explanation naming the capability.
         detail: String,
@@ -236,15 +258,75 @@ pub enum PolicyError {
     Store(#[from] StoreError),
 }
 
+/// Why [`PolicyGate::set_profile`] changed nothing.
+#[derive(Debug, Error)]
+pub enum SetProfileError {
+    /// The managed policy refuses the profile: locked, more permissive than
+    /// its floor, or held. `view` is the snapshot the check was made on, so
+    /// the refusal's audit row names the policy that refused.
+    #[error("{}", refusal.detail)]
+    Policy {
+        /// The policy's refusal (cause, detail, recovery).
+        refusal: WriteRefusal,
+        /// The policy in force when the change was checked.
+        view: Arc<PolicyView>,
+    },
+    /// The setting could not be written.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Whether the human may change the profile from `current` (the effective
+/// profile now) to `requested` under `view`.
+///
+/// [`PolicyView::check_profile`], with one exception: while the key is held
+/// — the policy cannot be read and its intent is unknown — a change that
+/// only tightens (`requested` at least as strict as `current`) passes. A
+/// held key reads the human's value, so tightening it can loosen nothing a
+/// policy could have meant.
+///
+/// # Errors
+///
+/// The policy's refusal: `policy_frozen` for a held key and a request that
+/// is not stricter, `setting_locked` for a locked one, `policy_not_allowed`
+/// below the floor.
+pub fn check_profile_write(
+    view: &PolicyView,
+    requested: Profile,
+    current: Profile,
+) -> Result<(), WriteRefusal> {
+    if view.is_held(Key::SecurityProfile)
+        && crate::managed_policy::stricter(requested, current) == requested
+    {
+        return Ok(());
+    }
+    view.check_profile(requested)
+}
+
+/// The profile the first boot persists: the managed policy's `default` when
+/// one is in force, else [`Profile::platform_default`]. Only the first boot
+/// reads it; a later change of the default never moves an existing install.
+fn seed_profile(view: &PolicyView) -> Profile {
+    let in_force = view
+        .status(Key::SecurityProfile)
+        .is_some_and(crate::managed_policy::LeafStatus::in_force);
+    view.policy()
+        .profile
+        .as_ref()
+        .filter(|_| in_force)
+        .and_then(|leaf| leaf.default)
+        .unwrap_or_else(Profile::platform_default)
+}
+
 /// The policy gate service. Constructed once from the store's persisted
 /// profile; consulted by the request pipeline before every enqueue. It is
 /// also the daemon's one live copy of the profile (see the module docs).
 #[derive(Debug)]
 pub struct PolicyGate {
     store: Arc<Store>,
-    /// Read on every evaluation, written only by [`Self::set_profile`]. A
-    /// sync lock: the critical section is one `Copy`, never held across an
-    /// await.
+    /// The human's stored profile: read on every evaluation (under the
+    /// managed policy), written only by [`Self::set_profile`]. A sync lock:
+    /// the critical section is one `Copy`, never held across an await.
     profile: RwLock<Profile>,
     /// The managed policy in force (see [`crate::managed_policy_service`]).
     policy: Arc<PolicyHandle>,
@@ -252,16 +334,16 @@ pub struct PolicyGate {
 
 impl PolicyGate {
     /// Builds a gate from the profile persisted under
-    /// [`PROFILE_SETTING_KEY`], falling back to
-    /// [`Profile::platform_default`] — and persisting it — when the
-    /// setting is unset. Holds `policy`, the managed policy read at boot
-    /// before the gate is built.
+    /// [`PROFILE_SETTING_KEY`], falling back — and persisting it — when the
+    /// setting is unset to the managed policy's `default` profile, or
+    /// [`Profile::platform_default`] when the policy has none. Holds
+    /// `policy`, the managed policy read at boot before the gate is built.
     pub async fn new(store: Arc<Store>, policy: Arc<PolicyHandle>) -> Result<Self, PolicyError> {
         let profile = if let Some(raw) = store.get_setting(PROFILE_SETTING_KEY).await? {
             serde_json::from_str(&raw)
                 .map_err(|_| PolicyError::UnrecognizedProfile { value: raw })?
         } else {
-            let profile = Profile::platform_default();
+            let profile = seed_profile(&policy.view());
             let raw = serde_json::to_string(&profile)
                 .expect("a Profile always serializes to a JSON string");
             store.set_setting(PROFILE_SETTING_KEY, &raw).await?;
@@ -281,27 +363,52 @@ impl PolicyGate {
         &self.policy
     }
 
-    /// The profile this gate enforces — the daemon's one source of truth.
+    /// The profile this gate enforces — the daemon's one source of truth:
+    /// the human's stored choice under the managed policy in force (see the
+    /// module docs).
     #[must_use]
     pub fn profile(&self) -> Profile {
+        self.effective_profile().0
+    }
+
+    /// [`Self::profile`] with its `effective` entry (where the value came
+    /// from, whether the human can change it, the floor), for
+    /// `admin.profile.get`.
+    #[must_use]
+    pub fn effective_profile(&self) -> (Profile, EffectiveEntry) {
+        self.policy
+            .view()
+            .effective_profile(Some(self.stored_profile()))
+    }
+
+    /// The human's stored choice, before the managed policy.
+    #[must_use]
+    pub fn stored_profile(&self) -> Profile {
         *self
             .profile
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Changes the enforced profile: persists it under
-    /// [`PROFILE_SETTING_KEY`], then swaps the live value. Returns the
-    /// profile it replaced.
+    /// Changes the human's profile: checks it against the managed policy
+    /// ([`check_profile_write`]), persists it under [`PROFILE_SETTING_KEY`],
+    /// then swaps the live value. Returns the stored profile it replaced.
     ///
     /// Persist first: a failed write leaves the live profile unchanged, so
     /// the daemon never enforces something a restart would not.
     ///
     /// # Errors
     ///
-    /// The underlying [`StoreError`] when the setting cannot be written;
-    /// nothing changed.
-    pub async fn set_profile(&self, profile: Profile) -> Result<Profile, StoreError> {
+    /// [`SetProfileError::Policy`] when the managed policy refuses the
+    /// value, [`SetProfileError::Store`] when the setting cannot be
+    /// written; either way nothing changed.
+    pub async fn set_profile(&self, profile: Profile) -> Result<Profile, SetProfileError> {
+        // One snapshot for the check: a reload mid-op applies to the next.
+        let view = self.policy.view();
+        let current = view.effective_profile(Some(self.stored_profile())).0;
+        if let Err(refusal) = check_profile_write(&view, profile, current) {
+            return Err(SetProfileError::Policy { refusal, view });
+        }
         let raw =
             serde_json::to_string(&profile).expect("a Profile always serializes to a JSON string");
         self.store.set_setting(PROFILE_SETTING_KEY, &raw).await?;
@@ -348,6 +455,17 @@ impl PolicyGate {
         capability: &str,
         class: CapabilityClass,
     ) -> Result<GateDecision, StoreError> {
+        // One snapshot of the managed policy for the whole decision.
+        let view = self.policy.view();
+        // A never-grant rule refuses first: every profile, grant or not.
+        // Control requests are the daemon's own bookkeeping, never work.
+        if class != CapabilityClass::Control
+            && let Some(rule) = view.never_match(capability, Some(class))
+        {
+            return self
+                .deny_by_policy(request_id, capability, &rule, &view)
+                .await;
+        }
         // Read-only and control capabilities bypass grants on every
         // profile (the queue exempts them from lanes for the same reason).
         if class.bypasses_lanes() {
@@ -358,7 +476,7 @@ impl PolicyGate {
         let granted = self.store.active_grant(capability).await?;
         // One read: the whole decision is made under the profile that was
         // live when it started.
-        let profile = self.profile();
+        let profile = view.effective_profile(Some(self.stored_profile())).0;
         let decision = match (profile, granted, class) {
             // An active grant on relaxed means go; on standard it means
             // go for non-destructive work.
@@ -400,6 +518,33 @@ impl PolicyGate {
             },
         };
         Ok(decision)
+    }
+
+    /// The refusal for a capability a never-grant `rule` matches. The
+    /// rule goes into the request's `policy.denied` audit row (the admin
+    /// plane can read it); the refusal itself does not name it.
+    async fn deny_by_policy(
+        &self,
+        request_id: &str,
+        capability: &str,
+        rule: &str,
+        view: &PolicyView,
+    ) -> Result<GateDecision, StoreError> {
+        let detail = denied_detail(capability, rule, view).to_string();
+        self.store
+            .append_audit(
+                request_id,
+                ACTION_POLICY_DENIED,
+                Decision::Refuse,
+                Actor::Policy,
+                Some(&detail),
+            )
+            .await?;
+        Ok(GateDecision::Refuse {
+            cause: CAUSE_POLICY_DENIED.to_owned(),
+            detail: format!("capability {capability:?} is not available on this machine"),
+            recovery: RECOVERY_POLICY_DENIED.to_owned(),
+        })
     }
 
     /// Inserts the grant row and its audit row for a relaxed-profile

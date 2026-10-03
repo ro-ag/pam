@@ -176,7 +176,8 @@ pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, Capabili
         .attempt_persisted()
         .await
         .map_err(|err| refusal(err.cause, "The evidence request exhausted its work budget."))?;
-    let policy = ScopePolicy::load(&ctx.store)
+    // The effective scopes, under the managed policy the flow service holds.
+    let policy = ScopePolicy::load_effective(&ctx.store, &ctx.flows.policy().view())
         .await
         .map_err(|_| unavailable())?;
     let repo = policy
@@ -220,7 +221,8 @@ pub(crate) async fn read(ctx: &ExecContext) -> Result<CapabilityOutput, Capabili
         .await
         .map_err(store_failure)?;
     // Recheck every outcome, including tombstones, after storage awaits.
-    let current = ScopePolicy::load(&ctx.store)
+    // A fresh view too: a policy tightened during the read withdraws it.
+    let current = ScopePolicy::load_effective(&ctx.store, &ctx.flows.policy().view())
         .await
         .map_err(|_| unavailable())?;
     current.authorize_repo(&repo).map_err(|_| unavailable())?;

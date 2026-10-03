@@ -39,6 +39,7 @@ const LONG_TIMEOUT: Duration = Duration::from_mins(10);
 /// directory that lives as long as the fixture.
 pub(crate) struct Fixture {
     pub(crate) store: Arc<Store>,
+    pub(crate) policy: Arc<crate::managed_policy_service::PolicyHandle>,
     pub(crate) models: Arc<ModelService>,
     pub(crate) admin: AdminService,
     pub(crate) dir: tempfile::TempDir,
@@ -46,21 +47,49 @@ pub(crate) struct Fixture {
 }
 
 pub(crate) async fn fixture() -> Fixture {
+    fixture_with(None).await
+}
+
+/// The handle a fixture's services read: the scripted, trusted managed
+/// policy file `policy`, or none.
+pub(crate) async fn policy_handle(
+    store: &Arc<Store>,
+    policy: Option<&str>,
+) -> Arc<crate::managed_policy_service::PolicyHandle> {
+    match policy {
+        Some(text) => {
+            let handle = crate::managed_policy_service::PolicyHandle::load(
+                Arc::clone(store),
+                Arc::new(crate::daemon_test::ScriptedPolicy::new(Some(text))),
+                std::path::Path::new("pam-tests-have-no-base"),
+            )
+            .await;
+            assert!(
+                matches!(handle.status().state.as_str(), "active" | "degraded"),
+                "{:?}",
+                handle.status()
+            );
+            handle
+        }
+        None => crate::managed_policy_service::PolicyHandle::none(),
+    }
+}
+
+/// [`fixture`] under the managed policy file `policy`.
+pub(crate) async fn fixture_with(policy: Option<&str>) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let policy = policy_handle(&store, policy).await;
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     ));
-    let models = ModelService::new(
-        Arc::clone(&store),
-        crate::managed_policy_service::PolicyHandle::none(),
-    )
-    .await
-    .unwrap();
+    let models = ModelService::new(Arc::clone(&store), Arc::clone(&policy))
+        .await
+        .unwrap();
     models.set_models_dir(dir.path()).await.unwrap();
     // The origin these tests download from is a plain-http loopback
     // listener; production refuses `http://`.
@@ -70,7 +99,7 @@ pub(crate) async fn fixture() -> Fixture {
         Arc::clone(&store),
         None,
         None,
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
@@ -88,10 +117,11 @@ pub(crate) async fn fixture() -> Fixture {
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
-        crate::managed_policy_service::PolicyHandle::none(),
+        Arc::clone(&policy),
     );
     Fixture {
         store,
+        policy,
         models,
         admin,
         dir,
@@ -102,6 +132,42 @@ pub(crate) async fn fixture() -> Fixture {
 impl Fixture {
     pub(crate) fn models_dir(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The id of the request the last [`Self::run`] used.
+    pub(crate) fn last_request_id(&self) -> String {
+        let index = self.next.load(std::sync::atomic::Ordering::Relaxed) - 1;
+        format!("req_model_{index:03}")
+    }
+
+    /// The last op's request carries the terminal `admin`/`refuse` row and
+    /// the policy's `policy.locked_write` row, whose detail names the op,
+    /// the key, the cause and the full digest of the policy that refused.
+    pub(crate) async fn assert_refused_by_policy(&self, op: &str, cause: &str, key: &str) {
+        let rows = self
+            .store
+            .audit_for_request(&self.last_request_id())
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.action == crate::admin::ACTION_ADMIN
+                    && row.decision == pam_store::Decision::Refuse),
+            "{rows:?}"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.action == "policy.locked_write")
+            .unwrap_or_else(|| panic!("no policy.locked_write row in {rows:?}"));
+        assert_eq!(row.decision, pam_store::Decision::Refuse);
+        assert_eq!(row.actor, pam_store::Actor::Policy);
+        let detail: Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["op"], op);
+        assert_eq!(detail["cause"], cause);
+        assert_eq!(detail["keys"], json!([key]));
+        let digest = detail["digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(Some(digest), self.policy.view().digest());
     }
 
     /// Runs one admin op through the whole service (row, tripwire,
@@ -1452,4 +1518,408 @@ fn an_import_of_a_catalog_sized_file_is_held_to_the_catalog_not_the_caller() {
         Some("f".repeat(64).as_str())
     );
     assert!(other.catalog.is_none());
+}
+
+// ---------------------------------------------------------------- managed policy
+
+/// A policy that locks `models.dir` to `dir`.
+fn locked_dir_policy(dir: &Path) -> String {
+    json!({
+        "version": 1,
+        "revision": "rev-m",
+        "contact": "it@example.test",
+        "models": { "dir": { "locked": dir.display().to_string() } },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_locked_models_dir_is_the_one_in_force_and_settings_set_refuses_it() {
+    timeout(DEADLINE, async {
+        let locked = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let fx = fixture_with(Some(&locked_dir_policy(locked.path()))).await;
+        // What the human saved is untouched; the policy's directory is in force.
+        assert_eq!(fx.models.models_dir(), locked.path());
+        let body = expect_result(fx.run(OP_MODELS_STATUS, json!({})).await, Outcome::Verified);
+        assert_eq!(
+            body["models_dir"],
+            locked.path().display().to_string().as_str()
+        );
+        assert_eq!(body["effective"]["models_dir"]["source"], "policy");
+        assert_eq!(body["effective"]["models_dir"]["locked"], true);
+        assert_eq!(
+            fx.store
+                .get_setting("model.models_dir")
+                .await
+                .unwrap()
+                .unwrap(),
+            json!(fx.models_dir().display().to_string()).to_string(),
+            "the stored row is never rewritten"
+        );
+
+        let detail = expect_refusal(
+            fx.run(
+                OP_MODELS_SETTINGS_SET,
+                json!({ "models_dir": elsewhere.path().display().to_string() }),
+            )
+            .await,
+            "setting_locked",
+        );
+        assert!(detail.contains("models.dir"), "{detail}");
+        assert!(detail.contains("it@example.test"), "{detail}");
+        assert!(detail.contains("rev rev-m"), "{detail}");
+        fx.assert_refused_by_policy(OP_MODELS_SETTINGS_SET, "setting_locked", "models.dir")
+            .await;
+        assert_eq!(fx.models.models_dir(), locked.path());
+        assert_eq!(
+            fx.store
+                .get_setting("model.models_dir")
+                .await
+                .unwrap()
+                .unwrap(),
+            json!(fx.models_dir().display().to_string()).to_string(),
+            "a refusal writes nothing"
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn the_policy_default_models_dir_applies_until_the_human_chooses() {
+    timeout(DEADLINE, async {
+        let default_dir = tempfile::tempdir().unwrap();
+        let chosen = tempfile::tempdir().unwrap();
+        let policy = json!({
+            "version": 1,
+            "models": { "dir": { "default": default_dir.path().display().to_string() } },
+        })
+        .to_string();
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let handle = policy_handle(&store, Some(&policy)).await;
+        let models = ModelService::new(Arc::clone(&store), handle).await.unwrap();
+        assert_eq!(models.models_dir(), default_dir.path());
+        let (_, entry) = models.models_dir_entry();
+        assert_eq!(entry.source, crate::network_service::Source::Policy);
+        assert!(!entry.locked);
+        models.set_models_dir(chosen.path()).await.unwrap();
+        assert_eq!(models.models_dir(), chosen.path());
+        let (_, entry) = models.models_dir_entry();
+        assert_eq!(entry.source, crate::network_service::Source::User);
+        // The human's choice is what a restart reads back, under the same policy.
+        let restarted = ModelService::new(
+            Arc::clone(&store),
+            policy_handle(&store, Some(&policy)).await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.models_dir(), chosen.path());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn the_idle_window_is_clamped_on_read_and_refused_outside_the_bounds_on_write() {
+    timeout(DEADLINE, async {
+        let policy = r#"{ "version": 1, "revision": "rev-i",
+            "models": { "idle_unload_min": { "min": 5, "max": 60 } } }"#;
+        let fx = fixture_with(Some(policy)).await;
+        // Stored "never" (0) is above any ceiling: the ceiling is in force, the row stays.
+        fx.models.set_idle_unload_min(0).await.unwrap();
+        let body = expect_result(fx.run(OP_MODELS_STATUS, json!({})).await, Outcome::Verified);
+        assert_eq!(body["idle_unload_min"], 60);
+        assert_eq!(body["effective"]["idle_unload_min"]["source"], "policy");
+        assert_eq!(body["effective"]["idle_unload_min"]["clamped"], true);
+        assert_eq!(
+            body["effective"]["idle_unload_min"]["constraint"],
+            json!({ "min": 5, "max": 60 })
+        );
+        assert_eq!(
+            fx.store
+                .get_setting("model.idle_unload_min")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(fx.models.idle_unload_min().await.unwrap(), 60);
+
+        for refused in [json!(0), json!(120), json!(2)] {
+            let detail = expect_refusal(
+                fx.run(
+                    OP_MODELS_SETTINGS_SET,
+                    json!({ "idle_unload_min": refused }),
+                )
+                .await,
+                "policy_not_allowed",
+            );
+            assert!(detail.contains("models.idle_unload_min"), "{detail}");
+            fx.assert_refused_by_policy(
+                OP_MODELS_SETTINGS_SET,
+                "policy_not_allowed",
+                "models.idle_unload_min",
+            )
+            .await;
+        }
+        assert_eq!(
+            fx.store
+                .get_setting("model.idle_unload_min")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "refusals write nothing"
+        );
+
+        let body = expect_result(
+            fx.run(OP_MODELS_SETTINGS_SET, json!({ "idle_unload_min": 30 }))
+                .await,
+            Outcome::Changed,
+        );
+        assert_eq!(body["idle_unload_min"], 30);
+        assert_eq!(body["effective"]["idle_unload_min"]["source"], "user");
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_refused_settings_save_applies_none_of_its_fields() {
+    timeout(DEADLINE, async {
+        let locked = tempfile::tempdir().unwrap();
+        let fx = fixture_with(Some(&locked_dir_policy(locked.path()))).await;
+        let before = fx.models.idle_unload_min().await.unwrap();
+        expect_refusal(
+            fx.run(
+                OP_MODELS_SETTINGS_SET,
+                json!({ "models_dir": locked.path().display().to_string(), "idle_unload_min": 33 }),
+            )
+            .await,
+            "setting_locked",
+        );
+        assert_eq!(fx.models.idle_unload_min().await.unwrap(), before);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_model_source_the_policy_does_not_list_is_refused_before_anything_happens() {
+    timeout(DEADLINE, async {
+        let fx = fixture_with(Some(
+            r#"{ "version": 1, "revision": "rev-s",
+                 "models": { "allowed_sources": ["catalog"] } }"#,
+        ))
+        .await;
+        // A pasted address, and a file import.
+        let url = json!({ "url": "http://127.0.0.1:9/tiny.gguf", "vendor": "qwen" });
+        let detail = expect_refusal(fx.run(OP_MODELS_DOWNLOAD, url).await, "policy_not_allowed");
+        assert!(detail.contains("models.allowed_sources"), "{detail}");
+        fx.assert_refused_by_policy(
+            OP_MODELS_DOWNLOAD,
+            "policy_not_allowed",
+            "models.allowed_sources",
+        )
+        .await;
+        let file = fx.dir.path().join("w.gguf");
+        std::fs::write(&file, tiny_gguf()).unwrap();
+        expect_refusal(
+            fx.run(
+                OP_MODELS_IMPORT,
+                json!({ "path": file.display().to_string(), "confirm": true }),
+            )
+            .await,
+            "policy_not_allowed",
+        );
+        fx.assert_refused_by_policy(
+            OP_MODELS_IMPORT,
+            "policy_not_allowed",
+            "models.allowed_sources",
+        )
+        .await;
+        assert!(
+            fx.store.list_model_jobs(10).await.unwrap().is_empty(),
+            "no job was started"
+        );
+        assert!(!fx.models_dir().join("imported").exists());
+
+        // The catalog is listed as allowed; the catalog says so.
+        let catalog = expect_result(
+            fx.run(OP_MODELS_CATALOG, json!({})).await,
+            Outcome::Verified,
+        );
+        assert_eq!(
+            catalog["effective"]["allowed_sources"]["constraint"],
+            json!({ "allow": ["catalog"] })
+        );
+
+        // The mirror image: only a pasted address and imports allowed, so a
+        // catalog preset is refused (and nothing is downloaded from upstream).
+        let fx = fixture_with(Some(
+            r#"{ "version": 1, "models": { "allowed_sources": ["custom_url", "import"] } }"#,
+        ))
+        .await;
+        expect_refusal(
+            fx.run(OP_MODELS_DOWNLOAD, json!({ "preset_id": CATALOG[0].id }))
+                .await,
+            "policy_not_allowed",
+        );
+        fx.assert_refused_by_policy(
+            OP_MODELS_DOWNLOAD,
+            "policy_not_allowed",
+            "models.allowed_sources",
+        )
+        .await;
+        assert!(fx.store.list_model_jobs(10).await.unwrap().is_empty());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_listed_source_still_works_and_arguments_are_checked_first() {
+    if pam_model::download::curl_path().is_err() {
+        return;
+    }
+    timeout(DEADLINE, async {
+        let fx = fixture_with(Some(
+            r#"{ "version": 1, "models": { "allowed_sources": ["custom_url"] } }"#,
+        ))
+        .await;
+        // A malformed request is an argument mistake, not a policy refusal.
+        expect_refusal(
+            fx.run(OP_MODELS_DOWNLOAD, json!({ "preset_id": "no-such-preset" }))
+                .await,
+            CAUSE_INVALID_ADMIN_ARGS,
+        );
+        let origin = pam_model::testing::serve(tiny_gguf(), "\"etag-p\"").await;
+        let started = expect_result(
+            fx.run(
+                OP_MODELS_DOWNLOAD,
+                json!({ "url": origin.url("tiny.gguf"), "vendor": "qwen" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        let job_id = started["job_id"].as_str().unwrap().to_owned();
+        loop {
+            let jobs = fx.store.list_model_jobs(10).await.unwrap();
+            let job = jobs.into_iter().find(|job| job.id == job_id).unwrap();
+            if job.state != "running" {
+                assert_eq!(job.state, "done", "{:?}", job.detail);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_source_list_the_policy_could_not_be_read_for_pauses_downloads_not_listing() {
+    timeout(DEADLINE, async {
+        // The wrong type: the leaf is rejected and, with no last-known-good
+        // copy, held. Nothing is known, so what is governed is paused.
+        let fx = fixture_with(Some(
+            r#"{ "version": 1, "models": { "allowed_sources": "catalog" } }"#,
+        ))
+        .await;
+        expect_refusal(
+            fx.run(
+                OP_MODELS_DOWNLOAD,
+                json!({ "url": "http://127.0.0.1:9/tiny.gguf", "vendor": "qwen" }),
+            )
+            .await,
+            "policy_frozen",
+        );
+        expect_result(fx.run(OP_MODELS_LIST, json!({})).await, Outcome::Verified);
+        expect_result(
+            fx.run(OP_MODELS_CATALOG, json!({})).await,
+            Outcome::Verified,
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+#[tokio::test]
+async fn a_curator_the_policy_does_not_allow_cannot_be_picked_listed_as_selected_or_run() {
+    timeout(DEADLINE, async {
+        let fx = fixture_with(Some(
+            r#"{ "version": 1, "revision": "rev-c", "models": { "allowed_curators": ["gemini"] } }"#,
+        ))
+        .await;
+        let detail = expect_refusal(
+            fx.run(OP_CURATOR_SET, json!({ "agent": "claude" })).await,
+            "policy_not_allowed",
+        );
+        assert!(detail.contains("models.allowed_curators"), "{detail}");
+        fx.assert_refused_by_policy(OP_CURATOR_SET, "policy_not_allowed", "models.allowed_curators")
+            .await;
+        assert_eq!(fx.store.get_setting(SETTING_CURATOR).await.unwrap(), None);
+        // An allowed pick passes the policy (it may still not be installed).
+        let allowed = fx.run(OP_CURATOR_SET, json!({ "agent": "gemini" })).await;
+        match allowed {
+            Response::Result { .. } => {}
+            other => {
+                expect_refusal_response(other, CAUSE_NOT_DETECTED);
+            }
+        }
+        fx.store.set_setting(SETTING_CURATOR, "null").await.unwrap();
+
+        // A pick saved before the policy that it now leaves out is not selected and is not run;
+        // the stored pick stays.
+        fx.store.set_setting(SETTING_CURATOR, "\"claude\"").await.unwrap();
+        let listed = expect_result(fx.run(OP_CURATOR_LIST, json!({})).await, Outcome::Verified);
+        assert_eq!(listed["selected"], Value::Null);
+        assert_eq!(
+            listed["effective"]["curator"]["constraint"],
+            json!({ "allow": ["gemini"] })
+        );
+        expect_refusal(fx.run(OP_CURATOR_TEST, json!({})).await, "policy_not_allowed");
+        fx.assert_refused_by_policy(OP_CURATOR_TEST, "policy_not_allowed", "models.allowed_curators")
+            .await;
+        assert_eq!(
+            fx.store.get_setting(SETTING_CURATOR).await.unwrap().as_deref(),
+            Some("\"claude\"")
+        );
+        // Clearing the pick is always allowed.
+        expect_result(fx.run(OP_CURATOR_SET, json!({})).await, Outcome::Changed);
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// An empty list disables every curator.
+#[tokio::test]
+async fn an_empty_curator_list_disables_the_curator() {
+    timeout(DEADLINE, async {
+        let fx = fixture_with(Some(
+            r#"{ "version": 1, "models": { "allowed_curators": [] } }"#,
+        ))
+        .await;
+        for agent in ["claude", "codex", "copilot", "gemini"] {
+            expect_refusal(
+                fx.run(OP_CURATOR_SET, json!({ "agent": agent })).await,
+                "policy_not_allowed",
+            );
+        }
+        fx.store
+            .set_setting(SETTING_CURATOR, "\"claude\"")
+            .await
+            .unwrap();
+        expect_refusal(
+            fx.run(OP_CURATOR_TEST, json!({})).await,
+            "policy_not_allowed",
+        );
+    })
+    .await
+    .expect("test within deadline");
+}
+
+fn expect_refusal_response(response: Response, cause: &str) {
+    let _ = expect_refusal(response, cause);
 }

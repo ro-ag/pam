@@ -15,8 +15,15 @@
 //! the catalog's `fetch` field shows the same address beforehand); a pasted URL is never
 //! rewritten. An import copies a file from this machine, never moves it, and is recorded as
 //! verified only when its digest is the catalog's or one the human supplied.
+//!
+//! The managed policy governs four things here, and every refusal is audited as `policy.locked_write`
+//! on the op's request: `models.allowed_sources` (a catalog download, a pasted address and an import
+//! each need their source listed), `models.allowed_curators` (a curator outside the list cannot be
+//! picked, shows as selected, or run), and the two settings `models.dir` and `models.idle_unload_min`
+//! ([`OP_MODELS_SETTINGS_SET`]; the reply and status carry an `effective` entry for each).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pam_model::catalog::{CATALOG, find_preset};
@@ -32,8 +39,12 @@ use crate::admin::{
     RECOVERY_INTERNAL, required_str,
 };
 use crate::daemon::CAUSE_INTERNAL_ERROR;
+use crate::managed_policy::{
+    CAUSE_POLICY_NOT_ALLOWED, EffectiveEntry, Key, ModelSource, PolicyView,
+};
 use crate::model_readiness::{Stage, admission_blocker};
 use crate::model_service::{ModelServiceError, ModelUnavailable, SETTING_CURATOR, Tier};
+use crate::network_service::Source;
 
 /// `admin.models.list` → `{ models, models_dir }`.
 pub const OP_MODELS_LIST: &str = "admin.models.list";
@@ -278,20 +289,24 @@ const RECOVERY_IMPORT_SPACE: &str = "Free the bytes named in the detail on the v
 impl AdminService {
     /// Answers one `admin.models.*` / `admin.curator.*` op, or `None` when
     /// the capability belongs to another part of the admin surface.
+    ///
+    /// `envelope_id` is the admin request's own id: a refusal by the
+    /// managed policy writes its `policy.locked_write` row on it.
     pub(crate) async fn dispatch_models(
         &self,
+        envelope_id: &str,
         op: &str,
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
             crate::admin_engine::OP_ENGINE_STATUS => self.engine_status(args).await,
-            crate::admin_engine::OP_ENGINE_INSTALL => self.engine_install(args).await,
-            crate::admin_engine::OP_ENGINE_IMPORT => self.engine_import(args).await,
+            crate::admin_engine::OP_ENGINE_INSTALL => self.engine_install(envelope_id, args).await,
+            crate::admin_engine::OP_ENGINE_IMPORT => self.engine_import(envelope_id, args).await,
             crate::admin_engine::OP_ENGINE_REMOVE => self.engine_remove(args).await,
-            OP_MODELS_IMPORT => self.models_import(args).await,
+            OP_MODELS_IMPORT => self.models_import(envelope_id, args).await,
             OP_MODELS_LIST => self.models_list().await,
             OP_MODELS_CATALOG => self.models_catalog().await,
-            OP_MODELS_DOWNLOAD => self.models_download(args).await,
+            OP_MODELS_DOWNLOAD => self.models_download(envelope_id, args).await,
             OP_MODELS_DOWNLOAD_CANCEL => self.models_download_cancel(args).await,
             OP_MODELS_DOWNLOAD_DISCARD => self.models_download_discard(args).await,
             OP_MODELS_DELETE => self.models_delete(args).await,
@@ -300,11 +315,11 @@ impl AdminService {
             OP_MODELS_UNLOAD => self.models_unload().await,
             OP_MODELS_STATUS => self.models_status().await,
             OP_MODELS_DEFAULTS_SET => self.models_defaults_set(args).await,
-            OP_MODELS_SETTINGS_SET => self.models_settings_set(args).await,
+            OP_MODELS_SETTINGS_SET => self.models_settings_set(envelope_id, args).await,
             OP_MODELS_TRY => self.models_try(args).await,
             OP_CURATOR_LIST => self.curator_list().await,
-            OP_CURATOR_SET => self.curator_set(args).await,
-            OP_CURATOR_TEST => self.curator_test().await,
+            OP_CURATOR_SET => self.curator_set(envelope_id, args).await,
+            OP_CURATOR_TEST => self.curator_test(envelope_id).await,
             _ => return None,
         })
     }
@@ -396,6 +411,7 @@ impl AdminService {
             "presets": presets,
             "host_ram_bytes": host_ram,
             "models_mirror": models_mirror.as_ref().map(|mirror| mirror.as_str().to_owned()),
+            "effective": { "allowed_sources": self.allowed_sources_entry().to_json() },
         });
         if let Some(issue) = network_issue {
             body["network_issue"] = json!({
@@ -434,8 +450,14 @@ impl AdminService {
     /// digest count as the catalog's: a supplied digest records a
     /// verification the way `admin.models.verify` would, and admission for
     /// jobs still needs a qualification record for that digest.
-    async fn models_import(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    async fn models_import(
+        &self,
+        envelope_id: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         let wanted = ImportArgs::parse(args)?;
+        self.gate_model_source(envelope_id, OP_MODELS_IMPORT, ModelSource::Import)
+            .await?;
         // The source's own facts, read off the async threads: the size
         // picks the catalog preset, if any, and nothing else about the file
         // is trusted until the copy is hashed.
@@ -497,8 +519,22 @@ impl AdminService {
     }
 
     /// Starts a transfer, from a catalog preset or a pasted URL.
-    async fn models_download(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    async fn models_download(
+        &self,
+        envelope_id: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         let (request, model_id) = self.download_request(args, OP_MODELS_DOWNLOAD)?;
+        // A catalog preset and a pasted address are different sources: an
+        // organisation may allow the first (digest pinned in this build)
+        // and not the second.
+        let source = if args.get("preset_id").is_some() {
+            ModelSource::Catalog
+        } else {
+            ModelSource::CustomUrl
+        };
+        self.gate_model_source(envelope_id, OP_MODELS_DOWNLOAD, source)
+            .await?;
         // A catalog preset is fetched from the models mirror when the human
         // set one: only the scheme-and-host prefix changes, the path, size
         // and digest stay the catalog's. A pasted address is never rewritten
@@ -829,7 +865,39 @@ impl AdminService {
     /// like) and refused when it would overlap the daemon's own base:
     /// weights are not PAM state and a registry scan or delete must never
     /// reach `state.sqlite3` or the engine.
-    async fn models_settings_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    async fn models_settings_set(
+        &self,
+        envelope_id: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
+        // Every argument is read and checked against the managed policy
+        // before anything is written, so a refusal leaves both settings as
+        // they were.
+        let view = self.policy.view();
+        let minutes = match args.get("idle_unload_min") {
+            None => None,
+            Some(raw) => Some(raw.as_u64().ok_or_else(|| AdminRefusal {
+                cause: CAUSE_INVALID_ADMIN_ARGS,
+                detail: format!("idle_unload_min must be a non-negative integer, got {raw}"),
+                recovery: RECOVERY_FIX_ARGS,
+            })?),
+        };
+        if args.get("models_dir").and_then(Value::as_str).is_some()
+            && let Err(refusal) = view.guard_locked(Key::ModelsDir)
+        {
+            return Err(self
+                .policy_refusal(envelope_id, OP_MODELS_SETTINGS_SET, refusal, &view)
+                .await);
+        }
+        if let Some(minutes) = minutes
+            // `0` is "never", the forever of this timer.
+            && let Err(refusal) =
+                view.check_window(Key::ModelsIdleUnloadMin, (minutes != 0).then_some(minutes))
+        {
+            return Err(self
+                .policy_refusal(envelope_id, OP_MODELS_SETTINGS_SET, refusal, &view)
+                .await);
+        }
         if let Some(raw) = args.get("models_dir").and_then(Value::as_str) {
             let requested = PathBuf::from(raw);
             let canonical =
@@ -862,19 +930,22 @@ impl AdminService {
                 .await
                 .map_err(diagnostic_refusal)?;
         }
-        if let Some(raw) = args.get("idle_unload_min") {
-            let minutes = raw.as_u64().ok_or_else(|| AdminRefusal {
-                cause: CAUSE_INVALID_ADMIN_ARGS,
-                detail: format!("idle_unload_min must be a non-negative integer, got {raw}"),
-                recovery: RECOVERY_FIX_ARGS,
-            })?;
+        if let Some(minutes) = minutes {
             self.models.set_idle_unload_min(minutes).await?;
         }
-        let models_dir = self.models.models_dir().display().to_string();
-        let idle_unload_min = self.models.idle_unload_min().await?;
+        let (models_dir, models_dir_entry) = self.models.models_dir_entry();
+        let models_dir = models_dir.display().to_string();
+        let (idle_unload_min, idle_entry) = self.models.idle_unload_min_entry().await?;
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: json!({ "models_dir": models_dir, "idle_unload_min": idle_unload_min }),
+            body: json!({
+                "models_dir": models_dir,
+                "idle_unload_min": idle_unload_min,
+                "effective": {
+                    "models_dir": models_dir_entry.to_json(),
+                    "idle_unload_min": idle_entry.to_json(),
+                },
+            }),
             audit: json!({
                 "op": OP_MODELS_SETTINGS_SET,
                 "models_dir": models_dir,
@@ -960,6 +1031,7 @@ impl AdminService {
                 "detected": detection.found,
                 "untrusted": detection.untrusted,
                 "selected": selected.map(AgentId::as_str),
+                "effective": { "curator": self.curator_entry(selected).to_json() },
             }),
             audit: json!({
                 "op": OP_CURATOR_LIST,
@@ -970,7 +1042,7 @@ impl AdminService {
     }
 
     /// Picks a curator CLI, or clears the pick.
-    async fn curator_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    async fn curator_set(&self, envelope_id: &str, args: &Value) -> Result<AdminOk, AdminRefusal> {
         let Some(raw) = args.get("agent").and_then(Value::as_str) else {
             self.store.set_setting(SETTING_CURATOR, "null").await?;
             return Ok(AdminOk {
@@ -984,6 +1056,8 @@ impl AdminService {
             detail: format!("{raw:?} is not an agent; expected claude, codex, copilot or gemini"),
             recovery: RECOVERY_FIX_ARGS,
         })?;
+        self.gate_curator(envelope_id, OP_CURATOR_SET, Some(agent))
+            .await?;
         let detection = detect_agents().await?;
         if !detection.found.iter().any(|cli| cli.id == agent) {
             return Err(AdminRefusal {
@@ -1003,7 +1077,12 @@ impl AdminService {
     }
 
     /// Asks the picked CLI one tool-free question and times the answer.
-    async fn curator_test(&self) -> Result<AdminOk, AdminRefusal> {
+    async fn curator_test(&self, envelope_id: &str) -> Result<AdminOk, AdminRefusal> {
+        // A pick the policy no longer allows is not run: asking the CLI is
+        // the egress the policy governs. (The pick itself stays stored.)
+        let picked = self.stored_agent().await?;
+        self.gate_curator(envelope_id, OP_CURATOR_TEST, picked)
+            .await?;
         let selected = self.selected_agent().await?.ok_or(AdminRefusal {
             cause: CAUSE_NO_CURATOR,
             detail: "no curator agent is selected".to_owned(),
@@ -1061,15 +1140,124 @@ impl AdminService {
         }
     }
 
-    /// The curator pick from the settings, ignoring a name this binary
-    /// does not know.
-    async fn selected_agent(&self) -> Result<Option<AgentId>, AdminRefusal> {
+    /// The curator pick the human saved, ignoring a name this binary does
+    /// not know, before any policy is applied.
+    async fn stored_agent(&self) -> Result<Option<AgentId>, AdminRefusal> {
         let Some(raw) = self.store.get_setting(SETTING_CURATOR).await? else {
             return Ok(None);
         };
         Ok(serde_json::from_str::<Option<String>>(&raw)
             .unwrap_or(Some(raw))
             .and_then(|name| AgentId::parse(&name)))
+    }
+
+    /// The curator in force: the saved pick, unless the managed policy's
+    /// `models.allowed_curators` leaves it out.
+    async fn selected_agent(&self) -> Result<Option<AgentId>, AdminRefusal> {
+        let view = self.policy.view();
+        Ok(self
+            .stored_agent()
+            .await?
+            .filter(|agent| view.curator_allowed(*agent)))
+    }
+
+    /// Where the curator pick stands under `models.allowed_curators`.
+    fn curator_entry(&self, selected: Option<AgentId>) -> EffectiveEntry {
+        let view = self.policy.view();
+        let allow = view.policy().allowed_curators.as_ref().map(|agents| {
+            json!({ "allow": agents.iter().map(|agent| agent.as_str()).collect::<Vec<_>>() })
+        });
+        let source = if selected.is_some() {
+            Source::User
+        } else {
+            Source::Default
+        };
+        crate::connector_service::plain_entry(
+            &view,
+            Key::ModelsAllowedCurators,
+            source,
+            false,
+            allow,
+        )
+    }
+
+    /// Where `models.allowed_sources` stands, for the catalog's `effective`.
+    fn allowed_sources_entry(&self) -> EffectiveEntry {
+        let view = self.policy.view();
+        let allow = view.policy().allowed_sources.as_ref().map(|sources| {
+            json!({ "allow": sources.iter().map(|source| source.as_str()).collect::<Vec<_>>() })
+        });
+        crate::connector_service::plain_entry(
+            &view,
+            Key::ModelsAllowedSources,
+            Source::Default,
+            false,
+            allow,
+        )
+    }
+
+    /// Refuses (and audits) bringing a model in through `source` when the
+    /// managed policy's `models.allowed_sources` does not list it, or
+    /// cannot be read (a held key pauses the ops it governs).
+    pub(crate) async fn gate_model_source(
+        &self,
+        envelope_id: &str,
+        op: &str,
+        source: ModelSource,
+    ) -> Result<(), AdminRefusal> {
+        let view = self.policy.view();
+        let key = Key::ModelsAllowedSources;
+        let refusal = view.guard_held(key).err().or_else(|| {
+            (!view.model_source_allowed(source)).then(|| {
+                view.refusal(
+                    key,
+                    CAUSE_POLICY_NOT_ALLOWED,
+                    match source {
+                        ModelSource::Catalog => {
+                            "downloading catalog models is not allowed on this machine"
+                        }
+                        ModelSource::CustomUrl => {
+                            "downloading a model from an address you type is not allowed on this machine"
+                        }
+                        ModelSource::Import => {
+                            "importing a model file is not allowed on this machine"
+                        }
+                    },
+                )
+            })
+        });
+        match refusal {
+            Some(refusal) => Err(self.policy_refusal(envelope_id, op, refusal, &view).await),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuses (and audits) choosing or running `agent` as the curator
+    /// when `models.allowed_curators` leaves it out (`[]` leaves out every
+    /// one). `None` (clearing the pick) is always allowed.
+    async fn gate_curator(
+        &self,
+        envelope_id: &str,
+        op: &str,
+        agent: Option<AgentId>,
+    ) -> Result<(), AdminRefusal> {
+        let view: Arc<PolicyView> = self.policy.view();
+        let key = Key::ModelsAllowedCurators;
+        let refusal = view.guard_held(key).err().or_else(|| {
+            agent
+                .filter(|agent| !view.curator_allowed(*agent))
+                .map(|agent| {
+                    view.refusal(
+                        key,
+                        CAUSE_POLICY_NOT_ALLOWED,
+                        &format!("{agent} is not a curator your organisation allows"),
+                    )
+                })
+        });
+        match refusal {
+            Some(refusal) => Err(self.policy_refusal(envelope_id, op, refusal, &view).await),
+            None => Ok(()),
+        }
     }
 }
 

@@ -29,6 +29,17 @@
 //!   the daemon's one source of truth for it: the setting is persisted and the live gate swapped,
 //!   so the new profile governs from the next evaluation (response carries `"applies": "now"`).
 //!   [`OP_PROFILE_GET`] reports the same live value — what is enforced, not what a file says.
+//! - **Managed policy**: the profile, grants and approvals ops answer under the policy in force
+//!   (one [`PolicyHandle::view`] snapshot per op). `admin.profile.get` reports the effective
+//!   profile and its `effective` entry; `admin.profile.set` refuses a locked or below-floor
+//!   profile; `admin.grants.add` refuses under `security.grants.manual: deny` and for a
+//!   capability a never-grant rule matches; `admin.grants.list` carries the grants policy and
+//!   marks each row a never rule blocks `blocked_by_policy` (the row stays, inert at the gate);
+//!   `admin.approvals.resolve` refuses `remember: true` where a remembered grant is not allowed
+//!   ([`crate::approval::remember_refusal`]). Every such refusal carries the policy's cause,
+//!   detail and recovery line, and writes a `policy.locked_write` audit row on the op's own
+//!   request before the terminal `admin`/`refuse` row. `admin.grants.revoke` is never refused by
+//!   the policy: removing authority is always the human's.
 //! - **Atomic security changes**: a grant added or revoked here is written in the same
 //!   transaction as this op's terminal state and audit row
 //!   ([`pam_store::Store::finish_request_with_grant_change`]); there is no window in which a
@@ -71,10 +82,11 @@ use crate::executor::outcome_str;
 use crate::flow_service::FlowService;
 use crate::ingress::Origin;
 use crate::log_service::LogService;
-use crate::managed_policy_service::PolicyHandle;
+use crate::managed_policy::{EffectiveEntry, Key, LeafStatus, Mode, PolicyView, WriteRefusal};
+use crate::managed_policy_service::{PolicyHandle, audit_locked_write};
 use crate::model_service::ModelService;
-use crate::network_service::NetworkService;
-use crate::policy::{CAP_CANCEL, Profile};
+use crate::network_service::{NetworkService, Source};
+use crate::policy::{CAP_CANCEL, Profile, SetProfileError, classify};
 use crate::terminal::{TerminalWriter, Written};
 use crate::transport::IncomingRequest;
 
@@ -90,14 +102,17 @@ pub const ADMIN_CALLER_AGENT: &str = "pam-gui";
 /// to the GUI, not to any workload repository.
 pub const ADMIN_REPO: &str = "gui";
 
-/// `admin.profile.get` → `{ profile }`.
+/// `admin.profile.get` → `{ profile, effective: { profile } }`: the profile
+/// the gate enforces and where it came from.
 pub const OP_PROFILE_GET: &str = "admin.profile.get";
 
 /// `admin.profile.set { profile }` → persists `policy.profile` and swaps
 /// the live gate's profile (applies at once; see the module docs).
 pub const OP_PROFILE_SET: &str = "admin.profile.set";
 
-/// `admin.grants.list` → every grant row, revoked history included.
+/// `admin.grants.list` → every grant row, revoked history included, each
+/// with `blocked_by_policy`; plus the grants `policy` block and its
+/// `effective` entries.
 pub const OP_GRANTS_LIST: &str = "admin.grants.list";
 
 /// `admin.grants.add { capability }` → records a new global grant.
@@ -441,7 +456,10 @@ impl AdminService {
         if let Some(answer) = self.dispatch_flows(&envelope.capability, args).await {
             return answer;
         }
-        if let Some(answer) = self.dispatch_models(&envelope.capability, args).await {
+        if let Some(answer) = self
+            .dispatch_models(&envelope.id, &envelope.capability, args)
+            .await
+        {
             return answer.map_err(OwnedRefusal::from);
         }
         if let Some(answer) = self
@@ -456,7 +474,10 @@ impl AdminService {
         {
             return answer.map_err(OwnedRefusal::from);
         }
-        if let Some(answer) = self.dispatch_retention(&envelope.capability, args).await {
+        if let Some(answer) = self
+            .dispatch_retention(&envelope.id, &envelope.capability, args)
+            .await
+        {
             return answer.map_err(OwnedRefusal::from);
         }
         if let Some(answer) = self
@@ -467,13 +488,13 @@ impl AdminService {
         }
         let answer: Result<AdminOk, AdminRefusal> = match envelope.capability.as_str() {
             OP_PROFILE_GET => Ok(self.profile_get()),
-            OP_PROFILE_SET => self.profile_set(args).await,
+            OP_PROFILE_SET => self.profile_set(&envelope.id, args).await,
             OP_GRANTS_LIST => self.grants_list().await,
             OP_GRANTS_ADD => self.grants_add(&envelope.id, args).await,
             OP_GRANTS_REVOKE => self.grants_revoke(&envelope.id, args).await,
             OP_REQUESTS_CANCEL => self.requests_cancel(args).await,
             OP_APPROVALS_PENDING => self.approvals_pending().await,
-            OP_APPROVALS_RESOLVE => self.approvals_resolve(args).await,
+            OP_APPROVALS_RESOLVE => self.approvals_resolve(&envelope.id, args).await,
             OP_ACTIVITY_LIST => self.activity_list(args).await,
             OP_CALLERS_LIST => self.callers_list().await,
             OP_AUDIT_REQUEST => self.audit_request(args).await,
@@ -486,19 +507,55 @@ impl AdminService {
         answer.map_err(OwnedRefusal::from)
     }
 
-    /// The active profile: what the running gate enforces, which is also
-    /// what is persisted (the gate is the only writer; see the module docs).
+    /// The active profile: what the running gate enforces — the human's
+    /// stored choice under the managed policy — with its `effective` entry
+    /// (`source`, `locked`, and the policy's mode, floor and reason).
     fn profile_get(&self) -> AdminOk {
+        let (profile, entry) = self.flows.gate().effective_profile();
         AdminOk {
             outcome: Outcome::Verified,
-            body: json!({ "profile": self.flows.gate().profile().as_str() }),
+            body: json!({
+                "profile": profile.as_str(),
+                "effective": { "profile": entry.to_json() },
+            }),
             audit: json!({ "op": OP_PROFILE_GET }),
         }
     }
 
+    /// Turns a managed-policy refusal into this op's refusal, after writing
+    /// the `policy.locked_write` audit row on the op's own request (the
+    /// terminal `admin`/`refuse` row follows from [`Self::finish_refused`]).
+    /// A failed audit write is logged; the op is refused either way.
+    pub(crate) async fn policy_refusal(
+        &self,
+        request_id: &str,
+        op: &str,
+        refusal: WriteRefusal,
+        view: &PolicyView,
+    ) -> AdminRefusal {
+        if let Err(error) = audit_locked_write(&self.store, request_id, op, &refusal, view).await {
+            tracing::warn!(
+                %error,
+                request_id,
+                op,
+                "the policy.locked_write audit row could not be written; the op is refused anyway"
+            );
+        }
+        AdminRefusal {
+            cause: refusal.cause,
+            detail: refusal.detail,
+            recovery: refusal.recovery,
+        }
+    }
+
     /// Validates a new profile and makes it the enforced one: persisted,
-    /// then live from the next gate evaluation. The body says so.
-    async fn profile_set(&self, args: &serde_json::Value) -> Result<AdminOk, AdminRefusal> {
+    /// then live from the next gate evaluation. The body says so. The
+    /// managed policy may refuse it (see [`crate::policy::check_profile_write`]).
+    async fn profile_set(
+        &self,
+        request_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         let requested = required_str(args, "profile", OP_PROFILE_SET)?;
         let profile: Profile =
             serde_json::from_value(json!(requested)).map_err(|_| AdminRefusal {
@@ -508,12 +565,22 @@ impl AdminService {
                 ),
                 recovery: RECOVERY_FIX_ARGS,
             })?;
-        let previous = self.flows.gate().set_profile(profile).await?;
+        let previous = match self.flows.gate().set_profile(profile).await {
+            Ok(previous) => previous,
+            Err(SetProfileError::Policy { refusal, view }) => {
+                return Err(self
+                    .policy_refusal(request_id, OP_PROFILE_SET, refusal, &view)
+                    .await);
+            }
+            Err(SetProfileError::Store(error)) => return Err(error.into()),
+        };
+        let (effective, entry) = self.flows.gate().effective_profile();
         Ok(AdminOk {
             outcome: Outcome::Changed,
             body: json!({
-                "profile": profile.as_str(),
+                "profile": effective.as_str(),
                 "applies": "now",
+                "effective": { "profile": entry.to_json() },
             }),
             audit: json!({
                 "op": OP_PROFILE_SET,
@@ -523,26 +590,38 @@ impl AdminService {
         })
     }
 
-    /// Every grant row, revoked history included.
+    /// Every grant row, revoked history included. A row a never-grant rule
+    /// matches is `blocked_by_policy`: it stays the human's, and the gate
+    /// ignores it while the rule is in force. The `policy` block and the
+    /// `effective` entries say what the managed policy decides about grants.
     async fn grants_list(&self) -> Result<AdminOk, AdminRefusal> {
+        let view = self.policy.view();
         let grants: Vec<serde_json::Value> = self
             .store
             .list_grants()
             .await?
             .into_iter()
             .map(|grant| {
+                let blocked = view
+                    .never_match(&grant.capability, classify(&grant.capability))
+                    .is_some();
                 json!({
                     "id": grant.id,
                     "capability": grant.capability,
                     "scope": grant.scope,
                     "granted_ts": grant.granted_ts,
                     "revoked_ts": grant.revoked_ts,
+                    "blocked_by_policy": blocked,
                 })
             })
             .collect();
         Ok(AdminOk {
             outcome: Outcome::Verified,
-            body: json!({ "grants": grants }),
+            body: json!({
+                "grants": grants,
+                "policy": grants_policy_json(&view),
+                "effective": grants_effective_json(&view),
+            }),
             audit: json!({ "op": OP_GRANTS_LIST }),
         })
     }
@@ -556,6 +635,12 @@ impl AdminService {
         args: &serde_json::Value,
     ) -> Result<AdminOk, AdminRefusal> {
         let capability = required_str(args, "capability", OP_GRANTS_ADD)?;
+        let view = self.policy.view();
+        if let Err(refusal) = view.check_grant_add(capability, classify(capability)) {
+            return Err(self
+                .policy_refusal(request_id, OP_GRANTS_ADD, refusal, &view)
+                .await);
+        }
         let audit = json!({ "op": OP_GRANTS_ADD, "capability": capability });
         match self
             .change_grant(request_id, GrantChange::Add(capability), &audit)
@@ -814,7 +899,13 @@ impl AdminService {
     /// [`ApprovalService::resolve`]. The optional `note` is recorded in
     /// this admin op's audit detail (the approval row's own note column
     /// is reserved for service-side resolutions such as cancellation).
-    async fn approvals_resolve(&self, args: &serde_json::Value) -> Result<AdminOk, AdminRefusal> {
+    /// `remember: true` is refused where the managed policy does not allow
+    /// the grant it would add; a plain approval is never refused by it.
+    async fn approvals_resolve(
+        &self,
+        request_id_of_op: &str,
+        args: &serde_json::Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         let request_id = required_str(args, "request_id", OP_APPROVALS_RESOLVE)?;
         let resolution = required_str(args, "resolution", OP_APPROVALS_RESOLVE)?;
         let remember = args
@@ -844,6 +935,15 @@ impl AdminService {
                 ),
                 recovery: RECOVERY_FIX_ARGS,
             });
+        }
+        if remember && resolution == "approved" {
+            let view = self.policy.view();
+            let capability = self.approvals.waiting_capability(request_id).await;
+            if let Some(refusal) = crate::approval::remember_refusal(&view, capability.as_deref()) {
+                return Err(self
+                    .policy_refusal(request_id_of_op, OP_APPROVALS_RESOLVE, refusal, &view)
+                    .await);
+            }
         }
         let decision = match resolution {
             "approved" => Resolution::Approve { remember },
@@ -1204,4 +1304,80 @@ pub(crate) fn required_str<'a>(
             recovery: RECOVERY_FIX_ARGS,
         }),
     }
+}
+
+/// The grants keys of the managed policy in force, for `admin.grants.list`:
+/// `{ manual, remember, never, never_classes }`, each `null` when the policy
+/// does not set it (or it is not in force).
+fn grants_policy_json(view: &PolicyView) -> serde_json::Value {
+    let in_force = |key| view.status(key).is_some_and(LeafStatus::in_force);
+    let permit = |key, value: Option<crate::managed_policy::Permit>| {
+        value.filter(|_| in_force(key)).map(|permit| match permit {
+            crate::managed_policy::Permit::Allow => "allow",
+            crate::managed_policy::Permit::Deny => "deny",
+        })
+    };
+    let policy = view.policy();
+    let never: Option<Vec<&str>> = policy
+        .grants_never
+        .as_ref()
+        .filter(|_| in_force(Key::GrantsNever))
+        .map(|patterns| {
+            patterns
+                .iter()
+                .map(crate::managed_policy::CapabilityPattern::as_str)
+                .collect()
+        });
+    let never_classes: Option<Vec<&str>> = policy
+        .grants_never_classes
+        .as_ref()
+        .filter(|_| in_force(Key::GrantsNeverClasses))
+        .map(|classes| classes.iter().map(|class| class.as_str()).collect());
+    json!({
+        "manual": permit(Key::GrantsManual, policy.grants_manual),
+        "remember": permit(Key::GrantsRemember, policy.grants_remember),
+        "never": never,
+        "never_classes": never_classes,
+    })
+}
+
+/// The `effective` entries of `admin.grants.list`, one per grants key. The
+/// keys are policy-only constraints: `source` is `policy` when the key is in
+/// force and `default` otherwise; `locked` says the human cannot do what the
+/// key forbids (`manual`/`remember: deny`), or that the key is held.
+fn grants_effective_json(view: &PolicyView) -> serde_json::Value {
+    let policy_json = grants_policy_json(view);
+    let entry = |key: Key, field: &str| {
+        let value = &policy_json[field];
+        let mut constraint = serde_json::Map::new();
+        constraint.insert(field.to_owned(), value.clone());
+        let entry = match view.status(key) {
+            Some(status) if status.in_force() => EffectiveEntry {
+                source: Source::Policy,
+                locked: *value == "deny",
+                mode: Some(Mode::Forbid),
+                constraint: Some(serde_json::Value::Object(constraint)),
+                reason: None,
+                state: Some(status.as_str()),
+                clamped: false,
+            },
+            Some(status @ LeafStatus::Held { .. }) => EffectiveEntry {
+                locked: true,
+                state: Some(status.as_str()),
+                ..EffectiveEntry::unmanaged(Source::Default)
+            },
+            Some(status @ LeafStatus::Rejected { .. }) => EffectiveEntry {
+                state: Some(status.as_str()),
+                ..EffectiveEntry::unmanaged(Source::Default)
+            },
+            _ => EffectiveEntry::unmanaged(Source::Default),
+        };
+        entry.to_json()
+    };
+    json!({
+        "manual": entry(Key::GrantsManual, "manual"),
+        "remember": entry(Key::GrantsRemember, "remember"),
+        "never": entry(Key::GrantsNever, "never"),
+        "never_classes": entry(Key::GrantsNeverClasses, "never_classes"),
+    })
 }

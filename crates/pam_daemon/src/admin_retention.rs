@@ -11,6 +11,12 @@
 //! and the database disagreeing for up to an hour. The windows, validation rule, and schedule live
 //! in [`crate::retention`]; this module is only the door.
 //!
+//! The windows every reply carries are the ones in force: what the human saved under the managed policy's
+//! bounds (see [`crate::retention`]), with an `effective` entry per window saying where it came from and
+//! whether the human can change it. [`OP_RETENTION_SET`] refuses a window the policy locks
+//! (`setting_locked`) or a value outside its bounds (`policy_not_allowed`, forever included under a
+//! ceiling), writes the `policy.locked_write` audit row, and stores nothing.
+//!
 //! Every reply carries `clock_guard`: `null`, or the notice of a pass the forward-clock-jump guard
 //! held back (cause `retention_clock_jump`, with its recovery line). [`OP_RETENTION_PRUNE`] is the
 //! human's confirmation and always runs; its audit row says when it overrode the guard.
@@ -24,13 +30,16 @@ use crate::admin::{
     RECOVERY_INTERNAL,
 };
 use crate::daemon::CAUSE_INTERNAL_ERROR;
+use crate::managed_policy::EffectiveEntry;
 use crate::retention::{
     CAUSE_CLOCK_JUMP, CAUSE_RETENTION_INVALID, ClockGuardNotice, PassOutcome, PruneReport,
     RECOVERY_CLOCK_JUMP, RECOVERY_RETENTION_INVALID, RetentionPatch, RetentionRefusal,
     RetentionService, RetentionSettings, Trigger,
 };
 
-/// `admin.retention.get` → `{ evidence_days, audit_days, last_run, clock_guard }`.
+/// `admin.retention.get` → `{ evidence_days, audit_days, effective, last_run, clock_guard }`.
+/// The windows are the ones in force (the managed policy's bounds applied);
+/// `effective` says, per window, where each came from.
 pub const OP_RETENTION_GET: &str = "admin.retention.get";
 
 /// `admin.retention.set { evidence_days?, audit_days? }` → the same
@@ -49,14 +58,18 @@ pub const RETENTION_ADMIN_OPS: &[&str] = &[OP_RETENTION_GET, OP_RETENTION_SET, O
 impl AdminService {
     /// Answers one `admin.retention.*` op, or `None` when the capability
     /// belongs to another part of the admin surface.
+    ///
+    /// `envelope_id` is the admin request's own id: a refusal by the managed
+    /// policy writes its `policy.locked_write` row on it.
     pub(crate) async fn dispatch_retention(
         &self,
+        envelope_id: &str,
         op: &str,
         args: &Value,
     ) -> Option<Result<AdminOk, AdminRefusal>> {
         Some(match op {
             OP_RETENTION_GET => self.retention_get().await,
-            OP_RETENTION_SET => self.retention_set(args).await,
+            OP_RETENTION_SET => self.retention_set(envelope_id, args).await,
             OP_RETENTION_PRUNE => self.retention_prune().await,
             _ => return None,
         })
@@ -85,19 +98,23 @@ impl AdminService {
     /// Both windows and the last pass's figures, as the panel opens.
     async fn retention_get(&self) -> Result<AdminOk, AdminRefusal> {
         let retention = self.retention();
-        let settings = retention.settings().await?;
+        let (settings, entries) = retention.effective().await?;
         let last_run = retention.last_run().await?;
         let guard = retention.clock_guard().await?;
         Ok(AdminOk {
             outcome: Outcome::Verified,
-            body: state_body(settings, last_run, guard)?,
+            body: state_body(settings, &entries, last_run, guard)?,
             audit: audit_detail(OP_RETENTION_GET, settings),
         })
     }
 
     /// Stores the named windows, then prunes at once (see the module
     /// docs) and answers with the fresh figures.
-    async fn retention_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    async fn retention_set(
+        &self,
+        envelope_id: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
         // `RetentionPatch` spells a window's three states as nested
         // options, the same shape `admin.connectors.configure` uses.
         let as_patch = |change| match change {
@@ -110,7 +127,16 @@ impl AdminService {
             audit_days: as_patch(optional_window(args, "audit_days")?),
         };
         let retention = self.retention();
-        let settings = retention.set_settings(patch).await.map_err(refuse)?;
+        let settings = match retention.set_settings(patch).await {
+            Ok(settings) => settings,
+            Err(RetentionRefusal::Policy { refusal, view }) => {
+                return Err(self
+                    .policy_refusal(envelope_id, OP_RETENTION_SET, refusal, &view)
+                    .await);
+            }
+            Err(other) => return Err(refuse(other)),
+        };
+        let (_, entries) = retention.effective().await?;
         // The save itself is a human act, but not a decision about the
         // clock, so the pass it triggers can still be held back.
         let (last_run, guard) = match retention.run_pass(Trigger::Settings).await? {
@@ -121,7 +147,7 @@ impl AdminService {
         audit["clock_guard_held_back"] = json!(guard.is_some());
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: state_body(settings, last_run, guard)?,
+            body: state_body(settings, &entries, last_run, guard)?,
             audit,
         })
     }
@@ -198,6 +224,7 @@ fn optional_window(args: &Value, key: &str) -> Result<WindowChange, AdminRefusal
 /// The body `get` and `set` share.
 fn state_body(
     settings: RetentionSettings,
+    entries: &[EffectiveEntry; 2],
     last_run: Option<PruneReport>,
     guard: Option<ClockGuardNotice>,
 ) -> Result<Value, AdminRefusal> {
@@ -208,6 +235,10 @@ fn state_body(
     Ok(json!({
         "evidence_days": settings.evidence_days,
         "audit_days": settings.audit_days,
+        "effective": {
+            "evidence_days": entries[0].to_json(),
+            "audit_days": entries[1].to_json(),
+        },
         "last_run": last_run,
         "clock_guard": guard.map(guard_body),
     }))
@@ -260,6 +291,13 @@ fn refuse(refusal: RetentionRefusal) -> AdminRefusal {
             cause: CAUSE_INTERNAL_ERROR,
             detail,
             recovery: RECOVERY_INTERNAL,
+        },
+        // `retention_set` answers a policy refusal itself (it audits it);
+        // this arm keeps the cause and text if another caller reaches here.
+        RetentionRefusal::Policy { refusal, .. } => AdminRefusal {
+            cause: refusal.cause,
+            detail: refusal.detail,
+            recovery: refusal.recovery,
         },
     }
 }

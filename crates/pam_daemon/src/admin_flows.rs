@@ -32,8 +32,10 @@ use crate::admin::{
 use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
     ArtifactsRootPatch, CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal,
-    RECOVERY_FLOW_EDIT, STEP_CAPABILITY_PREFIX, SettingsPatch,
+    RECOVERY_FLOW_EDIT, STEP_CAPABILITY_PREFIX, SettingsPatch, check_settings_patch,
 };
+use crate::managed_policy::{PolicyView, WriteRefusal};
+use crate::managed_policy_service::audit_locked_write;
 use crate::scope_policy::{CAUSE_SCOPE_INVALID, RECOVERY_SCOPE, ScopePolicy};
 use crate::transport::IncomingRequest;
 
@@ -72,17 +74,36 @@ pub const OP_FLOWS_RUN: &str = "admin.flows.run";
 pub const OP_FLOWS_INSPECT: &str = "admin.flows.inspect";
 
 /// `admin.flows.settings.get` → `{ allowed_programs, extra_path,
-/// artifacts_root, read_cache_roots, scope_policy }`.
+/// artifacts_root, read_cache_roots, scope_policy, effective,
+/// scope_policy_dropped }`. The five named fields are what the human saved
+/// (what the panel edits); `effective` has one entry per field, `{ value,
+/// source, locked, mode?, constraint?, reason?, state?, clamped? }`, with
+/// the value every consumer reads under the managed policy; and
+/// `scope_policy_dropped` lists `{ root, connector, key, reason }` for each
+/// stored scope entry the policy forbids (reported, never used, never
+/// deleted).
 pub const OP_FLOWS_SETTINGS_GET: &str = "admin.flows.settings.get";
 
 /// `admin.flows.settings.set { allowed_programs?, extra_path?,
 /// artifacts_root?, read_cache_roots?, scope_policy? }` → the settings as
-/// they now stand. `artifacts_root: null` clears the build output directory.
+/// they now stand, in the `get` shape. `artifacts_root: null` clears the
+/// build output directory. A field the managed policy locks refuses
+/// `setting_locked`, an entry outside its allowlist `policy_not_allowed`, a
+/// held key `policy_frozen` (a scope write that only narrows passes); each
+/// refusal also writes a `policy.locked_write` audit row on the request.
 pub const OP_FLOWS_SETTINGS_SET: &str = "admin.flows.settings.set";
 
-/// GUI-only landing recipe and mutation-scope inspection.
+/// GUI-only landing recipe and mutation-scope inspection: `{ revision,
+/// repositories, effective: { max_permissions, allowed_github_servers,
+/// repositories }, landing_policy_dropped }`. `repositories` is the stored
+/// document; `effective.repositories` is what landing checks read under the
+/// managed policy.
 pub const OP_LANDING_GET: &str = "admin.flows.landing.get";
-/// GUI-only compare-and-swap update of landing authority.
+/// GUI-only compare-and-swap update of landing authority. A permission above
+/// `landing.max_permissions` or a server outside
+/// `landing.allowed_github_servers` refuses `policy_not_allowed` (a held key
+/// `policy_frozen`, unless the save only narrows), with a
+/// `policy.locked_write` audit row.
 pub const OP_LANDING_SET: &str = "admin.flows.landing.set";
 
 /// Every op this module answers — the GUI bridge's whitelist reads it so
@@ -137,16 +158,44 @@ const RECOVERY_UNWRITABLE: &str =
     "make ~/.pam/flows writable by the user the daemon runs as, then save again";
 
 impl AdminService {
-    /// Answers one `admin.flows.*` op, or `None` when the capability
-    /// belongs to another part of the admin surface.
+    /// Temporary: [`Self::dispatch_flows_for`] with no request id, so a
+    /// managed-policy refusal still refuses but writes no
+    /// `policy.locked_write` row. Kept only until `admin.rs` passes the
+    /// envelope id; remove then (scratchpad `policy/cross-T6.md` item 1).
     pub(crate) async fn dispatch_flows(
         &self,
         op: &str,
         args: &Value,
     ) -> Option<Result<AdminOk, OwnedRefusal>> {
+        self.dispatch_flows_in(None, op, args).await
+    }
+
+    /// Answers one `admin.flows.*` op, or `None` when the capability
+    /// belongs to another part of the admin surface. `envelope_id` is the
+    /// admin request's own id: a managed-policy refusal writes its
+    /// `policy.locked_write` row on it.
+    #[allow(
+        dead_code,
+        reason = "admin.rs calls it once cross-T6 item 1 lands; the tests call it now"
+    )]
+    pub(crate) async fn dispatch_flows_for(
+        &self,
+        envelope_id: &str,
+        op: &str,
+        args: &Value,
+    ) -> Option<Result<AdminOk, OwnedRefusal>> {
+        self.dispatch_flows_in(Some(envelope_id), op, args).await
+    }
+
+    async fn dispatch_flows_in(
+        &self,
+        envelope_id: Option<&str>,
+        op: &str,
+        args: &Value,
+    ) -> Option<Result<AdminOk, OwnedRefusal>> {
         Some(match op {
             OP_LANDING_GET | OP_LANDING_SET => self
-                .landing_settings(op, args)
+                .landing_settings(envelope_id, op, args)
                 .await
                 .map_err(OwnedRefusal::from),
             OP_FLOWS_LIST => self.flows_list().map_err(OwnedRefusal::from),
@@ -158,31 +207,74 @@ impl AdminService {
             OP_FLOWS_INSPECT => self.flows_inspect(args).await,
             OP_FLOWS_SETTINGS_GET => self.flows_settings_get().await.map_err(OwnedRefusal::from),
             OP_FLOWS_SETTINGS_SET => self
-                .flows_settings_set(args)
+                .flows_settings_set(envelope_id, args)
                 .await
                 .map_err(OwnedRefusal::from),
             _ => return None,
         })
     }
 
-    async fn landing_settings(&self, op: &str, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    /// `admin.flows.landing.get` / `.set`, on one snapshot of the managed
+    /// policy for the check and the reply.
+    async fn landing_settings(
+        &self,
+        envelope_id: Option<&str>,
+        op: &str,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
+        use crate::landing_policy::{SaveRefusal, Snapshot};
+        let view = self.flows.policy().view();
         let snapshot = if op == OP_LANDING_SET {
-            crate::landing_policy::Snapshot::save(&self.store, args, self.flows.protected_base()).await
+            match Snapshot::save(&self.store, &view, args, self.flows.protected_base()).await {
+                Ok(snapshot) => Ok(snapshot),
+                Err(SaveRefusal::Landing(error)) => Err(error),
+                Err(SaveRefusal::Managed(refusal)) => {
+                    return Err(self.refuse_managed(envelope_id, op, &refusal, &view).await);
+                }
+            }
         } else {
-            crate::landing_policy::Snapshot::load(&self.store).await
-        }.map_err(|error| AdminRefusal {
-            cause: error.cause, detail: error.to_string(),
-            recovery: "Open PAM Settings → Flows → Landing; reload and correct the approved recipe and targets.",
-        })?;
+            Snapshot::load(&self.store).await
+        }
+        .map_err(|error| landing_refusal(&error))?;
+        let effective = snapshot.clone().managed(&view);
         Ok(AdminOk {
             outcome: if op == OP_LANDING_SET {
                 Outcome::Changed
             } else {
                 Outcome::Verified
             },
-            body: snapshot.response(),
+            body: snapshot.managed_response(&view, &effective),
             audit: json!({"op":op,"revision":snapshot.revision}),
         })
+    }
+
+    /// The refusal of a write the managed policy forbids: the policy's
+    /// cause, detail and recovery, plus the `policy.locked_write` audit row
+    /// on the op's own request (when the dispatcher passed its id). A row
+    /// that cannot be written is logged; the write is refused either way.
+    async fn refuse_managed(
+        &self,
+        envelope_id: Option<&str>,
+        op: &str,
+        refusal: &WriteRefusal,
+        view: &PolicyView,
+    ) -> AdminRefusal {
+        if let Some(request_id) = envelope_id
+            && let Err(error) = audit_locked_write(&self.store, request_id, op, refusal, view).await
+        {
+            tracing::warn!(
+                op,
+                key = %refusal.key,
+                %error,
+                "the policy.locked_write audit row could not be written; the write is refused \
+                 anyway"
+            );
+        }
+        AdminRefusal {
+            cause: refusal.cause,
+            detail: refusal.detail.clone(),
+            recovery: refusal.recovery,
+        }
     }
 
     /// Every flow, with the file path and digest the GUI list shows.
@@ -565,33 +657,56 @@ impl AdminService {
 
     /// The flow settings, as the Settings › Flows panel edits them.
     async fn flows_settings_get(&self) -> Result<AdminOk, AdminRefusal> {
-        let settings = self.flows.settings().await?;
-        let scope_policy = self
-            .flows
-            .scope_policy()
-            .await
-            .map_err(|error| refuse(&error))?;
+        let view = self.flows.policy().view();
         Ok(AdminOk {
             outcome: Outcome::Verified,
-            body: json!({
-                "allowed_programs": settings.allowed_programs,
-                "extra_path": settings.extra_path,
-                "artifacts_root": settings.artifacts_root,
-                "read_cache_roots": settings.read_cache_roots,
-                "scope_policy": scope_policy,
-            }),
+            body: self.flows_settings_body(&view).await?,
             audit: json!({ "op": OP_FLOWS_SETTINGS_GET }),
         })
+    }
+
+    /// The `get` (and `set`) reply: what the human saved, the `effective`
+    /// block under `view`, and `scope_policy_dropped`. The admin edit path
+    /// is the one place that reads the stored scope document as saved.
+    async fn flows_settings_body(&self, view: &PolicyView) -> Result<Value, AdminRefusal> {
+        let settings = self.flows.user_settings().await?;
+        let scope_policy =
+            ScopePolicy::load_user(&self.store)
+                .await
+                .map_err(|error| AdminRefusal {
+                    cause: error.cause(),
+                    detail: error.to_string(),
+                    recovery: RECOVERY_SCOPE,
+                })?;
+        let (effective, entries) = settings.managed(view);
+        let effective_scopes = scope_policy.clone().managed(view);
+        let mut effective = effective.effective_json(&entries);
+        effective["scope_policy"] = effective_scopes.effective_json(view);
+        Ok(json!({
+            "allowed_programs": settings.allowed_programs,
+            "extra_path": settings.extra_path,
+            "artifacts_root": settings.artifacts_root,
+            "read_cache_roots": settings.read_cache_roots,
+            "scope_policy": scope_policy,
+            "effective": effective,
+            "scope_policy_dropped": effective_scopes.dropped_json(),
+        }))
     }
 
     /// Replaces the named settings, refusing a shell in the allowlist.
     ///
     /// Everything refusable about the arguments — the scope policy's shape
-    /// and its repository paths, the settings' own checks — is validated
-    /// before the first write, so an argument refusal leaves both settings
-    /// untouched. The two are still separate settings rows: if the scope
-    /// write itself fails after the settings landed, the refusal says so.
-    async fn flows_settings_set(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
+    /// and its repository paths, the settings' own checks, and the managed
+    /// policy (on one snapshot) — is validated before the first write, so an
+    /// argument refusal leaves both settings untouched. The two are still
+    /// separate settings rows: if the scope write itself fails after the
+    /// settings landed, the refusal says so.
+    async fn flows_settings_set(
+        &self,
+        envelope_id: Option<&str>,
+        args: &Value,
+    ) -> Result<AdminOk, AdminRefusal> {
+        let view = self.flows.policy().view();
         let scope_policy = match args.get("scope_policy") {
             None => None,
             Some(value) => {
@@ -621,44 +736,71 @@ impl AdminService {
             artifacts_root: optional_string(args, "artifacts_root", OP_FLOWS_SETTINGS_SET)?,
             read_cache_roots: string_list(args, "read_cache_roots", OP_FLOWS_SETTINGS_SET)?,
         };
+        let managed = match &scope_policy {
+            None => Ok(()),
+            Some(policy) => {
+                // What the human saved now: a write that only narrows it
+                // passes a held key. An unreadable document narrows nothing.
+                let current = ScopePolicy::load_user(&self.store).await.ok();
+                policy.check_write(&view, current.as_ref())
+            }
+        }
+        .and_then(|()| check_settings_patch(&view, &patch));
+        if let Err(refusal) = managed {
+            return Err(self
+                .refuse_managed(envelope_id, OP_FLOWS_SETTINGS_SET, &refusal, &view)
+                .await);
+        }
         let settings = self
             .flows
             .set_settings(patch)
             .await
             .map_err(|refusal| refuse(&refusal))?;
-        let scope_policy = match scope_policy {
-            Some(policy) => self.flows.set_scope_policy(policy).await.map_err(|error| {
-                let mut refusal = refuse(&error);
-                refusal.detail = format!(
-                    "{}; the other flow settings in this request were already applied and stand",
-                    refusal.detail
-                );
-                refusal
-            }),
-            None => self
+        let approved = match scope_policy {
+            Some(policy) => self
                 .flows
-                .scope_policy()
+                .set_scope_policy(policy)
                 .await
-                .map_err(|error| refuse(&error)),
-        }?;
+                .map(|saved| saved.repositories.len())
+                .map_err(|error| {
+                    let mut refusal = refuse(&error);
+                    refusal.detail = format!(
+                        "{}; the other flow settings in this request were already applied and \
+                         stand",
+                        refusal.detail
+                    );
+                    refusal
+                })?,
+            None => ScopePolicy::load_user(&self.store)
+                .await
+                .map(|saved| saved.repositories.len())
+                .map_err(|error| AdminRefusal {
+                    cause: error.cause(),
+                    detail: error.to_string(),
+                    recovery: RECOVERY_SCOPE,
+                })?,
+        };
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: json!({
-                "allowed_programs": settings.allowed_programs,
-                "extra_path": settings.extra_path,
-                "artifacts_root": settings.artifacts_root,
-                "read_cache_roots": settings.read_cache_roots,
-                "scope_policy": scope_policy,
-            }),
+            body: self.flows_settings_body(&view).await?,
             audit: json!({
                 "op": OP_FLOWS_SETTINGS_SET,
                 "allowed_programs": settings.allowed_programs.len(),
                 "extra_path": settings.extra_path.len(),
                 "artifacts_root": settings.artifacts_root.is_some(),
                 "read_cache_roots": settings.read_cache_roots.len(),
-                "approved_repositories": scope_policy.repositories.len(),
+                "approved_repositories": approved,
             }),
         })
+    }
+}
+
+/// A landing document refusal, with the screen that fixes it.
+fn landing_refusal(error: &crate::landing_policy::Error) -> AdminRefusal {
+    AdminRefusal {
+        cause: error.cause,
+        detail: error.to_string(),
+        recovery: "Open PAM Settings → Flows → Landing; reload and correct the approved recipe and targets.",
     }
 }
 

@@ -12,11 +12,18 @@
 //!   human's surface, can resolve). Until the GUI lands, tests reach it via
 //!   [`DaemonHandle::approvals`]. [`ApprovalService::pending`] is store-backed, so it survives a
 //!   daemon restart.
-//! - **Remember (ask-once)**: `remember: true` on [`Resolution::Approve`] always inserts a `grant`
-//!   row ([`ACTION_GRANT_FROM_APPROVAL`]), regardless of profile/class; the policy matrix decides
-//!   its meaning — under relaxed it makes the next gate evaluation an outright allow, under
+//! - **Remember (ask-once)**: `remember: true` on [`Resolution::Approve`] inserts a `grant` row
+//!   ([`ACTION_GRANT_FROM_APPROVAL`]), regardless of profile/class; the policy matrix decides its
+//!   meaning — under relaxed it makes the next gate evaluation an outright allow, under
 //!   standard/strict a granted destructive/external capability still needs per-operation approval,
 //!   so the grant is harmless there.
+//! - **Managed policy over remember**: a remembered approval adds a grant, so it is refused
+//!   wherever the managed policy refuses one ([`remember_refusal`]): `security.grants.remember:
+//!   deny`, `security.grants.manual: deny`, a never-grant rule matching the capability, or either
+//!   grants key held. `admin.approvals.resolve` refuses `remember: true` up front; this service
+//!   enforces it again when it records the resolution, against the policy in force at that moment,
+//!   by downgrading the approval to a one-time one (no grant row; the audit detail says
+//!   `remember_refused`). A plain approval always works.
 //! - **State/audit split**: the service owns the `approval` row and resolution audit rows; the
 //!   pipeline owns every `request` state transition around the wait (single writer per path) — the
 //!   service moves the row into `waiting_approval` when the wait begins, the pipeline moves it out
@@ -58,6 +65,9 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot, watch};
 
+use crate::managed_policy::{
+    CAUSE_POLICY_NOT_ALLOWED, CAUSE_SETTING_LOCKED, Key, PolicyView, WriteRefusal,
+};
 use crate::managed_policy_service::PolicyHandle;
 use crate::transport::EventPublisher;
 
@@ -175,12 +185,55 @@ impl StepSnapshot {
     }
 }
 
+/// Why `view` refuses remembering an approval of `capability` (which would
+/// add a grant for it), or `None` when it may be remembered.
+///
+/// In order: the grants keys held ([`crate::managed_policy::CAUSE_POLICY_FROZEN`]),
+/// `security.grants.remember: deny` and `security.grants.manual: deny`
+/// ([`CAUSE_SETTING_LOCKED`]), a never-grant rule matching the capability
+/// ([`CAUSE_POLICY_NOT_ALLOWED`]). `capability` is `None` when the caller
+/// does not know which approval it is (nothing is pending under that id);
+/// the never rules are then not consulted.
+#[must_use]
+pub fn remember_refusal(view: &PolicyView, capability: Option<&str>) -> Option<WriteRefusal> {
+    if let Err(refusal) = view.check_remember() {
+        return Some(refusal);
+    }
+    for key in [Key::GrantsManual, Key::GrantsNever, Key::GrantsNeverClasses] {
+        if let Err(refusal) = view.guard_held(key) {
+            return Some(refusal);
+        }
+    }
+    if view.grants_manual_denied() {
+        return Some(view.refusal(
+            Key::GrantsManual,
+            CAUSE_SETTING_LOCKED,
+            "remembering an approval adds a grant, and your organisation's policy does not allow \
+             adding grants by hand",
+        ));
+    }
+    let capability = capability?;
+    let rule = view.never_match(capability, crate::policy::classify(capability))?;
+    let key = if rule.starts_with("class:") {
+        Key::GrantsNeverClasses
+    } else {
+        Key::GrantsNever
+    };
+    Some(view.refusal(
+        key,
+        CAUSE_POLICY_NOT_ALLOWED,
+        &format!("the capability {capability:?} is never allowed on this machine"),
+    ))
+}
+
 /// One live approval wait: how to reach the waiter, and what it waits on.
 #[derive(Debug)]
 struct PendingWait {
     /// The decision, with the channel the waiter acknowledges it on once
     /// the resolution is durable.
     tx: oneshot::Sender<(Resolution, oneshot::Sender<ApprovalOutcome>)>,
+    /// The capability the wait is for.
+    capability: String,
     snapshot: Option<StepSnapshot>,
 }
 
@@ -270,10 +323,14 @@ impl ApprovalService {
         // a GUI reacting to the event can always deliver its resolution.
         let rx = {
             let (tx, rx) = oneshot::channel();
-            self.pending
-                .lock()
-                .await
-                .insert(request_id.to_owned(), PendingWait { tx, snapshot });
+            self.pending.lock().await.insert(
+                request_id.to_owned(),
+                PendingWait {
+                    tx,
+                    capability: capability.to_owned(),
+                    snapshot,
+                },
+            );
             rx
         };
         let _ = self
@@ -282,6 +339,7 @@ impl ApprovalService {
             .await;
 
         let mut acknowledge = None;
+        let mut remember_refused = false;
         let outcome = tokio::select! {
             // Biased: a resolution that raced the timeout wins.
             biased;
@@ -289,7 +347,17 @@ impl ApprovalService {
                 Ok((resolution, ack)) => {
                     acknowledge = Some(ack);
                     match resolution {
-                        Resolution::Approve { remember } => ApprovalOutcome::Approved { remember },
+                        Resolution::Approve { remember } => {
+                            // The policy in force now decides whether the
+                            // approval may become a grant (see the module
+                            // docs); a refused remember is a one-time approval.
+                            remember_refused = remember
+                                && remember_refusal(&self.policy.view(), Some(capability))
+                                    .is_some();
+                            ApprovalOutcome::Approved {
+                                remember: remember && !remember_refused,
+                            }
+                        }
                         Resolution::Deny => ApprovalOutcome::Denied,
                     }
                 }
@@ -304,7 +372,7 @@ impl ApprovalService {
         // must get NotFound instead of a dead channel.
         self.pending.lock().await.remove(request_id);
 
-        self.record_resolution(request_id, capability, outcome)
+        self.record_resolution(request_id, capability, outcome, remember_refused)
             .await?;
         // Only now is the human's answer true: the resolution is durable.
         // A failed write above returned early and dropped the channel, so
@@ -385,6 +453,16 @@ impl ApprovalService {
         if as_decided { Ok(()) } else { Err(not_found()) }
     }
 
+    /// The capability `request_id`'s pending wait is for, when one is
+    /// pending.
+    pub async fn waiting_capability(&self, request_id: &str) -> Option<String> {
+        self.pending
+            .lock()
+            .await
+            .get(request_id)
+            .map(|wait| wait.capability.clone())
+    }
+
     /// The step snapshot of `request_id`'s pending wait, when it has one.
     pub async fn snapshot(&self, request_id: &str) -> Option<StepSnapshot> {
         self.pending
@@ -406,12 +484,14 @@ impl ApprovalService {
 
     /// Writes the approval row's resolution and the audit rows for one
     /// outcome (see the module docs for the exact decision/actor per
-    /// outcome).
+    /// outcome). `remember_refused` records that the human asked to
+    /// remember and the managed policy made it a one-time approval.
     async fn record_resolution(
         &self,
         request_id: &str,
         capability: &str,
         outcome: ApprovalOutcome,
+        remember_refused: bool,
     ) -> Result<(), StoreError> {
         let (resolution, note, decision, actor) = match outcome {
             ApprovalOutcome::Approved { .. } => (
@@ -446,6 +526,9 @@ impl ApprovalService {
         });
         if let ApprovalOutcome::Approved { .. } = outcome {
             detail["remember"] = serde_json::Value::Bool(remember);
+            if remember_refused {
+                detail["remember_refused"] = serde_json::Value::Bool(true);
+            }
         }
         if let Some(note) = note {
             detail["note"] = serde_json::Value::String(note.to_owned());

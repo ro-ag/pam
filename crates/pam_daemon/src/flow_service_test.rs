@@ -35,6 +35,26 @@ pub(crate) async fn flows_for_tests(
     connectors: &Arc<ConnectorService>,
     logs: &Arc<LogService>,
 ) -> Arc<FlowService> {
+    flows_for_tests_with_policy(
+        base,
+        store,
+        approvals,
+        connectors,
+        logs,
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+}
+
+/// [`flows_for_tests`] reading through `policy`.
+pub(crate) async fn flows_for_tests_with_policy(
+    base: &Path,
+    store: &Arc<Store>,
+    approvals: &Arc<ApprovalService>,
+    connectors: &Arc<ConnectorService>,
+    logs: &Arc<LogService>,
+    policy: Arc<crate::managed_policy_service::PolicyHandle>,
+) -> Arc<FlowService> {
     // The gate gets a store of its own: `PolicyGate::new` persists the
     // platform-default profile on its first read, and no test using this
     // helper runs a step (which is the only thing that consults the
@@ -55,8 +75,26 @@ pub(crate) async fn flows_for_tests(
         Arc::clone(connectors),
         Arc::clone(logs),
         gate,
-        crate::managed_policy_service::PolicyHandle::none(),
+        policy,
     ))
+}
+
+/// A policy handle that loaded `document` as a trusted file (its boot
+/// read writes the `policy.load` row on `store`).
+pub(crate) async fn managed_policy(
+    store: &Arc<Store>,
+    base: &Path,
+    document: &serde_json::Value,
+) -> Arc<crate::managed_policy_service::PolicyHandle> {
+    let source = crate::daemon_test::ScriptedPolicy::new(Some(&document.to_string()));
+    let handle = crate::managed_policy_service::PolicyHandle::load(
+        Arc::clone(store),
+        Arc::new(source),
+        base,
+    )
+    .await;
+    assert!(handle.view().is_managed(), "the test policy loaded");
+    handle
 }
 
 /// A pipeline ingress with no pipeline behind it: an `admin.flows.run`
@@ -69,8 +107,19 @@ pub(crate) fn closed_submit() -> mpsc::Sender<IncomingRequest> {
 
 /// A flow engine on a fresh temp directory, plus that directory.
 async fn service() -> (tempfile::TempDir, Arc<Store>, Arc<FlowService>) {
+    managed_service(None).await
+}
+
+/// [`service`] under a trusted managed policy `document` (none: unmanaged).
+async fn managed_service(
+    document: Option<serde_json::Value>,
+) -> (tempfile::TempDir, Arc<Store>, Arc<FlowService>) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
+    let policy = match &document {
+        Some(document) => managed_policy(&store, tmp.path(), document).await,
+        None => crate::managed_policy_service::PolicyHandle::none(),
+    };
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
@@ -91,7 +140,9 @@ async fn service() -> (tempfile::TempDir, Arc<Store>, Arc<FlowService>) {
         None,
         crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let flows = flows_for_tests(tmp.path(), &store, &approvals, &connectors, &logs).await;
+    let flows =
+        flows_for_tests_with_policy(tmp.path(), &store, &approvals, &connectors, &logs, policy)
+            .await;
     (tmp, store, flows)
 }
 
@@ -629,4 +680,250 @@ fn only_an_exact_github_host_names_the_origin() {
         origin_from_output("https://github.com/other/repo\nhttps://github.com/ro-ag/pam\n"),
         None
     );
+}
+
+// --- The managed policy ------------------------------------------------------
+
+/// An absolute path on this platform for a unix-shaped `path`.
+fn abs(path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", path.replace('/', "\\"))
+    } else {
+        path.to_owned()
+    }
+}
+
+/// The flow keys of a policy, one per mode the settings honour.
+fn flows_policy() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "revision": "flows-1",
+        "flows": {
+            "programs": { "allow": ["git", "make"], "reason": "SEC-7" },
+            "extra_path": { "allow": [abs("/opt/homebrew")] },
+            "artifacts_root": { "default": "~/pam-artifacts" },
+            "read_cache_roots": { "locked": ["~/.cargo/registry"] }
+        }
+    })
+}
+
+fn user_settings() -> FlowSettings {
+    FlowSettings {
+        allowed_programs: vec!["git".to_owned(), "cargo".to_owned(), "make".to_owned()],
+        extra_path: vec![
+            abs("/opt/homebrew/bin"),
+            abs("/opt/homebrewX"),
+            abs("/usr/local/bin"),
+        ],
+        artifacts_root: None,
+        read_cache_roots: vec!["~/.cargo/git".to_owned()],
+    }
+}
+
+#[test]
+fn the_effective_settings_narrow_each_list_and_say_how() {
+    let view = crate::scope_policy_test::view(&flows_policy());
+    let user = user_settings();
+    let (effective, entries) = user.managed(&view);
+    assert_eq!(effective.allowed_programs, ["git", "make"]);
+    // Prefixes by component: `/opt/homebrewX` is not under `/opt/homebrew`.
+    assert_eq!(effective.extra_path, [abs("/opt/homebrew/bin")]);
+    assert_eq!(effective.artifacts_root.as_deref(), Some("~/pam-artifacts"));
+    assert_eq!(effective.read_cache_roots, ["~/.cargo/registry"]);
+    assert!(!effective.allows("cargo"));
+    assert_eq!(
+        user,
+        user_settings(),
+        "the human's settings are never mutated"
+    );
+
+    let block = effective.effective_json(&entries);
+    assert_eq!(
+        block["allowed_programs"],
+        serde_json::json!({
+            "value": ["git", "make"],
+            "source": "policy",
+            "locked": false,
+            "mode": "allow",
+            "constraint": { "allow": ["git", "make"] },
+            "reason": "SEC-7",
+            "state": "applied",
+            "clamped": true,
+        })
+    );
+    assert_eq!(
+        block["extra_path"]["constraint"]["allow"],
+        serde_json::json!([abs("/opt/homebrew")])
+    );
+    assert_eq!(block["artifacts_root"]["source"], "policy");
+    assert_eq!(block["artifacts_root"]["locked"], false);
+    assert_eq!(block["artifacts_root"]["mode"], "default");
+    assert_eq!(block["read_cache_roots"]["locked"], true);
+    assert_eq!(block["read_cache_roots"]["mode"], "locked");
+
+    // No policy: the values are the human's and each entry is `{ value,
+    // source, locked }`.
+    let (same, entries) = user.managed(&crate::managed_policy::PolicyView::unmanaged());
+    assert_eq!(same, user);
+    let block = same.effective_json(&entries);
+    assert_eq!(
+        block["allowed_programs"],
+        serde_json::json!({ "value": ["git", "cargo", "make"], "source": "user", "locked": false })
+    );
+    assert_eq!(block["artifacts_root"]["source"], "default");
+}
+
+#[tokio::test]
+async fn the_flow_service_reads_effective_settings_and_keeps_the_rows_the_human_saved() {
+    let (_tmp, store, flows) = managed_service(Some(flows_policy())).await;
+    let saved = flows
+        .set_settings(SettingsPatch {
+            allowed_programs: Some(user_settings().allowed_programs),
+            extra_path: Some(user_settings().extra_path),
+            ..SettingsPatch::default()
+        })
+        .await
+        .expect("the settings save");
+    assert_eq!(
+        saved.allowed_programs,
+        ["git", "cargo", "make"],
+        "set returns what was saved"
+    );
+    let raw = store.get_setting(SETTING_ALLOWED_PROGRAMS).await.unwrap();
+
+    let effective = flows.settings().await.expect("settings read");
+    assert_eq!(effective.allowed_programs, ["git", "make"]);
+    assert_eq!(effective.extra_path, [abs("/opt/homebrew/bin")]);
+    assert_eq!(effective.read_cache_roots, ["~/.cargo/registry"]);
+    assert!(
+        effective.artifacts_root_dir().is_some(),
+        "the policy default applies"
+    );
+    let user = flows.user_settings().await.expect("settings read");
+    assert_eq!(user.allowed_programs, ["git", "cargo", "make"]);
+    assert_eq!(user.artifacts_root, None);
+    assert_eq!(
+        store.get_setting(SETTING_ALLOWED_PROGRAMS).await.unwrap(),
+        raw
+    );
+    assert!(
+        store
+            .get_setting(SETTING_ARTIFACTS_ROOT)
+            .await
+            .unwrap()
+            .is_none(),
+        "a policy default is never written into the human's row"
+    );
+}
+
+#[test]
+fn a_settings_patch_the_policy_forbids_is_refused_with_the_keys_cause() {
+    use crate::flow_service::check_settings_patch;
+    use crate::managed_policy::{
+        CAUSE_POLICY_FROZEN, CAUSE_POLICY_NOT_ALLOWED, CAUSE_SETTING_LOCKED, Key,
+    };
+    let view = crate::scope_policy_test::view(&flows_policy());
+    let refusal = check_settings_patch(
+        &view,
+        &SettingsPatch {
+            allowed_programs: Some(vec!["git".to_owned(), "cargo".to_owned()]),
+            ..SettingsPatch::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(refusal.cause, CAUSE_POLICY_NOT_ALLOWED);
+    assert_eq!(refusal.key, Key::FlowsPrograms);
+    assert!(
+        refusal.detail.contains("\"cargo\"")
+            && refusal.detail.contains("(flows.programs)")
+            && refusal.detail.contains("reason: SEC-7")
+            && refusal.detail.contains("rev flows-1"),
+        "{}",
+        refusal.detail
+    );
+    let locked = check_settings_patch(
+        &view,
+        &SettingsPatch {
+            read_cache_roots: Some(vec!["~/.cargo/registry".to_owned()]),
+            ..SettingsPatch::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        (locked.cause, locked.key),
+        (CAUSE_SETTING_LOCKED, Key::FlowsReadCacheRoots)
+    );
+    assert_eq!(
+        check_settings_patch(
+            &view,
+            &SettingsPatch {
+                extra_path: Some(vec![abs("/usr/local/bin")]),
+                ..SettingsPatch::default()
+            },
+        )
+        .unwrap_err()
+        .key,
+        Key::FlowsExtraPath
+    );
+    // Inside the bounds, and a default-only key, pass; a field left out is
+    // never checked.
+    check_settings_patch(
+        &view,
+        &SettingsPatch {
+            allowed_programs: Some(vec!["make".to_owned(), " git ".to_owned()]),
+            extra_path: Some(vec![abs("/opt/homebrew/sbin")]),
+            artifacts_root: ArtifactsRootPatch::Set("~/elsewhere".to_owned()),
+            read_cache_roots: None,
+        },
+    )
+    .unwrap();
+
+    let locked_root = crate::scope_policy_test::view(&serde_json::json!({
+        "version": 1, "flows": { "artifacts_root": { "locked": "~/pam-artifacts" } }
+    }));
+    assert_eq!(
+        check_settings_patch(
+            &locked_root,
+            &SettingsPatch {
+                artifacts_root: ArtifactsRootPatch::Clear,
+                ..SettingsPatch::default()
+            },
+        )
+        .unwrap_err()
+        .cause,
+        CAUSE_SETTING_LOCKED
+    );
+    let held = crate::scope_policy_test::view(&serde_json::json!({
+        "version": 1, "flows": { "programs": { "allow": "git" } }
+    }));
+    assert!(held.is_held(Key::FlowsPrograms));
+    assert_eq!(
+        check_settings_patch(
+            &held,
+            &SettingsPatch {
+                allowed_programs: Some(vec!["git".to_owned()]),
+                ..SettingsPatch::default()
+            },
+        )
+        .unwrap_err()
+        .cause,
+        CAUSE_POLICY_FROZEN
+    );
+}
+
+#[test]
+fn a_program_outside_the_policy_is_forbidden_whatever_the_human_allows() {
+    use crate::flow_service::policy_forbids_program;
+    let allow = crate::scope_policy_test::view(&flows_policy());
+    assert!(policy_forbids_program(&allow, "cargo"));
+    assert!(!policy_forbids_program(&allow, "git"));
+    let locked = crate::scope_policy_test::view(&serde_json::json!({
+        "version": 1, "flows": { "programs": { "locked": ["git"] } }
+    }));
+    assert!(policy_forbids_program(&locked, "make"));
+    assert!(!policy_forbids_program(&locked, "git"));
+    assert!(!policy_forbids_program(
+        &crate::managed_policy::PolicyView::unmanaged(),
+        "cargo"
+    ));
 }

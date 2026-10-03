@@ -20,11 +20,13 @@ use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::daemon::TERMINAL_ACTIONS;
 use crate::log_service::LogService;
+use crate::managed_policy_service::{ACTION_POLICY_LOCKED_WRITE, SourceRead};
 use crate::model_service::ModelService;
 use crate::network_service::{
     FixedManagedNetwork, ManagedNetwork, NetworkService, PROXY_CREDENTIAL_ID, ProxyEntry,
     SETTING_KEY,
 };
+use crate::network_service_test::{ca_pin_path, load_policy, normalized_digest, test_ca_pem};
 use crate::secrets::{FakeSecretBackend, SecretBackend, SecretStore, account_for};
 use crate::test_log::Captured;
 use crate::transport::EventPublisher;
@@ -55,6 +57,16 @@ async fn fixture() -> Fixture {
 /// service for the ops, the model downloads and (here) the probes, over a
 /// fake keychain and a temp base.
 async fn fixture_with(managed: Option<ManagedNetwork>) -> Fixture {
+    build(managed, None).await
+}
+
+/// The same, with the network and the admin ops under a real policy handle
+/// over a scripted trusted file (and `referenced` as the pinned CA file).
+async fn fixture_under_policy(policy: Value, referenced: SourceRead) -> Fixture {
+    build(None, Some((policy, referenced))).await
+}
+
+async fn build(managed: Option<ManagedNetwork>, policy: Option<(Value, SourceRead)>) -> Fixture {
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
@@ -64,6 +76,11 @@ async fn fixture_with(managed: Option<ManagedNetwork>) -> Fixture {
         crate::managed_policy_service::PolicyHandle::none(),
     ));
     let base = tempfile::tempdir().expect("tempdir");
+    let under_policy = policy.is_some();
+    let handle = match policy {
+        Some((policy, referenced)) => load_policy(&store, base.path(), &policy, referenced).await,
+        None => crate::managed_policy_service::PolicyHandle::none(),
+    };
     let models = ModelService::new(
         Arc::clone(&store),
         crate::managed_policy_service::PolicyHandle::none(),
@@ -74,14 +91,16 @@ async fn fixture_with(managed: Option<ManagedNetwork>) -> Fixture {
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let backend = Arc::new(FakeSecretBackend::default());
     let secrets = Arc::new(SecretStore::new(Arc::clone(&backend) as Arc<_>));
-    let network = Arc::new(
-        NetworkService::new(
-            Arc::clone(&store),
-            Some(Arc::clone(&secrets)),
-            base.path().to_path_buf(),
-        )
-        .with_managed(Arc::new(FixedManagedNetwork::new(managed))),
+    let network = NetworkService::new(
+        Arc::clone(&store),
+        Some(Arc::clone(&secrets)),
+        base.path().to_path_buf(),
     );
+    let network = Arc::new(if under_policy {
+        network.with_policy(Arc::clone(&handle))
+    } else {
+        network.with_managed(Arc::new(FixedManagedNetwork::new(managed)))
+    });
     network.allow_plain_http_probes_for_tests();
     models.set_network_service(Arc::clone(&network));
     let connectors = Arc::new(ConnectorService::new(
@@ -106,7 +125,7 @@ async fn fixture_with(managed: Option<ManagedNetwork>) -> Fixture {
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
-        crate::managed_policy_service::PolicyHandle::none(),
+        handle,
     )
     .with_network(Arc::clone(&network));
     Fixture {
@@ -1278,4 +1297,345 @@ async fn a_ca_bundle_import_is_refused_on_windows_and_get_says_why() {
 
     // Clearing is not an import: it is accepted.
     fixture.set(json!({ "ca_bundle": null })).await;
+}
+
+// --- The managed policy behind the ops ------------------------------------------
+
+/// A policy that locks a proxy needing no sign-in, with the administrator's
+/// reason, and offers a default no-proxy list.
+fn locked_proxy_policy() -> Value {
+    json!({
+        "version": 1,
+        "revision": "r7",
+        "contact": "it@example.com",
+        "network": {
+            "proxy": {
+                "locked": { "url": "http://managed.example.com:8080", "auth": "none" },
+                "reason": "NET-9",
+            },
+            "no_proxy": { "default": ["corp.example"], "reason": "NET-10" },
+        },
+    })
+}
+
+async fn locked_write_rows(fixture: &Fixture, id: &str) -> Vec<Value> {
+    fixture
+        .audit(id)
+        .await
+        .into_iter()
+        .filter(|row| row.action == ACTION_POLICY_LOCKED_WRITE)
+        .map(|row| serde_json::from_str(row.detail.as_deref().unwrap()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn effective_entries_carry_the_policys_mode_reason_and_state() {
+    let fixture = fixture_under_policy(locked_proxy_policy(), SourceRead::Absent).await;
+    let body = fixture.get().await;
+
+    assert_eq!(
+        body["settings"]["proxy"]["url"],
+        "http://managed.example.com:8080"
+    );
+    assert_eq!(
+        body["effective"]["proxy"],
+        json!({
+            "source": "policy", "locked": true, "mode": "locked",
+            "reason": "NET-9", "state": "applied",
+        })
+    );
+    // The pinned proxy needs no password, so the password is locked with it.
+    assert_eq!(body["effective"]["credential"], body["effective"]["proxy"]);
+    // A default is the policy's value and the field stays open.
+    assert_eq!(body["settings"]["no_proxy"], json!(["corp.example"]));
+    assert_eq!(
+        body["effective"]["no_proxy"],
+        json!({
+            "source": "policy", "locked": false, "mode": "default",
+            "reason": "NET-10", "state": "applied",
+        })
+    );
+    // Fields the policy does not mention stay `{ source, locked }`.
+    for field in ["ca_bundle", "engine_mirror", "models_mirror"] {
+        assert_eq!(
+            body["effective"][field],
+            json!({ "source": "default", "locked": false }),
+            "{field}"
+        );
+    }
+    assert!(body.get("closed_by_policy").is_none());
+}
+
+#[tokio::test]
+async fn a_locked_field_is_refused_with_the_policy_named_and_one_locked_write_row() {
+    let fixture = fixture_under_policy(locked_proxy_policy(), SourceRead::Absent).await;
+    let digest = fixture.admin.policy().view().digest12().unwrap().to_owned();
+
+    let (id, response) = fixture
+        .run(
+            OP_NETWORK_SET,
+            json!({ "proxy": null, "credential": { "set": "x" }, "no_proxy": ["mine.example"] }),
+        )
+        .await;
+    let (cause, detail, recovery) = refusal_of(response);
+    assert_eq!(cause, CAUSE_SETTING_LOCKED);
+    assert!(detail.contains("(network.proxy)"), "{detail}");
+    assert!(detail.contains("reason: NET-9"), "{detail}");
+    assert!(detail.contains("contact it@example.com"), "{detail}");
+    assert!(
+        detail.contains(&format!("policy {digest}, rev r7")),
+        "{detail}"
+    );
+    assert!(recovery.contains("administrator"), "{recovery}");
+
+    // One policy.locked_write row on the op's own request, next to the
+    // terminal admin row; no value in it.
+    assert_eq!(
+        locked_write_rows(&fixture, &id).await,
+        [json!({
+            "op": OP_NETWORK_SET,
+            "keys": ["network.proxy"],
+            "cause": "setting_locked",
+            "digest": fixture.admin.policy().view().digest(),
+            "revision": "r7",
+        })]
+    );
+    assert_eq!(fixture.terminal_actions(&id).await, [ACTION_ADMIN]);
+    // Nothing was applied, not even the unlocked field of the same patch.
+    assert!(
+        fixture
+            .store
+            .get_setting(SETTING_KEY)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .backend
+            .get(&account_for(PROXY_CREDENTIAL_ID))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Decision D6: the policy carries no secret, so a pinned proxy that signs
+/// in leaves the password to the human, while the proxy itself stays locked.
+#[tokio::test]
+async fn a_locked_proxy_that_signs_in_leaves_the_password_to_the_human() {
+    let fixture = fixture_under_policy(
+        json!({
+            "version": 1,
+            "network": { "proxy": { "locked": {
+                "url": "http://managed.example.com:8080", "auth": "basic", "username": "svc" } } },
+        }),
+        SourceRead::Absent,
+    )
+    .await;
+    let body = fixture.get().await;
+    assert_eq!(body["effective"]["proxy"]["locked"], true);
+    assert_eq!(
+        body["effective"]["credential"],
+        json!({ "source": "default", "locked": false })
+    );
+
+    // The proxy is still the policy's.
+    let (cause, ..) = fixture
+        .refuse(OP_NETWORK_SET, json!({ "proxy": proxy_patch("basic") }))
+        .await;
+    assert_eq!(cause, CAUSE_SETTING_LOCKED);
+
+    // The password the human types is stored, and no row carries it.
+    let (id, body) = fixture
+        .set(json!({ "credential": { "set": PROXY_PASSWORD } }))
+        .await;
+    assert_eq!(body["settings"]["credential"]["present"], true);
+    assert_eq!(
+        body["effective"]["credential"],
+        json!({ "source": "user", "locked": false })
+    );
+    assert_eq!(
+        body["effective"]["proxy"]["source"], "policy",
+        "the proxy did not move"
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .get(&account_for(PROXY_CREDENTIAL_ID))
+            .unwrap()
+            .as_deref(),
+        Some(PROXY_PASSWORD)
+    );
+    assert_no_secret(&fixture.everything_recorded(&id).await);
+    assert!(locked_write_rows(&fixture, &id).await.is_empty());
+    // And the sign-in the policy pinned is the one the profile uses.
+    let settings = fixture.network.resolve_settings().await.unwrap();
+    assert_eq!(settings.proxy().unwrap().host(), "managed.example.com");
+    assert!(settings.sends_proxy_credential());
+}
+
+#[tokio::test]
+async fn a_policy_default_is_open_for_the_human_to_replace() {
+    let fixture = fixture_under_policy(locked_proxy_policy(), SourceRead::Absent).await;
+    let (id, body) = fixture.set(json!({ "no_proxy": ["mine.example"] })).await;
+    assert_eq!(body["settings"]["no_proxy"], json!(["mine.example"]));
+    // A user value standing over a default carries no `mode`.
+    assert_eq!(
+        body["effective"]["no_proxy"],
+        json!({
+            "source": "user", "locked": false, "reason": "NET-10", "state": "applied",
+        })
+    );
+    assert!(locked_write_rows(&fixture, &id).await.is_empty());
+    // Clearing the human's list brings the policy's default back.
+    let (_, body) = fixture.set(json!({ "no_proxy": [] })).await;
+    assert_eq!(body["settings"]["no_proxy"], json!(["corp.example"]));
+    assert_eq!(body["effective"]["no_proxy"]["source"], "policy");
+}
+
+/// A managed CA bundle: locked, used from the loader's private copy, kept
+/// when the human saves another field, refused for edit.
+#[tokio::test]
+async fn a_managed_ca_bundle_is_locked_used_and_survives_other_saves() {
+    let pem = test_ca_pem();
+    let digest = normalized_digest(&pem);
+    let fixture = fixture_under_policy(
+        json!({
+            "version": 1,
+            "network": { "ca_bundle": {
+                "locked": { "path": ca_pin_path(), "sha256": digest }, "reason": "NET-11" } },
+        }),
+        SourceRead::Trusted(pem),
+    )
+    .await;
+    let body = fixture.get().await;
+    assert_eq!(body["settings"]["ca_bundle"]["sha256"], digest);
+    assert!(
+        body["settings"]["ca_bundle"]
+            .get("source_changed")
+            .is_none(),
+        "the policy loader re-verifies a managed bundle"
+    );
+    assert_eq!(
+        body["effective"]["ca_bundle"],
+        json!({
+            "source": "policy", "locked": true, "mode": "locked",
+            "reason": "NET-11", "state": "applied",
+        })
+    );
+    let copy = fixture.network.copy_path(&digest);
+    assert!(copy.exists());
+
+    let (id, response) = fixture
+        .run(OP_NETWORK_SET, json!({ "ca_bundle": null }))
+        .await;
+    let (cause, detail, _) = refusal_of(response);
+    assert_eq!(
+        cause, CAUSE_SETTING_LOCKED,
+        "locked before any platform rule"
+    );
+    assert!(detail.contains("(network.ca_bundle)"), "{detail}");
+    assert_eq!(
+        locked_write_rows(&fixture, &id).await[0]["keys"],
+        json!(["network.ca_bundle"])
+    );
+
+    // Saving another field prunes copies nothing names, never this one.
+    fixture.set(json!({ "no_proxy": ["corp.example"] })).await;
+    assert!(copy.exists(), "the managed copy outlives the prune");
+    let settings = fixture.network.resolve_settings().await.unwrap();
+    assert_eq!(settings.ca_bundle(), Some(copy.as_path()));
+}
+
+/// A failed import of the managed bundle closes the consumers with the
+/// cause, shows it on the screen, and refuses the Test; the human's other
+/// fields remain saveable.
+#[tokio::test]
+async fn a_failed_managed_ca_import_closes_the_network_and_the_screen_says_why() {
+    let pem = test_ca_pem();
+    let fixture = fixture_under_policy(
+        json!({
+            "version": 1,
+            "network": { "ca_bundle": { "locked": {
+                "path": ca_pin_path(), "sha256": normalized_digest(&pem) } } },
+        }),
+        SourceRead::Untrusted {
+            code: "writable_by_user",
+            detail: "the bundle can be modified by this user".to_owned(),
+        },
+    )
+    .await;
+    let body = fixture.get().await;
+    let closed = &body["closed_by_policy"];
+    assert_eq!(closed["key"], "network.ca_bundle");
+    assert_eq!(closed["code"], "writable_by_user");
+    assert!(
+        closed["detail"]
+            .as_str()
+            .unwrap()
+            .contains("modified by this user"),
+        "{closed}"
+    );
+    assert!(
+        closed["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("administrator")
+    );
+    // The bundle is still the policy's: the human cannot swap it.
+    assert_eq!(body["effective"]["ca_bundle"]["locked"], true);
+    let (cause, ..) = fixture
+        .refuse(OP_NETWORK_SET, json!({ "ca_bundle": null }))
+        .await;
+    assert_eq!(cause, CAUSE_SETTING_LOCKED);
+
+    let (cause, detail, _) = fixture.refuse(OP_NETWORK_TEST, json!({})).await;
+    assert_eq!(cause, CAUSE_NETWORK_INVALID);
+    assert!(detail.contains("network.ca_bundle"), "{detail}");
+    assert!(detail.contains("writable_by_user"), "{detail}");
+
+    // An unrelated field saves; the consumers stay closed until the policy
+    // is fixed.
+    fixture.set(json!({ "no_proxy": ["corp.example"] })).await;
+    let failure = fixture
+        .network
+        .resolve_settings()
+        .await
+        .expect_err("closed");
+    assert!(
+        failure.sentence().contains("network.ca_bundle"),
+        "{failure}"
+    );
+}
+
+/// A proxy leaf the policy names but cannot be applied (no last good) is
+/// held: the human's writes to it are paused with `policy_frozen`, and the
+/// consumers are closed.
+#[tokio::test]
+async fn a_held_proxy_pauses_its_writes_with_policy_frozen_and_closes_the_consumers() {
+    let fixture = fixture_under_policy(
+        json!({
+            "version": 1,
+            "network": { "proxy": { "locked": { "url": "http://p.example.com", "auth": "none" } } },
+        }),
+        SourceRead::Absent,
+    )
+    .await;
+    let body = fixture.get().await;
+    assert_eq!(body["effective"]["proxy"]["locked"], true);
+    assert_eq!(body["effective"]["proxy"]["state"], "held");
+    assert_eq!(body["closed_by_policy"]["key"], "network.proxy");
+
+    let (id, response) = fixture
+        .run(OP_NETWORK_SET, json!({ "proxy": proxy_patch("none") }))
+        .await;
+    let (cause, detail, recovery) = refusal_of(response);
+    assert_eq!(cause, "policy_frozen");
+    assert!(detail.contains("(network.proxy)"), "{detail}");
+    assert!(recovery.contains("administrator"), "{recovery}");
+    let rows = locked_write_rows(&fixture, &id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["cause"], "policy_frozen");
+    // Other fields still save.
+    fixture.set(json!({ "no_proxy": ["corp.example"] })).await;
 }

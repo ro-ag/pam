@@ -131,6 +131,13 @@ impl AdminService {
             credential: credential_arg(args, OP_CONNECTORS_CONFIGURE)?,
         };
         let credential = CredentialAction::audit_word(patch.credential.as_ref());
+        // The managed policy first: a refusal is audited on this request
+        // and nothing is written.
+        if let Err((refusal, view)) = self.connectors.check_configure(id, &patch) {
+            return Err(self
+                .policy_refusal(envelope_id, OP_CONNECTORS_CONFIGURE, refusal, &view)
+                .await);
+        }
         let summary = self
             .connectors
             .configure(id, patch)

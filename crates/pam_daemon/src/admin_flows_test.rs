@@ -49,8 +49,26 @@ async fn service() -> (
     AdminService,
     mpsc::Receiver<IncomingRequest>,
 ) {
+    managed_service(None).await
+}
+
+/// [`service`] under a trusted managed policy `document` (none: unmanaged).
+async fn managed_service(
+    document: Option<serde_json::Value>,
+) -> (
+    tempfile::TempDir,
+    Arc<Store>,
+    AdminService,
+    mpsc::Receiver<IncomingRequest>,
+) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
+    let policy = match &document {
+        Some(document) => {
+            crate::flow_service_test::managed_policy(&store, tmp.path(), document).await
+        }
+        None => crate::managed_policy_service::PolicyHandle::none(),
+    };
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
@@ -71,12 +89,13 @@ async fn service() -> (
         None,
         crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let flows = crate::flow_service_test::flows_for_tests(
+    let flows = crate::flow_service_test::flows_for_tests_with_policy(
         tmp.path(),
         &store,
         &approvals,
         &connectors,
         &logs,
+        Arc::clone(&policy),
     )
     .await;
     let (submit, ingress) = mpsc::channel(4);
@@ -88,7 +107,7 @@ async fn service() -> (
         connectors,
         flows,
         submit,
-        crate::managed_policy_service::PolicyHandle::none(),
+        policy,
     );
     (tmp, store, admin, ingress)
 }
@@ -1127,4 +1146,327 @@ async fn run_forwards_the_digest_the_human_was_shown() {
     );
     let envelope = pipeline.await.unwrap();
     assert_eq!(envelope.args["expected_digest"], digest);
+}
+
+// --- The managed policy ------------------------------------------------------
+
+/// A policy over the flow settings and the scopes: programs `allow`
+/// `[git, make]`, and repositories only under `allowed_root`.
+fn managed_document(allowed_root: &Path) -> serde_json::Value {
+    json!({
+        "version": 1,
+        "revision": "rev-9",
+        "contact": "it@example.test",
+        "flows": { "programs": { "allow": ["git", "make"] } },
+        "scopes": { "allowed_repository_roots": [crate::scope_policy::policy_path(allowed_root)] }
+    })
+}
+
+/// A refusal's three parts.
+fn refusal_of(response: Response) -> (String, String, String) {
+    match response {
+        Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } => (cause, detail, recovery),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Two directories, `inside` under the allowed root and `outside` not,
+/// canonical; the guard owns both.
+fn roots() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let canonical = tmp.path().canonicalize().unwrap();
+    let allowed = canonical.join("allowed");
+    let inside = allowed.join("inside");
+    let outside = canonical.join("outside");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    (tmp, inside, outside)
+}
+
+#[tokio::test]
+async fn settings_get_reports_the_effective_values_and_the_scopes_the_policy_drops() {
+    let (_dirs, inside, outside) = roots();
+    let allowed = inside.parent().unwrap().to_path_buf();
+    let (_tmp, store, admin, _ingress) = managed_service(Some(managed_document(&allowed))).await;
+    store
+        .set_setting(
+            crate::flow_service::SETTING_ALLOWED_PROGRAMS,
+            &json!(["git", "cargo"]).to_string(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_setting(
+            crate::scope_policy::SETTING_SCOPE_POLICY,
+            &json!({"version": 1, "repositories": [
+                {"root": inside, "connectors": []},
+                {"root": outside, "connectors": []},
+            ]})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let body = body_of(
+        admin
+            .handle(&admin_envelope("req_get", OP_FLOWS_SETTINGS_GET, json!({})))
+            .await,
+        Outcome::Verified,
+    );
+    // The named fields are what the human saved, for the panel to edit.
+    assert_eq!(body["allowed_programs"], json!(["git", "cargo"]));
+    assert_eq!(
+        body["scope_policy"]["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // `effective` is what every consumer reads.
+    let effective = &body["effective"];
+    assert_eq!(effective["allowed_programs"]["value"], json!(["git"]));
+    assert_eq!(effective["allowed_programs"]["source"], "policy");
+    assert_eq!(effective["allowed_programs"]["mode"], "allow");
+    assert_eq!(effective["extra_path"]["source"], "user");
+    assert_eq!(effective["extra_path"]["locked"], false);
+    assert_eq!(
+        effective["scope_policy"]["value"]["repositories"],
+        json!([{"root": inside, "connectors": []}])
+    );
+    assert_eq!(effective["scope_policy"]["source"], "policy");
+    assert_eq!(effective["scope_policy"]["mode"], "forbid");
+    assert_eq!(
+        body["scope_policy_dropped"],
+        json!([{
+            "root": outside,
+            "connector": null,
+            "key": "scopes.allowed_repository_roots",
+            "reason": "this repository is outside the repository roots your organisation's policy allows",
+        }])
+    );
+}
+
+#[tokio::test]
+async fn a_settings_write_the_policy_forbids_is_refused_and_changes_nothing() {
+    let (_dirs, inside, outside) = roots();
+    let allowed = inside.parent().unwrap().to_path_buf();
+    let (_tmp, store, admin, _ingress) = managed_service(Some(managed_document(&allowed))).await;
+    let digest12 = admin.flows.policy().view().digest12().unwrap().to_owned();
+    let programs = store
+        .get_setting(crate::flow_service::SETTING_ALLOWED_PROGRAMS)
+        .await
+        .unwrap();
+    let scopes = store
+        .get_setting(crate::scope_policy::SETTING_SCOPE_POLICY)
+        .await
+        .unwrap();
+
+    let (cause, detail, recovery) = refusal_of(
+        admin
+            .handle(&admin_envelope(
+                "req_programs",
+                OP_FLOWS_SETTINGS_SET,
+                json!({ "allowed_programs": ["git", "cargo"] }),
+            ))
+            .await,
+    );
+    assert_eq!(cause, crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED);
+    assert!(
+        detail.contains("(flows.programs)")
+            && detail.contains("contact it@example.test")
+            && detail.contains(&format!("(policy {digest12}, rev rev-9)")),
+        "{detail}"
+    );
+    assert_eq!(recovery, crate::managed_policy::RECOVERY_MANAGED);
+
+    // A repository outside the allowed roots refuses the whole request:
+    // the programs in it are not written either.
+    let (cause, detail, _) = refusal_of(
+        admin
+            .handle(&admin_envelope(
+                "req_scopes",
+                OP_FLOWS_SETTINGS_SET,
+                json!({
+                    "allowed_programs": ["git"],
+                    "scope_policy": {"version": 1, "repositories": [{"root": outside, "connectors": []}]},
+                }),
+            ))
+            .await,
+    );
+    assert_eq!(cause, crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED);
+    assert!(
+        detail.contains("(scopes.allowed_repository_roots)"),
+        "{detail}"
+    );
+    assert_eq!(
+        store
+            .get_setting(crate::flow_service::SETTING_ALLOWED_PROGRAMS)
+            .await
+            .unwrap(),
+        programs
+    );
+    assert_eq!(
+        store
+            .get_setting(crate::scope_policy::SETTING_SCOPE_POLICY)
+            .await
+            .unwrap(),
+        scopes
+    );
+    // The terminal refusal row is the admin plane's, on the request.
+    let rows = store.audit_for_request("req_scopes").await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row.decision == pam_store::Decision::Refuse),
+        "{rows:?}"
+    );
+
+    // Inside the bounds the same op saves.
+    let body = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_fine",
+                OP_FLOWS_SETTINGS_SET,
+                json!({
+                    "allowed_programs": ["make", "git"],
+                    "scope_policy": {"version": 1, "repositories": [{"root": inside, "connectors": []}]},
+                }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_eq!(body["allowed_programs"], json!(["make", "git"]));
+    assert_eq!(body["scope_policy_dropped"], json!([]));
+}
+
+#[tokio::test]
+async fn a_refused_settings_write_files_a_policy_locked_write_row_on_its_request() {
+    let (_dirs, inside, _outside) = roots();
+    let allowed = inside.parent().unwrap().to_path_buf();
+    let (_tmp, store, admin, _ingress) = managed_service(Some(managed_document(&allowed))).await;
+    let digest = admin.flows.policy().view().digest().unwrap().to_owned();
+    store
+        .insert_running_request_from(
+            "req_locked",
+            OP_FLOWS_SETTINGS_SET,
+            ADMIN_REPO,
+            ADMIN_CALLER_AGENT,
+            "{}",
+            None,
+            &pam_store::RequestOrigin::ADMIN,
+        )
+        .await
+        .unwrap();
+    let answer = admin
+        .dispatch_flows_for(
+            "req_locked",
+            OP_FLOWS_SETTINGS_SET,
+            &json!({ "allowed_programs": ["cargo"] }),
+        )
+        .await
+        .expect("a flow op")
+        .err()
+        .expect("refused");
+    assert_eq!(
+        answer.cause,
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    let rows = store.audit_for_request("req_locked").await.unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.action == crate::managed_policy_service::ACTION_POLICY_LOCKED_WRITE)
+        .expect("the policy.locked_write row");
+    assert_eq!(row.decision, pam_store::Decision::Refuse);
+    assert_eq!(row.actor, pam_store::Actor::Policy);
+    let detail: serde_json::Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        detail,
+        json!({
+            "op": OP_FLOWS_SETTINGS_SET,
+            "keys": ["flows.programs"],
+            "cause": "policy_not_allowed",
+            "digest": digest,
+            "revision": "rev-9",
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_landing_save_above_the_policy_ceiling_is_refused_with_its_audit_row() {
+    let (_dirs, inside, _outside) = roots();
+    let workspace = inside.parent().unwrap().join("work");
+    std::fs::create_dir(&workspace).unwrap();
+    let (_tmp, store, admin, _ingress) = managed_service(Some(json!({
+        "version": 1,
+        "revision": "land-2",
+        "landing": { "max_permissions": { "merge": false } }
+    })))
+    .await;
+    let get = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_landing_get",
+                crate::admin_flows::OP_LANDING_GET,
+                json!({}),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    assert_eq!(get["effective"]["max_permissions"]["value"]["merge"], false);
+    assert_eq!(get["landing_policy_dropped"], json!([]));
+    store
+        .insert_running_request_from(
+            "req_landing",
+            crate::admin_flows::OP_LANDING_SET,
+            ADMIN_REPO,
+            ADMIN_CALLER_AGENT,
+            "{}",
+            None,
+            &pam_store::RequestOrigin::ADMIN,
+        )
+        .await
+        .unwrap();
+    let update = json!({"expected_revision": get["revision"], "repositories": [{
+        "root": inside, "repository": "https://github.com/org/repo",
+        "github_server": "https://api.github.com/", "github_repository": "org/repo",
+        "base": "main", "branches": ["feature/work"], "workspace_root": workspace,
+        "checks": [{"name": "test", "argv": ["cargo", "test"], "timeout_seconds": 300}],
+        "required_checks": ["ci"], "main_checks": ["ci"],
+        "permissions": {"push": true, "create_pr": true, "merge": true, "sync": false}
+    }]});
+    let refusal = admin
+        .dispatch_flows_for("req_landing", crate::admin_flows::OP_LANDING_SET, &update)
+        .await
+        .expect("a flow op")
+        .err()
+        .expect("refused");
+    assert_eq!(
+        refusal.cause,
+        crate::managed_policy::CAUSE_POLICY_NOT_ALLOWED
+    );
+    assert!(
+        refusal.detail.contains("(landing.max_permissions)"),
+        "{}",
+        refusal.detail
+    );
+    assert_eq!(refusal.recovery, crate::managed_policy::RECOVERY_MANAGED);
+    let rows = store.audit_for_request("req_landing").await.unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.action == crate::managed_policy_service::ACTION_POLICY_LOCKED_WRITE)
+        .expect("the policy.locked_write row");
+    let detail: serde_json::Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["keys"], json!(["landing.max_permissions"]));
+    assert_eq!(detail["revision"], "land-2");
+    assert!(
+        store
+            .get_setting("flows.landing_policy")
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing was written"
+    );
 }

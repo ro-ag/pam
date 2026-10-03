@@ -3,6 +3,12 @@
 //! `configure` writes a row and credential; `test` proves it still works; `invoke` — the only one
 //! an agent can cause — never runs until the connector is configured, enabled, and credentialed.
 //!
+//! The managed policy (`connectors.disabled`, `connectors.allowed_base_hosts`) is held at both doors: a
+//! connector it disables, or whose saved base URL is outside the allowed hosts, is refused for a call, a
+//! preflight and a test (the text names no rule, since an agent reads it through a flow refusal), and
+//! `configure` refuses to enable it or to save an address outside the hosts. The saved row is never
+//! rewritten; the summary's `enabled` and `effective` say what is in force.
+//!
 //! The credential lives only in the OS keychain: read for one call into a
 //! [`pam_connectors::Secret`] (redacts `Debug`, overwrites bytes on drop), handed to the transport
 //! on stdin, then dropped — never written to the store, an audit row, evidence, argv, or the daemon
@@ -39,7 +45,12 @@ use pam_store::{ConnectorPatch, ConnectorRow, Store, StoreError};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::managed_policy::{
+    CAUSE_POLICY_NOT_ALLOWED, CAUSE_SETTING_LOCKED, EffectiveEntry, Key, Mode, PolicyView,
+    RECOVERY_MANAGED, WriteRefusal,
+};
 use crate::managed_policy_service::PolicyHandle;
+use crate::network_service::Source;
 use crate::scope_policy::{RECOVERY_SCOPE, ScopeError, ScopePolicy};
 use crate::secrets::{KeyringHealth, SecretBackend, SecretError, SecretStore};
 
@@ -91,7 +102,8 @@ pub struct ConnectorSummary {
     pub username_label: Option<&'static str>,
     /// Whether a base URL must be saved before the connector works.
     pub needs_base_url: bool,
-    /// Whether a flow step may call it.
+    /// Whether a flow step may call it: the row says so and the managed
+    /// policy does not disable the connector.
     pub enabled: bool,
     /// The saved base URL, normalized when it was saved.
     pub base_url: Option<String>,
@@ -104,6 +116,10 @@ pub struct ConnectorSummary {
     pub credential: CredentialStatus,
     /// The last credential test, when one has run.
     pub last_test: Option<LastTest>,
+    /// Where `enabled` and `base_url` stand under the managed policy
+    /// (`connectors.disabled`, `connectors.allowed_base_hosts`): the spec's
+    /// `effective` entries, each `{ source, locked, ... }`.
+    pub effective: serde_json::Value,
 }
 
 /// What the OS credential store said when this connector was summarized.
@@ -261,6 +277,7 @@ impl InvokeError {
     #[must_use]
     pub fn recovery(&self, id: ConnectorId) -> String {
         match self {
+            Self::Connector(error) if is_managed(error) => RECOVERY_MANAGED.to_owned(),
             Self::Connector(error) => error.recovery(id),
             other => other.recovery_line(id).to_owned(),
         }
@@ -284,6 +301,7 @@ impl InvokeError {
             Self::BaseUrlMissing | Self::BadUrl(_) => &lines.base_url,
             Self::NotConfigured(_) => &lines.not_configured,
             Self::Secret(error) => error.recovery(),
+            Self::Connector(error) if is_managed(error) => RECOVERY_MANAGED,
             Self::Connector(_) => &lines.test,
             Self::CurlMissing => pam_model::download::curl_recovery_line(),
             Self::Store(error) => crate::daemon::store_refusal_cause(error)
@@ -472,6 +490,14 @@ impl ConnectorService {
         id: ConnectorId,
         patch: ConfigurePatch,
     ) -> Result<ConnectorSummary, InvokeError> {
+        // The admin op asks first, to audit a refusal on its own request;
+        // this is the same check for every other caller.
+        self.check_configure(id, &patch).map_err(|(refusal, _)| {
+            InvokeError::Connector(ConnectorError::Policy {
+                cause: refusal.cause,
+                detail: refusal.detail,
+            })
+        })?;
         let _guard = self.configuration_locks[&id].lock().await;
         // A change to the base URL is checked before anything is written;
         // a value that trims to nothing clears the field.
@@ -536,6 +562,9 @@ impl ConnectorService {
     pub async fn test(&self, id: ConnectorId) -> Result<(bool, String), InvokeError> {
         let _guard = self.configuration_locks[&id].lock().await;
         let row = self.store.get_connector(id.as_str()).await?;
+        // A test sends the credential to the base URL, so it is held to the
+        // same managed policy as a call.
+        self.check_use(id, row.as_ref())?;
         let connection = self.connection(id, row.as_ref()).await?;
         self.ensure_transport()?;
 
@@ -658,9 +687,10 @@ impl ConnectorService {
         call: &str,
         args: &BTreeMap<String, ArgValue>,
     ) -> Result<Option<ConnectorRow>, InvokeError> {
-        let policy = ScopePolicy::load(&self.store).await?;
+        let policy = ScopePolicy::load_effective(&self.store, &self.policy.view()).await?;
         let canonical = policy.authorize_repo_blocking(repo).await?;
         let row = self.store.get_connector(id.as_str()).await?;
+        self.check_use(id, row.as_ref())?;
         if !row.as_ref().is_some_and(|row| row.enabled) {
             return Err(InvokeError::Disabled);
         }
@@ -741,19 +771,198 @@ impl ConnectorService {
                 }
             }
         };
+        let view = self.policy.view();
         ConnectorSummary {
             id: id.as_str().to_owned(),
             name: shape.name,
             auth: auth_str(shape.auth),
             username_label: shape.username_label,
             needs_base_url: shape.needs_base_url,
-            enabled: row.is_some_and(|row| row.enabled),
+            enabled: row.is_some_and(|row| row.enabled) && !view.connector_disabled(id),
             base_url: row.and_then(|row| row.base_url.clone()),
             username: row.and_then(|row| row.username.clone()),
             credential,
             last_test: row.and_then(last_test),
+            effective: effective_json(&view, id, row),
         }
     }
+
+    /// The managed policy's verdict on `patch` for connector `id`, with the
+    /// snapshot it was decided on (the admin op audits the refusal on its
+    /// own request).
+    ///
+    /// A connector the policy disables takes no change but the ones that
+    /// leave it less configured (switching it off, clearing a field or the
+    /// credential); a base URL is held to `connectors.allowed_base_hosts`.
+    pub(crate) fn check_configure(
+        &self,
+        id: ConnectorId,
+        patch: &ConfigurePatch,
+    ) -> Result<(), (WriteRefusal, Arc<PolicyView>)> {
+        let view = self.policy.view();
+        let name = descriptor(id).name;
+        let refused = |refusal: WriteRefusal| (refusal, Arc::clone(&view));
+        let sets_something =
+            patch.enabled == Some(true)
+                || patch.base_url.as_ref().is_some_and(|value| {
+                    value.as_deref().is_some_and(|raw| !raw.trim().is_empty())
+                })
+                || patch.username.as_ref().is_some_and(|value| {
+                    value.as_deref().is_some_and(|raw| !raw.trim().is_empty())
+                })
+                || matches!(patch.credential, Some(CredentialAction::Set(_)));
+        if sets_something {
+            view.guard_held(Key::ConnectorsDisabled).map_err(refused)?;
+            if view.connector_disabled(id) {
+                return Err(refused(view.refusal(
+                    Key::ConnectorsDisabled,
+                    CAUSE_SETTING_LOCKED,
+                    &format!(
+                        "{name} is disabled by your organisation's policy; nothing was changed"
+                    ),
+                )));
+            }
+        }
+        if let Some(Some(raw)) = &patch.base_url
+            && !raw.trim().is_empty()
+        {
+            view.guard_held(Key::ConnectorsAllowedBaseHosts)
+                .map_err(refused)?;
+            // An address that is not a usable service root is reported as
+            // such by the save itself.
+            if let Ok(url) = validate_base_url(id, raw.trim())
+                && !view.base_url_allowed(&url)
+            {
+                return Err(refused(view.refusal(
+                    Key::ConnectorsAllowedBaseHosts,
+                    CAUSE_POLICY_NOT_ALLOWED,
+                    &format!(
+                        "{} is not a host your organisation allows {name} to use",
+                        url.host_str().unwrap_or("that address")
+                    ),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a call, a preflight or a test of a connector the managed
+    /// policy disables, or whose saved base URL is outside the hosts it
+    /// allows. The text names no rule: an agent reads it through a flow
+    /// refusal, and the policy stays on the admin plane.
+    fn check_use(&self, id: ConnectorId, row: Option<&ConnectorRow>) -> Result<(), InvokeError> {
+        let view = self.policy.view();
+        let name = descriptor(id).name;
+        let managed = |cause: &'static str| {
+            InvokeError::Connector(ConnectorError::Policy {
+                cause,
+                detail: format!("{name} is not available on this machine; ask your administrator"),
+            })
+        };
+        if view.connector_disabled(id) {
+            return Err(managed(CAUSE_CONNECTOR_DISABLED));
+        }
+        let saved = row
+            .and_then(|row| row.base_url.as_deref())
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        if let Some(raw) = saved
+            && let Ok(url) = validate_base_url(id, raw)
+            && !view.base_url_allowed(&url)
+        {
+            return Err(managed(CAUSE_POLICY_NOT_ALLOWED));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a connector error is the managed policy's refusal (the two
+/// causes [`ConnectorService::check_use`] raises), whose recovery is to
+/// ask the administrator.
+fn is_managed(error: &ConnectorError) -> bool {
+    matches!(
+        error,
+        ConnectorError::Policy { cause, .. }
+            if *cause == CAUSE_POLICY_NOT_ALLOWED || *cause == CAUSE_CONNECTOR_DISABLED
+    )
+}
+
+/// One field of an `effective` block for a key the policy holds as a plain
+/// constraint (an allowlist, a disable list, a source restriction): no
+/// policy key named means exactly `{ source, locked }`. `source` is where
+/// the value in force came from; `locked` is whether the human cannot edit
+/// the field at all; `constraint` is what the policy permits.
+pub(crate) fn plain_entry(
+    view: &PolicyView,
+    key: Key,
+    source: Source,
+    locked: bool,
+    constraint: Option<serde_json::Value>,
+) -> EffectiveEntry {
+    let Some(status) = view.status(key) else {
+        return EffectiveEntry::unmanaged(source);
+    };
+    EffectiveEntry {
+        source,
+        locked: locked || view.is_held(key),
+        mode: Some(Mode::Forbid),
+        constraint: status.in_force().then_some(constraint).flatten(),
+        reason: None,
+        state: Some(status.as_str()),
+        clamped: source == Source::Policy && !locked,
+    }
+}
+
+/// The `effective` block of one connector's summary: whether the policy
+/// disables it, and whether its saved base URL is within the allowed hosts.
+fn effective_json(
+    view: &PolicyView,
+    id: ConnectorId,
+    row: Option<&ConnectorRow>,
+) -> serde_json::Value {
+    let disabled = view.connector_disabled(id);
+    let enabled_source = if disabled {
+        Source::Policy
+    } else if row.is_some() {
+        Source::User
+    } else {
+        Source::Default
+    };
+    let enabled = plain_entry(
+        view,
+        Key::ConnectorsDisabled,
+        enabled_source,
+        disabled,
+        None,
+    );
+    let saved = row
+        .and_then(|row| row.base_url.as_deref())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| validate_base_url(id, raw).ok());
+    let outside = saved
+        .as_ref()
+        .is_some_and(|url| !view.base_url_allowed(url));
+    let allow = view
+        .policy()
+        .allowed_base_hosts
+        .as_ref()
+        .map(|hosts| serde_json::json!({ "allow": hosts.entries }));
+    let base_url_source = if outside {
+        Source::Policy
+    } else if saved.is_some() {
+        Source::User
+    } else {
+        Source::Default
+    };
+    let base_url = plain_entry(
+        view,
+        Key::ConnectorsAllowedBaseHosts,
+        base_url_source,
+        false,
+        allow,
+    );
+    serde_json::json!({ "enabled": enabled.to_json(), "base_url": base_url.to_json() })
 }
 
 /// Checks one base-URL value on its way into the row, answering what to

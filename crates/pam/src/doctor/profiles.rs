@@ -30,6 +30,28 @@ use pam_proto::caller::KNOWN_AGENTS;
 /// The placeholder every template uses for PAM's base directory.
 pub const BASE_PLACEHOLDER: &str = "<base>";
 
+/// What `pam doctor --profile <harness>` prints on Windows, for every
+/// harness: there is no profile to apply, and the text says what applies
+/// instead (the short form of `docs/sandbox/windows/README.md`).
+pub const WINDOWS_STATEMENT: &str = "\
+No supported harness configuration establishes the PAM boundary on Windows,
+so there is no sandbox profile to print for this harness.
+
+`pam doctor` reports `not_established` here and lists every private path as
+reachable. GUI-only administration on Windows is a convention enforced by the
+harness's permission prompts, not by the operating system.
+
+The real options:
+  1. Run the agent in a VM or on a separate machine, with PAM installed there:
+     the boundary is then the hypervisor or the machine, not the OS user.
+  2. Or accept the convention and record it: run `pam doctor` from the agent's
+     position (it exits 6) and keep the report; the daemon stores it and
+     `pam status` shows that the check was made.
+
+Details, and what each harness documents for Windows:
+docs/sandbox/windows/README.md
+";
+
 /// Characters that are pattern syntax in the JSON and TOML harness
 /// configurations (their path entries are globs) or delimit a permission rule.
 /// A base containing one cannot be written there without guessing an escape

@@ -61,7 +61,7 @@ fn run_pam_blocking(base: &Path, args: &[String]) -> CliRun {
 
 /// A fresh clone of the built binary under `dir`, executable.
 fn fresh_binary(dir: &Path) -> PathBuf {
-    let exe = dir.join("pam");
+    let exe = dir.join(format!("pam{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(env!("CARGO_BIN_EXE_pam"), &exe).expect("the binary clones");
     exe
 }
@@ -74,12 +74,12 @@ fn exec(exe: &Path, base: &Path, args: &[String]) -> CliRun {
         .stdin(Stdio::null())
         .output()
         .expect("the pam binary runs");
-    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     #[cfg(unix)]
-    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&output.status) {
-        use std::fmt::Write as _;
-        let _ = write!(stderr, "[the pam process was ended by signal {signal}]");
-    }
+    let stderr = match std::os::unix::process::ExitStatusExt::signal(&output.status) {
+        Some(signal) => format!("{stderr}[the pam process was ended by signal {signal}]"),
+        None => stderr,
+    };
     CliRun {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -119,7 +119,7 @@ fn unserved_base() -> (tempfile::TempDir, PathBuf) {
     (tmp, base)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_json_is_one_document_exits_six_and_the_daemon_records_the_report() {
     timeout(DEADLINE, async {
@@ -136,7 +136,7 @@ async fn doctor_json_is_one_document_exits_six_and_the_daemon_records_the_report
         let report = document(&run);
         assert_eq!(report["schema_version"], 1);
         assert_eq!(report["verdict"], "not_established");
-        assert_eq!(report["platform"], "macos");
+        assert_eq!(report["platform"], std::env::consts::OS);
         assert_eq!(report["daemon"]["via"], "direct");
         assert_eq!(
             report["probes"][0],
@@ -163,7 +163,13 @@ async fn doctor_json_is_one_document_exits_six_and_the_daemon_records_the_report
         assert_eq!(report["daemon_reply"]["accepted"], true, "{report}");
         assert_eq!(report["daemon_reply"]["verdict"], "not_established");
         assert_eq!(report["daemon_reply"]["request_id"], request_id);
-        assert!(report["daemon_reply"]["peer"]["pid"].is_u64(), "{report}");
+        // The kernel names the peer on unix; the Windows public plane
+        // admits by nonce and has no pid to name.
+        assert_eq!(
+            report["daemon_reply"]["peer"]["pid"].is_u64(),
+            cfg!(unix),
+            "{report}"
+        );
 
         let block = boundary_block(&base).await;
         assert_eq!(
@@ -185,7 +191,7 @@ async fn doctor_json_is_one_document_exits_six_and_the_daemon_records_the_report
     .expect("test within deadline");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_no_report_keeps_the_verdict_and_leaves_the_daemon_never_checked() {
     timeout(DEADLINE, async {
@@ -221,7 +227,7 @@ async fn doctor_no_report_keeps_the_verdict_and_leaves_the_daemon_never_checked(
     .expect("test within deadline");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_human_output_names_the_verdict_the_record_and_the_daemons_view() {
     timeout(DEADLINE, async {
@@ -271,7 +277,6 @@ async fn doctor_human_output_names_the_verdict_the_record_and_the_daemons_view()
     .expect("test within deadline");
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_without_a_daemon_is_cannot_probe_exit_one_and_starts_nothing() {
     timeout(DEADLINE, async {
@@ -491,4 +496,54 @@ async fn doctor_poisons_nothing_it_runs_from() {
     })
     .await
     .expect("test within deadline");
+}
+
+/// Windows has no profile to print: every harness name answers with the
+/// Windows statement and exits `0`, whatever `--base` and `--managed` say;
+/// an unknown name stays a usage error.
+#[cfg(windows)]
+#[test]
+fn doctor_profile_answers_with_the_windows_statement_for_every_harness() {
+    let (_tmp, base) = unserved_base();
+    for harness in Harness::ALL {
+        let run = run_pam_blocking(
+            &base,
+            &["doctor", "--profile", harness.name()].map(str::to_owned),
+        );
+        assert_eq!(run.code, 0, "{harness}: {}", run.stderr);
+        assert!(
+            run.stdout
+                .contains("No supported harness configuration establishes"),
+            "{harness}: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("docs/sandbox/windows/README.md"),
+            "{harness}: {}",
+            run.stdout
+        );
+        assert!(run.stderr.is_empty(), "{harness}: {}", run.stderr);
+    }
+    let ignored = run_pam_blocking(
+        &base,
+        &[
+            "doctor",
+            "--profile",
+            "codex",
+            "--base",
+            "relative/dir",
+            "--managed",
+        ]
+        .map(str::to_owned),
+    );
+    assert_eq!(ignored.code, 0, "{}", ignored.stderr);
+    assert!(
+        ignored.stdout.contains("PAM boundary on Windows"),
+        "{}",
+        ignored.stdout
+    );
+    assert!(
+        !base.exists(),
+        "a profile run creates nothing under the base"
+    );
 }

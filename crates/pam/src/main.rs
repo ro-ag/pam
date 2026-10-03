@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use pam::client::{self, DEFAULT_FOLLOW_TIMEOUT_MS, StopOutcome};
 use pam::doctor;
-use pam::doctor::profiles::{Harness, Variant, render_variant};
+use pam::doctor::profiles::{Harness, Variant, WINDOWS_STATEMENT, render_variant};
 use pam::render;
 use pam::request::{DEFAULT_DEADLINE_MS, parse_args_object};
 use pam_daemon::daemon::{DaemonError, run_daemon};
@@ -612,7 +612,8 @@ async fn doctor_mode(base: &Path, json: bool, no_report: bool, timeout_ms: u64) 
 }
 
 /// `pam doctor --profile <harness>`: prints the reference sandbox profile
-/// for `base` and exits `0`; nothing is probed and nothing is dialed. An
+/// for `base` and exits `0` (on Windows, the Windows statement instead:
+/// there is no profile there, and `--base` and `--managed` are ignored); nothing is probed and nothing is dialed. An
 /// unknown harness, a base the profile cannot carry safely, or `--managed`
 /// for a harness without a managed variant is a usage error (exit `2`)
 /// with the recovery on stderr. Where the fragment cannot carry its own
@@ -625,6 +626,14 @@ fn doctor_profile(name: &str, base: Option<PathBuf>, managed: bool) -> ExitCode 
         );
         return ExitCode::from(EXIT_USAGE);
     };
+    // The profiles name POSIX paths and Windows has none to give: answer
+    // with what applies there, before any base is resolved or validated
+    // (`--base` and `--managed` have nothing to act on).
+    if cfg!(windows) {
+        let _ = (&base, managed);
+        print!("{WINDOWS_STATEMENT}");
+        return ExitCode::SUCCESS;
+    }
     let Some(base) = base.or_else(pam::default_base_dir) else {
         eprintln!(
             "pam doctor: cannot resolve the home directory to place ~/.pam; set $HOME or pass --base"

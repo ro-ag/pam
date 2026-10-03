@@ -4,8 +4,8 @@ use pam_proto::caller::KNOWN_AGENTS;
 use pam_proto::doctor::{INVENTORY, Platform, ProbeClass, ProbeId};
 
 use super::{
-    BASE_PLACEHOLDER, Format, Harness, Profile, RenderError, Variant, harness_for_agent, list,
-    render, render_guide, render_variant,
+    BASE_PLACEHOLDER, Format, Harness, Profile, RenderError, Variant, WINDOWS_STATEMENT,
+    harness_for_agent, list, render, render_guide, render_variant,
 };
 
 const BASE: &str = "/Users/tester/.pam";
@@ -1007,4 +1007,16 @@ fn the_loader_check_is_not_vacuous() {
     text.push_str("(\n");
     std::fs::write(&file, text).unwrap();
     assert!(!sandbox_exec_true(&file).status.success());
+}
+
+#[cfg(windows)]
+#[test]
+fn the_windows_statement_names_the_state_the_options_and_the_page() {
+    assert!(WINDOWS_STATEMENT.contains("No supported harness configuration establishes"));
+    assert!(WINDOWS_STATEMENT.contains("`not_established`"));
+    assert!(WINDOWS_STATEMENT.contains("VM or on a separate machine"));
+    assert!(WINDOWS_STATEMENT.contains("accept the convention and record it"));
+    assert!(WINDOWS_STATEMENT.contains("docs/sandbox/windows/README.md"));
+    // No template placeholder or POSIX base leaks into it.
+    assert!(!WINDOWS_STATEMENT.contains(BASE_PLACEHOLDER));
 }

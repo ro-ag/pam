@@ -245,6 +245,7 @@ pub(crate) enum GitCandidate {
     /// directory the root-owned `link` names, which is what `xcode-select
     /// -p` reports, is followed to its real `usr/bin/git` instead, the way
     /// the rest of the codebase pins the toolchain binary.
+    #[cfg_attr(windows, allow(dead_code))]
     XcodeShim {
         /// `/var/db/xcode_select_link` in production.
         link: PathBuf,
@@ -307,6 +308,7 @@ pub(crate) struct GitTrust {
 
 impl GitTrust {
     /// Root and the user that owns `protected_base`.
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
     pub(crate) fn for_daemon(protected_base: &Path) -> Result<Self, GitRefusal> {
         #[cfg(unix)]
         {

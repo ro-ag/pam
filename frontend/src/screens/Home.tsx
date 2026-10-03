@@ -19,12 +19,14 @@ import { INTENTS, ask, type Answer, type AskLink } from "../lib/ask/router";
 import { cn } from "../lib/cn";
 import {
   approvalsPending,
+  boundaryStatus,
   daemonStatus,
   keyringHealth,
   modelsStatus,
   toBridgeFailure,
 } from "../lib/ipc";
-import type { BridgeFailure } from "../lib/ipc";
+import type { BoundaryStatus, BridgeFailure } from "../lib/ipc";
+import { relativeTime } from "../lib/time";
 
 /** Read-only answers from live daemon state, with a three-exchange session history. */
 const PROMPT_LABELS: Record<string, string> = {
@@ -68,6 +70,25 @@ function partOfDay(nowMs: number): string {
   if (hour < 12) return "Good morning";
   if (hour < 18) return "Good afternoon";
   return "Good evening";
+}
+
+/**
+ * The overview's one line on the sandbox boundary: the last `pam doctor`
+ * verdict and its age, or that nobody checked. Only an established
+ * boundary is left alone; anything else points at Settings › Daemon, where
+ * the command to run lives.
+ */
+export function boundaryOverviewLine(boundary: BoundaryStatus, nowMs?: number): string {
+  const report = boundary.last_report;
+  if (report === null) return "not verified";
+  switch (report.verdict) {
+    case "established":
+      return `established ${relativeTime(report.received_ts, nowMs)}`;
+    case "not_established":
+      return "not established — see Settings › Daemon";
+    case "cannot_probe":
+      return "could not be probed — see Settings › Daemon";
+  }
 }
 
 /** One question and what came back; `answer === null` means still asking. */
@@ -128,6 +149,9 @@ export function HomeScreen() {
   // Only worth a line when it is not fine: a working keychain is the
   // expected state and does not need saying on the home screen.
   const keyring = keyringHealth(status.data?.status);
+  // The boundary is a fact for the human, never the beacon's colour: it
+  // gets its own line, and only from a daemon that publishes the block.
+  const boundary = boundaryStatus(status.data?.status);
   const greeting = pending.isPending
     ? "Checking approvals…"
     : pending.isError
@@ -197,6 +221,20 @@ export function HomeScreen() {
                 className="rounded-control text-danger hover:underline"
               >
                 Keychain {keyring.state} — connector credentials cannot be used
+              </Link>
+            )}
+            {connected && boundary && (
+              <Link
+                to="/settings"
+                hash="daemon"
+                className={cn(
+                  "rounded-control hover:underline",
+                  boundary.last_report?.verdict === "established"
+                    ? "text-ink-muted"
+                    : "text-warning",
+                )}
+              >
+                Sandbox boundary: {boundaryOverviewLine(boundary)}
               </Link>
             )}
           </aside>

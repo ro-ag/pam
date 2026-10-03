@@ -9,8 +9,11 @@
 //! as one request (`--no-wait` + `subscribe` to watch step by step). `service install` writes the
 //! unit first and then stops a loose daemon; it refuses a binary in a temp or cargo `target/`
 //! directory or a group/world-writable location, and pins a base directory only when `--base-dir` is
-//! given; `uninstall` stops the managed daemon on macOS (the next command starts one lazily). Exit codes: `0` success, `1` transport/client failure, `2` usage error, `3`
-//! refused, `4` unresolved, `5` blocked.
+//! given; `uninstall` stops the managed daemon on macOS (the next command starts one lazily).
+//! `pam doctor` probes the caller's own sandbox boundary and records the verdict with the daemon
+//! (`--profile` prints a reference sandbox profile instead). Exit codes: `0` success, `1`
+//! transport/client failure (for `doctor`: `cannot_probe`), `2` usage error, `3` refused, `4`
+//! unresolved, `5` blocked, `6` boundary not established (`doctor` only).
 
 use std::path::Path;
 

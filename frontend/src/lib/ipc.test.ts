@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BRIDGE_TIMEOUT_MS,
   BridgeUnavailable,
+  HARNESS_PROFILES,
+  boundaryStatus,
+  harnessProfileFor,
   CONFIRM_GRANT,
   CONFIRM_NETWORK,
   CONFIRM_RELAXED,
@@ -687,5 +690,82 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
     ).toBe(2);
     // The daemon said approval is needed again without listing which steps.
     expect(revokedStepCount({ reapproval_required: true })).toBe(1);
+  });
+});
+
+describe("boundaryStatus", () => {
+  it("is null without a block, and never invents a report from a bad verdict", () => {
+    expect(boundaryStatus(null)).toBeNull();
+    expect(boundaryStatus({})).toBeNull();
+    expect(boundaryStatus({ boundary: "yes" })).toBeNull();
+    const odd = boundaryStatus({ boundary: { last_report: { verdict: "fine" } } });
+    expect(odd?.last_report).toBeNull();
+    expect(odd?.summary).toBe("never checked — run pam doctor from the agent");
+    expect(odd?.admin_contacts.unattributed_24h).toBe(0);
+    expect(odd?.peer_identity).toBe("none");
+  });
+
+  it("reads the block as the daemon serves it", () => {
+    const block = boundaryStatus({
+      boundary: {
+        peer_identity: "kernel_pid",
+        last_report: {
+          verdict: "not_established",
+          ts: 10,
+          received_ts: 11,
+          age_s: 420,
+          agent: "claude",
+          repo: "/work/app",
+          relayed: false,
+          peer_pid: 48122,
+          peer_exe: "/Applications/PAM.app/Contents/MacOS/pam",
+          peer_harness: "claude",
+          failed: ["admin.dir", 7],
+          unverified: [],
+          request_id: "req_abc",
+        },
+        reports: { retained: 7, established: 5, not_established: 2 },
+        admin_contacts: {
+          unattributed: 1,
+          unattributed_24h: 1,
+          total: 3,
+          expected_total: 120,
+          last: {
+            ts: 5,
+            kind: "admin_contact",
+            peer_pid: 4711,
+            peer_exe: "/usr/local/bin/pam",
+            peer_harness: "zsh",
+            attributed: null,
+          },
+          last_expected: null,
+        },
+        public_unknown_harness: { total: 1, last: { ts: 4, peer_pid: 5, peer_exe: null } },
+        summary: "not_established 7 min ago by claude (pid 48122, direct); admin contacts unattributed: 1",
+      },
+    });
+    expect(block).not.toBeNull();
+    expect(block?.peer_identity).toBe("kernel_pid");
+    expect(block?.last_report?.verdict).toBe("not_established");
+    expect(block?.last_report?.failed).toEqual(["admin.dir"]);
+    expect(block?.last_report?.request_id).toBe("req_abc");
+    expect(block?.reports).toEqual({ retained: 7, established: 5, not_established: 2 });
+    expect(block?.admin_contacts.last?.peer_exe).toBe("/usr/local/bin/pam");
+    expect(block?.admin_contacts.last?.attributed).toBeNull();
+    expect(block?.admin_contacts.last_expected).toBeNull();
+    expect(block?.public_unknown_harness.last?.peer_pid).toBe(5);
+    expect(block?.summary).toMatch(/^not_established 7 min ago/);
+  });
+
+  it("maps a report's agent to the profile the CLI takes, falling back to sandbox-exec", () => {
+    expect(harnessProfileFor("claude")).toBe("claude-code");
+    expect(harnessProfileFor("Codex")).toBe("codex");
+    expect(harnessProfileFor("gemini")).toBe("gemini-cli");
+    expect(harnessProfileFor("copilot")).toBe("copilot-cli");
+    expect(harnessProfileFor("github-copilot")).toBe("copilot-cli");
+    expect(harnessProfileFor("cursor")).toBe("sandbox-exec");
+    expect(harnessProfileFor(null)).toBe("sandbox-exec");
+    expect(harnessProfileFor(undefined)).toBe("sandbox-exec");
+    for (const name of HARNESS_PROFILES) expect(harnessProfileFor(name)).toBe(name);
   });
 });

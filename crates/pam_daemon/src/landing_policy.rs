@@ -292,7 +292,7 @@ impl From<Error> for SaveRefusal {
 }
 
 /// The detail of a repository the policy dropped.
-const DROPPED_DETAIL: &str = "Your organisation's policy does not allow landing to this \
+const DROPPED_DETAIL: &str = "Your organization's policy does not allow landing to this \
      repository's GitHub server (landing.allowed_github_servers); ask your administrator.";
 
 /// Whether `permissions` asks for something `ceiling` caps off; the first
@@ -372,7 +372,7 @@ impl Snapshot {
                     root: repository.root.clone(),
                     key: Key::LandingAllowedGithubServers,
                     reason: "this repository's GitHub server is not on a host your \
-                             organisation's policy allows",
+                             organization's policy allows",
                 });
                 return false;
             }
@@ -416,7 +416,7 @@ impl Snapshot {
                     CAUSE_POLICY_NOT_ALLOWED,
                     &format!(
                         "{permission} for {root} is above the landing permissions your \
-                         organisation allows"
+                         organization allows"
                     ),
                 ));
             }
@@ -425,7 +425,7 @@ impl Snapshot {
                     Key::LandingAllowedGithubServers,
                     CAUSE_POLICY_NOT_ALLOWED,
                     &format!(
-                        "the GitHub server {} for {root} is not a host your organisation \
+                        "the GitHub server {} for {root} is not a host your organization \
                          allows",
                         repository.github_server
                     ),

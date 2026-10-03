@@ -169,7 +169,7 @@ export function checkMirrorUrl(raw: string): Checked<string | null> {
   if (refusedMirrorHost(parts.host)) {
     return {
       error:
-        "A mirror cannot be on this computer or a link-local address; use your organisation's mirror host.",
+        "A mirror cannot be on this computer or a link-local address; use your organization's mirror host.",
     };
   }
   if (tail.split("/").some((segment) => segment === "." || segment === "..")) {
@@ -845,7 +845,7 @@ export function SettingsNetworkSection() {
       <Panel ground="raised" className="space-y-4 p-4">
         <p className="font-data text-xs text-ink-faint">Certificate authority</p>
         <p className="font-sans text-sm text-ink-muted">
-          If your organisation inspects TLS and this computer's keychain or certificate store
+          If your organization inspects TLS and this computer's keychain or certificate store
           already trusts its root, leave this empty. Otherwise import a PEM file of the
           certificates PAM should trust. It replaces the system's trust for PAM's requests, so
           include every root those services need. A proxy that inspects TLS can read the
@@ -993,7 +993,7 @@ export function SettingsNetworkSection() {
             aria-label="allowed mirror hosts"
             className="select-text font-sans text-sm text-ink-muted"
           >
-            Your organisation allows mirrors only on: {allowedHosts.join(", ")}. This list is
+            Your organization allows mirrors only on: {allowedHosts.join(", ")}. This list is
             set by policy and cannot be edited here.
           </p>
         )}
@@ -1029,7 +1029,7 @@ export function SettingsNetworkSection() {
             <p>
               A proxy sits between PAM and your connector services. If it inspects TLS it can
               read the credentials PAM sends. Only continue with a proxy and password your
-              organisation gave you.
+              organization gave you.
             </p>
           </TypedConfirm>
         )}

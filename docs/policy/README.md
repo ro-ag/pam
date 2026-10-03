@@ -1,6 +1,6 @@
 # Managed policy: delivering and checking the file
 
-An organisation can manage PAM on its machines with one read-only JSON file,
+An organization can manage PAM on its machines with one read-only JSON file,
 delivered by MDM. This page is for the administrator who writes and ships it.
 The design, with every rule and its reasons, is in
 [the managed policy spec](../specs/2026-10-02-managed-policy-file.md).
@@ -8,7 +8,7 @@ The design, with every rule and its reasons, is in
 ## What the file governs
 
 The file can lock, default or bound the settings a person otherwise chooses in
-the PAM GUI, and add constraints only an organisation can state:
+the PAM GUI, and add constraints only an organization can state:
 
 | Section | What it can manage |
 | --- | --- |
@@ -141,16 +141,21 @@ installed file for a compliance check, for example in a Jamf extension attribute
 or an Intune detection script:
 
 ```sh
-pam policy check "/Library/Application Support/PAM/policy.json" --trust
+pam policy check "/Library/Application Support/PAM/policy.json" --trust --json
 ```
 
 ```powershell
-pam policy check "$env:ProgramData\PAM\policy.json" --trust
+pam policy check "$env:ProgramData\PAM\policy.json" --trust --json
 ```
 
-Exit `0` means that the installed file is trusted and valid. On a machine where
-PAM is running, `pam status --json` reports the policy the daemon has in force
-under `.policy` (state, revision and digest).
+Exit `0` means that the installed file is trusted and valid; a script branches
+on the exit code (`11` not trusted, `12` invalid, `13` rejected leaves, `1` no
+file there) and reads `meta.revision` and `digest` from the JSON document when it
+needs to compare them with what it shipped. There is no separate
+`--installed` or `--expect-revision` option. On a machine where PAM is running,
+`pam status --json` reports the policy the daemon has in force under `.policy`
+(state, revision, a 12-character digest prefix, rejected-leaf count), and
+`pam status` prints it on its `policy:` line.
 
 ## Samples
 
@@ -185,12 +190,13 @@ machine is then unmanaged (that is what offboarding looks like).
 
 ## What the person sees
 
-In the GUI, every settings page shows "Managed by {organization}" when a policy
-is in force. A locked setting is shown disabled with a lock, the policy's
+In the GUI, the Settings header says "Managed by your organization's policy."
+when a policy is in force, or warns when it is degraded, on its last good copy
+or frozen. A locked setting is shown disabled with a lock, the policy's
 `reason` and the `contact`. A bounded setting shows the permitted range or set
 next to the control, and a policy default is labelled as coming from the
-organisation. **Settings > Managed policy** shows the file's path and how its
-trust check went, its revision, digest, organisation and contact, when it was
+organization. **Settings › Security › Managed policy** shows the file's path and how its
+trust check went, its revision, digest, organization and contact, when it was
 loaded and last checked, and every key with its state and the reason for any
 problem. Banners explain a degraded, last-good or frozen policy, and a missing
 login unit the policy requires. An agent learns only that a policy exists, with

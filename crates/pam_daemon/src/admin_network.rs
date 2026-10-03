@@ -123,7 +123,7 @@ const PROBE_PARALLELISM: usize = 4;
 const TARGET_ENGINE: &str = "engine";
 const TARGET_MODELS: &str = "models";
 
-const RECOVERY_CLOSED: &str = "Managed by your organisation's policy; ask your administrator to correct the policy file. Connector calls and downloads are refused until then.";
+const RECOVERY_CLOSED: &str = "Managed by your organization's policy; ask your administrator to correct the policy file. Connector calls and downloads are refused until then.";
 const RECOVERY_CONFLICT: &str = "The network settings changed since this screen loaded; reload Settings › Network and apply the change again.";
 const RECOVERY_RELOAD: &str = "Open Settings › Network, correct the value and save again.";
 const RECOVERY_CA: &str = "Give the path of a PEM file of certificates that you or root own and that other users cannot write, then import again.";
@@ -398,7 +398,7 @@ impl AdminService {
             return Ok(());
         };
         let what = format!(
-            "{} {} set by your organisation's policy; nothing was changed",
+            "{} {} set by your organization's policy; nothing was changed",
             names.join(", "),
             if names.len() == 1 { "is" } else { "are" }
         );

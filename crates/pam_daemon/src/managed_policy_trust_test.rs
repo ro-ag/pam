@@ -32,6 +32,32 @@ fn reason_codes_are_stable_and_unique() {
     }
 }
 
+/// A recovery line that sends the administrator to a guide names a guide
+/// the repository ships, so the advice cannot point at a missing page.
+#[test]
+fn every_guide_a_recovery_line_names_exists() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut named = 0;
+    for reason in UntrustedReason::ALL {
+        for word in reason.recovery().split_whitespace() {
+            let word = word.trim_end_matches([',', '.', ';', ')']);
+            if word.starts_with("docs/") {
+                named += 1;
+                assert!(
+                    repo.join(word).is_file(),
+                    "{reason} recovery names {word}, which does not exist"
+                );
+            }
+        }
+    }
+    assert!(named > 0, "no recovery line names the delivery guide");
+    assert!(
+        UntrustedReason::WritableByUser
+            .recovery()
+            .contains("docs/policy/README.md")
+    );
+}
+
 #[test]
 fn production_rules_are_root_and_the_policy_bound() {
     let rules = TrustRules::production();

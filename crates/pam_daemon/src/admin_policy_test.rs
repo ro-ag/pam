@@ -33,7 +33,7 @@ fn sha256(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-/// A policy that applies, names the organisation, requires the login unit
+/// A policy that applies, names the organization, requires the login unit
 /// and carries one Tier B typo (a mirror on a host the allowlist omits).
 fn policy_text() -> String {
     json!({

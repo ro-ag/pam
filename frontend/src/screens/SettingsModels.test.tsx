@@ -477,14 +477,14 @@ describe("managed policy", () => {
   });
 
   it.each([
-    ["setting_locked", "models.dir is managed by your organisation's policy"],
+    ["setting_locked", "models.dir is managed by your organization's policy"],
     ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
-    ["policy_not_allowed", "this idle window is longer than your organisation allows"],
+    ["policy_not_allowed", "this idle window is longer than your organization allows"],
   ])("renders a %s refusal's detail and recovery", async (cause, detail) => {
     mocks.modelsSettingsSet.mockRejectedValue({
       cause,
       detail,
-      recovery: "Managed by your organisation's policy; ask your administrator.",
+      recovery: "Managed by your organization's policy; ask your administrator.",
     });
     const section = await renderModelsSection();
     const minutes = await section.findByLabelText("idle unload minutes");

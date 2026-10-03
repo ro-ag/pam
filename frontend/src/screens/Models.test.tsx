@@ -1102,7 +1102,7 @@ describe("catalog under a managed policy", () => {
     mocks.modelsDownload.mockRejectedValue({
       cause: "policy_not_allowed",
       detail: "downloading catalog models is not allowed on this machine",
-      recovery: "Managed by your organisation's policy; ask your administrator.",
+      recovery: "Managed by your organization's policy; ask your administrator.",
     });
     const catalog = await openDownloads();
     fireEvent.click(await catalog.findByRole("button", { name: "Download" }));

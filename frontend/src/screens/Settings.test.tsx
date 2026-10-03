@@ -1290,14 +1290,14 @@ describe("managed policy in Settings", () => {
     });
 
     it.each([
-      ["setting_locked", "the profile is managed by your organisation's policy"],
+      ["setting_locked", "the profile is managed by your organization's policy"],
       ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
-      ["policy_not_allowed", "relaxed is below the floor your organisation set"],
+      ["policy_not_allowed", "relaxed is below the floor your organization set"],
     ])("renders a %s refusal's detail and recovery through the failure note", async (cause, detail) => {
       mocks.profileSet.mockRejectedValue({
         cause,
         detail,
-        recovery: "Managed by your organisation's policy; ask your administrator.",
+        recovery: "Managed by your organization's policy; ask your administrator.",
       });
       renderSettings("security");
       await waitFor(() => expect(screen.getByRole("radio", { name: /strict/ })).toBeEnabled());
@@ -1350,8 +1350,8 @@ describe("managed policy in Settings", () => {
     it("renders a refused add through the failure note", async () => {
       mocks.grantsAdd.mockRejectedValue({
         cause: "policy_not_allowed",
-        detail: "capability \"echo\" is not allowed by your organisation",
-        recovery: "Managed by your organisation's policy; ask your administrator.",
+        detail: "capability \"echo\" is not allowed by your organization",
+        recovery: "Managed by your organization's policy; ask your administrator.",
       });
       renderSettings("security");
       const input = await screen.findByLabelText("capability to grant");
@@ -1365,7 +1365,7 @@ describe("managed policy in Settings", () => {
       });
       fireEvent.click(prompt.getByRole("button", { name: "Grant" }));
       expect(await screen.findByText(/grants · policy_not_allowed/)).toBeInTheDocument();
-      expect(screen.getByText(/is not allowed by your organisation/)).toBeInTheDocument();
+      expect(screen.getByText(/is not allowed by your organization/)).toBeInTheDocument();
     });
   });
 
@@ -1427,8 +1427,8 @@ describe("managed policy in Settings", () => {
     it("renders a refused window through the failure note", async () => {
       mocks.retentionSet.mockRejectedValue({
         cause: "setting_locked",
-        detail: "evidence_days is managed by your organisation's policy",
-        recovery: "Managed by your organisation's policy; ask your administrator.",
+        detail: "evidence_days is managed by your organization's policy",
+        recovery: "Managed by your organization's policy; ask your administrator.",
       });
       renderSettings("retention");
       const evidence = (await screen.findByLabelText("evidence age")) as HTMLSelectElement;

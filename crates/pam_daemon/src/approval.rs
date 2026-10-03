@@ -208,7 +208,7 @@ pub fn remember_refusal(view: &PolicyView, capability: Option<&str>) -> Option<W
         return Some(view.refusal(
             Key::GrantsManual,
             CAUSE_SETTING_LOCKED,
-            "remembering an approval adds a grant, and your organisation's policy does not allow \
+            "remembering an approval adds a grant, and your organization's policy does not allow \
              adding grants by hand",
         ));
     }

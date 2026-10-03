@@ -26,6 +26,9 @@ const DIGEST = "ab12cd34ef56".padEnd(64, "0");
 const NOW = Math.floor(Date.now() / 1000);
 
 function body(overrides: Partial<PolicyBody> = {}): PolicyBody {
+  // Read the clock when the body is built, not when the file loads: on a busy host the tests
+  // can start seconds after the module, and "30s ago" would read "31s ago".
+  const now = Math.floor(Date.now() / 1000);
   return {
     state: "active",
     reason_code: null,
@@ -48,8 +51,8 @@ function body(overrides: Partial<PolicyBody> = {}): PolicyBody {
     revision: "2026-10-02.1",
     organization: "Example Corp",
     contact: "it@example.com",
-    loaded_ts: NOW - 120,
-    checked_ts: NOW - 30,
+    loaded_ts: now - 120,
+    checked_ts: now - 30,
     last_good: null,
     rejected_leaves: 0,
     keys: [],

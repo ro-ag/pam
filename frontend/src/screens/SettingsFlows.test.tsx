@@ -491,7 +491,7 @@ describe("managed policy", () => {
           root: "/work/app",
           connector: "jenkins",
           key: "connectors.disabled",
-          reason: "your organisation's policy disables this connector",
+          reason: "your organization's policy disables this connector",
         },
       ],
     });
@@ -500,7 +500,7 @@ describe("managed policy", () => {
       name: "scope entries the policy is not using",
     });
     expect(note).toHaveTextContent("/work/app · jenkins");
-    expect(note).toHaveTextContent("your organisation's policy disables this connector");
+    expect(note).toHaveTextContent("your organization's policy disables this connector");
     expect(note).toHaveTextContent("kept, and nothing is deleted");
   });
 
@@ -519,14 +519,14 @@ describe("managed policy", () => {
   });
 
   it.each([
-    ["setting_locked", "allowed_programs is managed by your organisation's policy"],
-    ["policy_not_allowed", '"make" is not on the list your organisation allows'],
+    ["setting_locked", "allowed_programs is managed by your organization's policy"],
+    ["policy_not_allowed", '"make" is not on the list your organization allows'],
     ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
   ])("renders a %s refusal's detail and recovery", async (cause, detail) => {
     mocks.flowsSettingsSet.mockRejectedValue({
       cause,
       detail,
-      recovery: "Managed by your organisation's policy; ask your administrator.",
+      recovery: "Managed by your organization's policy; ask your administrator.",
     });
     await renderSection();
     fireEvent.change(screen.getByLabelText("Program to allow"), { target: { value: "make" } });

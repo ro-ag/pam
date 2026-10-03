@@ -228,14 +228,14 @@ it("reports the landing recipes the policy is not using", async () => {
       {
         root: "/repo",
         key: "landing.allowed_github_servers",
-        reason: "this repository's GitHub server is not one your organisation allows",
+        reason: "this repository's GitHub server is not one your organization allows",
       },
     ],
   });
   await setup();
   const note = screen.getByRole("note", { name: "landing recipes the policy is not using" });
   expect(note).toHaveTextContent("/repo");
-  expect(note).toHaveTextContent("not one your organisation allows");
+  expect(note).toHaveTextContent("not one your organization allows");
 });
 
 it("freezes the whole editor when the policy holds a landing key", async () => {
@@ -253,7 +253,7 @@ it("renders a refused save with the daemon's cause, detail and recovery", async 
   mocks.landingSet.mockRejectedValue({
     cause: "policy_not_allowed",
     detail: "landing.max_permissions does not allow create_pr",
-    recovery: "Managed by your organisation's policy; ask your administrator.",
+    recovery: "Managed by your organization's policy; ask your administrator.",
   });
   await setup();
   fireEvent.click(screen.getByLabelText("Landing repository 1: Push branch"));

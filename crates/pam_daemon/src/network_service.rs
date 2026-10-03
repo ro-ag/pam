@@ -10,7 +10,7 @@
 //! consumer is refused with `network_settings_invalid` until the human
 //! saves the settings again. Falling back to a direct connection on a
 //! corrupt proxy setting would send traffic around a proxy the
-//! organisation requires.
+//! organization requires.
 //!
 //! What a consumer gets ([`NetworkService::settings`]) is the resolved
 //! profile: the user's document under the managed overlay
@@ -28,7 +28,7 @@
 //! field stays editable. A **closure** (`closed`) means the policy named a
 //! proxy, no-proxy list or CA bundle that could not be put in force: every
 //! connector call and download is refused, never sent around the proxy the
-//! organisation requires. The managed CA bundle is imported, trust-checked
+//! organization requires. The managed CA bundle is imported, trust-checked
 //! and digest-pinned by the policy loader (`PolicyHandle`); this module only
 //! re-hashes the loader's private copy and never imports a second time.
 //!
@@ -220,7 +220,7 @@ impl NetworkDocument {
                         return Err(SettingsError {
                             field,
                             detail: format!(
-                                "the mirror host {} is not in your organisation's allowed list",
+                                "the mirror host {} is not in your organization's allowed list",
                                 base.host()
                             ),
                         });
@@ -1153,7 +1153,7 @@ impl NetworkService {
     }
 
     /// The refusal for [`Self::policy_closed`]. A direct connection would
-    /// go around the proxy or the trust the organisation requires, so
+    /// go around the proxy or the trust the organization requires, so
     /// nothing is sent. The failure is `network_policy_invalid`: its
     /// sentence names the policy key and the code, and its recovery sends
     /// the human to the administrator, not to Settings.
@@ -1241,8 +1241,8 @@ pub fn ignored_env() -> Vec<String> {
 #[must_use]
 pub fn policy_closed_sentence(closed: &PolicyClosed) -> String {
     format!(
-        "your organisation's policy ({}) could not be put in force ({}): {}; nothing was sent \
-         because it would bypass what your organisation requires. Ask your administrator to \
+        "your organization's policy ({}) could not be put in force ({}): {}; nothing was sent \
+         because it would bypass what your organization requires. Ask your administrator to \
          correct the policy file",
         closed.key, closed.code, closed.detail
     )

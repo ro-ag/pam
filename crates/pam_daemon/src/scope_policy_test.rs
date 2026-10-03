@@ -838,7 +838,7 @@ async fn the_effective_scopes_drop_what_the_policy_forbids_and_leave_the_stored_
             "root": outside,
             "connector": null,
             "key": "scopes.allowed_repository_roots",
-            "reason": "this repository is outside the repository roots your organisation's policy allows",
+            "reason": "this repository is outside the repository roots your organization's policy allows",
         })
     );
 

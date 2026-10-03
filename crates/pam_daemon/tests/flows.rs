@@ -716,7 +716,7 @@ async fn a_program_that_is_not_allowed_blocks_the_run() {
 async fn a_program_the_managed_policy_removed_is_refused_before_spawn_with_the_policy_cause() {
     Box::pin(with_deadline(async {
         // `git` is on the human's allowlist (the harness seeds it); the
-        // organisation's policy allows only the helper. The step is refused
+        // organization's policy allows only the helper. The step is refused
         // before the gate and before anything is spawned, naming the policy.
         let yaml = "schema: 1\nid: managed\nname: Managed\n\
                     steps:\n\
@@ -740,7 +740,7 @@ async fn a_program_the_managed_policy_removed_is_refused_before_spawn_with_the_p
         assert_eq!(look["error"]["cause"], "policy_denied");
         assert_eq!(
             look["error"]["recovery"],
-            "Managed by your organisation's policy; ask your administrator."
+            "Managed by your organization's policy; ask your administrator."
         );
         assert!(
             look["error"]["detail"]

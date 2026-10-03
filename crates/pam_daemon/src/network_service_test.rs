@@ -901,7 +901,7 @@ async fn a_closed_overlay_refuses_the_profile_and_the_mirrors_and_names_the_key_
     assert_eq!(failure.cause(), "network_policy_invalid");
     let sentence = failure.sentence();
     for needle in [
-        "organisation's policy",
+        "organization's policy",
         "network.ca_bundle",
         "writable_by_user",
         "can be modified by this user",

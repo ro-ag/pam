@@ -363,8 +363,8 @@ describe("saving", () => {
   it("renders a daemon refusal with its cause and recovery, and keeps the draft", async () => {
     mocks.networkSet.mockRejectedValue({
       cause: "setting_locked",
-      detail: "the proxy is managed by your organisation's policy",
-      recovery: "Managed by your organisation's policy; ask your administrator.",
+      detail: "the proxy is managed by your organization's policy",
+      recovery: "Managed by your organization's policy; ask your administrator.",
     });
     const save = await renderSection();
     type("no-proxy list", "jenkins.corp.example");
@@ -722,7 +722,7 @@ describe("test network settings", () => {
         detail:
           "The server's certificate was issued by CN=Corp Inspection CA, which is not trusted.",
         recovery:
-          "If your organisation inspects TLS, import its root CA in Settings › Network, or ask IT to deploy it to this computer's trust store.",
+          "If your organization inspects TLS, import its root CA in Settings › Network, or ask IT to deploy it to this computer's trust store.",
       },
       [
         "tls_untrusted_issuer",

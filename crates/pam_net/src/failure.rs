@@ -84,9 +84,9 @@ pub enum NetFailure {
     /// back to a direct connection.
     SettingsInvalid(String),
     /// The managed policy's network setting cannot be put in force (a
-    /// proxy, no-proxy list or CA bundle the organisation requires was
+    /// proxy, no-proxy list or CA bundle the organization requires was
     /// rejected or failed its import). Never answered by falling back to a
-    /// direct connection: that would bypass what the organisation requires.
+    /// direct connection: that would bypass what the organization requires.
     /// The human cannot fix it from Settings; the administrator can.
     PolicyInvalid(String),
     /// The private CA bundle copy no longer matches its recorded digest.
@@ -419,7 +419,7 @@ impl NetFailure {
                  leave through a proxy, set one in Settings › Network."
             }
             Self::TlsUntrustedIssuer { .. } => {
-                "If your organisation inspects TLS, import its root CA in Settings › Network, or \
+                "If your organization inspects TLS, import its root CA in Settings › Network, or \
                  ask IT to deploy it to this computer's trust store."
             }
             Self::TlsHostnameMismatch { .. } => {

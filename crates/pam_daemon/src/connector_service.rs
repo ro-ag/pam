@@ -818,7 +818,7 @@ impl ConnectorService {
                     Key::ConnectorsDisabled,
                     CAUSE_SETTING_LOCKED,
                     &format!(
-                        "{name} is disabled by your organisation's policy; nothing was changed"
+                        "{name} is disabled by your organization's policy; nothing was changed"
                     ),
                 )));
             }
@@ -837,7 +837,7 @@ impl ConnectorService {
                     Key::ConnectorsAllowedBaseHosts,
                     CAUSE_POLICY_NOT_ALLOWED,
                     &format!(
-                        "{} is not a host your organisation allows {name} to use",
+                        "{} is not a host your organization allows {name} to use",
                         url.host_str().unwrap_or("that address")
                     ),
                 )));

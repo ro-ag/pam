@@ -158,7 +158,7 @@ describe("PolicyDropNotice", () => {
             root: "/work/app",
             connector: "jenkins",
             key: "connectors.disabled",
-            reason: "your organisation's policy disables this connector",
+            reason: "your organization's policy disables this connector",
           },
           { root: "/elsewhere", reason: "this repository is outside the approved roots" },
         ]}
@@ -167,7 +167,7 @@ describe("PolicyDropNotice", () => {
     const note = screen.getByRole("note", { name: "dropped" });
     expect(note).toHaveTextContent("is not using these entries");
     expect(note).toHaveTextContent("/work/app · jenkins");
-    expect(note).toHaveTextContent("your organisation's policy disables this connector");
+    expect(note).toHaveTextContent("your organization's policy disables this connector");
     expect(note).toHaveTextContent("/elsewhere");
   });
 

@@ -448,7 +448,7 @@ impl AdminService {
         only_keys(args, &["confirm", "path"], OP_ENGINE_IMPORT)?;
         confirmed(args, OP_ENGINE_IMPORT, "import")?;
         // `engine_source: import_only` leaves this op open; the sources the
-        // organisation allows decide whether a local file may come in.
+        // organization allows decide whether a local file may come in.
         self.gate_model_source(envelope_id, OP_ENGINE_IMPORT, ModelSource::Import)
             .await?;
         let raw = crate::admin::required_str(args, "path", OP_ENGINE_IMPORT)?;

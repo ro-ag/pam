@@ -1245,7 +1245,7 @@ async fn settings_get_reports_the_effective_values_and_the_scopes_the_policy_dro
             "root": outside,
             "connector": null,
             "key": "scopes.allowed_repository_roots",
-            "reason": "this repository is outside the repository roots your organisation's policy allows",
+            "reason": "this repository is outside the repository roots your organization's policy allows",
         }])
     );
 }

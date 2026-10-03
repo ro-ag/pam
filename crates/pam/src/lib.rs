@@ -17,7 +17,7 @@
 //! check` only: `11` not trusted (`--trust`), `12` the file is invalid as a whole, `13` the file
 //! is valid but some leaves are rejected.
 //!
-//! `pam policy check <file>` is the one command about the organisation's managed policy, and it
+//! `pam policy check <file>` is the one command about the organization's managed policy, and it
 //! is not a security command: it reads the file the administrator names, the way the daemon would
 //! ([`check_policy_file`]), and changes nothing — no daemon, no store, no socket, no write. There
 //! is no command that sets, applies or installs a policy; the file is the MDM's.

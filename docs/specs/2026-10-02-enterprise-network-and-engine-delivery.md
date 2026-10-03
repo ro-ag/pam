@@ -58,7 +58,9 @@ Contract differences:
   loaded, under the operation lock, so a load cannot slip in.
 - **The managed layer** ships as the `ManagedNetworkLayer` trait with a fixed
   stub (`FixedManagedNetwork`); `mirror_allowed_hosts` is policy-only and is
-  enforced on the resolved value; the policy file is a later plan.
+  enforced on the resolved value. The policy file was built by plan 54
+  ([managed policy spec](2026-10-02-managed-policy-file.md)); what it changed
+  here is in [Policy layer](#policy-layer).
 - **`ignored_env`** lists eleven names (the proxy variables in both cases,
   `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`); the page prints them.
 - **`tools/check.sh`** does not yet export `PAM_REQUIRE_TLS_FIXTURE=1`; that
@@ -1030,8 +1032,45 @@ offers the test after every save.
 
 ## Policy layer
 
-A later plan adds a read-only managed policy file. The settings are shaped now so
-that layer is a pure overlay and needs no migration:
+**Built (plan 54).** The read-only managed policy file is designed and recorded
+in [the managed policy spec](2026-10-02-managed-policy-file.md), whose As built
+section is the behavior; the administrator's guide is
+[docs/policy/README.md](../policy/README.md). What it changed in this layer:
+
+- The file is read only from a fixed root/Administrators-owned path after a
+  trust check, never signed or fetched: the OS ownership is the signature.
+- The production layer is `PolicyNetwork`, wired by
+  `NetworkService::with_policy(handle)`. Besides the locked fields
+  (`current()`), it supplies unlocked policy defaults (`defaults()`: the
+  `no_proxy` list and the two mirrors, used only while the human has no value)
+  and a closure (`closed()`). `Resolved.sources` is `(Field, Source, Lock)`, so
+  a policy default reads `source: policy, locked: false`; `effective` entries
+  also carry `mode`, `reason` and `state` when the policy names the key.
+- **D6 amends the credential rule below:** a locked proxy with `auth: none`
+  (or pinned direct) also locks the password; with `basic` or `anyauth` the
+  password stays the human's to type. There is no pinned proxy credential
+  reference: a policy never carries a secret.
+- A proxy, no-proxy or CA leaf the policy requires but cannot put in force
+  (rejected with no last good value, or a CA pin that fails its trust check or
+  digest) refuses connector calls and downloads with the new cause
+  `network_policy_invalid` rather than going direct; `admin.network.get` still
+  reads and shows `closed_by_policy`.
+- A managed CA bundle is imported by the policy loader through the same trust
+  check as the policy file and must match its pinned SHA-256; the network
+  service uses that private copy through the unchanged `checked_copy` re-hash,
+  and pruning keeps it. **On Windows a pinned CA bundle is rejected** as a leaf
+  (`network_ca_unsupported_on_windows`) and has no effect, for the Schannel
+  reason in [Windows evidence](#windows-evidence-2026-10-02): install the CA in the
+  store through MDM.
+- Locked-field refusals keep the cause `setting_locked` and add a
+  `policy.locked_write` audit row; the user-facing strings now say
+  "organization" ("Managed by your organization").
+
+The design as written for the stub follows; where it disagrees with the list
+above, the list is the behavior.
+
+The settings are shaped so that layer is a pure overlay and needs no
+migration:
 
 - Resolution is a function over three values per field:
   `effective = managed.field.or(user.field).unwrap_or(default)`, producing

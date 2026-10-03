@@ -182,7 +182,7 @@ enum Cmd {
         #[arg(long, requires = "profile")]
         managed: bool,
     },
-    /// Check a managed policy file (the organisation's, delivered by MDM)
+    /// Check a managed policy file (the organization's, delivered by MDM)
     /// without a daemon. Reads the file named; writes nothing.
     Policy {
         #[command(subcommand)]

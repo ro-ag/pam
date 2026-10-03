@@ -1,4 +1,4 @@
-//! The managed policy document: an organisation's read-only file, parsed,
+//! The managed policy document: an organization's read-only file, parsed,
 //! validated leaf by leaf, and merged over the human's settings at read time.
 //!
 //! This module is pure: no I/O, no async, no store. The trust check that
@@ -97,7 +97,7 @@ pub const CAUSE_POLICY_DENIED: &str = "policy_denied";
 pub const CAUSE_NETWORK_SETTINGS_INVALID: &str = crate::admin_network::CAUSE_NETWORK_INVALID;
 
 /// The recovery line every policy refusal carries.
-pub const RECOVERY_MANAGED: &str = "Managed by your organisation's policy; ask your administrator.";
+pub const RECOVERY_MANAGED: &str = "Managed by your organization's policy; ask your administrator.";
 
 // --- File-level diagnostic codes ---------------------------------------
 
@@ -2953,7 +2953,7 @@ impl PolicyView {
             return Err(self.refusal(
                 key,
                 CAUSE_POLICY_FROZEN,
-                "this setting is managed by your organisation's policy, which cannot be read \
+                "this setting is managed by your organization's policy, which cannot be read \
                  right now; changes to it are paused",
             ));
         }
@@ -2972,7 +2972,7 @@ impl PolicyView {
             return Err(self.refusal(
                 key,
                 CAUSE_SETTING_LOCKED,
-                "this setting is set by your organisation's policy; nothing was changed",
+                "this setting is set by your organization's policy; nothing was changed",
             ));
         }
         Ok(())
@@ -3125,7 +3125,7 @@ impl PolicyView {
                 key,
                 CAUSE_POLICY_NOT_ALLOWED,
                 &format!(
-                    "the profile {:?} is more permissive than your organisation allows (at most {:?})",
+                    "the profile {:?} is more permissive than your organization allows (at most {:?})",
                     requested.as_str(),
                     floor.as_str()
                 ),
@@ -3204,7 +3204,7 @@ impl PolicyView {
                 key,
                 CAUSE_POLICY_NOT_ALLOWED,
                 &format!(
-                    "{shown} is outside what your organisation allows (min {}, max {})",
+                    "{shown} is outside what your organization allows (min {}, max {})",
                     leaf.min
                         .map_or_else(|| "none".to_owned(), |v| v.to_string()),
                     leaf.max
@@ -3385,7 +3385,7 @@ impl PolicyView {
             return Err(self.refusal(
                 key,
                 CAUSE_POLICY_NOT_ALLOWED,
-                &format!("{first:?} is not in the list your organisation allows"),
+                &format!("{first:?} is not in the list your organization allows"),
             ));
         }
         Ok(())
@@ -3487,7 +3487,7 @@ impl PolicyView {
             return Err(self.refusal(
                 Key::GrantsManual,
                 CAUSE_SETTING_LOCKED,
-                "your organisation's policy does not allow adding grants by hand",
+                "your organization's policy does not allow adding grants by hand",
             ));
         }
         if let Some(rule) = self.never_match(capability, class) {
@@ -3516,7 +3516,7 @@ impl PolicyView {
             return Err(self.refusal(
                 Key::GrantsRemember,
                 CAUSE_SETTING_LOCKED,
-                "your organisation's policy does not allow remembering an approval",
+                "your organization's policy does not allow remembering an approval",
             ));
         }
         Ok(())
@@ -3616,7 +3616,7 @@ impl PolicyView {
             .is_none_or(|agents| agents.contains(&agent))
     }
 
-    /// Whether the organisation requires the login unit (a compliance
+    /// Whether the organization requires the login unit (a compliance
     /// signal, never an enforcement).
     #[must_use]
     pub fn require_login_unit(&self) -> bool {

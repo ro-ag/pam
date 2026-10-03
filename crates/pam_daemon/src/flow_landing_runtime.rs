@@ -153,7 +153,7 @@ pub(super) async fn inspect_policy(
             return Err(FlowRefusal::new(
                 crate::managed_policy::CAUSE_POLICY_DENIED,
                 format!(
-                    "your organisation's policy does not allow landing to {permission} on this \
+                    "your organization's policy does not allow landing to {permission} on this \
                      machine (landing.max_permissions)"
                 ),
                 crate::managed_policy::RECOVERY_MANAGED,

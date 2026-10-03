@@ -954,7 +954,7 @@ pub fn render_ticket(ticket: &str, position: u64) -> String {
 pub fn render_status(body: &serde_json::Value) -> String {
     let field = |name: &str| body.get(name).map_or_else(|| "?".to_owned(), render_scalar);
     format!(
-        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  boundary:        {}\n  playbook:        pam playbook (the agent guide)",
+        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  boundary:        {}\n  policy:          {}\n  playbook:        pam playbook (the agent guide)",
         field("daemon_version"),
         field("protocol"),
         body.get("uptime_s")
@@ -964,7 +964,54 @@ pub fn render_status(body: &serde_json::Value) -> String {
         render_model(body.get("model")),
         render_keyring(body.get("keyring")),
         render_boundary(body.get("boundary")),
+        render_policy(body.get("policy")),
     )
+}
+
+/// The `policy:` line from the public `status.policy` block, which carries
+/// the state, revision, a 12-hex digest prefix and the rejected-leaf count,
+/// never the organization or a rule (the content stays on the admin plane):
+/// `none (unmanaged)`, `active, rev R, digest D`, `degraded, ...; N leaves
+/// rejected`, `last_good, ...` (the file cannot be used; the last good copy
+/// is in force) or `frozen` (the file cannot be used and there is no copy).
+/// A daemon that publishes no block is an older build and renders `?`.
+fn render_policy(policy: Option<&Value>) -> String {
+    let Some(policy) = policy.filter(|policy| policy.is_object()) else {
+        return "?".to_owned();
+    };
+    let state = terminal_safe(field(policy, "state"));
+    let mut facts = Vec::new();
+    if let Some(revision) = policy.get("revision").and_then(Value::as_str) {
+        facts.push(format!("rev {}", terminal_safe(revision)));
+    }
+    if let Some(digest) = policy.get("digest").and_then(Value::as_str) {
+        facts.push(format!("digest {}", terminal_safe(digest)));
+    }
+    let facts = if facts.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", facts.join(", "))
+    };
+    let rejected = policy
+        .get("rejected_leaves")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    match state.as_str() {
+        "none" => "none (unmanaged)".to_owned(),
+        "active" => format!("active{facts}"),
+        "degraded" => format!(
+            "degraded{facts}; {rejected} {} rejected, the rest applies",
+            if rejected == 1 { "leaf" } else { "leaves" }
+        ),
+        "last_good" => format!(
+            "last_good{facts}; the policy file cannot be used, the last good copy is in force"
+        ),
+        "frozen" => "frozen; the policy file cannot be used and there is no last good copy: \
+                     changes that widen what agents can do are paused"
+            .to_owned(),
+        "" => "?".to_owned(),
+        other => format!("{other}{facts}"),
+    }
 }
 
 /// The `boundary:` line: the block's own `summary` (`never checked — run

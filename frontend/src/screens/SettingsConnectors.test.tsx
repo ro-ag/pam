@@ -372,14 +372,14 @@ it("prints the hosts the policy allows beside the base URL, which stays editable
 });
 
 it.each([
-  ["connector_disabled", "GitHub is disabled by your organisation's policy"],
-  ["policy_not_allowed", "api.example.test is not a host your organisation allows"],
-  ["setting_locked", "this setting is managed by your organisation's policy"],
+  ["connector_disabled", "GitHub is disabled by your organization's policy"],
+  ["policy_not_allowed", "api.example.test is not a host your organization allows"],
+  ["setting_locked", "this setting is managed by your organization's policy"],
 ])("renders a %s refusal's detail and recovery", async (cause, detail) => {
   mocks.connectorsConfigure.mockRejectedValue({
     cause,
     detail,
-    recovery: "Managed by your organisation's policy; ask your administrator.",
+    recovery: "Managed by your organization's policy; ask your administrator.",
   });
   await setup();
   fireEvent.change(row().getByLabelText("GitHub credential"), { target: { value: "token" } });

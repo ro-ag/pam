@@ -4,7 +4,7 @@
 //! how long a request's audit record lives. Both default to forever (a store never told a window
 //! loses nothing) and are stored as JSON in the `setting` table (`null` = forever), so unset and
 //! deliberate "keep everything" read the same.
-//! - **Managed policy**: the windows the human saved are bounded at read time by the organisation's
+//! - **Managed policy**: the windows the human saved are bounded at read time by the organization's
 //!   `retention.evidence_days` / `retention.audit_days` ([`PolicyView::effective_retention`]):
 //!   `locked` forces a value, `min` lengthens a shorter window, `max` is a ceiling that also turns
 //!   "forever" (a stored `null`, or nothing stored) into the ceiling, and `default` applies until

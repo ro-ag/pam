@@ -2164,7 +2164,7 @@ impl RunState<'_> {
             return Err(FlowRefusal::new(
                 CAUSE_POLICY_DENIED,
                 format!(
-                    "step {:?} runs {program:?}, which your organisation's policy does not \
+                    "step {:?} runs {program:?}, which your organization's policy does not \
                      allow on this machine ({})",
                     step.id,
                     Key::FlowsPrograms
@@ -2484,14 +2484,14 @@ impl RunState<'_> {
         // Validation guarantees a command step has at least its program.
         let program = argv.first().cloned().unwrap_or_default();
         // The live policy, not only the settings this run started with: a
-        // program the organisation's policy removes is never spawned, and
+        // program the organization's policy removes is never spawned, and
         // the refusal names the policy rather than the human's allowlist.
         if policy_forbids_program(&self.service.policy.view(), &program) {
             report.fail(
                 StepStatus::Blocked,
                 CAUSE_POLICY_DENIED,
                 format!(
-                    "step {:?} runs {program:?}, which your organisation's policy does not \
+                    "step {:?} runs {program:?}, which your organization's policy does not \
                      allow on this machine ({})",
                     step.id,
                     Key::FlowsPrograms

@@ -212,7 +212,7 @@ impl ScopePolicy {
                     connector: None,
                     key: Key::ScopesAllowedRepositoryRoots,
                     reason: "this repository is outside the repository roots your \
-                             organisation's policy allows"
+                             organization's policy allows"
                         .to_owned(),
                 });
                 return false;
@@ -277,7 +277,7 @@ impl ScopePolicy {
                     Key::ScopesAllowedRepositoryRoots,
                     CAUSE_POLICY_NOT_ALLOWED,
                     &format!(
-                        "repository {root} is outside the repository roots your organisation \
+                        "repository {root} is outside the repository roots your organization \
                          allows"
                     ),
                 ));
@@ -300,7 +300,7 @@ impl ScopePolicy {
                         CAUSE_POLICY_NOT_ALLOWED,
                         &format!(
                             "the {connector} service {} for {root} is not a host your \
-                             organisation allows",
+                             organization allows",
                             scope.base_url
                         ),
                     ));
@@ -783,19 +783,19 @@ fn connector_forbidden(view: &PolicyView, scope: &ConnectorScope) -> Option<(Key
     if view.connector_disabled(scope.connector) {
         return Some((
             Key::ConnectorsDisabled,
-            "your organisation's policy disables this connector",
+            "your organization's policy disables this connector",
         ));
     }
     if !base_url_allowed(view, &scope.base_url) {
         return Some((
             Key::ConnectorsAllowedBaseHosts,
-            "this connector's service is not on a host your organisation's policy allows",
+            "this connector's service is not on a host your organization's policy allows",
         ));
     }
     if scope.access == ScopeAccess::ConnectorWide && view.connector_wide_denied() {
         return Some((
             Key::ScopesConnectorWide,
-            "your organisation's policy does not allow connector-wide access; approve \
+            "your organization's policy does not allow connector-wide access; approve \
              explicit targets",
         ));
     }
@@ -817,7 +817,7 @@ fn base_url_allowed(view: &PolicyView, base_url: &str) -> bool {
 /// A denial that names the policy: the human cannot fix it in Settings.
 fn policy_denied(entry: &ScopeDrop) -> ScopeError {
     ScopeError::Denied(format!(
-        "{} ({}); managed by your organisation's policy, ask your administrator",
+        "{} ({}); managed by your organization's policy, ask your administrator",
         entry.reason, entry.key
     ))
 }

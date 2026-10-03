@@ -57,7 +57,7 @@ All notable changes to pam are documented in this file. The format follows
   `admin.network.test` (GUI-only), audit action `network.configure` with field
   names only, and the typed word `network` for a proxy, password or CA change.
   Fields a managed policy pins are reported locked and refuse the whole patch
-  (`setting_locked`); the policy layer itself is a trait with a stub.
+  (`setting_locked`); the managed policy file below fills that layer.
 - The engine card says, before the click, exactly what Install does:
   `admin.models.engine.status` discloses the asset, its size and SHA-256, the
   URL and host it would be fetched from, whether a mirror is in use, the
@@ -120,9 +120,58 @@ All notable changes to pam are documented in this file. The format follows
   executable paths are attribution, and agents that need different authority
   run as different users. The playbook teaches `pam doctor --json` once per
   session, exit `6`, and stopping rather than working around a finding.
+- A managed policy file: an organization delivers one read-only JSON document
+  with its MDM to a fixed path, `/Library/Application Support/PAM/policy.json`
+  on macOS or `%ProgramData%\PAM\policy.json` on Windows (no flag, environment
+  variable or base directory can move it). The daemon reads it only after a
+  trust check: on macOS the file and every folder above it owned by root and
+  writable by nobody else, no symlink, one handle from check to read, and a
+  write probe; on Windows the daemon's own token must be unable to write,
+  delete or re-ACL the file or its folder. It can lock a setting, set an
+  organization default the human may change, bound it (`floor`, `min`,
+  `max`), allowlist it (`allow`), or add constraints only an organization
+  states: never-grant capability patterns and classes, allowed repository
+  roots, connector hosts, GitHub servers, model sources and curators, a
+  landing ceiling, an engine source and a login-unit requirement. Proxy,
+  no-proxy, CA bundle and mirrors are covered too. A damaged file follows a
+  two-tier rule: a rejected authority key (security, scopes, connectors,
+  programs, landing, retention, proxy) keeps the last good value or, with
+  none, is held so nothing loosens, while a rejected convenience key (mirrors,
+  models directory, idle unload) falls back to the human's value. The policy
+  is re-read at boot, on a 60 s stat poll, on a 10 min re-verify and on
+  "Check now"; it is an overlay computed at read, so the human's own settings
+  are never rewritten and come back when the file is removed. Guide and
+  samples: `docs/policy/`.
+- `pam policy check <file> [--platform macos|windows] [--trust] [--json]`
+  validates a policy file exactly as the daemon would, with no daemon and no
+  write, and exits `0` valid, `13` valid with rejected leaves, `12` invalid as
+  a whole, `11` not trusted (`--trust` runs this machine's trust check on the
+  file where it sits), `1` unreadable. MDM compliance scripts run it against
+  the fixed path with `--trust --json`.
+- Settings shows managed values: a locked control is disabled with "Managed by
+  your organization", the reason and the contact; a bounded or allowlisted
+  control prints its constraint; an organization default says so. Security ›
+  Managed policy shows the file's path and trust check, revision, digest,
+  organization, contact, the last good copy, every key's state and a "Check
+  now" button, and the Settings header carries a status line. Every settings
+  `get` op returns an `effective` entry per field (`source`, `locked`, `mode`,
+  `constraint`, `reason`, `state`).
+- Daemon ops `admin.policy.get` and `admin.policy.reload` (GUI-only). Refused
+  writes to a managed setting answer `setting_locked`, `policy_not_allowed` or
+  `policy_frozen` and write a `policy.locked_write` audit row; loads write
+  `policy.load`, `policy.reject` and `policy.clear` rows with the policy's
+  digest. `pam status` gains a `policy` block (state, revision, a digest
+  prefix, rejected-leaf count; never a rule or the organization) and a
+  `policy:` line.
 
 ### Changed
 
+- A proxy locked by policy with `auth: none` (or pinned direct) also locks the
+  proxy password; with `basic` or `anyauth` the password stays the human's to
+  type in Settings › Network, because a policy file never carries a secret.
+  A network setting the policy requires but cannot put in force refuses
+  connector calls and downloads with the new cause `network_policy_invalid`,
+  whose recovery sends the human to the administrator.
 - On Windows `admin.network.set` refuses a CA bundle file (`network_ca_unsupported_on_windows`)
   and Settings › Network shows the field read-only: install the CA in the Windows
   certificate store, which PAM's curl trusts. On macOS saving a bundle warns that it is
@@ -313,6 +362,22 @@ All notable changes to pam are documented in this file. The format follows
   `false` only when both the daemon's resolution and the client's own chain are
   known and differ; `null` (undetermined) when either is unknown, as under a
   profile that denies `/bin/ps`.
+- A corrupt, oversized or untrusted policy file never loosens security: it is
+  never read for its content, the last good copy stays in force, and with no
+  copy the authority keys are frozen (writes to them are refused
+  `policy_frozen`, except a stricter profile and revoking a grant). A trusted file that loosens (for example a
+  locked `relaxed` profile) is honoured only because it passed the same check.
+  The public `status` and agent refusals say that a policy exists and that a
+  capability is not available, never which rule refused it.
+- Control requests (`status`, `query`, `cancel`, `doctor.report`) stay
+  available under any never-grant rule, so a policy such as `never: ["*"]`
+  cannot take down the control plane; every work and admin capability can be
+  denied.
+- A policy that pins a CA bundle on Windows has that leaf rejected
+  (`network_ca_unsupported_on_windows`) and has no effect: install the CA in
+  the Windows certificate store through MDM. A bundle file would replace the
+  store's trust and break public hosts, so the network stays on store trust
+  and `pam policy check --platform windows` reports the leaf.
 
 ### Removed
 

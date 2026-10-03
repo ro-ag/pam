@@ -111,8 +111,8 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 6 | Medium | The advisory model sits on the flow's critical path with a 15-minute, uncancellable, globally serialized call | `model_service.rs:612-1197`, `log_service.rs:473-515` | fixed: 5 minutes in all, 2 minutes in the engine, cancel threaded from the flow step |
 | 7 | Medium | The summary prompt mixes the host's exit status with untrusted log text, and the summary reaches the agent unlabelled | `compact.rs:657`, `log_service.rs:42-648` | fixed: host facts in the system turn, evidence fenced by a per-call token, `[untrusted local-model summary]` in the CLI; the GUI summary is still unlabelled |
 | 8 | Medium | The structured diagnosis stack has no production caller and two latent authority bugs | `diagnosis_service.rs:512` | partly fixed: both latent bugs fixed; wiring or deleting the stack is an owner decision |
-| 9 | Medium | Two curl launchers with divergent policy; connectors cannot be configured for enterprise networks | `curl.rs:154`, `download.rs:818-853` | fixed (2026-10-02, [enterprise network and engine delivery](../specs/2026-10-02-enterprise-network-and-engine-delivery.md)): one launcher in `pam_net` with a constant argv, a cleared environment and https-only; daemon-owned proxy, no-proxy, CA bundle and mirror settings set in Settings › Network, applied to connectors and downloads alike; no environment variable is read |
-| 10 | Low-medium | The log redirect hop has no host or port constraint, and a second weaker redirect implementation exists | `connector_service.rs:876-902`, `curl.rs:320-339` | partly fixed: IP literals, local-looking names and ports other than 443 refused; since 2026-10-02 every redirect, download and mirror hop may only go to https (`proto-redir`), mirror hosts must be https and never loopback or link-local, and a managed `mirror_allowed_hosts` allowlist exists for mirrors; a strict host allowlist for the log redirect itself is still an owner decision |
+| 9 | Medium | Two curl launchers with divergent policy; connectors cannot be configured for enterprise networks | `curl.rs:154`, `download.rs:818-853` | fixed (2026-10-02, [enterprise network and engine delivery](../specs/2026-10-02-enterprise-network-and-engine-delivery.md)): one launcher in `pam_net` with a constant argv, a cleared environment and https-only; daemon-owned proxy, no-proxy, CA bundle and mirror settings set in Settings › Network, applied to connectors and downloads alike; no environment variable is read. Since 2026-10-03 an organization can lock or default them with the [managed policy file](../specs/2026-10-02-managed-policy-file.md) |
+| 10 | Low-medium | The log redirect hop has no host or port constraint, and a second weaker redirect implementation exists | `connector_service.rs:876-902`, `curl.rs:320-339` | partly fixed: IP literals, local-looking names and ports other than 443 refused; since 2026-10-02 every redirect, download and mirror hop may only go to https (`proto-redir`), mirror hosts must be https and never loopback or link-local, and a managed `mirror_allowed_hosts` allowlist exists for mirrors (delivered by the managed policy file since 2026-10-03); a strict host allowlist for the log redirect itself is still an owner decision |
 | 11 | Low-medium | Credentials are stored untrimmed; control characters round-trip into the header | `admin_connectors.rs:307`, `curl.rs:218-406` | fixed |
 | 12 | Low | One hung keychain prompt stalls every connector | `blocking_jobs.rs:151`, `secrets.rs:631` | fixed for reads (20 s bound); writes stay unbounded; a per-request credential cache is deferred |
 | 13 | Low | The AWS refusal is a single `if` in the daemon; the adapter is unsafe if it moves | `connector_service.rs:514`, `aws.rs:126-287` | fixed: the adapter's one spawn point refuses; deleting or containing the adapter is an owner decision |
@@ -223,6 +223,17 @@ From the fix reports:
   from a file, remove engine, and the disclosure on the engine card and in the
   README that closes ptrack issue 43 (the owner had not been told that
   inference runs a downloaded `llama-server` process).
+- Managed settings for enterprise fleets: the network spec deferred "the policy
+  file itself", so an organization could not lock or default what a person
+  sets. **Done 2026-10-03 (ptrack plan 54,
+  [managed policy spec](../specs/2026-10-02-managed-policy-file.md))**: one
+  read-only JSON file at a fixed root/Administrators-owned path, trust-checked
+  before use, that can lock, default, bound or allowlist every settings document
+  (profile, grants, scopes, connectors, flows, landing, models, retention,
+  network) and add organization-only constraints; Settings shows each managed
+  value; a damaged or untrusted file never loosens anything; `pam policy check`
+  validates a file before the push and checks it on the endpoint. Delivery
+  guide: [docs/policy/](../policy/README.md).
 - A strict host allowlist for log redirects (mirrors have a policy-only
   allowlist since 2026-10-02; the log redirect hop does not).
 - Bind the model qualification record to the prompt and server options, so a
@@ -230,7 +241,11 @@ From the fix reports:
 - Whether the AWS adapter stays, is contained, or is deleted.
 - A native confirmation dialog for authority-expanding admin operations (the
   bridge's typed phrase does not stop a compromised webview), and whether Stop
-  daemon should stay a no-op while the GUI is open.
+  daemon should stay a no-op while the GUI is open. Still open; on a managed
+  machine the policy narrows it: a key the policy locks or bounds (a `strict`
+  profile, `grants.manual: deny`, `grants.remember: deny`, never-grant rules)
+  is refused by the daemon whatever the webview sends, so a compromised webview
+  cannot widen it (2026-10-03, plan 54).
 
 ## Deferred
 

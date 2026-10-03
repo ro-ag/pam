@@ -1,6 +1,12 @@
 # Managed read-only policy file — design and implementation plan
 
-Status: design for review, 2026-10-02 (ptrack plan 54). Implements the owner
+Status: implemented; Windows ACL matrix and the owner's sudo pass pending (T13).
+Built on `feat/managed-policy` (T1–T12), 2026-10-02/03. What was built, and
+where it departs from the design below, is in [As built](#as-built-2026-10-03);
+where the two disagree, As built is the behavior. The administrator's guide is
+[docs/policy/README.md](../policy/README.md).
+
+Designed 2026-10-02 (ptrack plan 54). Implements the owner
 directive of 2026-10-02 ("do what is best for the product and make it easy for
 enterprise environments") for the one item the network spec deferred: a policy
 an organisation delivers with its MDM, which the human at the keyboard and the
@@ -367,8 +373,9 @@ refused with `policy_frozen` (the same cause for every held key); and nothing
 loosens. For a leaf whose *intent is known* (it was present and rejected) three
 network keys also close their consumers: a rejected `network.proxy`, `no_proxy` or
 `ca_bundle` with no last-good value makes connector calls and downloads refuse
-`network_policy_invalid`, the failure `NetworkService` already uses for a corrupt
-proxy (`network_service.rs`, module docs: "falling back to a direct connection on
+`network_policy_invalid` (as built a new `NetFailure::PolicyInvalid`; the
+corrupt-proxy refusal it was modelled on is `network_settings_invalid`;
+`network_service.rs`, module docs: "falling back to a direct connection on
 a corrupt proxy setting would send traffic around a proxy the organisation
 requires"). Nothing else stops: flows, the gate, the GUI and agents keep working.
 For a *file-level* failure with no last good policy the intent is unknown, so
@@ -563,7 +570,9 @@ other code as not):
 
 `pam policy check --installed [--expect-revision R] [--json]` exits `0` trusted
 and valid (and, if given, the revision matches); `10` no policy installed; `11`
-untrusted; `12` file-level invalid; `13` leaf problems; `14` revision mismatch.
+untrusted; `12` file-level invalid; `13` leaf problems; `14` revision mismatch. (As
+built, item 5: `--installed`, `--expect-revision`, `10` and `14` were not built;
+`pam policy check <fixed path> --trust --json` is the compliance command.)
 `pam status --json` gives `.policy.state` for a machine whose daemon is up
 (Jamf extension attribute, Intune detection script). `service.require_login_unit`
 is a *compliance requirement, not an enforcement*: PAM cannot make a user-scope
@@ -645,7 +654,10 @@ itself be floored by the policy.
 
 ## Delivery guidance (for administrators)
 
-This section becomes `docs/managed-policy.md` (T12).
+This section became [docs/policy/README.md](../policy/README.md) (written by
+T10; T12 linked it from the README, the boundary document and the trust
+refusals). The CA lines below are macOS only: a CA bundle a Windows policy pins
+is rejected (As built, item 6).
 
 ### Layout
 
@@ -710,7 +722,8 @@ inheritance behaviour are asserted in T13 before this text ships.
   runs the real trust check and the schema against the installed file, no daemon
   needed. Exit `0` trusted and valid; `10` none installed; `11` untrusted; `12`
   invalid; `13` leaf problems; `14` revision mismatch. This is the compliance
-  command for Jamf extension attributes and Intune Remediations.
+  command for Jamf extension attributes and Intune Remediations. (Not built
+  in this form; see As built, item 5.)
 - `pam status --json` `.policy` on a running machine; the GUI's Settings >
   Managed policy page for a human.
 
@@ -923,7 +936,9 @@ conventional-prefix PR title; wait for green PR checks before the squash merge
 
 ### Phase E
 
-**T12. Documentation (one agent, no code).** New `docs/managed-policy.md` (the
+**T12. Documentation (one agent, no code).** (As built: the guide is
+`docs/policy/README.md`, written by T10; T12 also took the loose ends listed in
+As built.) New `docs/managed-policy.md` (the
 [delivery guidance](#delivery-guidance-for-administrators), the key table in
 plain words, the compliance codes); `docs/admin-boundary.md` (a "Managed policy"
 section: what the file can and cannot do, the trust rule, the residual);
@@ -1003,6 +1018,198 @@ Only two need the owner.
    Configuration Profile or on GPO/ADMX registry policy, D8's adapters need `plist`
    or `winreg` (new dependencies, owner approval). Recommendation: ship the file,
    ask the pilot, add the adapter they need.
+
+## As built (2026-10-03)
+
+What shipped on `feat/managed-policy` for T1 to T12, and where it departs from
+the design above. Where this section and an earlier one disagree, this one is
+the behavior; the sections above stay as the reasoning. Line references in the
+design sections are to the tree it was written against and have moved.
+
+### Names and shapes
+
+1. **Trust rules.** `TrustRules::production()` is the only constructor
+   production code calls (the spec's name; an earlier brief said
+   `platform()`). The fixed path is `managed_policy_trust::policy_path()`, not a
+   field of the rules. `FileSource::platform()` uses both; `FileSource::at` is
+   `#[cfg(test)]`, so production has no way to name another path. Tests outside
+   the crate inject a `PolicySource` (`pam_testkit::ScriptedPolicy`).
+2. **The effective scope loader is `ScopePolicy::load_effective(store,
+   &PolicyView)`**, not a changed `load`. The raw loader is `load_user`,
+   `pub(crate)`, named only in `scope_policy.rs` and `admin_flows.rs`, and a
+   source-grep test holds it there. The rename to `load` was left as optional.
+   Landing follows the same pattern (`Snapshot::load_effective`); the landing
+   sweep keeps the raw `Snapshot::load` on purpose, because which workspace
+   roots exist is the human's document, not a permission.
+3. **Network defaults are a layer method, not a field.**
+   `ManagedNetworkLayer` gained `defaults()` (the in-force `default` of
+   `no_proxy`, `engine_mirror`, `models_mirror`) and `closed()`; production
+   wires `NetworkService::with_policy(handle)` (`PolicyNetwork`), whose
+   `closed()` is `PolicyHandle::network_closed()` and therefore includes a CA
+   pin that failed its trust check or digest. `ManagedNetwork` has no
+   `default` field. `network.proxy` takes `locked` only; `no_proxy` and the
+   mirrors take a default.
+4. **`network_policy_invalid` is a new cause**, `NetFailure::PolicyInvalid`
+   ("The managed network policy cannot be used: ..."; recovery: ask your
+   administrator, nothing was sent). It is never retried and its recovery never
+   points at Settings. The design called it an existing failure; the existing
+   one is `network_settings_invalid`.
+5. **`pam policy check`** is `pam policy check <file> [--platform
+   macos|windows] [--trust] [--json]`, with `--for` as an alias of
+   `--platform`. Exit `0` valid, `13` leaf problems, `12` file-level invalid,
+   `11` not trusted (`--trust` only; it takes precedence over 12 and 13
+   because the daemon never reads an untrusted file's content), `1` unreadable
+   (missing, not a regular file), `2` usage (including `--trust` with another
+   platform). **`--installed`, `--expect-revision` and exits `10` and `14` were
+   not built:** `--trust` answers the installed-file question for any file it
+   is given, at the fixed path or not, and the JSON document carries
+   `meta.revision`, `digest` and `trust.at_fixed_path`, so a script compares a
+   revision itself. A missing file at the fixed path is exit `1`, not `10`. The
+   one-line compliance command an MDM script uses today is
+   `pam policy check "/Library/Application Support/PAM/policy.json" --trust --json`
+   on macOS and
+   `pam policy check "$env:ProgramData\PAM\policy.json" --trust --json`
+   (PowerShell) on Windows; exit `0` is compliant. The samples are
+   `docs/policy/{minimal,network-only,strict-fleet}.json`, kept valid by
+   `crates/pam/tests/policy_cli.rs` (not `docs/managed-policy/samples/` and a
+   `managed_policy_samples_test.rs`).
+6. **A CA bundle pinned on Windows is rejected (decision note 751).** A
+   `network.ca_bundle.locked: {path, sha256}` in a Windows policy is a rejected
+   leaf with the code `network_ca_unsupported_on_windows` and the recovery
+   "install the CA in the Windows certificate store through MDM". It is not
+   held and not taken from a last-good copy, so it never closes the network:
+   the pin has no effect and PAM stays on store trust. `locked: null` (store
+   trust) is valid. `pam policy check --platform windows` reports it (exit
+   `13`). Reason: the measured Schannel behaviour (plan 52) is that a `cacert`
+   file replaces the store's trust and breaks public hosts, and closing the
+   network over it would take a fleet's connectors down over a policy mistake.
+7. **The control plane is exempt from never-grant rules (decision note
+   752).** `grants.never` and `never_classes` refuse `policy_denied` on every
+   profile, before the grant lookup and any auto-grant, for every class except
+   Control (`status`, `query`, `cancel`, `doctor.report`), so `never: ["*"]`
+   cannot take down the control plane. Read-only capabilities are denied.
+   `flow.inspect` applies the same rule (`inspect_admission`), so it never
+   shows a step admissible that the gate refuses.
+8. **D6 as implemented.** A proxy locked with `auth: none`, or pinned direct
+   (`locked: null`), also locks the password; a locked proxy with `basic` or
+   `anyauth` leaves the password field the human's to type, and a patch that
+   sets only the password is not counted as a proxy change.
+9. **`admin.policy.get`** is T3's `admin_json()` plus `origin.trust` and
+   `compliance`: `trust { verdict: trusted|untrusted|busy|absent, code,
+   recovery, owner, writable_by_user, symlink, parents }`, each fact `ok`,
+   `failed` or `unknown` (the check stops at the first failure, so the facts
+   after it are `unknown`). `compliance.login_unit.present` is `true`/`false`
+   on macOS (a plist under `~/Library/LaunchAgents` or `/Library/LaunchAgents`
+   with the unit's label) and **`null` on Windows**, because only `schtasks`
+   can tell and a read op spawns no program; the GUI's own `service status`
+   answers there. The compliance block is on the admin op only, not in
+   `status.policy`.
+10. **Audit `trigger` wording.** Rows written by the policy service carry
+    `trigger: boot | poll | reload`; `reload` is the word for an explicit
+    re-read, so the `policy.load`, `policy.reject` or `policy.clear` rows an
+    `admin.policy.reload` causes say `reload` and sit on the op's own request.
+    The op's terminal `admin` row says `trigger: "admin"` with the prior and
+    new state and digest. `policy.clear` carries `{trigger, prior_digest}`.
+    `policy.reject` is written once per `(code, digest, fingerprint)`.
+11. **Last-good row.** `setting` row `policy.last_good`: a JSON header line
+    `{format, digest, loaded_ts}`, a newline, then the exact file text
+    (escaping the text would push a 64 KiB file past the 70 KiB bound). It is
+    read through a new bounded store accessor, ignored when the text's
+    SHA-256 differs from the header, and re-parsed by the running binary. A
+    copy is not replaced while one of its leaves is what holds a rejected leaf
+    of the newer file.
+12. **The `status` block and the `pam status` line.** `status.policy` is
+    `{state, revision, digest (12 hex), loaded_ts, managed, rejected_leaves}`,
+    from memory. The `pam status` line carries no organization (D13 keeps it
+    off the public plane, which the design's example line contradicted):
+    `policy: none (unmanaged)`, `active, rev R, digest D`, `degraded, rev R,
+    digest D; N leaves rejected, the rest applies`, `last_good, ...; the
+    policy file cannot be used, the last good copy is in force`, or `frozen;
+    ... changes that widen what agents can do are paused`; `?` for an older
+    daemon.
+
+### Behaviour that differs from the design
+
+13. **Trust check.** The positive unix fixture is a `0444` file: under the
+    write probe a `0644` file the daemon's own user owns is writable by that
+    user and is refused, which is correct; `0644` is the production case for a
+    root-owned file. A swap between the stat and the open is `busy`
+    (transient: the previous view stays and the next poll reads in full), not a
+    hard refusal, because the delivery script's `mv -f` produces exactly that
+    race. A file that disappears after the first look is `busy`, not absent.
+    Execute bits and setuid/setgid/sticky are refused (`not_regular`). On
+    Windows `FILE_WRITE_ATTRIBUTES` is probed too, since a token with it can
+    clear a read-only attribute. A path that is not canonical is refused, so a
+    CA bundle path must be canonical (on macOS `/etc` is a symlink).
+14. **Grammar.** Host lists use the no-proxy grammar, which refuses wildcards:
+    `*.example.com` is a rejected leaf (write `example.com`; a domain covers its
+    subdomains). String, list, control-character and `reason` limits are leaf
+    level, not file level (D5). An empty `network.mirror_allowed_hosts: []` is
+    rejected (the network service would read it as any host), while an empty
+    `allowed_base_hosts` or `allowed_github_servers` means none. A section that
+    is not an object rejects every key it would hold, and dotted member names
+    are unknown keys. A retention pair breach is reported on
+    `retention.evidence_days`. `models.dir` must be absolute (no `~`); an idle
+    `max` must be at least 1.
+15. **Frozen.** A frozen view (a file-level failure with no last good copy)
+    holds every Tier A key and leaves the network open (intent unknown).
+    `profile.set` to a value at least as strict as the effective profile and
+    `grants.revoke` still pass; the exception lives in
+    `policy::check_profile_write`. A CA pin that failed its import refuses a
+    human edit with `setting_locked`, not `policy_frozen`, because the view
+    has no way to mark a leaf held after the fact (`reject_leaf` was left as
+    optional).
+16. **Defaults.** A profile `default` seeds the row on first boot, so the
+    effective entry reads `source: user` afterwards. A retention window the
+    human never set that the policy manages stays unset on save, so the
+    policy default keeps applying; a garbled stored window stays forever (a
+    `max` still clamps it).
+17. **Paths.** `scopes.allowed_repository_roots` prefixes are compared by
+    component against canonical repository roots: write canonical prefixes
+    (`/private/var`, not `/var`, on macOS). `PathRule::covers` strips the
+    Windows verbatim prefix (`\\?\C:\...`) itself.
+18. **Consumers.** Connector summaries report `enabled` as the row enabled and
+    not policy-disabled. A reload that moves the effective `models.dir`
+    unloads the loaded model (a change hook). The follow path of public
+    results authorizes under the policy view, so a repository the policy drops
+    cannot keep following an earlier ticket. A program the policy removes is
+    refused before the gate and again before spawn.
+19. **Reload and the GUI.** No `policy.changed` hub event was registered:
+    both admin ops reply with the fresh body, and the GUI re-reads on mount,
+    on window focus and after Check now (which invalidates every `effective`
+    query). Opening Settings reads `admin.policy.get`; it does not reload,
+    because a reload writes audit rows.
+20. **GUI.** The Managed policy view is a panel in Settings › Security, not a
+    tab; a status line in the Settings header says "Managed by your
+    organization's policy." or the warning for a degraded, last-good or frozen
+    state. A policy default is labelled only for `source: policy` with
+    `locked: false` (`source: default` means no policy is in play). Every
+    user-facing string, daemon and GUI, is spelled "organization" (the design
+    said "organisation"; T12 unified it). Checked in jsdom only, not in the
+    Tauri shell.
+21. **Not built.** The doctor's `policy_file_trusted` check and
+    `--require-policy`; the `status.policy.compliance` block (compliance is on
+    `admin.policy.get`); the reload when Settings opens (19).
+
+### Open items
+
+- **T13, Windows VM:** compile and run the `cfg(windows)` halves (`cargo test
+  -p pam_daemon` with `PAM_REQUIRE_WIN_ACL_FIXTURES=1`): the trust probes, the
+  ACL fixture matrix as the unprivileged user and the all-untrusted run as
+  SYSTEM, the verbatim-prefix path in the follow test, the delivery script end
+  to end, and the [evidence](#evidence-to-record) facts. Any contradicted rule
+  corrects this document before merge.
+- **T13, owner's macOS pass with `sudo`:** install a sample at the real path;
+  `pam policy check "/Library/Application Support/PAM/policy.json" --trust`
+  exits `0` and `pam status` shows `active`; `chmod g+w` exits `11` and the GUI
+  says why; an ACL (`chmod +a "user:<you> allow write"`) exits `11`; deleting
+  the file reads `none` after two polls.
+- Open questions 1 and 2 were decided by the owner's delegation (note 743):
+  the token probe ships for v1, and the file is the only transport until a
+  pilot needs another.
+- Optional cleanups left as they are: `load_effective` to `load`, a
+  `reject_leaf` on the view, the frozen-tightening exception moved into
+  `check_profile`.
 
 ## Evidence to record
 

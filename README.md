@@ -91,7 +91,7 @@ then `pam status` outside the sandbox.
 | `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket, including the state-changing steps that ran (`effects`). Local-model summaries are labelled `[untrusted local-model summary]`. |
 | `pam doctor [--json] [--no-report] [--timeout-ms N]` | Checks the caller's own sandbox boundary: from where it runs, it probes PAM's private paths, endpoints and brokers (writing, creating and sending nothing), prints the verdict and sends the document to the daemon as `doctor.report` (`--no-report` skips that; the exit code never depends on it). Exit `0` `established`, `6` `not_established` (the failed probes are listed), `1` `cannot_probe` (the daemon did not answer the hello; nothing is started). With `--json` the document is the only thing on stdout; when the daemon answered, its reply is the top-level `daemon_reply` member. See [Verifying your agent's sandbox](#verifying-your-agents-sandbox). |
 | `pam doctor --profile <claude-code\|codex\|gemini-cli\|copilot-cli\|sandbox-exec> [--base DIR] [--managed]` | Prints the reference sandbox profile for that harness with the base directory filled in (default: the resolved base; `--base` is made absolute and resolved) and exits `0` without probing or dialing; `--managed` prints the locked variant where one exists (Claude Code). The sources, with the per-harness guides, live under [docs/sandbox/](docs/sandbox/README.md). |
-| `pam policy check <file> [--platform macos\|windows] [--trust] [--json]` | Validates a managed policy file (the organisation's, delivered by MDM) exactly as the daemon would read it, with no daemon and no write: one line per key with its tier, modes, what each mode means and the value or the reason it was rejected, then the digest and what the file locks. `--platform` (or `--for`) checks path syntax for the target platform (default: this machine's); `--trust` also runs this machine's production trust check on the file where it sits and reports each rule. Exit `0` valid, `13` valid with rejected leaves, `12` invalid as a whole, `11` not trusted (`--trust`), `1` unreadable. A file over 64 KiB is refused unread. Delivery guide and samples: [docs/policy/](docs/policy/README.md). |
+| `pam policy check <file> [--platform macos\|windows] [--trust] [--json]` | Validates a managed policy file (the organization's, delivered by MDM) exactly as the daemon would read it, with no daemon and no write: one line per key with its tier, modes, what each mode means and the value or the reason it was rejected, then the digest and what the file locks. `--platform` (or `--for`) checks path syntax for the target platform (default: this machine's); `--trust` also runs this machine's production trust check on the file where it sits and reports each rule. Exit `0` valid, `13` valid with rejected leaves, `12` invalid as a whole, `11` not trusted (`--trust`), `1` unreadable. A file over 64 KiB is refused unread. Delivery guide and samples: [docs/policy/](docs/policy/README.md). |
 | `pam service install [--base-dir DIR]\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
 | `pam listen <dir>` (unix) | Serves a session socket relay: binds one socket, `pam.sock`, in `<dir>` and forwards to the daemon, for clients under an agent sandbox that blocks the daemon's own socket — point them at it with `PAM_SOCKET_DIR=<dir>` (see [Session socket relay](docs/session-socket-relay.md)). It refuses a `<dir>` that is a link or is shared, and replaces a daemon of version 0.4 or older when it starts. |
 | `pam daemon` | Runs the daemon in the foreground. |
@@ -232,7 +232,7 @@ proxy that inspects TLS can read the credentials PAM sends to connectors.
   without a leading dot), IP addresses, and CIDR ranges such as `10.0.0.0/8`
   when the system curl is 7.86 or newer. No ports, no wildcards inside names.
   Loopback targets never go through the proxy, whatever the list says.
-- **CA bundle.** Leave it empty when the root your organisation uses is
+- **CA bundle.** Leave it empty when the root your organization uses is
   already trusted by this computer (an MDM profile on macOS; Group Policy or
   Intune on Windows). On Windows a CA bundle file cannot be imported: install
   the CA in the Windows certificate store (machine or user), which PAM's curl
@@ -306,6 +306,34 @@ Settings › Daemon in the GUI shows the same state with Install, Remove and
 A daemon that a command starts lazily runs with a reduced environment, in its
 own process group, and does not inherit the caller's variables; add tool
 directories for flows through the flow settings, not the shell.
+
+## Managed deployment
+
+An organization can manage PAM on its machines with one read-only JSON file
+delivered by its MDM (Jamf, Kandji, Intune, a GPO startup script). It can
+lock a setting, set a default the human may change, bound or allowlist it,
+and add constraints only an organization states, such as capabilities that
+are never granted or the repository roots agents may work in. Settings shows
+every managed value and why; the human's own settings are never rewritten and
+come back when the file is removed.
+
+| Platform | Fixed path (no flag or variable moves it) | Must be |
+| --- | --- | --- |
+| macOS | `/Library/Application Support/PAM/policy.json` | owned by root, with every folder above it, and writable by nobody else |
+| Windows | `%ProgramData%\PAM\policy.json` | unwritable by the user's token: SYSTEM and Administrators full control, Users read |
+
+A file that fails this trust check, or is damaged, never loosens anything:
+the last good copy stays in force. Validate a file before the push, and check
+what an endpoint holds:
+
+```sh
+pam policy check policy.json --platform windows          # 0 valid, 13 rejected leaves, 12 invalid
+pam policy check "/Library/Application Support/PAM/policy.json" --trust --json   # 11 not trusted
+```
+
+The delivery guide, the scripts, every key and three sample files are in
+[docs/policy/](docs/policy/README.md); the design is in
+[the managed policy spec](docs/specs/2026-10-02-managed-policy-file.md).
 
 ## Build from source
 

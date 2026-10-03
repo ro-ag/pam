@@ -660,14 +660,14 @@ describe("managed policy", () => {
   });
 
   it.each([
-    ["policy_not_allowed", "remembering repo.push is not allowed by your organisation"],
-    ["setting_locked", "grants.remember is managed by your organisation's policy"],
+    ["policy_not_allowed", "remembering repo.push is not allowed by your organization"],
+    ["setting_locked", "grants.remember is managed by your organization's policy"],
     ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
   ])("renders a %s refusal's detail and recovery on the card", async (cause, detail) => {
     mocks.approvalsResolve.mockRejectedValue({
       cause,
       detail,
-      recovery: "Managed by your organisation's policy; ask your administrator.",
+      recovery: "Managed by your organization's policy; ask your administrator.",
     });
     renderApprovals();
     await screen.findByText("2 requests awaiting review");

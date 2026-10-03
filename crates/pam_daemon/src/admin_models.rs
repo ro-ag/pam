@@ -526,7 +526,7 @@ impl AdminService {
     ) -> Result<AdminOk, AdminRefusal> {
         let (request, model_id) = self.download_request(args, OP_MODELS_DOWNLOAD)?;
         // A catalog preset and a pasted address are different sources: an
-        // organisation may allow the first (digest pinned in this build)
+        // organization may allow the first (digest pinned in this build)
         // and not the second.
         let source = if args.get("preset_id").is_some() {
             ModelSource::Catalog
@@ -1250,7 +1250,7 @@ impl AdminService {
                     view.refusal(
                         key,
                         CAUSE_POLICY_NOT_ALLOWED,
-                        &format!("{agent} is not a curator your organisation allows"),
+                        &format!("{agent} is not a curator your organization allows"),
                     )
                 })
         });

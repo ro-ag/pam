@@ -1140,6 +1140,76 @@ fn status_prints_the_boundary_summary_and_the_last_report() {
     assert!(missing.contains("boundary:        ?"), "{missing}");
 }
 
+#[test]
+fn status_prints_one_policy_line_per_state() {
+    let line = |policy: serde_json::Value| {
+        render_status(&serde_json::json!({
+            "daemon_version": "0.1.0",
+            "protocol": 1,
+            "uptime_s": 1,
+            "active_requests": 0,
+            "policy": policy,
+        }))
+        .lines()
+        .find_map(|line| line.strip_prefix("  policy:          ").map(str::to_owned))
+        .expect("a policy line")
+    };
+    let block = |state: &str, revision: Option<&str>, digest: Option<&str>, rejected: u64| {
+        serde_json::json!({
+            "state": state,
+            "revision": revision,
+            "digest": digest,
+            "loaded_ts": 1_759_423_200,
+            "managed": state != "none",
+            "rejected_leaves": rejected,
+        })
+    };
+
+    assert_eq!(line(block("none", None, None, 0)), "none (unmanaged)");
+    assert_eq!(
+        line(block(
+            "active",
+            Some("2026-10-02.1"),
+            Some("ab12cd34ef56"),
+            0
+        )),
+        "active, rev 2026-10-02.1, digest ab12cd34ef56"
+    );
+    assert_eq!(
+        line(block("degraded", Some("r7"), Some("ab12cd34ef56"), 2)),
+        "degraded, rev r7, digest ab12cd34ef56; 2 leaves rejected, the rest applies"
+    );
+    assert_eq!(
+        line(block("degraded", Some("r7"), Some("ab12cd34ef56"), 1)),
+        "degraded, rev r7, digest ab12cd34ef56; 1 leaf rejected, the rest applies"
+    );
+    assert_eq!(
+        line(block("last_good", Some("r6"), Some("0123456789ab"), 0)),
+        "last_good, rev r6, digest 0123456789ab; the policy file cannot be used, the last good \
+         copy is in force"
+    );
+    assert_eq!(
+        line(block("frozen", None, None, 0)),
+        "frozen; the policy file cannot be used and there is no last good copy: changes that \
+         widen what agents can do are paused"
+    );
+    // A revision is the administrator's text: hidden characters are escaped.
+    let hostile = line(block(
+        "active",
+        Some("r1\u{1b}[2J\u{202e}"),
+        Some("ab12cd34ef56"),
+        0,
+    ));
+    assert!(
+        !hostile.contains('\u{1b}') && !hostile.contains('\u{202e}'),
+        "{hostile}"
+    );
+
+    // An older daemon publishes no block at all.
+    let missing = render_status(&serde_json::json!({ "daemon_version": "0.1.0" }));
+    assert!(missing.contains("policy:          ?"), "{missing}");
+}
+
 // --- pam policy check -------------------------------------------------------
 
 mod policy_check {

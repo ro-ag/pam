@@ -696,7 +696,7 @@ describe("managed policy", () => {
         throw {
           cause: "policy_not_allowed",
           detail: "installing the engine from the network is not allowed on this machine",
-          recovery: "Managed by your organisation's policy; ask your administrator.",
+          recovery: "Managed by your organization's policy; ask your administrator.",
         };
       },
     });

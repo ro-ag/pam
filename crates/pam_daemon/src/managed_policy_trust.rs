@@ -1,6 +1,6 @@
 //! The trust check for the managed policy file and for any file it names.
 //!
-//! An organisation delivers one policy file to a root- or
+//! An organization delivers one policy file to a root- or
 //! Administrators-owned location; PAM trusts it only when the operating
 //! system says neither the human at the keyboard nor the agent in the
 //! sandbox (both run as the daemon's own user) could have written it.
@@ -191,7 +191,7 @@ impl UntrustedReason {
         match self {
             Self::NotOwnedByRoot | Self::WritableByUser | Self::ParentWritable => {
                 "Install the file and its folder with the delivery script in \
-                 docs/managed-policy.md, so that only root (macOS) or SYSTEM and Administrators \
+                 docs/policy/README.md, so that only root (macOS) or SYSTEM and Administrators \
                  (Windows) can change them."
             }
             Self::Symlink => {

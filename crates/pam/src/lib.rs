@@ -16,6 +16,7 @@ use std::path::Path;
 
 pub use pam_client::{base_dir_from, caller, client, default_base_dir, request};
 
+pub mod doctor;
 pub mod render;
 
 /// The agent playbook, shipped inside the binary (`pam playbook`): the

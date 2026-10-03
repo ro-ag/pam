@@ -283,6 +283,13 @@ fn pam_readiness_matches_the_project_script_and_stops_dependent_gates() {
     let flow = parse(builtin_yaml("pam-pr-readiness").unwrap()).unwrap();
     let required: Vec<Vec<String>> = include_str!("../../../tools/check.sh")
         .lines()
+        // The gate may set an environment variable for one command
+        // (`PAM_REQUIRE_TLS_FIXTURE=1 cargo test …`); the flow runs the
+        // command itself.
+        .map(|line| {
+            line.strip_prefix("PAM_REQUIRE_TLS_FIXTURE=1 ")
+                .unwrap_or(line)
+        })
         .filter(|line| line.starts_with("cargo ") || line.starts_with("npm "))
         .map(|line| line.split_whitespace().map(str::to_owned).collect())
         .collect();

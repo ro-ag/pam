@@ -5,9 +5,9 @@
 //! its own transaction. A database stamped with a version newer than the
 //! binary knows is refused rather than guessed at.
 
-use turso::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
-use crate::error::StoreError;
+use crate::error::{StoreError, engine};
 
 /// One schema migration: the version it produces and the SQL that gets there.
 pub(crate) struct Migration {
@@ -69,7 +69,37 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 13,
         sql: SCHEMA_V13,
     },
+    Migration {
+        version: ENGINE_BOUNDARY,
+        sql: SCHEMA_V14,
+    },
 ];
+
+/// The schema version at which the store's engine changed. Every database
+/// written by the previous engine, and by every pam release up to 0.4.3, is
+/// below it; a database at or above it has been opened, checked and stamped
+/// by this engine. See [`SCHEMA_V14`].
+pub(crate) const ENGINE_BOUNDARY: i64 = 14;
+
+/// `PAM1`, the application id migration 14 stamps into the database header.
+pub(crate) const APPLICATION_ID: i64 = 0x5041_4D31;
+
+/// Migration 14: the engine boundary. No table changes.
+///
+/// It exists for two reasons. First, the version stamp: a pam built on the
+/// previous engine knows schema versions up to 13 at most (11 in release
+/// 0.4.3) and refuses anything newer before it reads a row, so a database
+/// this engine has taken over is never opened by a binary that predates the
+/// take-over; the way back is the `pre-sqlite` backup (see `backup`).
+/// Second, the mark: the one-time work of the first open by this engine (a
+/// copy of the files as found, the full integrity and foreign-key checks) is
+/// done exactly when the version is below this one, so stamping it is what
+/// keeps that work from repeating.
+///
+/// The application id names the file as pam's in its header, where `file(1)`
+/// and the open path can read it without the engine. It is written in the
+/// same transaction as the version.
+const SCHEMA_V14: &str = "PRAGMA application_id = 1346456881;";
 
 /// Migration 13: where a request entered the daemon, on its row.
 ///
@@ -142,68 +172,63 @@ END;
 const SCHEMA_V11: &str = "CREATE TABLE landing_session(request_id TEXT PRIMARY KEY REFERENCES request(id) ON DELETE CASCADE, revision INTEGER NOT NULL CHECK(revision>=0), document TEXT NOT NULL CHECK(length(CAST(document AS BLOB))<=131072));";
 
 /// Highest schema version this binary can produce.
+#[cfg(test)]
 pub(crate) fn latest_version() -> i64 {
     MIGRATIONS.last().map_or(0, |m| m.version)
 }
 
 /// Reads the schema version currently recorded in the database.
-pub(crate) async fn current_version(conn: &Connection) -> Result<i64, StoreError> {
-    let mut rows = conn.query("PRAGMA user_version", ()).await?;
-    // The pragma always yields one row; treat a missing row as a fresh db.
-    match rows.next().await? {
-        Some(row) => Ok(row.get(0)?),
-        None => Ok(0),
-    }
+pub(crate) fn current_version(conn: &Connection) -> Result<i64, StoreError> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(engine)
 }
 
-/// Applies every migration newer than the database's recorded version.
+/// Applies every migration of `migrations` newer than the database's
+/// recorded version.
 ///
 /// Idempotent on reopen: an up-to-date database is left untouched. A
-/// database whose version is newer than this binary knows is refused
-/// with [`StoreError::VersionTooNew`].
-pub(crate) async fn run(conn: &Connection) -> Result<(), StoreError> {
-    let current = current_version(conn).await?;
-    let latest = latest_version();
+/// database whose version is newer than the last of `migrations` is refused
+/// with [`StoreError::VersionTooNew`]: a binary never guesses at a schema it
+/// does not know. That refusal is the whole downgrade story, and it holds
+/// for binaries built on the previous engine too, which run this same check
+/// against the version this engine stamps (see [`SCHEMA_V14`]).
+///
+/// The list is [`MIGRATIONS`] everywhere but in tests that stand an older or
+/// a later binary next to a file.
+pub(crate) fn run_with(conn: &mut Connection, migrations: &[Migration]) -> Result<(), StoreError> {
+    let current = current_version(conn)?;
+    let latest = migrations.last().map_or(0, |m| m.version);
     if current > latest {
         return Err(StoreError::VersionTooNew {
             found: current,
             supported: latest,
         });
     }
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
-        apply(conn, migration).await?;
+    for migration in migrations.iter().filter(|m| m.version > current) {
+        apply(conn, migration)?;
     }
     Ok(())
 }
 
-/// Applies one migration inside its own transaction, rolling back on
-/// failure so a botched migration never leaves a half-stamped database.
-async fn apply(conn: &Connection, migration: &Migration) -> Result<(), StoreError> {
-    conn.execute("BEGIN", ()).await?;
-    let version = migration.version;
-    let applied = async {
-        conn.execute_batch(migration.sql).await?;
-        conn.execute(&format!("PRAGMA user_version = {version}"), ())
-            .await?;
-        Ok::<(), StoreError>(())
-    }
-    .await;
-    match applied {
-        Ok(()) => match conn.execute("COMMIT", ()).await {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                // A failed COMMIT leaves the transaction open; roll it
-                // back so the connection is not stuck inside it.
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(err.into())
-            }
-        },
-        Err(err) => {
-            // Best effort: the returned error is the one that matters.
-            let _ = conn.execute("ROLLBACK", ()).await;
-            Err(err)
-        }
-    }
+/// The application id currently recorded in the database.
+pub(crate) fn application_id(conn: &Connection) -> Result<i64, StoreError> {
+    conn.pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(engine)
+}
+
+/// Applies one migration inside its own transaction, so a botched migration
+/// never leaves a half-stamped database: the schema change and the version
+/// stamp commit together, and an error (or a failed `COMMIT`) rolls both
+/// back when the transaction is dropped.
+fn apply(conn: &mut Connection, migration: &Migration) -> Result<(), StoreError> {
+    let txn = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(engine)?;
+    txn.execute_batch(migration.sql).map_err(engine)?;
+    // An integer of ours, not caller text: the pragma takes no bound value.
+    txn.execute_batch(&format!("PRAGMA user_version = {}", migration.version))
+        .map_err(engine)?;
+    txn.commit().map_err(engine)
 }
 
 /// Migration 1: the full spine schema.

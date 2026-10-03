@@ -55,7 +55,7 @@ not necessarily bytes received. Attempts and HTTP call counts are never refunded
 Original ceilings remain 256 attempts, 128 HTTP sends, 128 MiB HTTP capture,
 128 MiB command capture and the admitted deadline (at most one hour).
 
-All store operations serialize access to the Turso connection. Journal state
+All store operations serialize access to the SQLite connection (the store's `ConnGate`). Journal state
 transitions and budget reservations/refunds use individual atomic statements,
 avoiding a cancelled future leaving an explicit transaction open.
 

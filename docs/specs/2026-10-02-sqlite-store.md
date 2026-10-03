@@ -1,6 +1,11 @@
 # `pam_store` on SQLite (rusqlite, bundled) — design and implementation plan
 
-Status: draft for owner approval, 2026-10-02. Implements the owner decision of
+Status: implemented (T0–T5, T7); T6 pending a Windows run. Built on
+`feat/sqlite-store`, 2026-10-02. Nothing here has been compiled or run on
+Windows yet, and T8's one real upgrade of an owner database is still to do.
+What was built, where it departs from the design below, is in
+[As built](#as-built-2026-10-02); corrections from the T1 port are under
+[Findings from T1](#findings-from-t1-2026-10-02). Implements the owner decision of
 2026-10-02 on ptrack issue 38 (design review, owner decision 1): the store that
 holds grants, approvals, the request ledger and the audit trail runs on real
 SQLite, and SQLite becomes a named exception to the no-C rule.
@@ -289,7 +294,8 @@ change working statements.
 Set at open, in this order, each read back where it can be:
 
 1. Open flags `READ_WRITE | CREATE | NO_MUTEX`, without `URI`, so a path is
-   never parsed as a URI.
+   never parsed as a URI. (T1: not sufficient on its own; see the `file:`
+   guard in the findings below.)
 2. `busy_timeout` 5 s (today's value).
 3. `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` on, until the integrity check has passed.
 4. `SQLITE_DBCONFIG_DEFENSIVE` on, `TRUSTED_SCHEMA` off, `DQS_DML` and `DQS_DDL`
@@ -502,6 +508,10 @@ Root `Cargo.toml`, replacing lines 40-44:
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "cache", "limits"] }
 ```
 
+(As landed in root `Cargo.toml`, the comment reads "Real SQLite for the store"
+and names the exception and the owner decision; the version is 0.40.1, see the
+findings below.)
+
 `crates/pam_store/Cargo.toml`: `rusqlite.workspace = true` in place of
 `turso.workspace = true`; tokio becomes `features = ["sync", "rt"]`.
 
@@ -560,7 +570,8 @@ a C compiler.
 `.cargo/config.toml:14-23` lifts the main thread to 16 MiB because store open
 replayed the WAL through turso and overflowed 1 MiB. SQLite's WAL recovery is
 iterative and, under this design, runs on a blocking-pool thread, not the main
-thread. The flag should go, on evidence: T6 removes it and runs the workspace
+thread. T1 measured the store at under 64 KiB of stack (findings below). The flag should
+go, on evidence: T6 removes it and runs the workspace
 suite and a daemon boot over a multi-megabyte WAL in the VM, debug build. If
 something else on the main thread overflows, the flag stays and its comment is
 rewritten to name the real cause. `target-feature=+fp16` on
@@ -842,3 +853,255 @@ Risks carried:
    file.
 3. `synchronous = FULL` and `secure_delete = ON`.
 4. No override for a failed pre-upgrade backup.
+
+## Findings from T1 (2026-10-02)
+
+The port is on `feat/sqlite-store` (`e963f51`). What it found that corrects or
+completes the sections above; the full spike report is the T1 record.
+
+- **rusqlite version.** The lock and this spec use rusqlite 0.40.1 with
+  `libsqlite3-sys` 0.38.1 (SQLite 3.53.2, read back by a test). crates.io's
+  newest at the time was 0.40.2 (`libsqlite3-sys` 0.38.2); 0.40.1 was what the
+  local registry cache held and the port was built offline. Whoever bumps it
+  must first read which SQLite 0.38.2 bundles. "0.40.1 is the newest release"
+  in the unverified list above is therefore false: it is the one in use, not the
+  newest.
+- **`file:` URI guard.** Opening without `OpenFlags::URI` is not enough: the
+  bundled build compiles `SQLITE_USE_URI`, so SQLite parses a name that starts
+  with `file:` as a URI whatever the flags say. `open.rs` opens such a path as
+  `./file:...`, and a test pins it. The "a path is a path" requirement stands;
+  the guard is how it is met.
+- **Check before the journal switch.** The boot `quick_check` runs before
+  `PRAGMA journal_mode = WAL`, not after: switching a rollback-journal file to
+  WAL writes the header, and a file that fails the check must be left
+  byte-identical (tested: a refused open leaves the main file and `-wal`
+  unchanged).
+- **Stack.** The fixture read-back (open, WAL recovery, migrations 11 to 13,
+  `quick_check`, every public read) passes with the driving thread and the
+  blocking threads both at 1 MiB, 512, 256, 192, 128, 96 and 64 KiB, and
+  overflows at 48 KiB. turso needed more than 1 MiB for the same reads. Store
+  statements, open included, no longer run on the main thread at all. The unit
+  test that guards this runs the boot and hot statements on 512 KiB threads
+  (was 1.5 MiB). T6 still has to prove nothing else on the main thread needs
+  the Windows 16 MiB `/STACK` flag: the daemon's startup poll chain runs inline
+  on the main thread (`runtime.block_on(serve(base))`), and deep async fixture
+  futures in the daemon tests are the other known consumer.
+- **Timing.** `pam_store` unit suite 1.65 to 1.90 s on turso, 1.19 to 1.27 s on
+  SQLite; `store_fixtures` 5 times faster; the `pam_daemon` unit suite (808
+  tests) 15.1 to 15.6 s on turso against 16.7 to 16.9 s on SQLite, **9 %
+  slower**, not attributed (candidates: the thread hop per call and one fsync
+  per commit with `synchronous = FULL`). The file-backed integration suites did
+  not move. Windows will be slower per commit than macOS; time it in the VM.
+- **Paused-clock tests.** There are 21 `start_paused` tests today (the text above counts
+  eighteen, ten of them driving the store); all pass under concurrency model (c).
+- **A race the port exposed in `pam_daemon`.** Under turso a store future never
+  returned `Pending`, so tasks never interleaved inside one. Under (c) every
+  store call suspends. `model_service::maybe_idle_unload` held the
+  `operation` try-lock across its settings read while `generate_diagnostic`
+  answers `Busy` if that lock is held, so the test
+  `diagnostic_requires_installed_id_and_does_not_resolve_or_load_a_default`
+  failed in about one run in four (16 of 60 alone). The same window existed in
+  production on the multi-thread runtime, once per 30 s idle tick. Proof it was
+  the cause: the same binary with the job run inline in the poll passed 60 of
+  60. Resolution: the setting is read before the lock is taken, so the lock is
+  never held across a store await (a three-line caller change, the first of the
+  three options the T1 report offered, landed with the port). General rule: a
+  store call suspends; do not hold a `try_lock`-style guard across one if another
+  task treats "held" as busy. A caller dropped after its job started must assume
+  the write landed (T5's audit).
+- **Other deviations.** `ConnGate` holds a `Connection`, not an
+  `Option<Connection>` (no `Store::close` until T2). A thin `db.rs` layer
+  (`Db`, `Stmt`, `Rows`, `Row`) returns `StoreError` instead of an
+  `impl From<rusqlite::Error>`, so no rusqlite type reaches the public
+  interface. `EngineError::message()` is an extra accessor. `pkg-config` is new
+  in the lock (the spec assumed it present), so 112 packages left the lock, not
+  85. `PRAGMA fullfsync` is not set: `synchronous = FULL` on macOS is `fsync`,
+  which does not flush the drive's cache; the owner decides whether real
+  power-loss durability there is worth the cost per commit.
+- **Removal (T3), done.** Root `Cargo.toml` lost the `turso` workspace
+  dependency, the `exclude` entries and the whole `[patch.crates-io]` table;
+  `vendor/` (441 tracked files) is gone; `Cargo.lock` lost its two
+  `[[patch.unused]]` entries. `cargo tree -i turso`, `-i turso_core` and
+  `-i aegis` match no package and cargo prints no unused-patch warning.
+
+## As built (2026-10-02)
+
+T2 (upgrade path, durability), T5 (shutdown close, timeout audit) and T7 (read
+connection) as they landed. Where this section and the design above disagree,
+this section is what the code does. The design text it supersedes:
+
+| Design above says | Built |
+| --- | --- |
+| Calls after `close` answer `Unavailable` | `StoreError::Closed`. `Unavailable` says "retry it", which is wrong for a closed store |
+| "There is no queue … a hard cap that refuses calls is not added" | 1,024 calls per connection, then `StoreError::Overloaded` |
+| `NO_CKPT_ON_CLOSE` on until the integrity check has passed, then cleared | On for the connection's whole life. Only `Store::close` folds the log |
+| Without `close`, the connection is checkpointed when the last `Arc` drops | A dropped store never checkpoints and writes nothing |
+| Backup in `backup/pre-sqlite-engine/` | `backup/state-<UTC time>-pre-sqlite/` |
+| Two new error variants | Four: `UpgradeBackup { path, needed_bytes, source }`, `NotPamDatabase`, `Closed`, `Overloaded` |
+| The read connection as a later, narrow task | Built; routing table below (`list_grants` stayed on the writer) |
+| One batch of migrations | Still one transaction per migration; a failed later one leaves the earlier ones applied, with the pre-batch backup to go back to |
+| T5 owned by B, `fullfsync` an open question | T5 done with T2; `fullfsync` measured and left off |
+
+### Open path
+
+`Store::open(path)` for a file, in order. A refusal at any step leaves every
+database file as it was found.
+
+1. **Look, without the engine** (`header.rs`: the first 100 bytes as plain
+   bytes).
+
+   | At the path | Result |
+   | --- | --- |
+   | nothing, no log | new database |
+   | nothing, or a zero-length file, with a non-empty `-wal` beside it | refused (`Corrupt`): a log without its main file. SQLite, opening that pair, deletes the log |
+   | zero-length file, no log, in a directory with no sign of an earlier PAM | new database |
+   | zero-length file, no log, where PAM has run before (`backup/`, a non-empty `log/`, `run/daemon.lock`, `flows/` or `model-trust/` beside it) | refused (`Corrupt`): an empty file is not a database PAM wrote. The refusal names the newest backup to restore, or says to move the empty file aside to start fresh |
+   | shorter than a header, or no `SQLite format 3` magic | refused (`Corrupt`) before any copy; the engine never opens it |
+   | a database | header `user_version`, `application_id`, and whether it carries the previous engine's stamp |
+   | unreadable | refused, naming the file |
+
+2. **Back up before anything can change.** A header version below the newest
+   this binary knows means an upgrade is pending: below 14 the copy is
+   `pre-sqlite`, otherwise `pre-v<latest>`. The header can lag the log and
+   never runs ahead of it, so this errs toward a copy too many. A copy that
+   cannot be written refuses the open (`UpgradeBackup`), the partial copy is
+   removed, and the engine never opens the file. No override.
+3. **Open and harden** (the connection settings above).
+4. **Read the real version, through the log.** Newer than this binary:
+   refused (`VersionTooNew`). Version 14 or later without PAM's
+   `application_id`: refused (`NotPamDatabase`), before any write. A header
+   that had only lagged: the copy just made is removed, or renamed to what it
+   really precedes.
+5. **Check before any write.** Below 14 (the first open by SQLite): full
+   `integrity_check`, then `foreign_key_check`, whatever the size. Otherwise
+   `quick_check` up to 256 MiB. A failure is `Corrupt`, naming the backup and
+   three ways on (the old release against the copy, `sqlite3 .recover`, move
+   the files aside).
+6. WAL asserted, `synchronous = FULL`, `journal_size_limit`, the macOS sync
+   settings; for a file below 14, a `wal_checkpoint(TRUNCATE)` so the previous
+   engine's log is in the main file before SQLite appends.
+7. **Migrate**, one transaction each. Migration 14 changes no table: it
+   stamps `user_version = 14` and `application_id = 0x50414D31` (`PAM1`)
+   together.
+8. **Checkpoint** whenever the header does not already show the latest
+   version, so the next open decides on a current header.
+9. Retention of `pre-v*` backups; the read-only connection.
+
+A second open of an upgraded file copies nothing and leaves the main file
+byte-identical after open and close.
+
+### Backups
+
+```
+<base>/backup/                              0700
+  state-20261002T201010Z-pre-sqlite/        0700   never deleted by pam
+    state.sqlite3                           0600
+    state.sqlite3-wal                       0600   (each file that existed)
+    state.sqlite3-shm
+  state-20270114T093000Z-pre-v15/                  newest 3 kept
+  .partial-state-…/                                a copy in progress
+```
+
+Plain copies of the main file, `-wal`, `-shm` and, for a database not in WAL
+mode, `-journal`. Each file is synced, then the directory, then the directory
+is renamed from `.partial-…`: a final name is always a complete copy. Never
+overwritten; a second backup in the same second gets `-2`, `-3`. An existing
+backup of the same kind whose content files equal the current ones byte for
+byte is reused, so a restart loop against a refused database does not fill the
+disk. `pre-v*` copies are pruned to the newest three after a successful
+migration; `pre-sqlite` is never pruned. Restore: stop the daemon, copy the
+directory's files over the ones beside `backup/` (removing a `-wal` or `-shm`
+the backup lacks), start the PAM that wrote them. The copy is consistent when
+nothing else is writing the database; the daemon holds its instance lock
+first, but an operator's `sqlite3` shell is not excluded.
+
+### Durability
+
+`synchronous = FULL`, and on macOS `checkpoint_fullfsync = ON`. `fullfsync`
+per commit was measured and left off:
+
+| 2,000 commits, internal SSD, debug build | per commit |
+| --- | --- |
+| `fsync` (as built) | 0.201, 0.177, 0.179 ms |
+| `F_FULLFSYNC` (`PRAGMA fullfsync = ON`) | 4.988, 5.217, 4.936 ms |
+
+5 ms is two and a half times the 2 ms bar, and a request is at least three
+commits. What that leaves: a process crash or `kill -9` loses nothing
+(tested, with `Child::kill`). An operating-system crash or power cut can lose
+the last commits the drive had accepted and not yet written; they disappear
+whole and newest first, the database stays consistent, and boot recovery
+closes a request left in its earlier state. Integrity does not depend on the
+drive's cache, because checkpoints use `F_FULLFSYNC`. On Windows
+`synchronous = FULL` is `FlushFileBuffers`, which does ask the drive to flush.
+The power-loss case cannot be tested from user space.
+
+### Close, drop, shutdown
+
+`Store::close` closes the reader, waits for the writer's running job, runs
+`wal_checkpoint(TRUNCATE)`, and closes: the main file is then the whole
+database. Later calls answer `Closed`. Idempotent. If another connection is
+mid-read the log stays, a warning is logged, nothing is lost. Dropping a
+store checkpoints nothing and writes nothing; nothing relies on it doing so
+(tests that read a store after dropping it reopen it through `Store::open`).
+
+`DaemonHandle::shutdown`: join the daemon's tasks, shut both listeners,
+`ModelService::shutdown` (cancel running downloads and verifications, wait up
+to five seconds for their followers to record the job rows, stop the
+idle-unload ticker; a follower that does not stop in time is logged and
+left), then `Store::close`. A terminal write that meets the closed store is
+not retried and not parked.
+
+The timeout audit (32 sites in `pam_daemon`) found no write that is unsafe to
+have landed after its caller gave up; no daemon code needed changing for it.
+The site-by-site table is T5's deliverable and goes in the pull request.
+
+### Queue bound
+
+1,024 calls per connection, waiting plus running; the next one is refused
+before it queues and writes nothing. The daemon admits at most 200 requests
+at once and runs about a dozen service loops, so about 200 waiters is the
+healthy maximum; five times that is reached only against a disk that is not
+answering. `close` takes no slot. On the public plane the refusal is
+`store_overloaded` (retryable, the store's sentence as detail, "Retry
+shortly."); a call that meets the closed store is `daemon_shutting_down`
+(retryable). The admin plane passes the store's sentence through in the
+refusal's detail. Capabilities that already give a store failure a cause of
+their own (`evidence_store_unavailable`, the `query` non-disclosure answer,
+`execution_failed` from `cancel`, the request budget's persistence error)
+keep it.
+
+### Read connection
+
+File-backed stores open a second connection: read-only, `query_only = ON`,
+the same hardening, its own gate and queue bound. In-memory stores keep one.
+`Store::read` runs its job as one deferred read transaction, which sees every
+write whose call had returned.
+
+| Read | Connection | Why |
+| --- | --- | --- |
+| `list_requests_filtered` (Activity) | reader | the review's head-of-line query |
+| `audit_for_request` | reader | list |
+| `read_evidence_view_range`, the page bytes | reader | SQLite loads the whole view (up to 64 MiB) to cut one page |
+| `read_evidence_view_range`, the charge | writer | it is a write, and must survive the read failing |
+| `retention_census` | reader | five counts over two tables, one snapshot |
+| `check_integrity` | reader | reads every page |
+| `get_evidence`, `list_evidence` | reader | blobs up to 64 MiB; list |
+| `compression_stats` | reader | scan plus JSON parsing in Rust |
+| `list_model_jobs`, `list_callers` | reader | lists |
+| `list_grants`, `active_grant`, `request_authorization_current`, `evidence_view_meta`, `get_request`, settings, recovery pages, everything else | writer | authorization reads, cheap point reads, or reads whose job also writes |
+
+### Deviations and what is open
+
+- A foreign database at version 0 is still migrated, as before; only version
+  14 or later without PAM's `application_id` is refused.
+- The future-migration backup (`pre-v<N>`) is tested with a stand-in later
+  binary, since no migration 15 exists.
+- Not verified: anything on Windows (T6, and the `cfg(not(unix))` branches of
+  the backup and open code, which were read and not built); the released
+  0.4.3 binary against an upgraded file (the downgrade refusal is tested with
+  the same migration runner handed a shorter list); a real `~/.pam` (T8).
+- One window rests on an assumption: a daemon killed between migration 14's
+  commit and the checkpoint leaves header 13 with 14 only in a SQLite-written
+  log, which an old binary refuses only if it replays that log.
+- The memento rule `turso-connection-concurrent-use` is still to be replaced
+  through the ledger.

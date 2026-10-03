@@ -1,6 +1,7 @@
 //! Crash-safe reservations; exact completed captures may refund unused capacity.
 use super::{Store, StoreError};
-use turso::params;
+use crate::db::Db;
+use rusqlite::params;
 
 /// Durable charged work, including incomplete or cancelled reservations.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -34,52 +35,57 @@ impl Store {
         id: &str,
         repository: &str,
     ) -> Result<Option<serde_json::Value>, StoreError> {
-        let conn = self.lock().await?;
-        let mut rows = conn.query(
-            "SELECT r.expires_at_ms,a.expires_at,a.remaining_bytes,a.remaining_pages FROM request r LEFT JOIN evidence_read_allowance a ON a.request_id=r.id AND a.repository=r.repo WHERE r.id=?1 AND r.repo=?2",
-            params![id,repository]).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let expiry: Option<i64> = row.get(0)?;
-        let evidence_expiry: Option<i64> = row.get(1)?;
-        let evidence_bytes: Option<i64> = row.get(2)?;
-        let evidence_pages: Option<i64> = row.get(3)?;
-        drop(rows);
-        let allowance_state = match evidence_expiry {
-            None => "not_initialized",
-            Some(expiry) if expiry <= super::now_ts() => "expired",
-            Some(_) if evidence_bytes.unwrap_or(0) <= 0 || evidence_pages.unwrap_or(0) <= 0 => {
-                "exhausted"
-            }
-            Some(_) => "existing_allowance",
-        };
-        let usage = Self::budget_usage_locked(&conn, id).await?;
-        let work = usage.map(|u| serde_json::json!({
-            "attempt_slots_charged":u.attempts,"http_call_slots_charged":u.http_calls,
-            "http_bytes_charged":u.http_bytes,"command_bytes_charged":u.command_bytes,
-            "attempt_slots_remaining":256-u.attempts,"http_call_slots_remaining":128-u.http_calls,
-            "http_bytes_remaining":134_217_728-u.http_bytes,"command_bytes_remaining":134_217_728-u.command_bytes,
-            "accounting":"completed_captures_plus_unsettled_reservations_not_physical_network_traffic"
-        }));
-        Ok(Some(
-            serde_json::json!({"execution_expires_at_ms":expiry,"work":work,
-            "evidence_reads":{"state":allowance_state,
-                "expires_at":evidence_expiry,"remaining_bytes":evidence_bytes,"remaining_pages":evidence_pages,
-                "authorization_state":"rechecked_per_read","availability":"not_guaranteed"}}),
-        ))
+        let id = id.to_owned();
+        let repository = repository.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT r.expires_at_ms,a.expires_at,a.remaining_bytes,a.remaining_pages FROM request r LEFT JOIN evidence_read_allowance a ON a.request_id=r.id AND a.repository=r.repo WHERE r.id=?1 AND r.repo=?2")?;
+            let mut rows = stmt.query(params![id,repository])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let expiry: Option<i64> = row.get(0)?;
+            let evidence_expiry: Option<i64> = row.get(1)?;
+            let evidence_bytes: Option<i64> = row.get(2)?;
+            let evidence_pages: Option<i64> = row.get(3)?;
+            drop(rows);
+            let allowance_state = match evidence_expiry {
+                None => "not_initialized",
+                Some(expiry) if expiry <= super::now_ts() => "expired",
+                Some(_) if evidence_bytes.unwrap_or(0) <= 0 || evidence_pages.unwrap_or(0) <= 0 => {
+                    "exhausted"
+                }
+                Some(_) => "existing_allowance",
+            };
+            let usage = Self::budget_usage_locked(conn, &id)?;
+            let work = usage.map(|u| serde_json::json!({
+                "attempt_slots_charged":u.attempts,"http_call_slots_charged":u.http_calls,
+                "http_bytes_charged":u.http_bytes,"command_bytes_charged":u.command_bytes,
+                "attempt_slots_remaining":256-u.attempts,"http_call_slots_remaining":128-u.http_calls,
+                "http_bytes_remaining":134_217_728-u.http_bytes,"command_bytes_remaining":134_217_728-u.command_bytes,
+                "accounting":"completed_captures_plus_unsettled_reservations_not_physical_network_traffic"
+            }));
+            Ok(Some(
+                serde_json::json!({"execution_expires_at_ms":expiry,"work":work,
+                "evidence_reads":{"state":allowance_state,
+                    "expires_at":evidence_expiry,"remaining_bytes":evidence_bytes,"remaining_pages":evidence_pages,
+                    "authorization_state":"rechecked_per_read","availability":"not_guaranteed"}}),
+            ))
+        })
+        .await
     }
 
     /// Initialize once for an existing request, or restore its spent allowance.
     pub async fn load_request_budget(&self, id: &str) -> Result<RequestBudgetUsage, StoreError> {
-        let conn = self.lock().await?;
-        conn.execute("INSERT INTO request_budget(request_id) SELECT id FROM request WHERE id=?1 ON CONFLICT(request_id) DO NOTHING", params![id]).await?;
-        Self::budget_usage_locked(&conn, id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
-                table: "request",
-                id: id.to_owned(),
-            })
+        let id = id.to_owned();
+        self.run(move |conn| {
+            conn.execute("INSERT INTO request_budget(request_id) SELECT id FROM request WHERE id=?1 ON CONFLICT(request_id) DO NOTHING", params![id])?;
+            Self::budget_usage_locked(conn, &id)?
+                .ok_or_else(|| StoreError::NotFound {
+                    table: "request",
+                    id: id.clone(),
+                })
+        })
+        .await
     }
 
     /// Atomically reserve against compiled ceilings; `None` means no work is allowed.
@@ -100,12 +106,15 @@ impl Store {
         };
         let http = i64::try_from(http).expect("compiled bound fits i64");
         let command = i64::try_from(command).expect("compiled bound fits i64");
-        let conn = self.lock().await?;
-        let changed=conn.execute("UPDATE request_budget SET attempts=attempts+?2,http_calls=http_calls+?3,http_bytes=http_bytes+?4,command_bytes=command_bytes+?5 WHERE request_id=?1 AND attempts BETWEEN 0 AND 256-?2 AND http_calls BETWEEN 0 AND 128-?3 AND http_bytes BETWEEN 0 AND 134217728-?4 AND command_bytes BETWEEN 0 AND 134217728-?5 AND EXISTS(SELECT 1 FROM request WHERE id=?1)",params![id,attempt,calls,http,command]).await?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        Self::budget_usage_locked(&conn, id).await
+        let id = id.to_owned();
+        self.run(move |conn| {
+            let changed=conn.execute("UPDATE request_budget SET attempts=attempts+?2,http_calls=http_calls+?3,http_bytes=http_bytes+?4,command_bytes=command_bytes+?5 WHERE request_id=?1 AND attempts BETWEEN 0 AND 256-?2 AND http_calls BETWEEN 0 AND 128-?3 AND http_bytes BETWEEN 0 AND 134217728-?4 AND command_bytes BETWEEN 0 AND 134217728-?5 AND EXISTS(SELECT 1 FROM request WHERE id=?1)",params![id,attempt,calls,http,command])?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            Self::budget_usage_locked(conn, &id)
+        })
+        .await
     }
 
     /// Refund only the unused bytes of one completed, consuming reservation.
@@ -127,29 +136,32 @@ impl Store {
         };
         let http = i64::try_from(http).expect("compiled bound");
         let command = i64::try_from(command).expect("compiled bound");
-        let conn = self.lock().await?;
-        let changed=conn.execute("UPDATE request_budget SET http_bytes=http_bytes-?2,command_bytes=command_bytes-?3 WHERE request_id=?1 AND http_bytes>=?2 AND command_bytes>=?3",params![id,http,command]).await?;
-        if changed != 1 {
-            return Err(StoreError::UnexpectedValue {
-                column: "request_budget_refund",
-                value: "missing reservation or insufficient charge".to_owned(),
-            });
-        }
-        Self::budget_usage_locked(&conn, id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
-                table: "request_budget",
-                id: id.to_owned(),
-            })
+        let id = id.to_owned();
+        self.run(move |conn| {
+            let changed=conn.execute("UPDATE request_budget SET http_bytes=http_bytes-?2,command_bytes=command_bytes-?3 WHERE request_id=?1 AND http_bytes>=?2 AND command_bytes>=?3",params![id,http,command])?;
+            if changed != 1 {
+                return Err(StoreError::UnexpectedValue {
+                    column: "request_budget_refund",
+                    value: "missing reservation or insufficient charge".to_owned(),
+                });
+            }
+            Self::budget_usage_locked(conn, &id)?
+                .ok_or_else(|| StoreError::NotFound {
+                    table: "request_budget",
+                    id: id.clone(),
+                })
+        })
+        .await
     }
 
     /// `conn` is the caller's locked connection; one autocommit read, no transaction to strand.
-    async fn budget_usage_locked(
-        conn: &turso::Connection,
+    fn budget_usage_locked(
+        conn: Db<'_>,
         id: &str,
     ) -> Result<Option<RequestBudgetUsage>, StoreError> {
-        let mut rows=conn.query("SELECT attempts,http_calls,http_bytes,command_bytes FROM request_budget WHERE request_id=?1",params![id]).await?;
-        let Some(row) = rows.next().await? else {
+        let mut stmt = conn.prepare("SELECT attempts,http_calls,http_bytes,command_bytes FROM request_budget WHERE request_id=?1")?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
             return Ok(None);
         };
         let mut values = [0_u64; 4];

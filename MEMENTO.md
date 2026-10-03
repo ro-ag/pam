@@ -27,7 +27,7 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - fix: pam_store::Store conn_lock (tokio Mutex) taken at the top of every method; regression test store_test::concurrent_inserts_and_finishes_never_fail; daemon logs failed terminal writes (log_terminal_failure). Diagnosis path: dump the daemon log on test failure and read the statement timeline (BEGIN with no COMMIT).
 - hits: 2026-09-01
 - cost: 120
-- status: enforced -> /Users/rodox/dev/rs/pam/AGENTS.md
+- status: retired
 
 ## stage-only-task-files
 - kind: habit
@@ -251,6 +251,33 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - rule: A Save action must consume the validated draft shown by the editor, not a parent snapshot delivered later by a passive effect.
 - fix: The full landing gate caught an enabled Save silently skipping a just-validated draft. Pass the current draft with the Save event; add a regression with a stale disabled parent draft.
 - hits: 2026-09-18
+- cost: 0
+- status: watching
+
+## lock-held-across-store-await
+- kind: habit
+- scope: project
+- rule: Never hold a try_lock or other non-reentrant guard across an await on the store (or any call that can suspend): SQLite store calls run on a blocking thread and yield, so a concurrent caller sees the guard held and answers Busy for nothing. Read settings first, take the lock after.
+- fix: ModelService::maybe_idle_unload read idle_unload_min while holding operation.try_lock; under turso the read completed in one poll and hid the race, under rusqlite a diagnostic request failed 16 of 60 runs. Fixed by reading the setting before taking the lock (commit e963f51). When porting sync-in-poll code to spawn_blocking, grep for guards held across store awaits.
+- hits: 2026-10-02
+- cost: 0
+- status: watching
+
+## windows-cleared-env-powershell-module-scan
+- kind: habit
+- scope: project
+- rule: A broker that runs powershell.exe with a cleared environment drops PSModulePath, and PowerShell then resolves a cmdlet by scanning every installed module: milliseconds on a bare VM, 20-30 s on GitHub runners and enterprise machines with hundreds of modules. Import the needed module by absolute System32 path and never rely on command auto-discovery.
+- fix: Symptom: Start-Process broker passes in the Parallels VM, times out on windows-2025 and windows-11-arm runners with the caller hanging 30 s. Reproduce locally by installing ~800 dummy modules. Fix in pam_client Windows broker: Import-Module Microsoft.PowerShell.Management by absolute path, clear PSModulePath, then Start-Process (commit 3bc9639). A timeout test must report facts (did the CLI exit, broker status, daemon present) instead of guessing a cause.
+- hits: 2026-10-02
+- cost: 0
+- status: watching
+
+## windows-temp-dir-short-name
+- kind: habit
+- scope: project
+- rule: On Windows compare paths only after std::fs::canonicalize: std::env::temp_dir() can return the 8.3 short form (RUNNER~1) while a child process reports the long form; string or case-insensitive comparison fails on GitHub runners and passes on a local VM.
+- fix: broker_windows_test working-directory assertion (commit dbc2f7a); same class as the earlier git.exe and verbatim-path assertions in tests/flows.rs.
+- hits: 2026-10-02
 - cost: 0
 - status: watching
 

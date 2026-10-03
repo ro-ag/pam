@@ -168,15 +168,11 @@ async fn request_retention_removes_bindings_and_never_allows_orphans() {
     assert!(store.read_correlation_steps("r").await.unwrap().is_empty());
     assert!(store.bind_correlation_target("r", "{}").await.is_err());
     for table in ["correlation_step", "correlation_target"] {
-        let mut rows = store
-            .lock()
-            .await
-            .unwrap()
-            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
-            .await
-            .unwrap();
         assert_eq!(
-            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            store
+                .raw_scalar::<i64, _>(&format!("SELECT COUNT(*) FROM {table}"), ())
+                .await
+                .unwrap(),
             0
         );
     }

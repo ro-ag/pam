@@ -86,11 +86,11 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 4 | High | The GUI's polling creates unbounded request and audit rows, and no index supports the hot list query | `bridge.rs:325-335`, `queue.rs:321`, `store.rs` | fixed: indexes (schema 12) and ledger-free `status`; admission ignores expired rows |
 | 5 | Medium | The grant revocation revision is a global count; any revoke orphans every older ticket's results and evidence | `store.rs:704-757`, `evidence_service.rs:175-182` | partly fixed: scoped to the grants a request depends on; any flow's step revocation still voids every `flow.run` ticket (needs an owner decision: a column written at admission) |
 | 6 | Medium | `update_request_state` can resurrect a terminal request | `store.rs:1055-1062` | fixed: returns `AlreadyTerminal` and writes nothing |
-| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched; chunked view storage, a read connection and a delayed first prune are deferred |
+| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched; chunked view storage, a read connection (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)) and a delayed first prune are deferred |
 | 8 | Medium | "One audit row per operation, refusals included" is not structural: pre-admission refusals leave no row | `migrations.rs:153`, `daemon.rs:792-963` | needs owner decision |
 | 9 | Medium | Immutability of audit and evidence is by convention only | `migrations.rs`, `store.rs:1265-1289` | partly fixed: triggers make `audit` append-only and `evidence_view` immutable except retention's tombstone; a unique terminal audit row, re-hashing served bytes and a view-to-evidence key are deferred |
 | 10 | Medium | Retention is irreversible, runs on an unvalidated wall clock, and its settings flow is non-atomic | `retention.rs:200-216`, `store.rs:2075-2089` | partly fixed: an out-of-range stored window reads as forever, both windows save in one transaction; a forward clock jump still prunes early (needs an owner decision) |
-| 11 | Medium | A beta engine under the audit and authorization spine: no integrity check, no backup, no fallback, engine types leak | `migrations.rs`, `store.rs:592`, `lib.rs` | partly fixed: boot `quick_check` (files up to 256 MiB), on-demand check, corruption mapped to a legible error; backup, export and an alternate backend need an owner decision |
+| 11 | Medium | A beta engine under the audit and authorization spine: no integrity check, no backup, no fallback, engine types leak | `migrations.rs`, `store.rs:592`, `lib.rs` | partly fixed: boot `quick_check` (files up to 256 MiB), on-demand check, corruption mapped to a legible error; backup, export and an alternate backend need an owner decision (decided 2026-10-02: SQLite, [spec](../specs/2026-10-02-sqlite-store.md); backup in its T2) |
 | 12 | Low | Evidence range edge cases: end-of-view reads error, a NULL blob pages forever | `evidence_views.rs:223-244` | fixed |
 | 13 | Low | Crash-window leftovers: ghost pending approvals, orphan checkpoints, unrecoverable journal | `lifecycle.rs:218-246`, `store.rs:1595` | partly fixed: finished requests' approvals are hidden and the approval insert is atomic; journal-before-checkpoint and orphan checkpoint rows are deferred |
 | 14 | Low | Version skew: a stale client makes a newer daemon drain and restart | `migrations.rs:91-96`, `daemon.rs:915-935` | fixed (daemon core, finding 2) |
@@ -152,6 +152,12 @@ not settle. The first five are ptrack issues 38 to 42.
    on-demand check and a legible corruption error, plus triggers for append-only
    audit rows. Still open: a pre-migration backup, an export, and whether to keep
    a fallback backend.
+   **Decided 2026-10-02: SQLite.** The store runs on real SQLite, bundled through
+   `rusqlite`, and SQLite becomes a named exception to the no-C rule beside the
+   Tauri and objc2 shims. The one-time pre-upgrade backup, the full check on
+   first open and the downgrade refusal are part of the plan; an alternate
+   backend is not planned. Design and plan:
+   [the SQLite store spec](../specs/2026-10-02-sqlite-store.md).
 2. **The public transport (issue 39).** Decided 2026-10-02: replace ZeroMQ with the
    framed protocol the administration plane already speaks, on the same socket
    path, with per-connection events and the kernel's view of who connected. The

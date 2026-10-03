@@ -474,7 +474,6 @@ async fn one_drain_answers_both_planes_before_either_endpoint_goes_away() {
         let fixture = Fixture::start().await;
         let dirs = fixture.dirs();
         let base = fixture.daemon.base_dir();
-        let store = fixture.daemon.store();
         let mut phase = fixture.daemon.handle().lifecycle();
 
         let mut watcher = admin_transport::events(&base)
@@ -566,8 +565,10 @@ async fn one_drain_answers_both_planes_before_either_endpoint_goes_away() {
             "{reply:?}"
         );
 
-        let _tmp = stopping.await.expect("the daemon stops");
+        let tmp = stopping.await.expect("the daemon stops");
         // Neither refused newcomer left a row; the work that drained did.
+        // The stopped daemon closed its store: read what it left on disk.
+        let store = pam_testkit::open_store(&tmp).await;
         for id in ["pl_late", "pl_late_admin"] {
             assert!(store.get_request(id).await.unwrap().is_none(), "{id} left a row");
         }

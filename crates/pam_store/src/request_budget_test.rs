@@ -114,10 +114,7 @@ async fn database_failure_cannot_manufacture_a_reservation() {
     let store = Store::open_in_memory().await.unwrap();
     seed(&store).await;
     store
-        .lock()
-        .await
-        .unwrap()
-        .execute("DROP TABLE request_budget", ())
+        .raw_execute("DROP TABLE request_budget", ())
         .await
         .unwrap();
     assert!(
@@ -152,10 +149,7 @@ async fn refund_preserves_counts_and_failure_is_not_reported_as_success() {
     );
     assert_eq!(store.load_request_budget("budget").await.unwrap(), usage);
     store
-        .lock()
-        .await
-        .unwrap()
-        .execute("DROP TABLE request_budget", ())
+        .raw_execute("DROP TABLE request_budget", ())
         .await
         .unwrap();
     assert!(

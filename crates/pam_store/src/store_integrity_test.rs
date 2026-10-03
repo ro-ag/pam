@@ -3,8 +3,6 @@
 //! voids only the requests that depended on it, and stranded admissions are
 //! finished rather than counted forever.
 
-use turso::params;
-
 use crate::{
     Actor, ApprovalResolution, AuditEntry, Decision, EvidenceViewInsert, GrantChange,
     GrantChangeOutcome, OUTCOME_ADMIN_DENIED, RequestState, Store, StoreError,
@@ -36,20 +34,13 @@ async fn running(store: &Store, id: &str) {
 }
 
 async fn count(store: &Store, sql: &str) -> i64 {
-    let mut rows = store.lock().await.unwrap().query(sql, ()).await.unwrap();
-    rows.next().await.unwrap().unwrap().get(0).unwrap()
+    store.raw_scalar(sql, ()).await.unwrap()
 }
 
 /// Makes one statement fail from now on, to prove a multi-statement write
 /// rolls back as a whole.
 async fn inject_failure(store: &Store, trigger_sql: &str) {
-    store
-        .lock()
-        .await
-        .unwrap()
-        .execute(trigger_sql, ())
-        .await
-        .unwrap();
+    store.raw_execute(trigger_sql, ()).await.unwrap();
 }
 
 // --- terminal states are absorbing -----------------------------------------
@@ -403,10 +394,7 @@ async fn audit_rows_cannot_be_rewritten() {
         .await
         .unwrap();
     let error = store
-        .lock()
-        .await
-        .unwrap()
-        .execute("UPDATE audit SET decision='refuse', detail='rewritten'", ())
+        .raw_execute("UPDATE audit SET decision='refuse', detail='rewritten'", ())
         .await
         .unwrap_err();
     assert!(error.to_string().contains("append-only"), "{error}");
@@ -886,9 +874,49 @@ async fn hiding_probes_never_hides_a_refused_admin_attempt() {
 }
 
 #[tokio::test]
+async fn like_patterns_ignore_ascii_case_which_only_hides_or_voids_more() {
+    // The engine's LIKE ignores ASCII case. The store's two patterns are
+    // prefixes of names the daemon writes in lower case, so the difference
+    // is only reachable through an oddly spelled capability, and then it
+    // errs on the closed side: more is voided, more is treated as a probe.
+    let store = Store::open_in_memory().await.unwrap();
+
+    // `flow.step:%`: a step grant spelled in capitals still counts as one a
+    // flow.run ticket depends on.
+    store.insert_grant("FLOW.STEP:deploy/push").await.unwrap();
+    admitted(&store, "ticket", "flow.run", FAR_FUTURE_MS).await;
+    assert!(store.request_authorization_current("ticket").await.unwrap());
+    store.revoke_grant("FLOW.STEP:deploy/push").await.unwrap();
+    assert!(!store.request_authorization_current("ticket").await.unwrap());
+    assert_eq!(
+        store
+            .grant_revocation_revision_for("flow.run")
+            .await
+            .unwrap(),
+        1
+    );
+
+    // `admin.%`: an admin op spelled in capitals is hidden with the probes.
+    store
+        .insert_running_request("probe", "ADMIN.Grants.List", "(admin)", "gui", "{}", None)
+        .await
+        .unwrap();
+    let ids = |rows: Vec<crate::RequestRow>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+    let shown = store
+        .list_requests_filtered(None, None, None, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(ids(shown), ["ticket"]);
+    let all = store
+        .list_requests_filtered(None, None, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+#[tokio::test]
 async fn the_hot_scans_are_served_by_indexes() {
     let store = Store::open_in_memory().await.unwrap();
-    let conn = store.lock().await.unwrap();
     let evidence_prune = Store::evidence_prune_batch_sql()
         .replace("?1", "5")
         .replace("?2", "'flow.result'");
@@ -913,18 +941,25 @@ async fn the_hot_scans_are_served_by_indexes() {
             "evidence_kind_ts_idx",
         ),
     ] {
-        let mut rows = conn
-            .query(&format!("EXPLAIN QUERY PLAN {sql}"), ())
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let plan = store
+            .raw(move |conn| {
+                let mut stmt = conn.prepare(&explain)?;
+                let mut rows = stmt.query(())?;
+                let mut plan = String::new();
+                while let Some(row) = rows.next()? {
+                    plan.push_str(&row.get::<_, String>(3)?);
+                    plan.push('\n');
+                }
+                Ok(plan)
+            })
             .await
             .unwrap();
-        let mut plan = String::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            plan.push_str(&row.get::<String>(3).unwrap());
-            plan.push('\n');
-        }
         assert!(plan.contains(index), "{sql}\nplan:\n{plan}");
+        // The engine names a sort it had to add "USE TEMP B-TREE FOR ORDER
+        // BY" (the previous engine said "SORTER").
         assert!(
-            !plan.contains("SORTER"),
+            !plan.contains("SORTER") && !plan.contains("TEMP B-TREE"),
             "{sql} still sorts:\nplan:\n{plan}"
         );
     }
@@ -966,15 +1001,14 @@ async fn pruning_more_than_one_batch_removes_every_old_record_whole() {
         .insert_evidence("ev_inflight", "inflight", "log.source", b"keep", None)
         .await
         .unwrap();
-    {
-        let conn = store.lock().await.unwrap();
-        conn.execute("UPDATE request SET updated_ts = 10, created_ts = 10", ())
-            .await
-            .unwrap();
-        conn.execute("UPDATE evidence SET ts = 10", params![])
-            .await
-            .unwrap();
-    }
+    store
+        .raw_execute("UPDATE request SET updated_ts = 10, created_ts = 10", ())
+        .await
+        .unwrap();
+    store
+        .raw_execute("UPDATE evidence SET ts = 10", ())
+        .await
+        .unwrap();
     running(&store, "recent").await;
     store
         .finish_request(
@@ -1047,14 +1081,16 @@ async fn a_structurally_damaged_database_is_refused_legibly_at_open() {
 
 // --- stack budget -------------------------------------------------------------
 
-/// Runs the store's boot and hot-path statements on a thread with `stack`
-/// bytes. An overflow aborts the test process, so this either passes or
-/// fails loudly.
+/// Runs the store's boot and hot-path statements on a runtime whose threads
+/// — the one driving the calls and the blocking ones the statements run on —
+/// have `stack` bytes each. An overflow aborts the test process, so this
+/// either passes or fails loudly.
 fn run_hot_statements_on_a_stack_of(stack: usize) {
     std::thread::Builder::new()
         .stack_size(stack)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(stack)
                 .enable_all()
                 .build()
                 .unwrap()
@@ -1099,12 +1135,13 @@ async fn hot_statements() {
 
 #[test]
 fn boot_recovery_and_the_hot_statements_fit_well_inside_a_thread_stack() {
-    // A debug build's engine translates expressions recursively with very
-    // large frames. The recovery page queries once summed eight lengths
-    // inside a comparison, which alone needed about 1.7 MiB and left the
-    // daemon's boot path a few kilobytes short of a test thread's 2 MiB.
-    // Every statement here now fits in 1 MiB on the development host; the
-    // budget below leaves room for other platforms' frame sizes and still
-    // fails if that depth ever comes back.
-    run_hot_statements_on_a_stack_of(3 * 512 * 1024);
+    // The statements run on the runtime's blocking threads, 2 MiB each by
+    // default. The previous engine translated expressions recursively with
+    // very large frames in a debug build and came within a few kilobytes of
+    // that; this one compiles a statement iteratively, and everything here
+    // (open, migrate, boot recovery, the terminal write, both prunes) passes
+    // on a far smaller stack on the development host. The budget below leaves
+    // room for other platforms' frame sizes and still fails if a statement
+    // ever needs most of a megabyte.
+    run_hot_statements_on_a_stack_of(512 * 1024);
 }

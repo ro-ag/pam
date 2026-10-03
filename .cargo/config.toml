@@ -9,12 +9,4 @@
 # hardware — every machine that meets the 32 GB model floor (Snapdragon X)
 # does.
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+fp16", "-C", "link-arg=/STACK:16777216"]
-
-# Windows reserves 1 MiB for the main thread (PE /STACK) where macOS
-# gives it 8 MiB, and the daemon's startup poll chain — store open
-# replays the WAL through turso — overflows that reserve (issue #23). This
-# lifts the main thread to 16 MiB; Rust's std and tokio threads request
-# their own explicit sizes, so other threads are unaffected.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:16777216"]
+rustflags = ["-C", "target-feature=+fp16"]

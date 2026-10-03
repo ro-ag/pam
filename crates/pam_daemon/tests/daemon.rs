@@ -1020,7 +1020,10 @@ async fn graceful_drain_finishes_inflight_work_and_refuses_newcomers() {
         assert!(store.get_request("req_late").await.unwrap().is_none());
 
         // The drain waits for the in-flight echo before the daemon exits.
-        daemon.stop().await;
+        // A stopped daemon has closed its store, so the row is read back
+        // from the files it left.
+        let tmp = daemon.stop().await;
+        let store = open_store(&tmp).await;
         let row = store.get_request("req_drain").await.unwrap().unwrap();
         assert_eq!(row.state, RequestState::Done);
         assert_eq!(row.outcome.as_deref(), Some("solved"));

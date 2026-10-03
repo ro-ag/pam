@@ -36,11 +36,17 @@ Remaining work is tracked in ptrack: restart reconciliation, durable watches,
 guarded landing, model admission/qualification and task-focused GUI completion.
 No release or push is implied by this checkpoint. The no-C constraint is
 settled (issue #16, 2026-09-12): PAM's own dependency choices stay pure Rust —
-no C libraries, no cmake, no vendored C code (turso rather than rusqlite; the
-transport, a pure-Rust ZeroMQ crate at the time, has since become PAM's own
-frame protocol on tokio sockets with no socket library) — while the platform binding shims Tauri and
-objc2 compile on macOS (the Objective-C exception helper, also required by the
-Metal inference kernels) are an accepted exception, not PAM code. Deployment-
+no C libraries, no cmake, no vendored C code (the transport, a pure-Rust ZeroMQ
+crate at the time, has since become PAM's own frame protocol on tokio sockets
+with no socket library) — while the platform binding shims Tauri and objc2
+compile on macOS (the Objective-C exception helper, also required by the Metal
+inference kernels) are an accepted exception, not PAM code. Amended 2026-10-02
+(issue 38, owner decision): bundled SQLite, compiled from the amalgamation in
+`libsqlite3-sys` and linked through `rusqlite`, is a second named exception,
+because the audit and authorization spine runs on SQLite proper; this replaced
+the earlier choice of the pure-Rust Turso engine. See
+[the SQLite store design](specs/2026-10-02-sqlite-store.md) and
+[native build dependencies](native-build-dependencies.md). Deployment-
 specific compatibility claims still wait until the documented live protocol is
 run with authorized credentials.
 

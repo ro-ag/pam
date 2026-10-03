@@ -118,10 +118,7 @@ async fn byte_and_page_caps_are_shared_across_evidence() {
     let _ = store.read_evidence_view_range(&r).await.unwrap();
     {
         store
-            .lock()
-            .await
-            .unwrap()
-            .execute("UPDATE evidence_read_allowance SET remaining_bytes=1", ())
+            .raw_execute("UPDATE evidence_read_allowance SET remaining_bytes=1", ())
             .await
             .unwrap();
     }
@@ -158,10 +155,7 @@ async fn byte_and_page_caps_are_shared_across_evidence() {
     ));
     {
         store
-            .lock()
-            .await
-            .unwrap()
-            .execute(
+            .raw_execute(
                 "UPDATE evidence_read_allowance SET remaining_bytes=100,remaining_pages=0",
                 (),
             )
@@ -180,10 +174,7 @@ async fn pruning_preserves_authorized_tombstone_until_request_retention() {
     let _ = store.read_evidence_view_range(&r).await.unwrap();
     {
         store
-            .lock()
-            .await
-            .unwrap()
-            .execute(
+            .raw_execute(
                 "UPDATE request SET state='done',updated_ts=1 WHERE id='r'",
                 (),
             )
@@ -359,10 +350,7 @@ async fn a_view_whose_bytes_vanished_without_a_tombstone_is_unavailable_not_an_e
     // that is gone without one is damage. The trigger allows the NULLing
     // write, so this is the state a partial repair would leave.
     store
-        .lock()
-        .await
-        .unwrap()
-        .execute("UPDATE evidence_view SET view_blob=NULL", ())
+        .raw_execute("UPDATE evidence_view SET view_blob=NULL", ())
         .await
         .unwrap();
     r.offset = 0;
@@ -440,14 +428,13 @@ async fn the_largest_serialized_segment_times_the_segment_ceiling_fits_the_map_b
 #[tokio::test]
 async fn evidence_view_identity_and_bytes_cannot_be_rewritten() {
     let (_dir, store, _r) = fixture().await;
-    let conn = store.lock().await.unwrap();
     for tamper in [
         "UPDATE evidence_view SET view_blob=x'00'",
         "UPDATE evidence_view SET view_sha256='forged'",
         "UPDATE evidence_view SET map_json='[]', view_id='other'",
         "UPDATE evidence_view SET origin_json='{\"targets\":[]}'",
     ] {
-        let error = conn.execute(tamper, ()).await.unwrap_err();
+        let error = store.raw_execute(tamper, ()).await.unwrap_err();
         assert!(
             error.to_string().contains("evidence views are immutable"),
             "{tamper}: {error}"

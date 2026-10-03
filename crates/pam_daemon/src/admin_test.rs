@@ -1150,6 +1150,64 @@ async fn a_grant_change_is_written_with_its_audit_row_and_terminal_state() {
     .unwrap();
 }
 
+/// The private plane is the human's: a store refusal reaches it in the
+/// store's own words, under the admin plane's bookkeeping cause. (The public
+/// plane gives the queue bound and the closed store causes of their own;
+/// see `daemon_test`.)
+#[test]
+fn a_store_refusal_reaches_the_admin_plane_in_the_store_own_words() {
+    use pam_store::StoreError;
+
+    for error in [StoreError::Overloaded { waiting: 1024 }, StoreError::Closed] {
+        let sentence = error.to_string();
+        let refusal = crate::admin::AdminRefusal::from(error);
+        assert_eq!(refusal.cause, crate::daemon::CAUSE_INTERNAL_ERROR);
+        assert!(refusal.detail.ends_with(&sentence), "{}", refusal.detail);
+    }
+    let overloaded = crate::admin::AdminRefusal::from(StoreError::Overloaded { waiting: 1024 });
+    assert!(
+        overloaded
+            .detail
+            .contains("the store has 1024 calls waiting for the database"),
+        "{}",
+        overloaded.detail
+    );
+    assert!(
+        overloaded.detail.contains("Retry it"),
+        "{}",
+        overloaded.detail
+    );
+}
+
+/// An admin op that runs but finds the store closed when it records its
+/// audit row is not reported as done, and says why in the store's words.
+#[tokio::test]
+async fn an_admin_op_that_meets_a_closed_store_is_refused_with_the_store_sentence() {
+    timeout(DEADLINE, async {
+        let (store, admin, _events) = service().await;
+        store.close().await.unwrap();
+        let response = admin
+            .handle(&admin_envelope(
+                "req_closed_admin",
+                OP_GRANTS_LIST,
+                serde_json::json!({}),
+            ))
+            .await;
+        let Response::Refusal { cause, detail, .. } = &response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert_eq!(cause, crate::daemon::CAUSE_INTERNAL_ERROR);
+        assert!(
+            detail.contains("could not record the admin request: the store is closed"),
+            "{detail}"
+        );
+        assert!(detail.contains("shutting down"), "{detail}");
+        assert_eq!(admin.terminals.parked_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
 /// An admin success whose terminal row the store will not take used to be
 /// answered as a success with no audit row and no log line.
 #[tokio::test]

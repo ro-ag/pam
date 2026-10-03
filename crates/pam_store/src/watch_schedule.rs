@@ -1,6 +1,6 @@
 //! Durable scheduling for an already admitted, checkpointed read-only watch.
 use super::{Store, StoreError, now_ts};
-use turso::params;
+use rusqlite::params;
 
 impl Store {
     /// Park only a running, admitted flow whose checkpoint is ready. Neither
@@ -14,21 +14,21 @@ impl Store {
         if now_ms < 0 || resume_at_ms <= now_ms {
             return Ok(false);
         }
-        let conn = self.lock().await?;
-        Ok(conn
-            .execute(
+        let id = id.to_owned();
+        self.run(move |conn| {
+            Ok(conn.execute(
                 &format!(
                     "UPDATE request SET state='queued',resume_at_ms=?2,updated_ts=?4
-             WHERE id=?1 AND capability='flow.run' AND state='running'
-             AND queue_authorized=1 AND expires_at_ms>?3 AND expires_at_ms>=?2
-             AND {admission}
-             AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
+                 WHERE id=?1 AND capability='flow.run' AND state='running'
+                 AND queue_authorized=1 AND expires_at_ms>?3 AND expires_at_ms>=?2
+                 AND {admission}
+                 AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
                     admission = super::ADMISSION_STANDS
                 ),
                 params![id, resume_at_ms, now_ms, now_ts()],
-            )
-            .await?
-            == 1)
+            )? == 1)
+        })
+        .await
     }
 
     /// Check a recovered schedule using only scalar metadata, before indexing
@@ -38,21 +38,20 @@ impl Store {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let conn = self.lock().await?;
-        let mut rows = conn
-            .query(
-                &format!(
-                    "SELECT 1 FROM request WHERE id=?1 AND capability='flow.run' AND state='queued'
-             AND resume_at_ms>0 AND resume_at_ms<=expires_at_ms
-             AND queue_authorized=1 AND expires_at_ms>?2
-             AND {admission}
-             AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
-                    admission = super::ADMISSION_STANDS
-                ),
-                params![id, now_ms],
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
+        let id = id.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT 1 FROM request WHERE id=?1 AND capability='flow.run' AND state='queued'
+                 AND resume_at_ms>0 AND resume_at_ms<=expires_at_ms
+                 AND queue_authorized=1 AND expires_at_ms>?2
+                 AND {admission}
+                 AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
+                admission = super::ADMISSION_STANDS
+            ))?;
+            let mut rows = stmt.query(params![id, now_ms])?;
+            Ok(rows.next()?.is_some())
+        })
+        .await
     }
 
     /// Distinguish expiry from authorization failure after a rejected wake,
@@ -62,14 +61,14 @@ impl Store {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let conn = self.lock().await?;
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM request WHERE id=?1 AND expires_at_ms<=?2",
-                params![id, now_ms],
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
+        let id = id.to_owned();
+        self.run(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM request WHERE id=?1 AND expires_at_ms<=?2")?;
+            let mut rows = stmt.query(params![id, now_ms])?;
+            Ok(rows.next()?.is_some())
+        })
+        .await
     }
 
     /// Release a due parked checkpoint without granting fresh authority. The
@@ -79,21 +78,21 @@ impl Store {
         id: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let conn = self.lock().await?;
-        Ok(conn
-            .execute(
+        let id = id.to_owned();
+        self.run(move |conn| {
+            Ok(conn.execute(
                 &format!(
                     "UPDATE request SET resume_at_ms=NULL,updated_ts=?3
-             WHERE id=?1 AND capability='flow.run' AND state='queued'
-             AND resume_at_ms IS NOT NULL AND resume_at_ms<=?2
-             AND queue_authorized=1 AND expires_at_ms>?2
-             AND {admission}
-             AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
+                 WHERE id=?1 AND capability='flow.run' AND state='queued'
+                 AND resume_at_ms IS NOT NULL AND resume_at_ms<=?2
+                 AND queue_authorized=1 AND expires_at_ms>?2
+                 AND {admission}
+                 AND EXISTS(SELECT 1 FROM flow_journal WHERE request_id=?1 AND state='ready')",
                     admission = super::ADMISSION_STANDS
                 ),
                 params![id, now_ms, now_ts()],
-            )
-            .await?
-            == 1)
+            )? == 1)
+        })
+        .await
     }
 }

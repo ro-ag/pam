@@ -21,6 +21,9 @@ installs, supervises and talks to over a private socket. Companion to
 - Linking llama.cpp (any `llama-cpp-*` crate) would compile C++ with cmake
   inside PAM's build. Running the upstream binary keeps the no-C rule for
   PAM's own dependency graph and gives every CI target a matching asset.
+  (Since 2026-10-02 the rule has one more named exception, bundled SQLite for
+  the store, see [the SQLite store design](2026-10-02-sqlite-store.md); the
+  argument about llama.cpp is unchanged.)
 
 ## Pinning (`pam_model::engine`)
 

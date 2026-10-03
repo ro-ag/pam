@@ -1,7 +1,8 @@
 //! Immutable redacted evidence views and durable, non-renewable read allowances.
 use super::{Store, StoreError, blob_column};
+use crate::db::Db;
+use rusqlite::params;
 use sha2::{Digest, Sha256};
-use turso::params;
 
 pub(crate) const META_LIMIT: usize = 16 * 1024;
 /// Most segments a stored provenance map may hold. A producer with a finer
@@ -124,6 +125,22 @@ pub enum EvidenceRangeOutcome {
     Range(EvidenceRange),
 }
 
+/// What charging a range read came to.
+enum Charged {
+    /// There is no page to read; this is the answer.
+    Answer(EvidenceRangeOutcome),
+    /// The page was paid for.
+    Page(RangeCharge),
+}
+
+/// The allowance as one charge left it, and the view's full length.
+struct RangeCharge {
+    total: u64,
+    allowance_expires_at: i64,
+    remaining_bytes: u64,
+    remaining_pages: u32,
+}
+
 fn invalid() -> StoreError {
     StoreError::UnexpectedValue {
         column: "evidence_view",
@@ -159,34 +176,50 @@ impl Store {
         let view_sha256 = hex::encode(Sha256::digest(&view.view_bytes));
         let mut identity: serde_json::Value =
             serde_json::from_str(&view.identity_json).map_err(|_| invalid())?;
-        let identity_fields = identity.as_object_mut().ok_or_else(invalid)?;
-        let conn = self.lock().await?;
-        // Only bounded metadata is loaded; the protected source may be a large
-        // serialized compact rather than the logical text passed to redaction.
-        let mut rows = conn.query(
-            "SELECT substr(content_hash,1,65),LENGTH(content) FROM evidence WHERE id=?1 AND request_id=?2",
-            params![view.evidence_id.clone(), view.request_id.clone()],
-        ).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(false);
+        if !identity.is_object() {
+            return Err(invalid());
+        }
+        // The job outlives this borrow: the view is copied once, here, and
+        // its bytes are bound by reference.
+        let view = EvidenceViewInsert {
+            evidence_id: view.evidence_id.clone(),
+            request_id: view.request_id.clone(),
+            repository: view.repository.clone(),
+            origin_json: view.origin_json.clone(),
+            // Rebuilt below from `identity`; the original text is not stored.
+            identity_json: String::new(),
+            map_json: view.map_json.clone(),
+            view_id: view.view_id.clone(),
+            view_bytes: view.view_bytes.clone(),
         };
-        let digest: String = row.get(0)?;
-        let bytes = u64::try_from(row.get::<i64>(1)?).map_err(|_| invalid())?;
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(invalid());
-        }
-        drop(rows);
-        identity_fields.insert("protected_evidence_sha256".into(), digest.into());
-        identity_fields.insert("protected_evidence_bytes".into(), bytes.into());
-        let identity_json = identity.to_string();
-        if identity_json.len() > META_LIMIT {
-            return Err(invalid());
-        }
-        let affected = conn.execute(
-            "INSERT INTO evidence_view (evidence_id,request_id,repository,origin_json,identity_json,map_json,view_id,view_sha256,view_bytes,view_blob) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM evidence e JOIN request r ON r.id=e.request_id WHERE e.id=?1 AND e.request_id=?2)",
-            params![view.evidence_id.clone(),view.request_id.clone(),view.repository.clone(),view.origin_json.clone(),identity_json,view.map_json.clone(),view.view_id.clone(),view_sha256, i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes.clone()],
-        ).await?;
-        Ok(affected > 0)
+        self.run(move |conn| {
+            let identity_fields = identity.as_object_mut().ok_or_else(invalid)?;
+            // Only bounded metadata is loaded; the protected source may be a large
+            // serialized compact rather than the logical text passed to redaction.
+            let mut stmt = conn.prepare("SELECT substr(content_hash,1,65),LENGTH(content) FROM evidence WHERE id=?1 AND request_id=?2")?;
+            let mut rows = stmt.query(params![view.evidence_id, view.request_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(false);
+            };
+            let digest: String = row.get(0)?;
+            let bytes = u64::try_from(row.get::<i64>(1)?).map_err(|_| invalid())?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(invalid());
+            }
+            drop(rows);
+            identity_fields.insert("protected_evidence_sha256".into(), digest.into());
+            identity_fields.insert("protected_evidence_bytes".into(), bytes.into());
+            let identity_json = identity.to_string();
+            if identity_json.len() > META_LIMIT {
+                return Err(invalid());
+            }
+            let affected = conn.execute(
+                "INSERT INTO evidence_view (evidence_id,request_id,repository,origin_json,identity_json,map_json,view_id,view_sha256,view_bytes,view_blob) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM evidence e JOIN request r ON r.id=e.request_id WHERE e.id=?1 AND e.request_id=?2)",
+                params![view.evidence_id,view.request_id,view.repository,view.origin_json,identity_json,view.map_json,view.view_id,view_sha256, i64::try_from(view.view_bytes.len()).map_err(|_| invalid())?,view.view_bytes],
+            )?;
+            Ok(affected > 0)
+        })
+        .await
     }
 
     /// Looks up bounded metadata using the full ownership tuple. Private origin
@@ -197,52 +230,92 @@ impl Store {
         evidence_id: &str,
         repository: &str,
     ) -> Result<Option<EvidenceViewMeta>, StoreError> {
-        let conn = self.lock().await?;
-        let mut rows = conn.query(&format!("SELECT v.identity_json,v.origin_json,v.map_json,v.view_id,v.view_sha256,v.view_bytes,v.expired_at,request.authorization_revision,CASE WHEN {admission} THEN 1 ELSE 0 END FROM evidence_view v JOIN request ON request.id=v.request_id WHERE v.evidence_id=?1 AND v.request_id=?2 AND v.repository=?3", admission = super::ADMISSION_STANDS), params![evidence_id,request_id,repository]).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        Ok(Some(EvidenceViewMeta {
-            authorization_revision: row.get(7)?,
-            authorization_current: row.get::<i64>(8)? == 1,
-            identity_json: row.get(0)?,
-            origin_json: row.get(1)?,
-            map_json: row.get(2)?,
-            view_id: row.get(3)?,
-            view_sha256: row.get(4)?,
-            view_bytes: u64::try_from(row.get::<i64>(5)?).map_err(|_| invalid())?,
-            expired_at: row.get(6)?,
-        }))
+        let request_id = request_id.to_owned();
+        let evidence_id = evidence_id.to_owned();
+        let repository = repository.to_owned();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(&format!("SELECT v.identity_json,v.origin_json,v.map_json,v.view_id,v.view_sha256,v.view_bytes,v.expired_at,request.authorization_revision,CASE WHEN {admission} THEN 1 ELSE 0 END FROM evidence_view v JOIN request ON request.id=v.request_id WHERE v.evidence_id=?1 AND v.request_id=?2 AND v.repository=?3", admission = super::ADMISSION_STANDS))?;
+            let mut rows = stmt.query(params![evidence_id,request_id,repository])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(Some(EvidenceViewMeta {
+                authorization_revision: row.get(7)?,
+                authorization_current: row.get::<i64>(8)? == 1,
+                identity_json: row.get(0)?,
+                origin_json: row.get(1)?,
+                map_json: row.get(2)?,
+                view_id: row.get(3)?,
+                view_sha256: row.get(4)?,
+                view_bytes: u64::try_from(row.get::<i64>(5)?).map_err(|_| invalid())?,
+                expired_at: row.get(6)?,
+            }))
+        })
+        .await
     }
 
     /// Charges every valid range attempt against a persisted first-read one-hour,
     /// 64-MiB, 4096-page allowance. Continuations and retries never renew it.
     /// Cancellation after charging does not refund uncertain delivery.
+    ///
+    /// Two steps. The charge is a write and runs on the writing connection,
+    /// each statement committing on its own: it must survive whatever happens
+    /// to the read. The page itself is then read on the read-only connection
+    /// (see `Store::read`): the engine loads a whole view, up to 64 MiB, to
+    /// cut one page out of it, and no write should wait behind that. A view
+    /// that retention removes between the two steps answers `Expired` or
+    /// `Unavailable`, charged, like any other delivery that did not happen.
     pub async fn read_evidence_view_range(
         &self,
         request: &EvidenceRangeRequest,
     ) -> Result<EvidenceRangeOutcome, StoreError> {
-        let conn = self.lock().await?;
-        // Each write autocommits: dropping this future cannot leave a BEGIN open
-        // or roll back a charged attempt. The lock prevents local interleaving.
-        Self::evidence_range_locked(&conn, request).await
+        let request = std::sync::Arc::new(EvidenceRangeRequest {
+            request_id: request.request_id.clone(),
+            evidence_id: request.evidence_id.clone(),
+            repository: request.repository.clone(),
+            expected_view_id: request.expected_view_id.clone(),
+            expected_sha256: request.expected_sha256.clone(),
+            offset: request.offset,
+            length: request.length,
+            now: request.now,
+        });
+        let charging = std::sync::Arc::clone(&request);
+        let charged = self
+            .run(move |conn| Self::charge_evidence_range(conn, &charging))
+            .await?;
+        let charge = match charged {
+            Charged::Answer(outcome) => return Ok(outcome),
+            Charged::Page(charge) => charge,
+        };
+        self.read(move |conn| Self::read_charged_range(conn, &request, &charge))
+            .await
     }
 
-    async fn evidence_range_locked(
-        conn: &turso::Connection,
+    /// Validates the range and charges it. Answers the outcome when there is
+    /// no page to read (no such view, expired, invalid, end of view, budget
+    /// exhausted), and otherwise the allowance as the charge left it.
+    fn charge_evidence_range(
+        conn: Db<'_>,
         r: &EvidenceRangeRequest,
-    ) -> Result<EvidenceRangeOutcome, StoreError> {
-        let mut rows = conn.query("SELECT view_bytes,expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5",params![r.evidence_id.clone(),r.request_id.clone(),r.repository.clone(),r.expected_view_id.clone(),r.expected_sha256.clone()]).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(EvidenceRangeOutcome::Unavailable);
+    ) -> Result<Charged, StoreError> {
+        let mut stmt = conn.prepare("SELECT view_bytes,expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5")?;
+        let mut rows = stmt.query(params![
+            r.evidence_id.clone(),
+            r.request_id.clone(),
+            r.repository.clone(),
+            r.expected_view_id.clone(),
+            r.expected_sha256.clone()
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(Charged::Answer(EvidenceRangeOutcome::Unavailable));
         };
         let total = u64::try_from(row.get::<i64>(0)?).map_err(|_| invalid())?;
         if row.get::<Option<i64>>(1)?.is_some() {
-            return Ok(EvidenceRangeOutcome::Expired);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::Expired));
         }
         drop(rows);
         if r.length == 0 || r.length > RANGE_LIMIT || r.offset > total {
-            return Ok(EvidenceRangeOutcome::InvalidRange);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::InvalidRange));
         }
         if r.offset == total {
             // Exactly at the end, which for an empty view is also the start:
@@ -250,19 +323,51 @@ impl Store {
             // empty end-of-view page instead of an error, and charges
             // nothing, since no bytes and no page were delivered.
             return Self::end_of_view(conn, r, total)
-                .await
-                .map(EvidenceRangeOutcome::Range);
+                .map(|range| Charged::Answer(EvidenceRangeOutcome::Range(range)));
         }
         let Some(expires) = r.now.checked_add(3600) else {
             return Err(invalid());
         };
-        conn.execute("INSERT OR IGNORE INTO evidence_read_allowance (request_id,repository,started_at,expires_at,remaining_bytes,remaining_pages) VALUES (?1,?2,?3,?4,67108864,4096)",params![r.request_id.clone(),r.repository.clone(),r.now,expires]).await?;
-        let changed = conn.execute("UPDATE evidence_read_allowance SET remaining_bytes=remaining_bytes-?3,remaining_pages=remaining_pages-1 WHERE request_id=?1 AND repository=?2 AND expires_at>?4 AND remaining_bytes>=?3 AND remaining_pages>0",params![r.request_id.clone(),r.repository.clone(),i64::from(r.length),r.now]).await?;
+        conn.execute("INSERT OR IGNORE INTO evidence_read_allowance (request_id,repository,started_at,expires_at,remaining_bytes,remaining_pages) VALUES (?1,?2,?3,?4,67108864,4096)",params![r.request_id.clone(),r.repository.clone(),r.now,expires])?;
+        let changed = conn.execute("UPDATE evidence_read_allowance SET remaining_bytes=remaining_bytes-?3,remaining_pages=remaining_pages-1 WHERE request_id=?1 AND repository=?2 AND expires_at>?4 AND remaining_bytes>=?3 AND remaining_pages>0",params![r.request_id.clone(),r.repository.clone(),i64::from(r.length),r.now])?;
         if changed == 0 {
-            return Ok(EvidenceRangeOutcome::BudgetExhausted);
+            return Ok(Charged::Answer(EvidenceRangeOutcome::BudgetExhausted));
         }
-        let mut rows = conn.query("SELECT substr(v.view_blob,?3,?4),a.expires_at,a.remaining_bytes,a.remaining_pages FROM evidence_view v JOIN evidence_read_allowance a ON a.request_id=v.request_id AND a.repository=v.repository WHERE v.evidence_id=?1 AND v.request_id=?2",params![r.evidence_id.clone(),r.request_id.clone(),i64::try_from(r.offset).map_err(|_| invalid())? + 1,i64::from(r.length)]).await?;
-        let row = rows.next().await?.ok_or_else(invalid)?;
+        let mut stmt = conn.prepare("SELECT expires_at,remaining_bytes,remaining_pages FROM evidence_read_allowance WHERE request_id=?1 AND repository=?2")?;
+        let mut rows = stmt.query(params![r.request_id.clone(), r.repository.clone()])?;
+        let row = rows.next()?.ok_or_else(invalid)?;
+        Ok(Charged::Page(RangeCharge {
+            total,
+            allowance_expires_at: row.get(0)?,
+            remaining_bytes: u64::try_from(row.get::<i64>(1)?).map_err(|_| invalid())?,
+            remaining_pages: u32::try_from(row.get::<i64>(2)?).map_err(|_| invalid())?,
+        }))
+    }
+
+    /// Reads the page a charge paid for. The view is named by its whole
+    /// identity again: this runs after the charge, not with it.
+    fn read_charged_range(
+        conn: Db<'_>,
+        r: &EvidenceRangeRequest,
+        charge: &RangeCharge,
+    ) -> Result<EvidenceRangeOutcome, StoreError> {
+        let mut stmt = conn.prepare("SELECT substr(view_blob,?6,?7),expired_at FROM evidence_view WHERE evidence_id=?1 AND request_id=?2 AND repository=?3 AND view_id=?4 AND view_sha256=?5")?;
+        let mut rows = stmt.query(params![
+            r.evidence_id.clone(),
+            r.request_id.clone(),
+            r.repository.clone(),
+            r.expected_view_id.clone(),
+            r.expected_sha256.clone(),
+            i64::try_from(r.offset).map_err(|_| invalid())? + 1,
+            i64::from(r.length)
+        ])?;
+        let Some(row) = rows.next()? else {
+            // The record went away after the charge.
+            return Ok(EvidenceRangeOutcome::Unavailable);
+        };
+        if row.get::<Option<i64>>(1)?.is_some() {
+            return Ok(EvidenceRangeOutcome::Expired);
+        }
         let bytes = blob_column(&row, 0)?;
         if bytes.is_empty() {
             // `offset < total` yet no bytes: the blob is gone without a
@@ -277,11 +382,11 @@ impl Store {
             view_sha256: r.expected_sha256.clone(),
             offset: r.offset,
             bytes,
-            total_bytes: total,
-            next_offset: (next < total).then_some(next),
-            allowance_expires_at: row.get(1)?,
-            remaining_bytes: u64::try_from(row.get::<i64>(2)?).map_err(|_| invalid())?,
-            remaining_pages: u32::try_from(row.get::<i64>(3)?).map_err(|_| invalid())?,
+            total_bytes: charge.total,
+            next_offset: (next < charge.total).then_some(next),
+            allowance_expires_at: charge.allowance_expires_at,
+            remaining_bytes: charge.remaining_bytes,
+            remaining_pages: charge.remaining_pages,
         }))
     }
 
@@ -289,18 +394,14 @@ impl Store {
     /// are the persisted ones when a read already started the allowance, and
     /// the untouched first-read figures when none has: reading the end of a
     /// view does not start the clock.
-    async fn end_of_view(
-        conn: &turso::Connection,
+    fn end_of_view(
+        conn: Db<'_>,
         r: &EvidenceRangeRequest,
         total: u64,
     ) -> Result<EvidenceRange, StoreError> {
-        let mut rows = conn
-            .query(
-                "SELECT expires_at,remaining_bytes,remaining_pages FROM evidence_read_allowance WHERE request_id=?1 AND repository=?2",
-                params![r.request_id.clone(), r.repository.clone()],
-            )
-            .await?;
-        let (allowance_expires_at, remaining_bytes, remaining_pages) = match rows.next().await? {
+        let mut stmt = conn.prepare("SELECT expires_at,remaining_bytes,remaining_pages FROM evidence_read_allowance WHERE request_id=?1 AND repository=?2")?;
+        let mut rows = stmt.query(params![r.request_id.clone(), r.repository.clone()])?;
+        let (allowance_expires_at, remaining_bytes, remaining_pages) = match rows.next()? {
             Some(row) => (
                 row.get::<i64>(0)?,
                 u64::try_from(row.get::<i64>(1)?.max(0)).map_err(|_| invalid())?,

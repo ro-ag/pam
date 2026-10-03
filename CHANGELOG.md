@@ -50,6 +50,28 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- The store runs on SQLite (bundled through `rusqlite`) instead of the Turso
+  engine. Databases written by earlier versions are opened in place after a
+  one-time backup. Building from source now needs a C compiler on every
+  target: the Xcode command line tools on macOS, the MSVC build tools on
+  Windows.
+- The store refuses a call when 1,024 are already waiting for the same
+  connection, instead of queueing without bound behind a disk that is not
+  keeping up. A public request that meets the bound is refused with the new
+  cause `store_overloaded`, marked retryable, with the store's own sentence as
+  the detail and "Retry shortly." as the recovery; a `pam wait` or
+  `pam subscribe` retries it with backoff. It used to be `internal_error`.
+  The private admin plane shows the same sentence.
+- A request that reaches the store after the daemon has closed it, at the
+  very end of a shutdown, is refused `daemon_shutting_down` (retryable)
+  instead of `internal_error`.
+- The Activity list, a request's audit trail, evidence reads, the retention
+  preview and the integrity check read through a second, read-only
+  connection: they no longer wait behind writes, and writes no longer wait
+  behind them.
+- A model download or verification still running when the daemon stops is
+  stopped and recorded as failed (`daemon_restart`) before the daemon exits,
+  not at the next start. A download keeps its partial file and resumes.
 - Supported platforms are macOS 12+ on Apple Silicon and Windows on amd64 and
   arm64. Linux and Intel Macs are not supported, and CI no longer builds or
   tests for them.
@@ -150,6 +172,8 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Removed
 
+- The Turso engine and its vendored sources (`vendor/turso_core`,
+  `vendor/aegis`, and their patches); no `vendor/` directory remains.
 - ZeroMQ: the `zeromq` dependency, its vendored patch and its separate gate
   step are gone, and nothing on either plane speaks ZMTP.
 - `events.sock`, the event broadcast socket, and the second socket
@@ -233,16 +257,55 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Compatibility
 
+- The first start after upgrading copies the state database, its write-ahead
+  log and its `-shm` file (those that exist) into
+  `<base>/backup/state-<UTC time>-pre-sqlite/` before anything is written,
+  checks the database in full once, and only then migrates it. The copy takes
+  as much disk as the database, holds audit data (mode `0600` inside the
+  base) and is never deleted by PAM. On a large database this start is slower
+  by the copy and the check.
+- If that copy cannot be written, or the check fails, the daemon refuses to
+  start, leaves every database file untouched and says what to do: free the
+  space or fix the `backup` directory's permissions; for a damaged database,
+  run the release that wrote it against the copy, salvage with
+  `sqlite3 <copy> .recover`, or move the state file and its `-wal` and `-shm`
+  out of the base to start empty. There is no override. A restart loop gets
+  the same refusal and makes no second copy.
+- Later schema migrations copy the database first as well, into
+  `backup/state-<UTC time>-pre-v<N>/`. The newest three of those copies are
+  kept.
+- There is no downgrade. Opening a database stamps it schema version 14 and
+  marks it as PAM's; an older binary refuses it (see the next entry). To go
+  back, stop the daemon, copy the files of the `pre-sqlite` backup over
+  `state.sqlite3` and its `-wal`, and start the old release; what was written
+  since the upgrade is lost.
+- A power cut or an operating-system crash can lose the last committed
+  transactions, never the database's consistency: a request acknowledged in
+  that moment is back in its earlier state and boot recovery closes it. A
+  full flush to the drive on every commit measured about 5 ms against 0.2 ms
+  on macOS and is left off; checkpoints are fully synced there. A daemon that
+  crashes or is killed loses nothing.
+- A clean stop leaves `state.sqlite3` as a complete copy of the database: the
+  write-ahead log is folded into it, so copying that one file is a full
+  backup. A daemon that was killed leaves a `-wal` beside it, replayed at the
+  next start; until then the main file alone is an older database.
+- A state file that is missing or empty while its `-wal` has content is
+  refused instead of being restarted empty. An empty state file with no log
+  is refused too in a base PAM has used before (a `backup` directory, a log,
+  the daemon's lock, flows or model records): restore the newest backup, or
+  move the empty file aside to start fresh.
+
 - `pam service status --json` no longer reports `"platform": "linux"`; on a
   platform with no login-start integration it reports the `unsupported` state
   with its reason.
 - Schema version 12 adds indexes for Activity and retention and makes audit
   rows append-only and evidence views immutable. Version 13 adds the origin
-  columns to request rows. A store upgraded by this version is refused by
-  older binaries: a 0.4.3 daemon started on it exits `1` with "database schema
-  version 13 is newer than this binary supports (max 11)", so there is no way
-  back to an older daemon on the same base, and a login unit that still pins
-  an old binary cannot start it.
+  columns to request rows. Version 14 changes no table: it is the mark that
+  the database has been opened by the SQLite engine. A store upgraded by this
+  version is refused by older binaries: a 0.4.3 daemon started on it exits `1`
+  with "database schema version 14 is newer than this binary supports (max
+  11)", so there is no way back to an older daemon on the same base, and a
+  login unit that still pins an old binary cannot start it.
 - Upgrading from 0.4.x or 0.3.0 with a daemon still running: the old daemon
   speaks the previous protocol on the same socket, and a new client recognises
   it by its greeting. The first `pam` command run outside a sandbox, the GUI,

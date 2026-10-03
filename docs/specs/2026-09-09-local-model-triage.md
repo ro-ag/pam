@@ -33,7 +33,7 @@ for deployment assumptions and the Windows unsupported-platform behavior.
 Secrets belong in the OS keychain, not a PAM key store or model context.
 Authorized daemon connector adapters resolve credentials transiently; the model
 and agent never own them. Core inference is local, with no outbound inference
-or inference API keys. Retain one binary and the Rust-only Candle/turso design.
+or inference API keys. Retain one binary and the Rust-only Candle design (the store was turso then; since 2026-10-02 it is bundled SQLite, a named exception to the no-C rule, see [the SQLite store design](2026-10-02-sqlite-store.md)).
 
 ## What exists, what changes
 

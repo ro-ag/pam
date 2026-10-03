@@ -1232,14 +1232,16 @@ const TRANSIENT_MAX: Duration = Duration::from_secs(8);
 
 /// Causes that describe the daemon's momentary condition, not a decision
 /// about the caller: it is out of capacity (request slots, follower slots,
-/// connections) or over its rate window, draining, restarting for a newer
-/// binary, or timed something out. A follow retries these with backoff;
-/// every other refusal is a policy answer and stops it. The daemon marks
-/// its own transient refusals `retryable`; this list is the fallback for an
-/// answer that carries no such mark (an `error` frame).
-pub const TRANSIENT_CAUSES: [&str; 10] = [
+/// connections) or over its rate window, its store has too many calls
+/// waiting for the disk, it is draining, restarting for a newer binary, or
+/// timed something out. A follow retries these with backoff; every other
+/// refusal is a policy answer and stops it. The daemon marks its own
+/// transient refusals `retryable`; this list is the fallback for an answer
+/// that carries no such mark (an `error` frame).
+pub const TRANSIENT_CAUSES: [&str; 11] = [
     "request_capacity_exhausted",
     "request_rate_exhausted",
+    "store_overloaded",
     "daemon_shutting_down",
     CAUSE_DAEMON_OUTDATED,
     "deadline_exceeded",

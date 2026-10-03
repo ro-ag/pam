@@ -1,0 +1,995 @@
+{
+ "files": {
+  "state.sqlite3": {
+   "bytes": 262144,
+   "sha256": "5cd20fae38a3010c29f5f2ed9f51972e89c4c87a6d40fed83c5e8e3b52871982"
+  },
+  "state.sqlite3-wal": {
+   "bytes": 185432,
+   "sha256": "9b791cad931182a87ce5e2ad3aeb1ae8c6f6051dd0dcda8c5a05cd78e9c9fef9"
+  }
+ },
+ "fixture": "v11",
+ "format": 1,
+ "probes": {
+  "keep_kind": "log.summary",
+  "now_ms": [0,1850000000000,9223372036854775807],
+  "repositories": ["/Users/ünï/pam-répo","/tmp/it's a \"repo\"","/other/repo"],
+  "setting_keys": ["policy.profile","retention.evidence_days","retention.audit_days","retention.watermark_ts","setting.large","kéy 'q' \"d\" ✓","wal.only","missing.key"],
+  "terminal_actions": ["execute","admin.tripwire","approval"],
+  "views": [
+   ["v11_compress_between","ev_v11_source","/Users/ünï/pam-répo"],
+   ["v11_compress_between","ev_v11_summary","/Users/ünï/pam-répo"],
+   ["v11_compress_between","ev_v11_summary","/other/repo"],
+   ["v11_flow_before","ev_v11_watch","/Users/ünï/pam-répo"],
+   ["missing","missing","/Users/ünï/pam-répo"]
+  ]
+ },
+ "variants": {
+  "as_written": {
+   "public": {
+    "approval": {
+     "count": 4,
+     "not_readable": "an older approval row of a request that has a newer one",
+     "pending": [
+      {"args_json":"{}","caller_agent":"claude-code","capability":"deploy","repo":"/Users/ünï/pam-répo","request_capability":"deploy","request_id":"v11_waiting","requested_ts":1750000401}
+     ],
+     "read_via": "approval_for_request per request: the newest approval of each",
+     "rows": [
+      {"capability":"deploy","id":2,"note":"lgtm ✓ — 'ok'","request_id":"v11_approved","requested_ts":1750000401,"resolution":"approved","resolved_ts":1750000402},
+      {"capability":"deploy","id":3,"note":"no; \"prod\" freeze","request_id":"v11_denied","requested_ts":1750000401,"resolution":"denied","resolved_ts":1750000402},
+      {"capability":"deploy","id":4,"note":null,"request_id":"v11_timeout","requested_ts":1750000401,"resolution":"timeout","resolved_ts":1750000402},
+      {"capability":"deploy","id":1,"note":null,"request_id":"v11_waiting","requested_ts":1750000401,"resolution":null,"resolved_ts":null}
+     ]
+    },
+    "audit": {
+     "count": 9,
+     "read_via": "audit_for_request per request (request id ascending, then audit id)",
+     "rows": [
+      {"action":"approval","actor":"human","decision":"approve","detail":null,"id":4,"request_id":"v11_approved","ts":1750000403},
+      {"action":"execute","actor":"system","decision":"allow","detail":null,"id":8,"request_id":"v11_compress_between","ts":1750000403},
+      {"action":"approval","actor":"human","decision":"deny","detail":null,"id":5,"request_id":"v11_denied","ts":1750000403},
+      {"action":"execute","actor":"system","decision":"allow","detail":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","id":1,"request_id":"v11_done","ts":1750000403},
+      {"action":"enqueue","actor":"policy","decision":"allow","detail":null,"id":9,"request_id":"v11_echo_before","ts":1750000400},
+      {"action":"reap","actor":"system","decision":"timeout","detail":null,"id":3,"request_id":"v11_failed","ts":1750000403},
+      {"action":"execute","actor":"system","decision":"allow","detail":"wal only ✓","id":10,"request_id":"v11_legacy_queued","ts":1750000710},
+      {"action":"admin.tripwire","actor":"policy","decision":"refuse","detail":"{}","id":2,"request_id":"v11_refused","ts":1750000403},
+      {"action":"approval","actor":"system","decision":"timeout","detail":null,"id":6,"request_id":"v11_timeout","ts":1750000403}
+     ]
+    },
+    "caller": {
+     "count": 4,
+     "read_via": "list_callers, most recently seen first",
+     "rows": [
+      {"agent":"wal-agent","first_seen":1750000740,"last_seen":1750000740,"repo":"/Users/ünï/pam-répo"},
+      {"agent":"","first_seen":1750000603,"last_seen":1750000603,"repo":""},
+      {"agent":"claude-code","first_seen":1750000600,"last_seen":1750000602,"repo":"/Users/ünï/pam-répo"},
+      {"agent":"agënt ✓ 'q' \"d\"","first_seen":1750000601,"last_seen":1750000601,"repo":"/tmp/it's a \"repo\""}
+     ]
+    },
+    "connector": {
+     "count": 3,
+     "read_via": "list_connectors by id; each row re-read with get_connector",
+     "rows": [
+      {"base_url":"https://api.github.com/","enabled":true,"id":"github","last_test_detail":"ok ✓","last_test_status":"passed","last_test_ts":1750000600,"updated_ts":1750000600,"username":null},
+      {"base_url":"https://jenkins.example/ünï","enabled":false,"id":"jenkins","last_test_detail":"401 \"unauthorized\"","last_test_status":"failed","last_test_ts":1750000600,"updated_ts":1750000600,"username":"o'brien"},
+      {"base_url":null,"enabled":false,"id":"never-configured","last_test_detail":null,"last_test_status":null,"last_test_ts":null,"updated_ts":1750000600,"username":null}
+     ]
+    },
+    "correlation": {
+     "correlation_membership": {
+      "not_readable": "a step with no membership row and one with an empty list both answer []; a step whose binding is not a GitHub run is refused before any read",
+      "read_via": "read_correlation_membership per step, under the step's own binding",
+      "rows": [{"members":{"refused":"unexpected_value:correlation_membership"},"request_id":"v11_flow_before","step_id":"other 'step'"},{"members":[1,2,3,5],"request_id":"v11_flow_before","step_id":"wait-ci"}]
+     },
+     "correlation_step": {
+      "count": 2,
+      "read_via": "read_correlation_steps per request, by step id",
+      "rows": [{"canonical_json":"{\"free\":\"form\"}","request_id":"v11_flow_before","step_id":"other 'step'"},{"canonical_json":"{\"schema_version\":1,\"decision\":{\"status\":\"matched\"},\"origin\":{\"connector\":\"github\",\"call\":\"run\",\"base_url\":\"https://api.github.com/\"},\"identity\":{\"repository\":\"org/repo\",\"run_id\":123456789,\"run_attempt\":1}}","request_id":"v11_flow_before","step_id":"wait-ci"}]
+     },
+     "correlation_target": {
+      "count": 1,
+      "read_via": "read_correlation_target per request",
+      "rows": [{"canonical_json":"{\"kind\":\"pull_request\",\"title\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\"}","request_id":"v11_flow_before"}]
+     }
+    },
+    "evidence": {
+     "compression_stats_since_ever": {
+      "compact_bytes": 9000,
+      "compressions": 1,
+      "source_bytes": 30000,
+      "tokens_avoided_est": 5250
+     },
+     "compression_stats_since_never": {
+      "compact_bytes": 0,
+      "compressions": 0,
+      "source_bytes": 0,
+      "tokens_avoided_est": 0
+     },
+     "count": 7,
+     "not_readable": "path (always NULL: evidence is blob-backed)",
+     "read_via": "list_evidence per request (oldest first), each blob read with get_evidence",
+     "retention_census": {
+      "all_evidence": {"eligible_rows":3,"total_rows":15},
+      "all_requests": {"eligible_rows":12,"total_rows":15},
+      "both": {"eligible_rows":12,"total_rows":15},
+      "no_window": {"eligible_rows":0,"total_rows":15},
+      "nothing_old_enough": {"eligible_rows":0,"total_rows":15}
+     },
+     "rows": [
+      {"as_flow_checkpoint":null,"content":{"bytes":9000,"sha256":"54907c577d2c333dcd33cefacd348ec047d2910bd0f8b1d6f709111d4a2848ed"},"content_hash":"54907c577d2c333dcd33cefacd348ec047d2910bd0f8b1d6f709111d4a2848ed","id":"ev_v11_compact","kind":"log.compact","meta_json":"{\"source_bytes\":30000,\"compact_bytes\":9000,\"tokens_avoided_est\":5250}","request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":null,"content":{"bytes":0,"hex":"","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"content_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","id":"ev_v11_empty","kind":"log.source","meta_json":null,"request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":null,"content":{"bytes":255,"sha256":"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266"},"content_hash":"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266","id":"ev_v11_small","kind":"log.source","meta_json":null,"request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":null,"content":{"bytes":20,"hex":"72c3a973756dc3a920e29c932027712720226422","sha256":"4c923b7dd533012c5528848dfab2de91fdf29ec351dc75a10ae34925b09e6efa"},"content_hash":"4c923b7dd533012c5528848dfab2de91fdf29ec351dc75a10ae34925b09e6efa","id":"ev_v11_summary","kind":"log.summary","meta_json":"{\"model\":\"qwen ü\"}","request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":{"bytes":24,"hex":"7b2270726976617465223a22636865636b706f696e74227d","sha256":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b"},"content":{"bytes":24,"hex":"7b2270726976617465223a22636865636b706f696e74227d","sha256":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b"},"content_hash":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b","id":"ev_v11_checkpoint","kind":"flow.checkpoint","meta_json":null,"request_id":"v11_flow_before","ts":1750000500},
+      {"as_flow_checkpoint":null,"content":{"bytes":11,"hex":"6f62736572766174696f6e","sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"content_hash":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149","id":"ev_v11_watch","kind":"flow.watch","meta_json":"{\"watch_progress\":{\"connector\":\"github\",\"evidence_id\":\"ev_v11_watch\",\"next_poll_at\":null,\"omissions\":0,\"polls\":2,\"status\":\"in_progress\",\"step\":\"wait-ci\",\"watch_state\":\"pending\"}}","request_id":"v11_flow_before","ts":1750000500},
+      {"as_flow_checkpoint":null,"content":{"bytes":5000,"sha256":"7fd97788d3d5280bd8d1fabb422e6f1486b578be71db0973206cab96f4f8753c"},"content_hash":"7fd97788d3d5280bd8d1fabb422e6f1486b578be71db0973206cab96f4f8753c","id":"ev_v11_wal","kind":"log.source","meta_json":null,"request_id":"v11_wal_1","ts":1750000730}
+     ]
+    },
+    "evidence_view": {
+     "count": 3,
+     "not_readable": "the store cannot list views; a tuple outside the probes is not seen",
+     "read_via": "evidence_view_meta for each tuple in probes.views; the bytes are read in evidence_view_reads",
+     "rows": [
+      {"evidence_id":"ev_v11_source","meta":{"authorization_current":false,"authorization_revision":3,"expired_at":1750000406,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_v11_source\",\"offset_basis\":\"view_bytes\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"v11_compress_between\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":3000,"view_id":"view_ev_v11_source","view_sha256":"2af86a201e773eb3c804d8d7846082e0e88a08dd572fe061c7f62dd22a9e5e4e"},"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between"},
+      {"evidence_id":"ev_v11_summary","meta":{"authorization_current":false,"authorization_revision":3,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_v11_summary\",\"offset_basis\":\"view_bytes\",\"provenance_map\":{\"merged_segments\":300,\"resolution\":\"coarsened\",\"segments\":100,\"source_segments\":400},\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"v11_compress_between\",\"schema_version\":1}","map_json":{"bytes":8827,"head":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"coar","sha256":"8ae7b19c396314d86d3bf58d8c7cb337890455d91734d46e5508c9717d806879"},"origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":20000,"view_id":"view_ev_v11_summary","view_sha256":"425234b042aa972631dfc59fb997de4f653541a9be68f5e8a96fed859b9e18e6"},"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between"},
+      {"evidence_id":"ev_v11_summary","meta":null,"repository":"/other/repo","request_id":"v11_compress_between"},
+      {"evidence_id":"ev_v11_watch","meta":{"authorization_current":false,"authorization_revision":2,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_v11_watch\",\"offset_basis\":\"view_bytes\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"v11_flow_before\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":11,"view_id":"view_ev_v11_watch","view_sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before"},
+      {"evidence_id":"missing","meta":null,"repository":"/Users/ünï/pam-répo","request_id":"missing"}
+     ]
+    },
+    "evidence_view_reads": {
+     "read_via": "read_evidence_view_range, 64 KiB pages; each page is charged to the request's allowance (a write), which is why this runs last",
+     "rows": [
+      {"end_of_view":{"outcome":"expired"},"evidence_id":"ev_v11_source","repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1750004005,"remaining_bytes":67043328,"remaining_pages":4095},"content":{"bytes":20000,"sha256":"425234b042aa972631dfc59fb997de4f653541a9be68f5e8a96fed859b9e18e6"},"evidence_id":"ev_v11_summary","pages":[{"allowance_expires_at":1750004005,"bytes":20000,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":66977792,"remaining_pages":4094,"total_bytes":20000,"view_id":"view_ev_v11_summary"}],"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67108864,"remaining_pages":4096},"content":{"bytes":11,"hex":"6f62736572766174696f6e","sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"evidence_id":"ev_v11_watch","pages":[{"allowance_expires_at":1700003600,"bytes":11,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043328,"remaining_pages":4095,"total_bytes":11,"view_id":"view_ev_v11_watch"}],"repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before","under_another_digest":{"outcome":"unavailable"}}
+     ]
+    },
+    "flow_journal": {
+     "count": 5,
+     "projections": [
+      {"projection":{"evidence_origins":"incomplete","flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"v11_compress_between"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"v11_compress_between"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":null,"watch_progress":"{\"connector\":\"github\",\"evidence_id\":\"ev_v11_watch\",\"next_poll_at\":1900000000000,\"omissions\":0,\"polls\":3,\"status\":\"in_progress\",\"step\":\"wait-ci\",\"watch_state\":\"pending\"}"},"repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"v11_flow_before"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"v11_flow_before"},
+      {"projection":{"evidence_origins":"incomplete","flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"v11_wal_1"},
+      {"projection":{"evidence_origins":"incomplete","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"v11_wal_1"},
+      {"projection":{"evidence_origins":"incomplete","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"v11_wal_1"}
+     ],
+     "projections_read_via": "request_evidence_origins_state, flow_result_meta and flow_watch_progress per request under its own and each probe repository; a pair with no evidence, result or progress is left out",
+     "read_via": "read_flow_journal per request",
+     "rows": [
+      {"attempt":1,"checkpoint_json":{"bytes":5012,"head":"{\"notes\":\"ünï ✓ ünï ✓ ünï ✓ ünï ✓ ünï ✓ ünï ✓ ün","sha256":"d4afeece51197628d2dac5d9292beccd20907fca34b164f4dbf97e1636c6e959"},"effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_done","revision":1,"state":"completed","step_id":"final"},
+      {"attempt":1,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_failed","revision":1,"state":"uncertain","step_id":"merge"},
+      {"attempt":1,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_flow_after","revision":1,"state":"prepared","step_id":"push"},
+      {"attempt":0,"checkpoint_json":"{\"next_step\":0,\"watch\":{\"polls\":3,\"next_poll_ms\":1900000000000,\"last_evidence\":\"ev_v11_watch\"}}","effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before","revision":0,"state":"ready","step_id":null},
+      {"attempt":0,"checkpoint_json":"{}","effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/tmp/it's a \"repo\"","request_id":"v11_parked","revision":0,"state":"ready","step_id":null}
+     ]
+    },
+    "grant": {
+     "count": 7,
+     "not_readable": "revoked_seq has no public read; it shows through request_queries/*/authorization_current and per_capability/*/revocation_revision",
+     "per_capability": {
+      "": {"active":false,"revocation_revision":0},
+      "admin.grants.add": {"active":false,"revocation_revision":0},
+      "deploy": {"active":false,"revocation_revision":1},
+      "echo": {"active":true,"revocation_revision":1},
+      "flow.run": {"active":true,"revocation_revision":1},
+      "flow.step:github.run": {"active":false,"revocation_revision":1},
+      "git.push": {"active":false,"revocation_revision":1},
+      "log.compress": {"active":false,"revocation_revision":1}
+     },
+     "read_via": "list_grants, newest first",
+     "revocation_revision": 5,
+     "rows": [
+      {"capability":"echo","granted_ts":1750000201,"id":7,"revoked_ts":null,"scope":"global"},
+      {"capability":"git.push","granted_ts":1750000100,"id":6,"revoked_ts":1750000720,"scope":"global"},
+      {"capability":"deploy","granted_ts":1750000100,"id":5,"revoked_ts":1750000250,"scope":"global"},
+      {"capability":"flow.run","granted_ts":1750000100,"id":4,"revoked_ts":null,"scope":"global"},
+      {"capability":"flow.step:github.run","granted_ts":1750000100,"id":3,"revoked_ts":1750000300,"scope":"global"},
+      {"capability":"log.compress","granted_ts":1750000100,"id":2,"revoked_ts":1750000300,"scope":"global"},
+      {"capability":"echo","granted_ts":1750000100,"id":1,"revoked_ts":1750000200,"scope":"global"}
+     ]
+    },
+    "landing_session": {
+     "count": 1,
+     "live_documents": ["{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"push\",\"state\":\"prepared\",\"step_id\":\"push\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}"],
+     "read_via": "read_landing_session per request",
+     "rows": [
+      {"document":"{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"push\",\"state\":\"prepared\",\"step_id\":\"push\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}","request_id":"v11_flow_after","revision":1}
+     ]
+    },
+    "model_job": {
+     "count": 4,
+     "read_via": "list_model_jobs, newest first",
+     "rows": [
+      {"bytes_done":0,"bytes_total":null,"created_ts":1750000600,"detail":"{\"cause\":\"daemon_restart\"}","id":"job_v11_running","kind":"verify","model_id":"qwen/tiny","source":null,"state":"failed","updated_ts":1750000750},
+      {"bytes_done":0,"bytes_total":null,"created_ts":1750000600,"detail":"{\"cause\":\"ünï 'q'\"}","id":"job_v11_failed","kind":"verify","model_id":"qwen/tiny","source":null,"state":"failed","updated_ts":1750000600},
+      {"bytes_done":9223372036854775806,"bytes_total":9223372036854775807,"created_ts":1750000600,"detail":"{\"sha256\":\"ab\"}","id":"job_v11_done","kind":"download","model_id":"qwen/tiny","source":"https://example.invalid/models/ünï.gguf","state":"done","updated_ts":1750000600},
+      {"bytes_done":5,"bytes_total":0,"created_ts":1750000600,"detail":null,"id":"job_v11_cancelled","kind":"download","model_id":"qwen/tiny","source":"https://example.invalid/models/ünï.gguf","state":"cancelled","updated_ts":1750000600}
+     ]
+    },
+    "request": {
+     "count": 21,
+     "read_via": "list_requests_filtered, newest first; each row re-read with get_request",
+     "rows": [
+      {"args_json":"{\"wal\":true}","authorization_revision":4,"caller_agent":"claude-code","capability":"echo","created_ts":1750000705,"expires_at_ms":9223372036854775807,"id":"v11_wal_5","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000705},
+      {"args_json":"{\"wal\":true}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000704,"expires_at_ms":null,"id":"v11_wal_4","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1750000704},
+      {"args_json":"{\"wal\":true}","authorization_revision":4,"caller_agent":"claude-code","capability":"echo","created_ts":1750000703,"expires_at_ms":9223372036854775807,"id":"v11_wal_3","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000703},
+      {"args_json":"{\"wal\":true}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000702,"expires_at_ms":null,"id":"v11_wal_2","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1750000702},
+      {"args_json":"{\"wal\":true}","authorization_revision":4,"caller_agent":"claude-code","capability":"echo","created_ts":1750000701,"expires_at_ms":9223372036854775807,"id":"v11_wal_1","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000701},
+      {"args_json":"{\"wal\":true}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000700,"expires_at_ms":null,"id":"v11_wal_0","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1750000700},
+      {"args_json":"","authorization_revision":null,"caller_agent":"claude-code","capability":"","created_ts":1750000400,"expires_at_ms":null,"id":"v11_ünï 'q' \"d\"","idempotency_key":"","ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"queued","updated_ts":1750000400},
+      {"args_json":"{}","authorization_revision":4,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":9223372036854775807,"id":"v11_waiting","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"waiting_approval","updated_ts":1750000401},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":null,"id":"v11_timeout","idempotency_key":null,"ingress":"public","outcome":"approval_timeout","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"admin.grants.add","created_ts":1750000400,"expires_at_ms":null,"id":"v11_refused","idempotency_key":null,"ingress":"public","outcome":"admin_denied","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"refused","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000400,"expires_at_ms":null,"id":"v11_failed","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1750000403},
+      {"args_json":{"bytes":12011,"head":"{\"text\":\"ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï","sha256":"f2d9fa6fb601c65664465050c954df153026048a2e0ae4756ccf1646467382ad"},"authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000400,"expires_at_ms":null,"id":"v11_done","idempotency_key":"","ingress":"public","outcome":"{\"ok\":true}","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":null,"id":"v11_denied","idempotency_key":null,"ingress":"public","outcome":"denied","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"refused","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":null,"id":"v11_approved","idempotency_key":null,"ingress":"public","outcome":"deployed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":4,"caller_agent":"claude-code","capability":"flow.run","created_ts":1750000320,"expires_at_ms":9223372036854775807,"id":"v11_parked","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/tmp/it's a \"repo\"","resume_at_ms":1900000000000,"state":"queued","updated_ts":1750000321},
+      {"args_json":"{}","authorization_revision":4,"caller_agent":"claude-code","capability":"flow.run","created_ts":1750000310,"expires_at_ms":9223372036854775807,"id":"v11_flow_after","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000310},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"log.compress","created_ts":1750000300,"expires_at_ms":9223372036854775807,"id":"v11_compress_between","idempotency_key":null,"ingress":"public","outcome":"compressed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":2,"caller_agent":"claude-code","capability":"flow.run","created_ts":1750000260,"expires_at_ms":9223372036854775807,"id":"v11_flow_before","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000260},
+      {"args_json":"{}","authorization_revision":1,"caller_agent":"claude-code","capability":"echo","created_ts":1750000210,"expires_at_ms":9223372036854775807,"id":"v11_echo_after","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1750000211},
+      {"args_json":"{\"text\":\"hi\"}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000120,"expires_at_ms":null,"id":"v11_legacy_queued","idempotency_key":"k-legacy","ingress":"public","outcome":"finished in the wal","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000710},
+      {"args_json":"{}","authorization_revision":0,"caller_agent":"claude-code","capability":"echo","created_ts":1750000110,"expires_at_ms":9223372036854775807,"id":"v11_echo_before","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000110}
+     ]
+    },
+    "request_budget": {
+     "count": 3,
+     "not_readable": "evidence_read_allowance.started_at, and an allowance under a repository other than the request's own (see evidence_view_reads for those)",
+     "read_via": "request_budget_report per request under its own repository: `charged` and `remaining` are the request_budget row, `evidence_reads` the evidence_read_allowance row; a request with neither is left out",
+     "rows": [
+      {"charged":null,"evidence_reads":{"expires_at":1750004005,"remaining_bytes":67043328,"remaining_pages":4095,"state":"expired"},"execution_expires_at_ms":9223372036854775807,"remaining":null,"request_id":"v11_compress_between"},
+      {"charged":{"attempts":3,"command_bytes":1,"http_bytes":4096,"http_calls":2},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":null,"remaining":{"attempts":253,"command_bytes":134217727,"http_bytes":134213632,"http_calls":126},"request_id":"v11_done"},
+      {"charged":{"attempts":1,"command_bytes":0,"http_bytes":0,"http_calls":0},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":9223372036854775807,"remaining":{"attempts":255,"command_bytes":134217728,"http_bytes":134217728,"http_calls":128},"request_id":"v11_flow_after"},
+      {"charged":{"attempts":256,"command_bytes":134217728,"http_bytes":134217728,"http_calls":128},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":9223372036854775807,"remaining":{"attempts":0,"command_bytes":0,"http_bytes":0,"http_calls":0},"request_id":"v11_flow_before"}
+     ]
+    },
+    "request_lists": {
+     "admission_usage": {
+      "bytes": 497,
+      "count": 9
+     },
+     "admission_usage_at_ms": {
+      "0": {"bytes":497,"count":9},
+      "1850000000000": {"bytes":497,"count":9},
+      "9223372036854775807": {"bytes":0,"count":0}
+     },
+     "count_inflight": 13,
+     "filtered": {
+      "by_agent": {"claude-code":["v11_wal_5","v11_wal_4","v11_wal_3","v11_wal_2","v11_wal_1","v11_wal_0","v11_ünï 'q' \"d\"","v11_waiting","v11_timeout","v11_refused","v11_failed","v11_done","v11_denied","v11_approved","v11_parked","v11_flow_after","v11_compress_between","v11_flow_before","v11_echo_after","v11_legacy_queued","v11_echo_before"]},
+      "by_capability_hiding_probes": {"":["v11_ünï 'q' \"d\""],"admin.grants.add":["v11_refused"],"deploy":["v11_waiting","v11_timeout","v11_denied","v11_approved"],"echo":["v11_wal_5","v11_wal_4","v11_wal_3","v11_wal_2","v11_wal_1","v11_wal_0","v11_failed","v11_done","v11_echo_after","v11_legacy_queued","v11_echo_before"],"flow.run":["v11_parked","v11_flow_after","v11_flow_before"],"log.compress":["v11_compress_between"]},
+      "by_repo": {"":["v11_ünï 'q' \"d\""],"/Users/ünï/pam-répo":["v11_wal_5","v11_wal_4","v11_wal_3","v11_wal_2","v11_wal_1","v11_wal_0","v11_waiting","v11_timeout","v11_refused","v11_failed","v11_done","v11_denied","v11_approved","v11_flow_after","v11_compress_between","v11_flow_before","v11_echo_after","v11_legacy_queued","v11_echo_before"],"/tmp/it's a \"repo\"":["v11_parked"]},
+      "by_state": {"done":["v11_done","v11_approved","v11_compress_between","v11_legacy_queued"],"failed":["v11_timeout","v11_failed"],"queued":["v11_wal_4","v11_wal_2","v11_wal_0","v11_ünï 'q' \"d\"","v11_parked","v11_echo_after"],"refused":["v11_refused","v11_denied"],"running":["v11_wal_5","v11_wal_3","v11_wal_1","v11_flow_after","v11_flow_before","v11_echo_before"],"waiting_approval":["v11_waiting"]},
+      "hide_probes": ["v11_wal_5","v11_wal_4","v11_wal_3","v11_wal_2","v11_wal_1","v11_wal_0","v11_ünï 'q' \"d\"","v11_waiting","v11_timeout","v11_refused","v11_failed","v11_done","v11_denied","v11_approved","v11_parked","v11_flow_after","v11_compress_between","v11_flow_before","v11_echo_after","v11_legacy_queued","v11_echo_before"]
+     },
+     "queued_ordered": ["v11_echo_after","v11_parked","v11_ünï 'q' \"d\"","v11_wal_0","v11_wal_2","v11_wal_4"],
+     "queued_recovery": ["v11_echo_after","v11_parked","v11_ünï 'q' \"d\"","v11_wal_0","v11_wal_2","v11_wal_4"],
+     "queued_recovery_within_64_bytes": ["v11_echo_after","v11_parked","v11_ünï 'q' \"d\"","v11_wal_0","v11_wal_2","v11_wal_4"],
+     "stuck_recovery": ["v11_echo_before","v11_flow_before","v11_flow_after","v11_waiting","v11_wal_1","v11_wal_3","v11_wal_5"],
+     "stuck_recovery_within_64_bytes": null,
+     "terminal_missing_audit": ["v11_failed"],
+     "terminal_missing_audit_no_actions": ["v11_legacy_queued","v11_compress_between","v11_approved","v11_denied","v11_done","v11_failed","v11_refused","v11_timeout"]
+    },
+    "request_queries": {
+     "v11_approved": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_compress_between": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_denied": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_done": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_echo_after": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_echo_before",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_echo_before": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_echo_before",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_failed": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_echo_before",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_flow_after": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_flow_before",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_flow_before": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_flow_before",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_legacy_queued": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_parked": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_parked",
+      "authorization_current": true,
+      "parked_schedule_valid": [true,true,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_refused": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_timeout": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_waiting": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_wal_0": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_wal_1",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_wal_1": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_wal_1",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_wal_2": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_wal_1",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_wal_3": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_wal_1",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_wal_4": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_wal_1",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_wal_5": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_wal_1",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_ünï 'q' \"d\"": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     }
+    },
+    "setting": {
+     "count": 7,
+     "not_readable": "the store cannot list settings; a key outside the probes is not seen",
+     "read_via": "get_setting and get_setting_bounded for each key in probes.setting_keys",
+     "rows": [
+      {"bounded_to_32_kib":"\"standard\"","bounded_to_64_bytes":"\"standard\"","key":"policy.profile","value":"\"standard\""},
+      {"bounded_to_32_kib":"14","bounded_to_64_bytes":"14","key":"retention.evidence_days","value":"14"},
+      {"bounded_to_32_kib":"365","bounded_to_64_bytes":"365","key":"retention.audit_days","value":"365"},
+      {"bounded_to_32_kib":"1800000000","bounded_to_64_bytes":"1800000000","key":"retention.watermark_ts","value":"1800000000"},
+      {"bounded_to_32_kib":{"bytes":8192,"head":"éééééééééééééééééééééééééééééééééééééééééééééééé","sha256":"9a74b60bb3129364917037174fdb432c3346b4f1136a04069b9e26e34cf497e4"},"bounded_to_64_bytes":{"refused":"unexpected_value:setting"},"key":"setting.large","value":{"bytes":8192,"head":"éééééééééééééééééééééééééééééééééééééééééééééééé","sha256":"9a74b60bb3129364917037174fdb432c3346b4f1136a04069b9e26e34cf497e4"}},
+      {"bounded_to_32_kib":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","bounded_to_64_bytes":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","key":"kéy 'q' \"d\" ✓","value":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語"},
+      {"bounded_to_32_kib":"true","bounded_to_64_bytes":"true","key":"wal.only","value":"true"},
+      {"bounded_to_32_kib":null,"bounded_to_64_bytes":null,"key":"missing.key","value":null}
+     ]
+    }
+   },
+   "raw": {
+    "freelist_count": 5,
+    "page_count": 64,
+    "schema_objects": ["index:audit_request_idx","index:evidence_request_idx","index:evidence_view_request_idx","index:model_job_state_idx","index:request_idempotency_idx","index:request_state_idx","index:sqlite_autoindex_caller_1","index:sqlite_autoindex_connector_1","index:sqlite_autoindex_correlation_membership_1","index:sqlite_autoindex_correlation_step_1","index:sqlite_autoindex_correlation_target_1","index:sqlite_autoindex_evidence_1","index:sqlite_autoindex_evidence_read_allowance_1","index:sqlite_autoindex_evidence_view_1","index:sqlite_autoindex_evidence_view_2","index:sqlite_autoindex_flow_journal_1","index:sqlite_autoindex_landing_session_1","index:sqlite_autoindex_model_job_1","index:sqlite_autoindex_request_1","index:sqlite_autoindex_request_budget_1","index:sqlite_autoindex_setting_1","table:approval","table:audit","table:caller","table:connector","table:correlation_membership","table:correlation_step","table:correlation_target","table:evidence","table:evidence_read_allowance","table:evidence_view","table:flow_journal","table:grant","table:landing_session","table:model_job","table:request","table:request_budget","table:setting"],
+    "tables": {
+     "approval": {
+      "count": 4,
+      "row_digests": ["4d92bef9ad5650de","dc0fb9a30422bcb4","81bc4c8d5619a0f2","d1e85d5176be62d0"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"capability\")||'|'||quote(\"requested_ts\")||'|'||quote(\"resolved_ts\")||'|'||quote(\"resolution\")||'|'||quote(\"note\")) FROM \"approval\" ORDER BY rowid"
+     },
+     "audit": {
+      "count": 9,
+      "row_digests": ["9c3476574452c76d","202f8c3fe1a88bf2","2afb39b89a13a424","400a18481737f4e0","3c5107bebb5d3f53","3b90dc7c99063514","c54375bfa0447bbf","d9269a93667efedb","27a272568cc35f5e"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"action\")||'|'||quote(\"decision\")||'|'||quote(\"actor\")||'|'||quote(\"detail\")||'|'||quote(\"ts\")) FROM \"audit\" ORDER BY rowid"
+     },
+     "caller": {
+      "count": 4,
+      "row_digests": ["1645d5d2e8cc160c","63a1fa1aad39fcb2","fc25770fd862991e","dc5c0b4b67238006"],
+      "rows_sql": "SELECT hex(quote(\"agent\")||'|'||quote(\"repo\")||'|'||quote(\"first_seen\")||'|'||quote(\"last_seen\")) FROM \"caller\" ORDER BY rowid"
+     },
+     "connector": {
+      "count": 3,
+      "row_digests": ["66217bbaa27dbec9","8575bfa29d2cec31","3e0f391b64fc67ff"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"enabled\")||'|'||quote(\"base_url\")||'|'||quote(\"username\")||'|'||quote(\"last_test_status\")||'|'||quote(\"last_test_detail\")||'|'||quote(\"last_test_ts\")||'|'||quote(\"updated_ts\")) FROM \"connector\" ORDER BY rowid"
+     },
+     "correlation_membership": {
+      "count": 1,
+      "row_digests": ["8db64093651149b9"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"step_id\")||'|'||quote(\"members_json\")) FROM \"correlation_membership\" ORDER BY rowid"
+     },
+     "correlation_step": {
+      "count": 2,
+      "row_digests": ["5587336151509122","985f61f86e6ebec5"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"step_id\")||'|'||quote(\"canonical_json\")) FROM \"correlation_step\" ORDER BY rowid"
+     },
+     "correlation_target": {
+      "count": 1,
+      "row_digests": ["f27ae09a47394b51"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"canonical_json\")) FROM \"correlation_target\" ORDER BY rowid"
+     },
+     "evidence": {
+      "count": 7,
+      "row_digests": ["fba76043ffddd419","51ab9002441dba84","d8434a113ea3287d","dc3f70fe071f3c41","f808c8743facccad","1922c17e61f4ed7a","49a02b1692e12659"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"kind\")||'|'||quote(\"content\")||'|'||quote(\"path\")||'|'||quote(\"content_hash\")||'|'||quote(\"ts\")||'|'||quote(\"meta_json\")) FROM \"evidence\" ORDER BY rowid"
+     },
+     "evidence_read_allowance": {
+      "count": 1,
+      "row_digests": ["1eee20c817fba4cc"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"repository\")||'|'||quote(\"started_at\")||'|'||quote(\"expires_at\")||'|'||quote(\"remaining_bytes\")||'|'||quote(\"remaining_pages\")) FROM \"evidence_read_allowance\" ORDER BY rowid"
+     },
+     "evidence_view": {
+      "count": 3,
+      "row_digests": ["94cdde8fa04f43f9","20083fc41432ae53","69b0bb3424efbeb7"],
+      "rows_sql": "SELECT hex(quote(\"evidence_id\")||'|'||quote(\"request_id\")||'|'||quote(\"repository\")||'|'||quote(\"origin_json\")||'|'||quote(\"identity_json\")||'|'||quote(\"map_json\")||'|'||quote(\"view_id\")||'|'||quote(\"view_sha256\")||'|'||quote(\"view_bytes\")||'|'||quote(\"view_blob\")||'|'||quote(\"expired_at\")) FROM \"evidence_view\" ORDER BY rowid"
+     },
+     "flow_journal": {
+      "count": 5,
+      "row_digests": ["5bc33d2b9459eadd","28447ac4d696d0fd","2224c49ff9d823bb","3ddb2127f6626ecd","e512f9601557b905"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"schema_version\")||'|'||quote(\"flow_digest\")||'|'||quote(\"repository\")||'|'||quote(\"input_fingerprint\")||'|'||quote(\"revision\")||'|'||quote(\"state\")||'|'||quote(\"step_id\")||'|'||quote(\"attempt\")||'|'||quote(\"effectful\")||'|'||quote(\"checkpoint_json\")||'|'||quote(\"evidence_refs_json\")) FROM \"flow_journal\" ORDER BY rowid"
+     },
+     "grant": {
+      "count": 7,
+      "row_digests": ["7336d26037b7cf8e","5fc45d98af8acbeb","f550f1a7def89e1e","acae91045024e72c","8176bf2acb591f9f","7a8b0a7d31d6479e","17d4a66f1693fb86"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"capability\")||'|'||quote(\"scope\")||'|'||quote(\"granted_ts\")||'|'||quote(\"revoked_ts\")) FROM \"grant\" ORDER BY rowid"
+     },
+     "landing_session": {
+      "count": 1,
+      "row_digests": ["58934e08029fe309"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"revision\")||'|'||quote(\"document\")) FROM \"landing_session\" ORDER BY rowid"
+     },
+     "model_job": {
+      "count": 4,
+      "row_digests": ["8ed37a21dc0bdaff","08b35328275682ef","5a6279be4bcd5af6","d13fe035e04e937d"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"kind\")||'|'||quote(\"model_id\")||'|'||quote(\"source\")||'|'||quote(\"state\")||'|'||quote(\"bytes_done\")||'|'||quote(\"bytes_total\")||'|'||quote(\"detail\")||'|'||quote(\"created_ts\")||'|'||quote(\"updated_ts\")) FROM \"model_job\" ORDER BY rowid"
+     },
+     "request": {
+      "count": 21,
+      "row_digests": ["64f29c7e5178ae37","365e62be087f80bb","3af34aa971c84273","f06f7f25d8f8941d","ae71d13346434623","68903bac59909219","df961913efb40450","8fbce262af4303af","8b9a5a870f03c93f","1831f8fa2ebebc7d","9216e2bd4fadb25e","dadb8b9cd3cea6a3","63cfe2494fa0a50d","9de5111617197a87","0b42bf164dc7b706","598e41c76e880be3","14aec13f0f6139eb","e141edf137c19337","8f0bb9a3bdefbe86","ff7040e22555ca6e","f3dd59fbd6f9de69"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"capability\")||'|'||quote(\"repo\")||'|'||quote(\"caller_agent\")||'|'||quote(\"args_json\")||'|'||quote(\"state\")||'|'||quote(\"outcome\")||'|'||quote(\"created_ts\")||'|'||quote(\"updated_ts\")||'|'||quote(\"idempotency_key\")||'|'||quote(\"expires_at_ms\")||'|'||quote(\"authorization_revision\")||'|'||quote(\"queue_authorized\")||'|'||quote(\"resume_at_ms\")) FROM \"request\" ORDER BY rowid"
+     },
+     "request_budget": {
+      "count": 3,
+      "row_digests": ["fe55a0f67e551c7c","9afff04e71cc462a","23a3dc70f1870bd1"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"attempts\")||'|'||quote(\"http_calls\")||'|'||quote(\"http_bytes\")||'|'||quote(\"command_bytes\")) FROM \"request_budget\" ORDER BY rowid"
+     },
+     "setting": {
+      "count": 7,
+      "row_digests": ["29c7e72be5866614","1124946a2cb2edc4","010eb5737a7ff47e","765c334cb157b0a3","f3bf8996fb6e8e2a","23150d0cc65438be","54f673f330f87756"],
+      "rows_sql": "SELECT hex(quote(\"key\")||'|'||quote(\"value\")) FROM \"setting\" ORDER BY rowid"
+     }
+    },
+    "user_version": 11
+   }
+  },
+  "main_only": {
+   "public": {
+    "approval": {
+     "count": 4,
+     "not_readable": "an older approval row of a request that has a newer one",
+     "pending": [
+      {"args_json":"{}","caller_agent":"claude-code","capability":"deploy","repo":"/Users/ünï/pam-répo","request_capability":"deploy","request_id":"v11_waiting","requested_ts":1750000401}
+     ],
+     "read_via": "approval_for_request per request: the newest approval of each",
+     "rows": [
+      {"capability":"deploy","id":2,"note":"lgtm ✓ — 'ok'","request_id":"v11_approved","requested_ts":1750000401,"resolution":"approved","resolved_ts":1750000402},
+      {"capability":"deploy","id":3,"note":"no; \"prod\" freeze","request_id":"v11_denied","requested_ts":1750000401,"resolution":"denied","resolved_ts":1750000402},
+      {"capability":"deploy","id":4,"note":null,"request_id":"v11_timeout","requested_ts":1750000401,"resolution":"timeout","resolved_ts":1750000402},
+      {"capability":"deploy","id":1,"note":null,"request_id":"v11_waiting","requested_ts":1750000401,"resolution":null,"resolved_ts":null}
+     ]
+    },
+    "audit": {
+     "count": 8,
+     "read_via": "audit_for_request per request (request id ascending, then audit id)",
+     "rows": [
+      {"action":"approval","actor":"human","decision":"approve","detail":null,"id":4,"request_id":"v11_approved","ts":1750000403},
+      {"action":"execute","actor":"system","decision":"allow","detail":null,"id":8,"request_id":"v11_compress_between","ts":1750000403},
+      {"action":"approval","actor":"human","decision":"deny","detail":null,"id":5,"request_id":"v11_denied","ts":1750000403},
+      {"action":"execute","actor":"system","decision":"allow","detail":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","id":1,"request_id":"v11_done","ts":1750000403},
+      {"action":"enqueue","actor":"policy","decision":"allow","detail":null,"id":9,"request_id":"v11_echo_before","ts":1750000400},
+      {"action":"reap","actor":"system","decision":"timeout","detail":null,"id":3,"request_id":"v11_failed","ts":1750000403},
+      {"action":"admin.tripwire","actor":"policy","decision":"refuse","detail":"{}","id":2,"request_id":"v11_refused","ts":1750000403},
+      {"action":"approval","actor":"system","decision":"timeout","detail":null,"id":6,"request_id":"v11_timeout","ts":1750000403}
+     ]
+    },
+    "caller": {
+     "count": 3,
+     "read_via": "list_callers, most recently seen first",
+     "rows": [
+      {"agent":"","first_seen":1750000603,"last_seen":1750000603,"repo":""},
+      {"agent":"claude-code","first_seen":1750000600,"last_seen":1750000602,"repo":"/Users/ünï/pam-répo"},
+      {"agent":"agënt ✓ 'q' \"d\"","first_seen":1750000601,"last_seen":1750000601,"repo":"/tmp/it's a \"repo\""}
+     ]
+    },
+    "connector": {
+     "count": 3,
+     "read_via": "list_connectors by id; each row re-read with get_connector",
+     "rows": [
+      {"base_url":"https://api.github.com/","enabled":true,"id":"github","last_test_detail":"ok ✓","last_test_status":"passed","last_test_ts":1750000600,"updated_ts":1750000600,"username":null},
+      {"base_url":"https://jenkins.example/ünï","enabled":false,"id":"jenkins","last_test_detail":"401 \"unauthorized\"","last_test_status":"failed","last_test_ts":1750000600,"updated_ts":1750000600,"username":"o'brien"},
+      {"base_url":null,"enabled":false,"id":"never-configured","last_test_detail":null,"last_test_status":null,"last_test_ts":null,"updated_ts":1750000600,"username":null}
+     ]
+    },
+    "correlation": {
+     "correlation_membership": {
+      "not_readable": "a step with no membership row and one with an empty list both answer []; a step whose binding is not a GitHub run is refused before any read",
+      "read_via": "read_correlation_membership per step, under the step's own binding",
+      "rows": [{"members":{"refused":"unexpected_value:correlation_membership"},"request_id":"v11_flow_before","step_id":"other 'step'"},{"members":[1,2,3,5],"request_id":"v11_flow_before","step_id":"wait-ci"}]
+     },
+     "correlation_step": {
+      "count": 2,
+      "read_via": "read_correlation_steps per request, by step id",
+      "rows": [{"canonical_json":"{\"free\":\"form\"}","request_id":"v11_flow_before","step_id":"other 'step'"},{"canonical_json":"{\"schema_version\":1,\"decision\":{\"status\":\"matched\"},\"origin\":{\"connector\":\"github\",\"call\":\"run\",\"base_url\":\"https://api.github.com/\"},\"identity\":{\"repository\":\"org/repo\",\"run_id\":123456789,\"run_attempt\":1}}","request_id":"v11_flow_before","step_id":"wait-ci"}]
+     },
+     "correlation_target": {
+      "count": 1,
+      "read_via": "read_correlation_target per request",
+      "rows": [{"canonical_json":"{\"kind\":\"pull_request\",\"title\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\"}","request_id":"v11_flow_before"}]
+     }
+    },
+    "evidence": {
+     "compression_stats_since_ever": {
+      "compact_bytes": 9000,
+      "compressions": 1,
+      "source_bytes": 30000,
+      "tokens_avoided_est": 5250
+     },
+     "compression_stats_since_never": {
+      "compact_bytes": 0,
+      "compressions": 0,
+      "source_bytes": 0,
+      "tokens_avoided_est": 0
+     },
+     "count": 6,
+     "not_readable": "path (always NULL: evidence is blob-backed)",
+     "read_via": "list_evidence per request (oldest first), each blob read with get_evidence",
+     "retention_census": {
+      "all_evidence": {"eligible_rows":3,"total_rows":13},
+      "all_requests": {"eligible_rows":11,"total_rows":13},
+      "both": {"eligible_rows":11,"total_rows":13},
+      "no_window": {"eligible_rows":0,"total_rows":13},
+      "nothing_old_enough": {"eligible_rows":0,"total_rows":13}
+     },
+     "rows": [
+      {"as_flow_checkpoint":null,"content":{"bytes":9000,"sha256":"54907c577d2c333dcd33cefacd348ec047d2910bd0f8b1d6f709111d4a2848ed"},"content_hash":"54907c577d2c333dcd33cefacd348ec047d2910bd0f8b1d6f709111d4a2848ed","id":"ev_v11_compact","kind":"log.compact","meta_json":"{\"source_bytes\":30000,\"compact_bytes\":9000,\"tokens_avoided_est\":5250}","request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":null,"content":{"bytes":0,"hex":"","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"content_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","id":"ev_v11_empty","kind":"log.source","meta_json":null,"request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":null,"content":{"bytes":255,"sha256":"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266"},"content_hash":"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266","id":"ev_v11_small","kind":"log.source","meta_json":null,"request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":null,"content":{"bytes":20,"hex":"72c3a973756dc3a920e29c932027712720226422","sha256":"4c923b7dd533012c5528848dfab2de91fdf29ec351dc75a10ae34925b09e6efa"},"content_hash":"4c923b7dd533012c5528848dfab2de91fdf29ec351dc75a10ae34925b09e6efa","id":"ev_v11_summary","kind":"log.summary","meta_json":"{\"model\":\"qwen ü\"}","request_id":"v11_compress_between","ts":1750000404},
+      {"as_flow_checkpoint":{"bytes":24,"hex":"7b2270726976617465223a22636865636b706f696e74227d","sha256":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b"},"content":{"bytes":24,"hex":"7b2270726976617465223a22636865636b706f696e74227d","sha256":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b"},"content_hash":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b","id":"ev_v11_checkpoint","kind":"flow.checkpoint","meta_json":null,"request_id":"v11_flow_before","ts":1750000500},
+      {"as_flow_checkpoint":null,"content":{"bytes":11,"hex":"6f62736572766174696f6e","sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"content_hash":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149","id":"ev_v11_watch","kind":"flow.watch","meta_json":"{\"watch_progress\":{\"connector\":\"github\",\"evidence_id\":\"ev_v11_watch\",\"next_poll_at\":null,\"omissions\":0,\"polls\":2,\"status\":\"in_progress\",\"step\":\"wait-ci\",\"watch_state\":\"pending\"}}","request_id":"v11_flow_before","ts":1750000500}
+     ]
+    },
+    "evidence_view": {
+     "count": 3,
+     "not_readable": "the store cannot list views; a tuple outside the probes is not seen",
+     "read_via": "evidence_view_meta for each tuple in probes.views; the bytes are read in evidence_view_reads",
+     "rows": [
+      {"evidence_id":"ev_v11_source","meta":{"authorization_current":false,"authorization_revision":3,"expired_at":1750000406,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_v11_source\",\"offset_basis\":\"view_bytes\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"v11_compress_between\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":3000,"view_id":"view_ev_v11_source","view_sha256":"2af86a201e773eb3c804d8d7846082e0e88a08dd572fe061c7f62dd22a9e5e4e"},"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between"},
+      {"evidence_id":"ev_v11_summary","meta":{"authorization_current":false,"authorization_revision":3,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_v11_summary\",\"offset_basis\":\"view_bytes\",\"provenance_map\":{\"merged_segments\":300,\"resolution\":\"coarsened\",\"segments\":100,\"source_segments\":400},\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"v11_compress_between\",\"schema_version\":1}","map_json":{"bytes":8827,"head":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"coar","sha256":"8ae7b19c396314d86d3bf58d8c7cb337890455d91734d46e5508c9717d806879"},"origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":20000,"view_id":"view_ev_v11_summary","view_sha256":"425234b042aa972631dfc59fb997de4f653541a9be68f5e8a96fed859b9e18e6"},"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between"},
+      {"evidence_id":"ev_v11_summary","meta":null,"repository":"/other/repo","request_id":"v11_compress_between"},
+      {"evidence_id":"ev_v11_watch","meta":{"authorization_current":false,"authorization_revision":2,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_v11_watch\",\"offset_basis\":\"view_bytes\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"v11_flow_before\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":11,"view_id":"view_ev_v11_watch","view_sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before"},
+      {"evidence_id":"missing","meta":null,"repository":"/Users/ünï/pam-répo","request_id":"missing"}
+     ]
+    },
+    "evidence_view_reads": {
+     "read_via": "read_evidence_view_range, 64 KiB pages; each page is charged to the request's allowance (a write), which is why this runs last",
+     "rows": [
+      {"end_of_view":{"outcome":"expired"},"evidence_id":"ev_v11_source","repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1750004005,"remaining_bytes":67043328,"remaining_pages":4095},"content":{"bytes":20000,"sha256":"425234b042aa972631dfc59fb997de4f653541a9be68f5e8a96fed859b9e18e6"},"evidence_id":"ev_v11_summary","pages":[{"allowance_expires_at":1750004005,"bytes":20000,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":66977792,"remaining_pages":4094,"total_bytes":20000,"view_id":"view_ev_v11_summary"}],"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67108864,"remaining_pages":4096},"content":{"bytes":11,"hex":"6f62736572766174696f6e","sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"evidence_id":"ev_v11_watch","pages":[{"allowance_expires_at":1700003600,"bytes":11,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043328,"remaining_pages":4095,"total_bytes":11,"view_id":"view_ev_v11_watch"}],"repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before","under_another_digest":{"outcome":"unavailable"}}
+     ]
+    },
+    "flow_journal": {
+     "count": 5,
+     "projections": [
+      {"projection":{"evidence_origins":"incomplete","flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"v11_compress_between"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"v11_compress_between"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"v11_compress_between"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":null,"watch_progress":"{\"connector\":\"github\",\"evidence_id\":\"ev_v11_watch\",\"next_poll_at\":1900000000000,\"omissions\":0,\"polls\":3,\"status\":\"in_progress\",\"step\":\"wait-ci\",\"watch_state\":\"pending\"}"},"repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"v11_flow_before"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"v11_flow_before"}
+     ],
+     "projections_read_via": "request_evidence_origins_state, flow_result_meta and flow_watch_progress per request under its own and each probe repository; a pair with no evidence, result or progress is left out",
+     "read_via": "read_flow_journal per request",
+     "rows": [
+      {"attempt":1,"checkpoint_json":{"bytes":5012,"head":"{\"notes\":\"ünï ✓ ünï ✓ ünï ✓ ünï ✓ ünï ✓ ünï ✓ ün","sha256":"d4afeece51197628d2dac5d9292beccd20907fca34b164f4dbf97e1636c6e959"},"effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_done","revision":1,"state":"completed","step_id":"final"},
+      {"attempt":1,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_failed","revision":1,"state":"uncertain","step_id":"merge"},
+      {"attempt":1,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_flow_after","revision":1,"state":"prepared","step_id":"push"},
+      {"attempt":0,"checkpoint_json":"{\"next_step\":0,\"watch\":{\"polls\":3,\"next_poll_ms\":1900000000000,\"last_evidence\":\"ev_v11_watch\"}}","effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"v11_flow_before","revision":0,"state":"ready","step_id":null},
+      {"attempt":0,"checkpoint_json":"{}","effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/tmp/it's a \"repo\"","request_id":"v11_parked","revision":0,"state":"ready","step_id":null}
+     ]
+    },
+    "grant": {
+     "count": 7,
+     "not_readable": "revoked_seq has no public read; it shows through request_queries/*/authorization_current and per_capability/*/revocation_revision",
+     "per_capability": {
+      "": {"active":false,"revocation_revision":0},
+      "admin.grants.add": {"active":false,"revocation_revision":0},
+      "deploy": {"active":false,"revocation_revision":1},
+      "echo": {"active":true,"revocation_revision":1},
+      "flow.run": {"active":true,"revocation_revision":1},
+      "flow.step:github.run": {"active":false,"revocation_revision":1},
+      "git.push": {"active":true,"revocation_revision":0},
+      "log.compress": {"active":false,"revocation_revision":1}
+     },
+     "read_via": "list_grants, newest first",
+     "revocation_revision": 4,
+     "rows": [
+      {"capability":"echo","granted_ts":1750000201,"id":7,"revoked_ts":null,"scope":"global"},
+      {"capability":"git.push","granted_ts":1750000100,"id":6,"revoked_ts":null,"scope":"global"},
+      {"capability":"deploy","granted_ts":1750000100,"id":5,"revoked_ts":1750000250,"scope":"global"},
+      {"capability":"flow.run","granted_ts":1750000100,"id":4,"revoked_ts":null,"scope":"global"},
+      {"capability":"flow.step:github.run","granted_ts":1750000100,"id":3,"revoked_ts":1750000300,"scope":"global"},
+      {"capability":"log.compress","granted_ts":1750000100,"id":2,"revoked_ts":1750000300,"scope":"global"},
+      {"capability":"echo","granted_ts":1750000100,"id":1,"revoked_ts":1750000200,"scope":"global"}
+     ]
+    },
+    "landing_session": {
+     "count": 1,
+     "live_documents": ["{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"push\",\"state\":\"prepared\",\"step_id\":\"push\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}"],
+     "read_via": "read_landing_session per request",
+     "rows": [
+      {"document":"{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"push\",\"state\":\"prepared\",\"step_id\":\"push\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}","request_id":"v11_flow_after","revision":1}
+     ]
+    },
+    "model_job": {
+     "count": 4,
+     "read_via": "list_model_jobs, newest first",
+     "rows": [
+      {"bytes_done":0,"bytes_total":null,"created_ts":1750000600,"detail":null,"id":"job_v11_running","kind":"verify","model_id":"qwen/tiny","source":null,"state":"running","updated_ts":1750000600},
+      {"bytes_done":0,"bytes_total":null,"created_ts":1750000600,"detail":"{\"cause\":\"ünï 'q'\"}","id":"job_v11_failed","kind":"verify","model_id":"qwen/tiny","source":null,"state":"failed","updated_ts":1750000600},
+      {"bytes_done":9223372036854775806,"bytes_total":9223372036854775807,"created_ts":1750000600,"detail":"{\"sha256\":\"ab\"}","id":"job_v11_done","kind":"download","model_id":"qwen/tiny","source":"https://example.invalid/models/ünï.gguf","state":"done","updated_ts":1750000600},
+      {"bytes_done":5,"bytes_total":0,"created_ts":1750000600,"detail":null,"id":"job_v11_cancelled","kind":"download","model_id":"qwen/tiny","source":"https://example.invalid/models/ünï.gguf","state":"cancelled","updated_ts":1750000600}
+     ]
+    },
+    "request": {
+     "count": 15,
+     "read_via": "list_requests_filtered, newest first; each row re-read with get_request",
+     "rows": [
+      {"args_json":"","authorization_revision":null,"caller_agent":"claude-code","capability":"","created_ts":1750000400,"expires_at_ms":null,"id":"v11_ünï 'q' \"d\"","idempotency_key":"","ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"queued","updated_ts":1750000400},
+      {"args_json":"{}","authorization_revision":4,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":9223372036854775807,"id":"v11_waiting","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"waiting_approval","updated_ts":1750000401},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":null,"id":"v11_timeout","idempotency_key":null,"ingress":"public","outcome":"approval_timeout","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"admin.grants.add","created_ts":1750000400,"expires_at_ms":null,"id":"v11_refused","idempotency_key":null,"ingress":"public","outcome":"admin_denied","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"refused","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000400,"expires_at_ms":null,"id":"v11_failed","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1750000403},
+      {"args_json":{"bytes":12011,"head":"{\"text\":\"ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï","sha256":"f2d9fa6fb601c65664465050c954df153026048a2e0ae4756ccf1646467382ad"},"authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000400,"expires_at_ms":null,"id":"v11_done","idempotency_key":"","ingress":"public","outcome":"{\"ok\":true}","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":null,"id":"v11_denied","idempotency_key":null,"ingress":"public","outcome":"denied","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"refused","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1750000400,"expires_at_ms":null,"id":"v11_approved","idempotency_key":null,"ingress":"public","outcome":"deployed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":4,"caller_agent":"claude-code","capability":"flow.run","created_ts":1750000320,"expires_at_ms":9223372036854775807,"id":"v11_parked","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/tmp/it's a \"repo\"","resume_at_ms":1900000000000,"state":"queued","updated_ts":1750000321},
+      {"args_json":"{}","authorization_revision":4,"caller_agent":"claude-code","capability":"flow.run","created_ts":1750000310,"expires_at_ms":9223372036854775807,"id":"v11_flow_after","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000310},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"log.compress","created_ts":1750000300,"expires_at_ms":9223372036854775807,"id":"v11_compress_between","idempotency_key":null,"ingress":"public","outcome":"compressed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1750000403},
+      {"args_json":"{}","authorization_revision":2,"caller_agent":"claude-code","capability":"flow.run","created_ts":1750000260,"expires_at_ms":9223372036854775807,"id":"v11_flow_before","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000260},
+      {"args_json":"{}","authorization_revision":1,"caller_agent":"claude-code","capability":"echo","created_ts":1750000210,"expires_at_ms":9223372036854775807,"id":"v11_echo_after","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1750000211},
+      {"args_json":"{\"text\":\"hi\"}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1750000120,"expires_at_ms":null,"id":"v11_legacy_queued","idempotency_key":"k-legacy","ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1750000120},
+      {"args_json":"{}","authorization_revision":0,"caller_agent":"claude-code","capability":"echo","created_ts":1750000110,"expires_at_ms":9223372036854775807,"id":"v11_echo_before","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1750000110}
+     ]
+    },
+    "request_budget": {
+     "count": 3,
+     "not_readable": "evidence_read_allowance.started_at, and an allowance under a repository other than the request's own (see evidence_view_reads for those)",
+     "read_via": "request_budget_report per request under its own repository: `charged` and `remaining` are the request_budget row, `evidence_reads` the evidence_read_allowance row; a request with neither is left out",
+     "rows": [
+      {"charged":null,"evidence_reads":{"expires_at":1750004005,"remaining_bytes":67043328,"remaining_pages":4095,"state":"expired"},"execution_expires_at_ms":9223372036854775807,"remaining":null,"request_id":"v11_compress_between"},
+      {"charged":{"attempts":3,"command_bytes":1,"http_bytes":4096,"http_calls":2},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":null,"remaining":{"attempts":253,"command_bytes":134217727,"http_bytes":134213632,"http_calls":126},"request_id":"v11_done"},
+      {"charged":{"attempts":1,"command_bytes":0,"http_bytes":0,"http_calls":0},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":9223372036854775807,"remaining":{"attempts":255,"command_bytes":134217728,"http_bytes":134217728,"http_calls":128},"request_id":"v11_flow_after"},
+      {"charged":{"attempts":256,"command_bytes":134217728,"http_bytes":134217728,"http_calls":128},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":9223372036854775807,"remaining":{"attempts":0,"command_bytes":0,"http_bytes":0,"http_calls":0},"request_id":"v11_flow_before"}
+     ]
+    },
+    "request_lists": {
+     "admission_usage": {
+      "bytes": 323,
+      "count": 6
+     },
+     "admission_usage_at_ms": {
+      "0": {"bytes":323,"count":6},
+      "1850000000000": {"bytes":323,"count":6},
+      "9223372036854775807": {"bytes":0,"count":0}
+     },
+     "count_inflight": 8,
+     "filtered": {
+      "by_agent": {"claude-code":["v11_ünï 'q' \"d\"","v11_waiting","v11_timeout","v11_refused","v11_failed","v11_done","v11_denied","v11_approved","v11_parked","v11_flow_after","v11_compress_between","v11_flow_before","v11_echo_after","v11_legacy_queued","v11_echo_before"]},
+      "by_capability_hiding_probes": {"":["v11_ünï 'q' \"d\""],"admin.grants.add":["v11_refused"],"deploy":["v11_waiting","v11_timeout","v11_denied","v11_approved"],"echo":["v11_failed","v11_done","v11_echo_after","v11_legacy_queued","v11_echo_before"],"flow.run":["v11_parked","v11_flow_after","v11_flow_before"],"log.compress":["v11_compress_between"]},
+      "by_repo": {"":["v11_ünï 'q' \"d\""],"/Users/ünï/pam-répo":["v11_waiting","v11_timeout","v11_refused","v11_failed","v11_done","v11_denied","v11_approved","v11_flow_after","v11_compress_between","v11_flow_before","v11_echo_after","v11_legacy_queued","v11_echo_before"],"/tmp/it's a \"repo\"":["v11_parked"]},
+      "by_state": {"done":["v11_done","v11_approved","v11_compress_between"],"failed":["v11_timeout","v11_failed"],"queued":["v11_ünï 'q' \"d\"","v11_parked","v11_echo_after","v11_legacy_queued"],"refused":["v11_refused","v11_denied"],"running":["v11_flow_after","v11_flow_before","v11_echo_before"],"waiting_approval":["v11_waiting"]},
+      "hide_probes": ["v11_ünï 'q' \"d\"","v11_waiting","v11_timeout","v11_refused","v11_failed","v11_done","v11_denied","v11_approved","v11_parked","v11_flow_after","v11_compress_between","v11_flow_before","v11_echo_after","v11_legacy_queued","v11_echo_before"]
+     },
+     "queued_ordered": ["v11_legacy_queued","v11_echo_after","v11_parked","v11_ünï 'q' \"d\""],
+     "queued_recovery": ["v11_legacy_queued","v11_echo_after","v11_parked","v11_ünï 'q' \"d\""],
+     "queued_recovery_within_64_bytes": null,
+     "stuck_recovery": ["v11_echo_before","v11_flow_before","v11_flow_after","v11_waiting"],
+     "stuck_recovery_within_64_bytes": null,
+     "terminal_missing_audit": ["v11_failed"],
+     "terminal_missing_audit_no_actions": ["v11_compress_between","v11_approved","v11_denied","v11_done","v11_failed","v11_refused","v11_timeout"]
+    },
+    "request_queries": {
+     "v11_approved": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_compress_between": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_denied": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_done": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_echo_after": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_echo_before",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_echo_before": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_echo_before",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_failed": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_echo_before",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_flow_after": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_flow_before",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_flow_before": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_flow_before",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_legacy_queued": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_parked": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_parked",
+      "authorization_current": true,
+      "parked_schedule_valid": [true,true,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_refused": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_timeout": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "v11_waiting": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "v11_waiting",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "v11_ünï 'q' \"d\"": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     }
+    },
+    "setting": {
+     "count": 6,
+     "not_readable": "the store cannot list settings; a key outside the probes is not seen",
+     "read_via": "get_setting and get_setting_bounded for each key in probes.setting_keys",
+     "rows": [
+      {"bounded_to_32_kib":"\"standard\"","bounded_to_64_bytes":"\"standard\"","key":"policy.profile","value":"\"standard\""},
+      {"bounded_to_32_kib":"14","bounded_to_64_bytes":"14","key":"retention.evidence_days","value":"14"},
+      {"bounded_to_32_kib":"365","bounded_to_64_bytes":"365","key":"retention.audit_days","value":"365"},
+      {"bounded_to_32_kib":"1750000000","bounded_to_64_bytes":"1750000000","key":"retention.watermark_ts","value":"1750000000"},
+      {"bounded_to_32_kib":{"bytes":8192,"head":"éééééééééééééééééééééééééééééééééééééééééééééééé","sha256":"9a74b60bb3129364917037174fdb432c3346b4f1136a04069b9e26e34cf497e4"},"bounded_to_64_bytes":{"refused":"unexpected_value:setting"},"key":"setting.large","value":{"bytes":8192,"head":"éééééééééééééééééééééééééééééééééééééééééééééééé","sha256":"9a74b60bb3129364917037174fdb432c3346b4f1136a04069b9e26e34cf497e4"}},
+      {"bounded_to_32_kib":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","bounded_to_64_bytes":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","key":"kéy 'q' \"d\" ✓","value":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語"},
+      {"bounded_to_32_kib":null,"bounded_to_64_bytes":null,"key":"wal.only","value":null},
+      {"bounded_to_32_kib":null,"bounded_to_64_bytes":null,"key":"missing.key","value":null}
+     ]
+    }
+   },
+   "raw": {
+    "freelist_count": 6,
+    "page_count": 64,
+    "schema_objects": ["index:audit_request_idx","index:evidence_request_idx","index:evidence_view_request_idx","index:model_job_state_idx","index:request_idempotency_idx","index:request_state_idx","index:sqlite_autoindex_caller_1","index:sqlite_autoindex_connector_1","index:sqlite_autoindex_correlation_membership_1","index:sqlite_autoindex_correlation_step_1","index:sqlite_autoindex_correlation_target_1","index:sqlite_autoindex_evidence_1","index:sqlite_autoindex_evidence_read_allowance_1","index:sqlite_autoindex_evidence_view_1","index:sqlite_autoindex_evidence_view_2","index:sqlite_autoindex_flow_journal_1","index:sqlite_autoindex_landing_session_1","index:sqlite_autoindex_model_job_1","index:sqlite_autoindex_request_1","index:sqlite_autoindex_request_budget_1","index:sqlite_autoindex_setting_1","table:approval","table:audit","table:caller","table:connector","table:correlation_membership","table:correlation_step","table:correlation_target","table:evidence","table:evidence_read_allowance","table:evidence_view","table:flow_journal","table:grant","table:landing_session","table:model_job","table:request","table:request_budget","table:setting"],
+    "tables": {
+     "approval": {
+      "count": 4,
+      "row_digests": ["4d92bef9ad5650de","dc0fb9a30422bcb4","81bc4c8d5619a0f2","d1e85d5176be62d0"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"capability\")||'|'||quote(\"requested_ts\")||'|'||quote(\"resolved_ts\")||'|'||quote(\"resolution\")||'|'||quote(\"note\")) FROM \"approval\" ORDER BY rowid"
+     },
+     "audit": {
+      "count": 8,
+      "row_digests": ["9c3476574452c76d","202f8c3fe1a88bf2","2afb39b89a13a424","400a18481737f4e0","3c5107bebb5d3f53","3b90dc7c99063514","c54375bfa0447bbf","d9269a93667efedb"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"action\")||'|'||quote(\"decision\")||'|'||quote(\"actor\")||'|'||quote(\"detail\")||'|'||quote(\"ts\")) FROM \"audit\" ORDER BY rowid"
+     },
+     "caller": {
+      "count": 3,
+      "row_digests": ["1645d5d2e8cc160c","63a1fa1aad39fcb2","fc25770fd862991e"],
+      "rows_sql": "SELECT hex(quote(\"agent\")||'|'||quote(\"repo\")||'|'||quote(\"first_seen\")||'|'||quote(\"last_seen\")) FROM \"caller\" ORDER BY rowid"
+     },
+     "connector": {
+      "count": 3,
+      "row_digests": ["66217bbaa27dbec9","8575bfa29d2cec31","3e0f391b64fc67ff"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"enabled\")||'|'||quote(\"base_url\")||'|'||quote(\"username\")||'|'||quote(\"last_test_status\")||'|'||quote(\"last_test_detail\")||'|'||quote(\"last_test_ts\")||'|'||quote(\"updated_ts\")) FROM \"connector\" ORDER BY rowid"
+     },
+     "correlation_membership": {
+      "count": 1,
+      "row_digests": ["8db64093651149b9"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"step_id\")||'|'||quote(\"members_json\")) FROM \"correlation_membership\" ORDER BY rowid"
+     },
+     "correlation_step": {
+      "count": 2,
+      "row_digests": ["5587336151509122","985f61f86e6ebec5"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"step_id\")||'|'||quote(\"canonical_json\")) FROM \"correlation_step\" ORDER BY rowid"
+     },
+     "correlation_target": {
+      "count": 1,
+      "row_digests": ["f27ae09a47394b51"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"canonical_json\")) FROM \"correlation_target\" ORDER BY rowid"
+     },
+     "evidence": {
+      "count": 6,
+      "row_digests": ["fba76043ffddd419","51ab9002441dba84","d8434a113ea3287d","dc3f70fe071f3c41","f808c8743facccad","1922c17e61f4ed7a"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"kind\")||'|'||quote(\"content\")||'|'||quote(\"path\")||'|'||quote(\"content_hash\")||'|'||quote(\"ts\")||'|'||quote(\"meta_json\")) FROM \"evidence\" ORDER BY rowid"
+     },
+     "evidence_read_allowance": {
+      "count": 1,
+      "row_digests": ["1eee20c817fba4cc"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"repository\")||'|'||quote(\"started_at\")||'|'||quote(\"expires_at\")||'|'||quote(\"remaining_bytes\")||'|'||quote(\"remaining_pages\")) FROM \"evidence_read_allowance\" ORDER BY rowid"
+     },
+     "evidence_view": {
+      "count": 3,
+      "row_digests": ["94cdde8fa04f43f9","20083fc41432ae53","69b0bb3424efbeb7"],
+      "rows_sql": "SELECT hex(quote(\"evidence_id\")||'|'||quote(\"request_id\")||'|'||quote(\"repository\")||'|'||quote(\"origin_json\")||'|'||quote(\"identity_json\")||'|'||quote(\"map_json\")||'|'||quote(\"view_id\")||'|'||quote(\"view_sha256\")||'|'||quote(\"view_bytes\")||'|'||quote(\"view_blob\")||'|'||quote(\"expired_at\")) FROM \"evidence_view\" ORDER BY rowid"
+     },
+     "flow_journal": {
+      "count": 5,
+      "row_digests": ["5bc33d2b9459eadd","28447ac4d696d0fd","2224c49ff9d823bb","3ddb2127f6626ecd","e512f9601557b905"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"schema_version\")||'|'||quote(\"flow_digest\")||'|'||quote(\"repository\")||'|'||quote(\"input_fingerprint\")||'|'||quote(\"revision\")||'|'||quote(\"state\")||'|'||quote(\"step_id\")||'|'||quote(\"attempt\")||'|'||quote(\"effectful\")||'|'||quote(\"checkpoint_json\")||'|'||quote(\"evidence_refs_json\")) FROM \"flow_journal\" ORDER BY rowid"
+     },
+     "grant": {
+      "count": 7,
+      "row_digests": ["7336d26037b7cf8e","5fc45d98af8acbeb","f550f1a7def89e1e","acae91045024e72c","8176bf2acb591f9f","12c47ee03cd6c0ce","17d4a66f1693fb86"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"capability\")||'|'||quote(\"scope\")||'|'||quote(\"granted_ts\")||'|'||quote(\"revoked_ts\")) FROM \"grant\" ORDER BY rowid"
+     },
+     "landing_session": {
+      "count": 1,
+      "row_digests": ["58934e08029fe309"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"revision\")||'|'||quote(\"document\")) FROM \"landing_session\" ORDER BY rowid"
+     },
+     "model_job": {
+      "count": 4,
+      "row_digests": ["8ed37a21dc0bdaff","08b35328275682ef","5a6279be4bcd5af6","4b5f2745a0e8ac22"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"kind\")||'|'||quote(\"model_id\")||'|'||quote(\"source\")||'|'||quote(\"state\")||'|'||quote(\"bytes_done\")||'|'||quote(\"bytes_total\")||'|'||quote(\"detail\")||'|'||quote(\"created_ts\")||'|'||quote(\"updated_ts\")) FROM \"model_job\" ORDER BY rowid"
+     },
+     "request": {
+      "count": 15,
+      "row_digests": ["64f29c7e5178ae37","aabcce9e2c74e09d","3af34aa971c84273","f06f7f25d8f8941d","ae71d13346434623","68903bac59909219","df961913efb40450","8fbce262af4303af","8b9a5a870f03c93f","1831f8fa2ebebc7d","9216e2bd4fadb25e","dadb8b9cd3cea6a3","63cfe2494fa0a50d","9de5111617197a87","0b42bf164dc7b706"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"capability\")||'|'||quote(\"repo\")||'|'||quote(\"caller_agent\")||'|'||quote(\"args_json\")||'|'||quote(\"state\")||'|'||quote(\"outcome\")||'|'||quote(\"created_ts\")||'|'||quote(\"updated_ts\")||'|'||quote(\"idempotency_key\")||'|'||quote(\"expires_at_ms\")||'|'||quote(\"authorization_revision\")||'|'||quote(\"queue_authorized\")||'|'||quote(\"resume_at_ms\")) FROM \"request\" ORDER BY rowid"
+     },
+     "request_budget": {
+      "count": 3,
+      "row_digests": ["fe55a0f67e551c7c","9afff04e71cc462a","23a3dc70f1870bd1"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"attempts\")||'|'||quote(\"http_calls\")||'|'||quote(\"http_bytes\")||'|'||quote(\"command_bytes\")) FROM \"request_budget\" ORDER BY rowid"
+     },
+     "setting": {
+      "count": 6,
+      "row_digests": ["29c7e72be5866614","1124946a2cb2edc4","010eb5737a7ff47e","345b487b9ed1afab","f3bf8996fb6e8e2a","23150d0cc65438be"],
+      "rows_sql": "SELECT hex(quote(\"key\")||'|'||quote(\"value\")) FROM \"setting\" ORDER BY rowid"
+     }
+    },
+    "user_version": 11
+   }
+  }
+ },
+ "written_by": "turso 0.7 on a raw connection: migrations 1 to 11 from src/migrations.rs, rows written with release 0.4.3's statements, the last commits only in the write-ahead log"
+}

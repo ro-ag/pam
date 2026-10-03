@@ -1,0 +1,737 @@
+{
+ "files": {
+  "state.sqlite3": {
+   "bytes": 561152,
+   "sha256": "b27765a59e62c7eb712882e843bebd477387b7ea36faded72af1f7679da2a314"
+  },
+  "state.sqlite3-wal": {
+   "bytes": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+ },
+ "fixture": "v13-full",
+ "format": 1,
+ "probes": {
+  "keep_kind": "log.summary",
+  "now_ms": [0,1850000000000,9223372036854775807],
+  "repositories": ["/Users/ünï/pam-répo","/tmp/it's a \"repo\"","/other/repo"],
+  "setting_keys": ["policy.profile","retention.evidence_days","retention.audit_days","retention.watermark_ts","retention.last_run","retention.clock_guard","flows.scope_policy","setting.empty","setting.large","setting.overwritten","kéy 'q' \"d\" ✓","wal.only","missing.key"],
+  "terminal_actions": ["execute","admin.grants.revoke","admin.grants.add","admin.tripwire","approval"],
+  "views": [
+   ["req_00_pruned","ev_00_source","/Users/ünï/pam-répo"],
+   ["req_01_tombstone","ev_01_source","/Users/ünï/pam-répo"],
+   ["req_01_tombstone","ev_01_summary","/Users/ünï/pam-répo"],
+   ["req_03_flow_voided","ev_03_result","/tmp/it's a \"repo\""],
+   ["req_30_evidence","ev_30_empty","/Users/ünï/pam-répo"],
+   ["req_30_evidence","ev_30_small","/Users/ünï/pam-répo"],
+   ["req_30_evidence","ev_30_small","/other/repo"],
+   ["req_30_evidence","ev_30_large","/Users/ünï/pam-répo"],
+   ["req_31_foreign","ev_31_source","/other/repo"],
+   ["req_32_ready","ev_32_result","/Users/ünï/pam-répo"],
+   ["req_40_watch","ev_40_watch","/Users/ünï/pam-répo"],
+   ["req_50_late_prune","ev_50_source","/Users/ünï/pam-répo"],
+   ["missing","missing","/Users/ünï/pam-répo"]
+  ]
+ },
+ "variants": {
+  "as_written": {
+   "public": {
+    "approval": {
+     "count": 5,
+     "not_readable": "an older approval row of a request that has a newer one",
+     "pending": [
+      {"args_json":"{}","caller_agent":"claude-code","capability":"deploy","repo":"/Users/ünï/pam-répo","request_capability":"deploy","request_id":"req_15_waiting","requested_ts":1790967837},
+      {"args_json":"{}","caller_agent":"claude-code","capability":"deploy again","repo":"/Users/ünï/pam-répo","request_capability":"deploy","request_id":"req_19_two_approvals","requested_ts":1790967837}
+     ],
+     "read_via": "approval_for_request per request: the newest approval of each",
+     "rows": [
+      {"capability":"deploy","id":1,"note":null,"request_id":"req_15_waiting","requested_ts":1790967837,"resolution":null,"resolved_ts":null},
+      {"capability":"deploy","id":2,"note":"lgtm ✓ — 'ok'","request_id":"req_16_approved","requested_ts":1790967837,"resolution":"approved","resolved_ts":1790967837},
+      {"capability":"deploy","id":3,"note":"no; \"prod\" freeze","request_id":"req_17_denied","requested_ts":1790967837,"resolution":"denied","resolved_ts":1790967837},
+      {"capability":"deploy","id":4,"note":null,"request_id":"req_18_timeout","requested_ts":1790967837,"resolution":"timeout","resolved_ts":1790967837},
+      {"capability":"deploy again","id":6,"note":null,"request_id":"req_19_two_approvals","requested_ts":1790967837,"resolution":null,"resolved_ts":null}
+     ]
+    },
+    "audit": {
+     "count": 18,
+     "read_via": "audit_for_request per request (request id ascending, then audit id)",
+     "rows": [
+      {"action":"execute","actor":"system","decision":"allow","detail":null,"id":1,"request_id":"req_01_tombstone","ts":1790967837},
+      {"action":"admin.grants.revoke","actor":"human","decision":"allow","detail":"{\"capability\":\"log.compress\"}","id":2,"request_id":"req_04_admin_revoke","ts":1790967837},
+      {"action":"admin.grants.add","actor":"human","decision":"allow","detail":null,"id":3,"request_id":"req_05_admin_grant","ts":1790967837},
+      {"action":"admin.grants.add","actor":"policy","decision":"refuse","detail":null,"id":4,"request_id":"req_06_admin_noop","ts":1790967837},
+      {"action":"auto_grant","actor":"policy","decision":"allow","detail":"{\"profile\":\"relaxed\"}","id":5,"request_id":"req_07_autogrant","ts":1790967837},
+      {"action":"approval","actor":"human","decision":"approve","detail":"{}","id":10,"request_id":"req_16_approved","ts":1790967837},
+      {"action":"grant","actor":"human","decision":"allow","detail":null,"id":11,"request_id":"req_16_approved","ts":1790967837},
+      {"action":"execute","actor":"system","decision":"allow","detail":null,"id":12,"request_id":"req_16_approved","ts":1790967837},
+      {"action":"approval","actor":"human","decision":"deny","detail":null,"id":13,"request_id":"req_17_denied","ts":1790967837},
+      {"action":"approval","actor":"system","decision":"timeout","detail":null,"id":14,"request_id":"req_18_timeout","ts":1790967837},
+      {"action":"approval","actor":"system","decision":"timeout","detail":null,"id":15,"request_id":"req_18_timeout","ts":1790967837},
+      {"action":"execute","actor":"system","decision":"allow","detail":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","id":6,"request_id":"req_20_done","ts":1790967837},
+      {"action":"admin.tripwire","actor":"policy","decision":"refuse","detail":"{}","id":7,"request_id":"req_21_admin_denied","ts":1790967837},
+      {"action":"execute","actor":"system","decision":"refuse","detail":null,"id":8,"request_id":"req_22_failed","ts":1790967837},
+      {"action":"reap","actor":"system","decision":"timeout","detail":null,"id":9,"request_id":"req_23_expired","ts":1790967837},
+      {"action":"execute","actor":"system","decision":"refuse","detail":"{\"cause\":\"flow_effect_uncertain\",\"reconciliation_required\":true,\"requested_cause\":\"ok\",\"requested_decision\":\"allow\",\"requested_detail\":\"claimed success\",\"requested_state\":\"done\"}","id":17,"request_id":"req_43_uncertain","ts":1790967838},
+      {"action":"execute","actor":"system","decision":"allow","detail":null,"id":16,"request_id":"req_44_completed","ts":1790967838},
+      {"action":"execute","actor":"system","decision":"allow","detail":null,"id":18,"request_id":"req_50_late_prune","ts":1790967838}
+     ]
+    },
+    "caller": {
+     "count": 3,
+     "read_via": "list_callers, most recently seen first",
+     "rows": [
+      {"agent":"","first_seen":1790967838,"last_seen":1790967838,"repo":""},
+      {"agent":"agënt ✓ 'q' \"d\"","first_seen":1790967838,"last_seen":1790967838,"repo":"/tmp/it's a \"repo\""},
+      {"agent":"claude-code","first_seen":1790967838,"last_seen":1790967838,"repo":"/Users/ünï/pam-répo"}
+     ]
+    },
+    "connector": {
+     "count": 4,
+     "read_via": "list_connectors by id; each row re-read with get_connector",
+     "rows": [
+      {"base_url":"https://api.github.com/","enabled":true,"id":"github","last_test_detail":"ok ✓","last_test_status":"passed","last_test_ts":1790967838,"updated_ts":1790967838,"username":null},
+      {"base_url":"https://jenkins.example/ünï","enabled":false,"id":"jenkins","last_test_detail":null,"last_test_status":null,"last_test_ts":null,"updated_ts":1790967838,"username":null},
+      {"base_url":null,"enabled":false,"id":"never-configured","last_test_detail":null,"last_test_status":null,"last_test_ts":null,"updated_ts":1790967838,"username":null},
+      {"base_url":null,"enabled":false,"id":"sonar","last_test_detail":"","last_test_status":"failed","last_test_ts":1790967838,"updated_ts":1790967838,"username":null}
+     ]
+    },
+    "correlation": {
+     "correlation_membership": {
+      "not_readable": "a step with no membership row and one with an empty list both answer []; a step whose binding is not a GitHub run is refused before any read",
+      "read_via": "read_correlation_membership per step, under the step's own binding",
+      "rows": [{"members":{"refused":"unexpected_value:correlation_membership"},"request_id":"req_40_watch","step_id":"other 'step'"},{"members":[1,2,3,5],"request_id":"req_40_watch","step_id":"wait-ci"}]
+     },
+     "correlation_step": {
+      "count": 2,
+      "read_via": "read_correlation_steps per request, by step id",
+      "rows": [{"canonical_json":"{\"free\":\"form\"}","request_id":"req_40_watch","step_id":"other 'step'"},{"canonical_json":"{\"schema_version\":1,\"decision\":{\"status\":\"matched\"},\"origin\":{\"connector\":\"github\",\"call\":\"run\",\"base_url\":\"https://api.github.com/\"},\"identity\":{\"repository\":\"org/repo\",\"run_id\":123456789,\"run_attempt\":1}}","request_id":"req_40_watch","step_id":"wait-ci"}]
+     },
+     "correlation_target": {
+      "count": 1,
+      "read_via": "read_correlation_target per request",
+      "rows": [{"canonical_json":"{\"kind\":\"pull_request\",\"title\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\"}","request_id":"req_40_watch"}]
+     }
+    },
+    "evidence": {
+     "compression_stats_since_ever": {
+      "compact_bytes": 10000,
+      "compressions": 3,
+      "source_bytes": 200000,
+      "tokens_avoided_est": 47500
+     },
+     "compression_stats_since_never": {
+      "compact_bytes": 0,
+      "compressions": 0,
+      "source_bytes": 0,
+      "tokens_avoided_est": 0
+     },
+     "count": 12,
+     "not_readable": "path (always NULL: evidence is blob-backed)",
+     "read_via": "list_evidence per request (oldest first), each blob read with get_evidence",
+     "retention_census": {
+      "all_evidence": {"eligible_rows":0,"total_rows":26},
+      "all_requests": {"eligible_rows":15,"total_rows":26},
+      "both": {"eligible_rows":15,"total_rows":26},
+      "no_window": {"eligible_rows":0,"total_rows":26},
+      "nothing_old_enough": {"eligible_rows":0,"total_rows":26}
+     },
+     "rows": [
+      {"as_flow_checkpoint":null,"content":{"bytes":54,"hex":"72c3a973756dc3a93a2033206572726f727320e28094202771756f746564272022646f75626c652220e29c9320e697a5e69cace8aa9e","sha256":"1aa9313f8a7958eb5d5194034cc0a597c1b22f441e1e7dfea29f026e6df8296f"},"content_hash":"1aa9313f8a7958eb5d5194034cc0a597c1b22f441e1e7dfea29f026e6df8296f","id":"ev_01_summary","kind":"log.summary","meta_json":"{\"model\":\"qwen ü\"}","request_id":"req_01_tombstone","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":2,"hex":"7b7d","sha256":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},"content_hash":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","id":"ev_03_result","kind":"flow.result","meta_json":"{\"agent_result\":{\"status\":\"passed\"}}","request_id":"req_03_flow_voided","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":1,"hex":"78","sha256":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"},"content_hash":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881","id":"ev_30_bad_meta","kind":"log.compact","meta_json":"not json","request_id":"req_30_evidence","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":0,"hex":"","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"content_hash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","id":"ev_30_empty","kind":"log.source","meta_json":null,"request_id":"req_30_evidence","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":100000,"sha256":"3c4ed92be6240ea3c9abcf0ac3b47ff277363a1ad1be7bcc67614c89a3f29cff"},"content_hash":"3c4ed92be6240ea3c9abcf0ac3b47ff277363a1ad1be7bcc67614c89a3f29cff","id":"ev_30_large","kind":"log.source","meta_json":null,"request_id":"req_30_evidence","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":1,"hex":"79","sha256":"a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa"},"content_hash":"a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa","id":"ev_30_no_meta","kind":"log.compact","meta_json":null,"request_id":"req_30_evidence","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":10000,"sha256":"5382c587341d7aa0fdbf6cb941f15659f9ca4ebcd0c8566b9f1d3aeecc2f66ce"},"content_hash":"5382c587341d7aa0fdbf6cb941f15659f9ca4ebcd0c8566b9f1d3aeecc2f66ce","id":"ev_30_pages","kind":"log.compact","meta_json":"{\"source_bytes\":200000,\"compact_bytes\":10000,\"tokens_avoided_est\":47500}","request_id":"req_30_evidence","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":255,"sha256":"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266"},"content_hash":"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266","id":"ev_30_small","kind":"log.source","meta_json":"{\"lines\":3}","request_id":"req_30_evidence","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":7,"hex":"666f726569676e","sha256":"656771905e1ef731f65cd0a0d9fb061238380a1a012e6abdf846ecc7d2ea36fd"},"content_hash":"656771905e1ef731f65cd0a0d9fb061238380a1a012e6abdf846ecc7d2ea36fd","id":"ev_31_source","kind":"log.source","meta_json":null,"request_id":"req_31_foreign","ts":1790967837},
+      {"as_flow_checkpoint":{"bytes":24,"hex":"7b2270726976617465223a22636865636b706f696e74227d","sha256":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b"},"content":{"bytes":24,"hex":"7b2270726976617465223a22636865636b706f696e74227d","sha256":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b"},"content_hash":"0159a4dbe83ad52c1cae39f469dd908f06914c6368646f4d6e31ab073ca8ff1b","id":"ev_32_checkpoint","kind":"flow.checkpoint","meta_json":null,"request_id":"req_32_ready","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":2,"hex":"7b7d","sha256":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},"content_hash":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","id":"ev_32_result","kind":"flow.result","meta_json":"{\"agent_result\":{\"status\":\"passed\",\"summary\":\"ünï 'q'\"}}","request_id":"req_32_ready","ts":1790967837},
+      {"as_flow_checkpoint":null,"content":{"bytes":11,"hex":"6f62736572766174696f6e","sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"content_hash":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149","id":"ev_40_watch","kind":"flow.watch","meta_json":"{\"watch_progress\":{\"connector\":\"github\",\"evidence_id\":\"ev_40_watch\",\"next_poll_at\":null,\"omissions\":0,\"polls\":2,\"status\":\"in_progress\",\"step\":\"wait-ci\",\"watch_state\":\"pending\"}}","request_id":"req_40_watch","ts":1790967837}
+     ]
+    },
+    "evidence_view": {
+     "count": 10,
+     "not_readable": "the store cannot list views; a tuple outside the probes is not seen",
+     "read_via": "evidence_view_meta for each tuple in probes.views; the bytes are read in evidence_view_reads",
+     "rows": [
+      {"evidence_id":"ev_00_source","meta":null,"repository":"/Users/ünï/pam-répo","request_id":"req_00_pruned"},
+      {"evidence_id":"ev_01_source","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":1790967837,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_01_source\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":6000,\"protected_evidence_sha256\":\"114b6576e882859814ca40f96239d280905440fde7b75e3cee471dbae941e9bc\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_01_tombstone\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":1500,"view_id":"view_ev_01_source","view_sha256":"e041415aaf417a00d9f8729fca9618cd4b941c8a1beaf6a764e726c91acf8d4e"},"repository":"/Users/ünï/pam-répo","request_id":"req_01_tombstone"},
+      {"evidence_id":"ev_01_summary","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_01_summary\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":54,\"protected_evidence_sha256\":\"1aa9313f8a7958eb5d5194034cc0a597c1b22f441e1e7dfea29f026e6df8296f\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_01_tombstone\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":300,"view_id":"view_ev_01_summary","view_sha256":"f6245e8973e01df3e44ea202aed4722d13f2894f53120e08bce5d804e5db70ec"},"repository":"/Users/ünï/pam-répo","request_id":"req_01_tombstone"},
+      {"evidence_id":"ev_03_result","meta":{"authorization_current":false,"authorization_revision":0,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_03_result\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":2,\"protected_evidence_sha256\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_03_flow_voided\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":2,"view_id":"view_ev_03_result","view_sha256":"2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df"},"repository":"/tmp/it's a \"repo\"","request_id":"req_03_flow_voided"},
+      {"evidence_id":"ev_30_empty","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_30_empty\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":0,\"protected_evidence_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_30_evidence\",\"schema_version\":1}","map_json":"[]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":0,"view_id":"view_ev_30_empty","view_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence"},
+      {"evidence_id":"ev_30_small","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_30_small\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":255,\"protected_evidence_sha256\":\"929351ec9c272028c6c70f92a33c69059639c1ef81d7baea0650552d39730266\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_30_evidence\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":57,"view_id":"view_ev_30_small","view_sha256":"935692f3e392e38010952f87d23df9a4a53a211230211c1de4b7d77731dcf133"},"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence"},
+      {"evidence_id":"ev_30_small","meta":null,"repository":"/other/repo","request_id":"req_30_evidence"},
+      {"evidence_id":"ev_30_large","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_30_large\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":100000,\"protected_evidence_sha256\":\"3c4ed92be6240ea3c9abcf0ac3b47ff277363a1ad1be7bcc67614c89a3f29cff\",\"provenance_map\":{\"merged_segments\":1536,\"resolution\":\"coarsened\",\"segments\":512,\"source_segments\":2048},\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_30_evidence\",\"schema_version\":1}","map_json":{"bytes":46618,"head":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"coar","sha256":"bc80582af80bfbcdc2c1ccbb3e6eee8ed605e2ffea465b41dba5158bd55ad188"},"origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":80000,"view_id":"view_ev_30_large","view_sha256":"ef080530c5759939a32541fc583e227c94851c9b93adb5b2a20c1c786cbcf23d"},"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence"},
+      {"evidence_id":"ev_31_source","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_31_source\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":7,\"protected_evidence_sha256\":\"656771905e1ef731f65cd0a0d9fb061238380a1a012e6abdf846ecc7d2ea36fd\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_31_foreign\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":7,"view_id":"view_ev_31_source","view_sha256":"656771905e1ef731f65cd0a0d9fb061238380a1a012e6abdf846ecc7d2ea36fd"},"repository":"/other/repo","request_id":"req_31_foreign"},
+      {"evidence_id":"ev_32_result","meta":{"authorization_current":true,"authorization_revision":3,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_32_result\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":2,\"protected_evidence_sha256\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_32_ready\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":6,"view_id":"view_ev_32_result","view_sha256":"284d1e8c4918248233df17642bbb940c001e1fa856c18aab86ba6dbe7813eb13"},"repository":"/Users/ünï/pam-répo","request_id":"req_32_ready"},
+      {"evidence_id":"ev_40_watch","meta":{"authorization_current":true,"authorization_revision":3,"expired_at":null,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_40_watch\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":11,\"protected_evidence_sha256\":\"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_40_watch\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":11,"view_id":"view_ev_40_watch","view_sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"repository":"/Users/ünï/pam-répo","request_id":"req_40_watch"},
+      {"evidence_id":"ev_50_source","meta":{"authorization_current":false,"authorization_revision":null,"expired_at":1790967838,"identity_json":"{\"captured_at\":1700000000,\"completeness\":\"not_asserted\",\"evidence_id\":\"ev_50_source\",\"offset_basis\":\"view_bytes\",\"protected_evidence_bytes\":40000,\"protected_evidence_sha256\":\"d39d2490a0fa49db421ac9a806da171aee6bb488c2fe6ae3ef3792248c2626e7\",\"redaction\":{\"policy\":\"detectors ü1\",\"replacements\":2},\"request_id\":\"req_50_late_prune\",\"schema_version\":1}","map_json":"[{\"parent\":{\"end\":48,\"start\":0},\"relation\":\"identity\",\"view\":{\"end\":16,\"start\":0}}]","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}","view_bytes":9000,"view_id":"view_ev_50_source","view_sha256":"ebf5a70c4e48d614771619a78874d4eed340f772fac3913cff576322df2f8d59"},"repository":"/Users/ünï/pam-répo","request_id":"req_50_late_prune"},
+      {"evidence_id":"missing","meta":null,"repository":"/Users/ünï/pam-répo","request_id":"missing"}
+     ]
+    },
+    "evidence_view_reads": {
+     "read_via": "read_evidence_view_range, 64 KiB pages; each page is charged to the request's allowance (a write), which is why this runs last",
+     "rows": [
+      {"end_of_view":{"outcome":"expired"},"evidence_id":"ev_01_source","repository":"/Users/ünï/pam-répo","request_id":"req_01_tombstone","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67108864,"remaining_pages":4096},"content":{"bytes":300,"sha256":"f6245e8973e01df3e44ea202aed4722d13f2894f53120e08bce5d804e5db70ec"},"evidence_id":"ev_01_summary","pages":[{"allowance_expires_at":1700003600,"bytes":300,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043328,"remaining_pages":4095,"total_bytes":300,"view_id":"view_ev_01_summary"}],"repository":"/Users/ünï/pam-répo","request_id":"req_01_tombstone","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67108864,"remaining_pages":4096},"content":{"bytes":2,"hex":"6f6b","sha256":"2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df"},"evidence_id":"ev_03_result","pages":[{"allowance_expires_at":1700003600,"bytes":2,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043328,"remaining_pages":4095,"total_bytes":2,"view_id":"view_ev_03_result"}],"repository":"/tmp/it's a \"repo\"","request_id":"req_03_flow_voided","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67104752,"remaining_pages":4094},"content":{"bytes":0,"hex":"","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"evidence_id":"ev_30_empty","pages":[],"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67104752,"remaining_pages":4094},"content":{"bytes":57,"hex":"76c3a46c7565202773696e676c65272022646f75626c6522205c206261636b0a6e65776c696e650974616220e29c9320e697a5e69cace8aa9e","sha256":"935692f3e392e38010952f87d23df9a4a53a211230211c1de4b7d77731dcf133"},"evidence_id":"ev_30_small","pages":[{"allowance_expires_at":1700003600,"bytes":57,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67039216,"remaining_pages":4093,"total_bytes":57,"view_id":"view_ev_30_small"}],"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67039216,"remaining_pages":4093},"content":{"bytes":80000,"sha256":"ef080530c5759939a32541fc583e227c94851c9b93adb5b2a20c1c786cbcf23d"},"evidence_id":"ev_30_large","pages":[{"allowance_expires_at":1700003600,"bytes":65536,"next_offset":65536,"offset":0,"outcome":"range","remaining_bytes":66973680,"remaining_pages":4092,"total_bytes":80000,"view_id":"view_ev_30_large"},{"allowance_expires_at":1700003600,"bytes":14464,"next_offset":null,"offset":65536,"outcome":"range","remaining_bytes":66908144,"remaining_pages":4091,"total_bytes":80000,"view_id":"view_ev_30_large"}],"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67108857,"remaining_pages":4095},"content":{"bytes":7,"hex":"666f726569676e","sha256":"656771905e1ef731f65cd0a0d9fb061238380a1a012e6abdf846ecc7d2ea36fd"},"evidence_id":"ev_31_source","pages":[{"allowance_expires_at":1700003600,"bytes":7,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043321,"remaining_pages":4094,"total_bytes":7,"view_id":"view_ev_31_source"}],"repository":"/other/repo","request_id":"req_31_foreign","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":9223372036854772207,"remaining_bytes":67108861,"remaining_pages":4095},"content":{"bytes":6,"hex":"706173736564","sha256":"284d1e8c4918248233df17642bbb940c001e1fa856c18aab86ba6dbe7813eb13"},"evidence_id":"ev_32_result","pages":[{"allowance_expires_at":9223372036854772207,"bytes":6,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043325,"remaining_pages":4094,"total_bytes":6,"view_id":"view_ev_32_result"}],"repository":"/Users/ünï/pam-répo","request_id":"req_32_ready","under_another_digest":{"outcome":"unavailable"}},
+      {"allowance_before":{"expires_at":1700003600,"remaining_bytes":67108864,"remaining_pages":4096},"content":{"bytes":11,"hex":"6f62736572766174696f6e","sha256":"772c6953848bf5b19aedf9a34ccb066f31eacca29bdbfcb1b9821765f1060149"},"evidence_id":"ev_40_watch","pages":[{"allowance_expires_at":1700003600,"bytes":11,"next_offset":null,"offset":0,"outcome":"range","remaining_bytes":67043328,"remaining_pages":4095,"total_bytes":11,"view_id":"view_ev_40_watch"}],"repository":"/Users/ünï/pam-répo","request_id":"req_40_watch","under_another_digest":{"outcome":"unavailable"}},
+      {"end_of_view":{"outcome":"expired"},"evidence_id":"ev_50_source","repository":"/Users/ünï/pam-répo","request_id":"req_50_late_prune","under_another_digest":{"outcome":"unavailable"}}
+     ]
+    },
+    "flow_journal": {
+     "count": 7,
+     "projections": [
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"req_01_tombstone"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_01_tombstone"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_01_tombstone"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"req_03_flow_voided"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_03_flow_voided"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":{"metadata_json":"{\"agent_result\":{\"status\":\"passed\"}}","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"},"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_03_flow_voided"},
+      {"projection":{"evidence_origins":"incomplete","flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"req_30_evidence"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_30_evidence"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_30_evidence"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"req_31_foreign"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_31_foreign"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_31_foreign"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":{"metadata_json":"{\"agent_result\":{\"status\":\"passed\",\"summary\":\"ünï 'q'\"}}","origin_json":"{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"},"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"req_32_ready"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_32_ready"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_32_ready"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":null,"watch_progress":"{\"connector\":\"github\",\"evidence_id\":\"ev_40_watch\",\"next_poll_at\":1900000000000,\"omissions\":0,\"polls\":3,\"status\":\"in_progress\",\"step\":\"wait-ci\",\"watch_state\":\"pending\"}"},"repository":"/Users/ünï/pam-répo","request_id":"req_40_watch"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_40_watch"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_40_watch"},
+      {"projection":{"evidence_origins":{"ready":["{\"connector\":\"github\",\"base_url\":\"https://api.github.com/\",\"targets\":[\"org/répo\"]}"]},"flow_result":null,"watch_progress":null},"repository":"/Users/ünï/pam-répo","request_id":"req_50_late_prune"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/other/repo","request_id":"req_50_late_prune"},
+      {"projection":{"evidence_origins":"foreign","flow_result":null,"watch_progress":null},"repository":"/tmp/it's a \"repo\"","request_id":"req_50_late_prune"}
+     ],
+     "projections_read_via": "request_evidence_origins_state, flow_result_meta and flow_watch_progress per request under its own and each probe repository; a pair with no evidence, result or progress is left out",
+     "read_via": "read_flow_journal per request",
+     "rows": [
+      {"attempt":1,"checkpoint_json":"{\"next_step\":0,\"watch\":{\"polls\":3,\"next_poll_ms\":1900000000000,\"last_evidence\":\"ev_40_watch\"}}","effectful":false,"evidence_refs":["ev_40_watch"],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"req_40_watch","revision":2,"state":"ready","step_id":"wait-ci"},
+      {"attempt":1,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"req_41_prepared","revision":1,"state":"prepared","step_id":"push"},
+      {"attempt":1,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"req_42_recovered","revision":2,"state":"ready","step_id":"merge"},
+      {"attempt":256,"checkpoint_json":"{}","effectful":true,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"req_43_uncertain","revision":2,"state":"uncertain","step_id":"ensure-pr"},
+      {"attempt":1,"checkpoint_json":{"bytes":9026,"head":"{\"next_step\":9,\"notes\":\"ünï ✓ ünï ✓ ünï ✓ ünï ✓ ","sha256":"35154d113e1c22479e629c4108424d30ad54179fb4eb3651ac15278d6e9b6bf2"},"effectful":false,"evidence_refs":["ev_44_a","ev_44_b"],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"req_44_completed","revision":2,"state":"completed","step_id":"final"},
+      {"attempt":2,"checkpoint_json":"{}","effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/tmp/it's a \"repo\"","request_id":"req_45_abandoned","revision":2,"state":"ready","step_id":"read-logs"},
+      {"attempt":0,"checkpoint_json":"{}","effectful":false,"evidence_refs":[],"flow_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":"/Users/ünï/pam-répo","request_id":"req_47_woken","revision":0,"state":"ready","step_id":null}
+     ]
+    },
+    "grant": {
+     "count": 10,
+     "not_readable": "revoked_seq has no public read; it shows through request_queries/*/authorization_current and per_capability/*/revocation_revision",
+     "per_capability": {
+      "": {"active":false,"revocation_revision":0},
+      "admin.grants.add": {"active":false,"revocation_revision":0},
+      "admin.grants.revoke": {"active":false,"revocation_revision":0},
+      "admin.log.compress": {"active":false,"revocation_revision":0},
+      "admin.status": {"active":false,"revocation_revision":0},
+      "deploy": {"active":true,"revocation_revision":0},
+      "echo": {"active":true,"revocation_revision":1},
+      "flow.run": {"active":true,"revocation_revision":1},
+      "flow.step:github.run": {"active":true,"revocation_revision":1},
+      "git.fetch": {"active":true,"revocation_revision":0},
+      "git.push": {"active":true,"revocation_revision":0},
+      "log.compress": {"active":false,"revocation_revision":1},
+      "status": {"active":false,"revocation_revision":0},
+      "ünï 'q' \"d\"": {"active":true,"revocation_revision":0}
+     },
+     "read_via": "list_grants, newest first",
+     "revocation_revision": 3,
+     "rows": [
+      {"capability":"deploy","granted_ts":1790967837,"id":10,"revoked_ts":null,"scope":"global"},
+      {"capability":"git.fetch","granted_ts":1790967837,"id":9,"revoked_ts":null,"scope":"global"},
+      {"capability":"flow.step:github.run","granted_ts":1790967837,"id":8,"revoked_ts":null,"scope":"global"},
+      {"capability":"git.push","granted_ts":1790967837,"id":7,"revoked_ts":null,"scope":"global"},
+      {"capability":"echo","granted_ts":1790967837,"id":6,"revoked_ts":null,"scope":"global"},
+      {"capability":"ünï 'q' \"d\"","granted_ts":1790967837,"id":5,"revoked_ts":null,"scope":"global"},
+      {"capability":"flow.step:github.run","granted_ts":1790967837,"id":4,"revoked_ts":1790967837,"scope":"global"},
+      {"capability":"flow.run","granted_ts":1790967837,"id":3,"revoked_ts":null,"scope":"global"},
+      {"capability":"log.compress","granted_ts":1790967837,"id":2,"revoked_ts":1790967837,"scope":"global"},
+      {"capability":"echo","granted_ts":1790967837,"id":1,"revoked_ts":1790967837,"scope":"global"}
+     ]
+    },
+    "landing_session": {
+     "count": 2,
+     "live_documents": ["{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"push\",\"state\":\"prepared\",\"step_id\":\"push\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}","{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"merge\",\"state\":\"prepared\",\"step_id\":\"merge\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}"],
+     "read_via": "read_landing_session per request",
+     "rows": [
+      {"document":"{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"push\",\"state\":\"prepared\",\"step_id\":\"push\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}","request_id":"req_41_prepared","revision":1},
+      {"document":"{\"flow_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intent\":{\"operation\":\"merge\",\"state\":\"prepared\",\"step_id\":\"merge\"},\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"repository\":\"/Users/ünï/pam-répo\",\"version\":1}","request_id":"req_42_recovered","revision":0}
+     ]
+    },
+    "model_job": {
+     "count": 5,
+     "read_via": "list_model_jobs, newest first",
+     "rows": [
+      {"bytes_done":0,"bytes_total":null,"created_ts":1790967838,"detail":null,"id":"job_05_running","kind":"verify","model_id":"qwen/tiny","source":null,"state":"running","updated_ts":1790967838},
+      {"bytes_done":0,"bytes_total":null,"created_ts":1790967838,"detail":"{\"cause\":\"daemon_restart\"}","id":"job_04_restart","kind":"download","model_id":"qwen/tiny","source":"https://example.invalid/models/ünï.gguf","state":"failed","updated_ts":1790967838},
+      {"bytes_done":0,"bytes_total":0,"created_ts":1790967838,"detail":null,"id":"job_03_cancelled","kind":"download","model_id":"vendor/other","source":"https://example.invalid/models/ünï.gguf","state":"cancelled","updated_ts":1790967838},
+      {"bytes_done":0,"bytes_total":null,"created_ts":1790967838,"detail":"{\"cause\":\"digest_mismatch\",\"detail\":\"ünï 'q'\"}","id":"job_02_failed","kind":"verify","model_id":"qwen/tiny","source":null,"state":"failed","updated_ts":1790967838},
+      {"bytes_done":9223372036854775806,"bytes_total":9223372036854775807,"created_ts":1790967838,"detail":"{\"sha256\":\"ab\"}","id":"job_01_done","kind":"download","model_id":"qwen/tiny","source":"https://example.invalid/models/ünï.gguf","state":"done","updated_ts":1790967838}
+     ]
+    },
+    "request": {
+     "count": 37,
+     "read_via": "list_requests_filtered, newest first; each row re-read with get_request",
+     "rows": [
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"log.compress","created_ts":1790967838,"expires_at_ms":null,"id":"req_50_late_prune","idempotency_key":null,"ingress":"public","outcome":"compressed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1790967838},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967838,"expires_at_ms":9223372036854775807,"id":"req_45_abandoned","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/tmp/it's a \"repo\"","resume_at_ms":null,"state":"running","updated_ts":1790967838},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967838,"expires_at_ms":9223372036854775807,"id":"req_43_uncertain","idempotency_key":null,"ingress":"public","outcome":"flow_effect_uncertain","peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1790967838},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967838,"expires_at_ms":9223372036854775807,"id":"req_42_recovered","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1790967838},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967838,"expires_at_ms":9223372036854775807,"id":"req_41_prepared","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967838},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_47_woken","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_44_completed","idempotency_key":null,"ingress":"public","outcome":"ok","peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1790967838},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_40_watch","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":1900000000000,"state":"queued","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"flow.run","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_32_ready","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"log.compress","created_ts":1790967837,"expires_at_ms":null,"id":"req_31_foreign","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"log.compress","created_ts":1790967837,"expires_at_ms":null,"id":"req_30_evidence","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"gui","capability":"admin.status","created_ts":1790967837,"expires_at_ms":null,"id":"req_28_admin_probe","idempotency_key":null,"ingress":"admin","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":{"bytes":20011,"head":"{\"text\":\"ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï-✓ ünï","sha256":"490af02086157c353c352b59711e0dc10485d717cbe461f91a2195e461cc05ad"},"authorization_revision":3,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":2000000000000,"id":"req_27_big_args","idempotency_key":"idem-27","ingress":"public","outcome":null,"peer_pid":4294967295,"peer_uid":0,"queue_authorized":false,"relayed":false,"repo":"/tmp/it's a \"repo\"","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"","authorization_revision":null,"caller_agent":"","capability":"","created_ts":1790967837,"expires_at_ms":null,"id":"req_26_ünï 'q' \"d\"","idempotency_key":"","ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"queued","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"gui","capability":"admin.log.compress","created_ts":1790967837,"expires_at_ms":null,"id":"req_25_admin_compress","idempotency_key":null,"ingress":"admin","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":null,"id":"req_24_resumed","idempotency_key":null,"ingress":"public","outcome":"resumed ✓","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":-9223372036854775808,"id":"req_23_expired","idempotency_key":null,"ingress":"public","outcome":"deadline_exceeded","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":null,"id":"req_22_failed","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"intruder","capability":"admin.grants.add","created_ts":1790967837,"expires_at_ms":null,"id":"req_21_admin_denied","idempotency_key":null,"ingress":"public","outcome":"admin_denied","peer_pid":0,"peer_uid":4294967295,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"refused","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":null,"id":"req_20_done","idempotency_key":"","ingress":"public","outcome":"{\"ok\":true}","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1790967837,"expires_at_ms":null,"id":"req_19_two_approvals","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"deploy","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_18_timeout","idempotency_key":null,"ingress":"public","outcome":"approval_timeout","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"failed","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"deploy","created_ts":1790967837,"expires_at_ms":null,"id":"req_17_denied","idempotency_key":null,"ingress":"public","outcome":"denied","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"refused","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"deploy","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_16_approved","idempotency_key":null,"ingress":"public","outcome":"deployed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"deploy","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_15_waiting","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"waiting_approval","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_14_started","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_13_authorized","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":true,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1790967837},
+      {"args_json":"{\"text\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\"}","authorization_revision":3,"caller_agent":"agënt ✓ 'q' \"d\"","capability":"echo","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_12_admitted","idempotency_key":"idem-'12'","ingress":"public","outcome":null,"peer_pid":4242,"peer_uid":501,"queue_authorized":false,"relayed":true,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":null,"caller_agent":"claude-code","capability":"status","created_ts":1790967837,"expires_at_ms":null,"id":"req_11_status_probe","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{\"text\":\"hi\"}","authorization_revision":null,"caller_agent":"claude-code","capability":"echo","created_ts":1790967837,"expires_at_ms":null,"id":"req_10_queued","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"queued","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":3,"caller_agent":"claude-code","capability":"git.fetch","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_07_autogrant","idempotency_key":"key-7","ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{\"capability\":\"…\"}","authorization_revision":null,"caller_agent":"gui","capability":"admin.grants.add","created_ts":1790967837,"expires_at_ms":null,"id":"req_06_admin_noop","idempotency_key":null,"ingress":"admin","outcome":"already_granted","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"refused","updated_ts":1790967837},
+      {"args_json":"{\"capability\":\"…\"}","authorization_revision":null,"caller_agent":"gui","capability":"admin.grants.add","created_ts":1790967837,"expires_at_ms":null,"id":"req_05_admin_grant","idempotency_key":null,"ingress":"admin","outcome":"granted","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"done","updated_ts":1790967837},
+      {"args_json":"{\"capability\":\"…\"}","authorization_revision":null,"caller_agent":"gui","capability":"admin.grants.revoke","created_ts":1790967837,"expires_at_ms":null,"id":"req_04_admin_revoke","idempotency_key":null,"ingress":"admin","outcome":"revoked","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"","resume_at_ms":null,"state":"done","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":0,"caller_agent":"agënt ✓ 'q' \"d\"","capability":"flow.run","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_03_flow_voided","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/tmp/it's a \"repo\"","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{}","authorization_revision":0,"caller_agent":"claude-code","capability":"log.compress","created_ts":1790967837,"expires_at_ms":9223372036854775807,"id":"req_02_voided","idempotency_key":null,"ingress":"public","outcome":null,"peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"running","updated_ts":1790967837},
+      {"args_json":"{\"path\":\"build.log\"}","authorization_revision":null,"caller_agent":"claude-code","capability":"log.compress","created_ts":1790967837,"expires_at_ms":null,"id":"req_01_tombstone","idempotency_key":null,"ingress":"public","outcome":"compressed","peer_pid":null,"peer_uid":null,"queue_authorized":false,"relayed":false,"repo":"/Users/ünï/pam-répo","resume_at_ms":null,"state":"done","updated_ts":1790967837}
+     ]
+    },
+    "request_budget": {
+     "count": 2,
+     "not_readable": "evidence_read_allowance.started_at, and an allowance under a repository other than the request's own (see evidence_view_reads for those)",
+     "read_via": "request_budget_report per request under its own repository: `charged` and `remaining` are the request_budget row, `evidence_reads` the evidence_read_allowance row; a request with neither is left out",
+     "rows": [
+      {"charged":null,"evidence_reads":{"expires_at":1700003600,"remaining_bytes":67104752,"remaining_pages":4094,"state":"expired"},"execution_expires_at_ms":null,"remaining":null,"request_id":"req_30_evidence"},
+      {"charged":null,"evidence_reads":{"expires_at":9223372036854772207,"remaining_bytes":67108861,"remaining_pages":4095,"state":"existing_allowance"},"execution_expires_at_ms":9223372036854775807,"remaining":null,"request_id":"req_32_ready"},
+      {"charged":{"attempts":2,"command_bytes":4096,"http_bytes":134216728,"http_calls":1},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":9223372036854775807,"remaining":{"attempts":254,"command_bytes":134213632,"http_bytes":1000,"http_calls":127},"request_id":"req_40_watch"},
+      {"charged":{"attempts":256,"command_bytes":0,"http_bytes":0,"http_calls":0},"evidence_reads":{"expires_at":null,"remaining_bytes":null,"remaining_pages":null,"state":"not_initialized"},"execution_expires_at_ms":9223372036854775807,"remaining":{"attempts":0,"command_bytes":134217728,"http_bytes":134217728,"http_calls":128},"request_id":"req_44_completed"}
+     ]
+    },
+    "request_lists": {
+     "admission_usage": {
+      "bytes": 20897,
+      "count": 14
+     },
+     "admission_usage_at_ms": {
+      "0": {"bytes":20897,"count":14},
+      "1850000000000": {"bytes":20897,"count":14},
+      "9223372036854775807": {"bytes":0,"count":0}
+     },
+     "count_inflight": 23,
+     "filtered": {
+      "by_agent": {"":["req_26_ünï 'q' \"d\""],"agënt ✓ 'q' \"d\"":["req_12_admitted","req_03_flow_voided"],"claude-code":["req_50_late_prune","req_45_abandoned","req_43_uncertain","req_42_recovered","req_41_prepared","req_47_woken","req_44_completed","req_40_watch","req_32_ready","req_31_foreign","req_30_evidence","req_27_big_args","req_24_resumed","req_23_expired","req_22_failed","req_20_done","req_19_two_approvals","req_18_timeout","req_17_denied","req_16_approved","req_15_waiting","req_14_started","req_13_authorized","req_11_status_probe","req_10_queued","req_07_autogrant","req_02_voided","req_01_tombstone"],"gui":["req_28_admin_probe","req_25_admin_compress","req_06_admin_noop","req_05_admin_grant","req_04_admin_revoke"],"intruder":["req_21_admin_denied"]},
+      "by_capability_hiding_probes": {"":["req_26_ünï 'q' \"d\""],"admin.grants.add":["req_21_admin_denied"],"admin.grants.revoke":[],"admin.log.compress":["req_25_admin_compress"],"admin.status":[],"deploy":["req_19_two_approvals","req_18_timeout","req_17_denied","req_16_approved","req_15_waiting"],"echo":["req_27_big_args","req_24_resumed","req_23_expired","req_22_failed","req_20_done","req_14_started","req_13_authorized","req_12_admitted","req_10_queued"],"flow.run":["req_45_abandoned","req_43_uncertain","req_42_recovered","req_41_prepared","req_47_woken","req_44_completed","req_40_watch","req_32_ready","req_03_flow_voided"],"git.fetch":["req_07_autogrant"],"log.compress":["req_50_late_prune","req_31_foreign","req_30_evidence","req_02_voided","req_01_tombstone"],"status":[]},
+      "by_repo": {"":["req_28_admin_probe","req_26_ünï 'q' \"d\"","req_11_status_probe","req_06_admin_noop","req_05_admin_grant","req_04_admin_revoke"],"/Users/ünï/pam-répo":["req_50_late_prune","req_43_uncertain","req_42_recovered","req_41_prepared","req_47_woken","req_44_completed","req_40_watch","req_32_ready","req_31_foreign","req_30_evidence","req_25_admin_compress","req_24_resumed","req_23_expired","req_22_failed","req_21_admin_denied","req_20_done","req_19_two_approvals","req_18_timeout","req_17_denied","req_16_approved","req_15_waiting","req_14_started","req_13_authorized","req_12_admitted","req_10_queued","req_07_autogrant","req_02_voided","req_01_tombstone"],"/tmp/it's a \"repo\"":["req_45_abandoned","req_27_big_args","req_03_flow_voided"]},
+      "by_state": {"done":["req_50_late_prune","req_44_completed","req_20_done","req_16_approved","req_05_admin_grant","req_04_admin_revoke","req_01_tombstone"],"failed":["req_43_uncertain","req_23_expired","req_22_failed","req_18_timeout"],"queued":["req_42_recovered","req_47_woken","req_40_watch","req_26_ünï 'q' \"d\"","req_19_two_approvals","req_13_authorized","req_10_queued"],"refused":["req_21_admin_denied","req_17_denied","req_06_admin_noop"],"running":["req_45_abandoned","req_41_prepared","req_32_ready","req_31_foreign","req_30_evidence","req_28_admin_probe","req_27_big_args","req_25_admin_compress","req_24_resumed","req_14_started","req_12_admitted","req_11_status_probe","req_07_autogrant","req_03_flow_voided","req_02_voided"],"waiting_approval":["req_15_waiting"]},
+      "hide_probes": ["req_50_late_prune","req_45_abandoned","req_43_uncertain","req_42_recovered","req_41_prepared","req_47_woken","req_44_completed","req_40_watch","req_32_ready","req_31_foreign","req_30_evidence","req_27_big_args","req_26_ünï 'q' \"d\"","req_25_admin_compress","req_24_resumed","req_23_expired","req_22_failed","req_21_admin_denied","req_20_done","req_19_two_approvals","req_18_timeout","req_17_denied","req_16_approved","req_15_waiting","req_14_started","req_13_authorized","req_12_admitted","req_10_queued","req_07_autogrant","req_03_flow_voided","req_02_voided","req_01_tombstone"]
+     },
+     "queued_ordered": ["req_10_queued","req_13_authorized","req_19_two_approvals","req_26_ünï 'q' \"d\"","req_40_watch","req_47_woken","req_42_recovered"],
+     "queued_recovery": ["req_10_queued","req_13_authorized","req_19_two_approvals","req_26_ünï 'q' \"d\"","req_40_watch","req_47_woken","req_42_recovered"],
+     "queued_recovery_within_64_bytes": null,
+     "stuck_recovery": ["req_02_voided","req_03_flow_voided","req_07_autogrant","req_11_status_probe","req_12_admitted","req_14_started","req_15_waiting","req_24_resumed","req_25_admin_compress","req_27_big_args","req_28_admin_probe","req_30_evidence","req_31_foreign","req_32_ready","req_41_prepared","req_45_abandoned"],
+     "stuck_recovery_within_64_bytes": null,
+     "terminal_missing_audit": ["req_23_expired"],
+     "terminal_missing_audit_no_actions": ["req_01_tombstone","req_04_admin_revoke","req_05_admin_grant","req_06_admin_noop","req_16_approved","req_17_denied","req_18_timeout","req_20_done","req_21_admin_denied","req_22_failed","req_23_expired","req_44_completed","req_43_uncertain","req_50_late_prune"]
+    },
+    "request_queries": {
+     "req_01_tombstone": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_02_voided": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_02_voided",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_03_flow_voided": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_03_flow_voided",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_04_admin_revoke": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_05_admin_grant": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_06_admin_noop": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_07_autogrant": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_07_autogrant",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_10_queued": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_11_status_probe": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_12_admitted": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_12_admitted",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_13_authorized": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_13_authorized",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_14_started": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_13_authorized",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_15_waiting": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_15_waiting",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_16_approved": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_15_waiting",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_17_denied": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_15_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_18_timeout": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_15_waiting",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_19_two_approvals": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_15_waiting",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_20_done": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_21_admin_denied": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_22_failed": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_13_authorized",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_23_expired": {
+      "admission_expired": [true,true,true],
+      "admitted_by_shape": "req_13_authorized",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_24_resumed": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_13_authorized",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_25_admin_compress": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_26_ünï 'q' \"d\"": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_27_big_args": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_27_big_args",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_28_admin_probe": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": null,
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_30_evidence": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_02_voided",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_31_foreign": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_02_voided",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     },
+     "req_32_ready": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_40_watch": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [true,true,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_41_prepared": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_42_recovered": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_43_uncertain": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_44_completed": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_45_abandoned": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_03_flow_voided",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_47_woken": {
+      "admission_expired": [false,false,true],
+      "admitted_by_shape": "req_32_ready",
+      "authorization_current": true,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":true,"columns":"as_row"}
+     },
+     "req_50_late_prune": {
+      "admission_expired": [false,false,false],
+      "admitted_by_shape": "req_02_voided",
+      "authorization_current": false,
+      "parked_schedule_valid": [false,false,false],
+      "status_meta": {"authorization_current":false,"columns":"as_row"}
+     }
+    },
+    "setting": {
+     "count": 11,
+     "not_readable": "the store cannot list settings; a key outside the probes is not seen",
+     "read_via": "get_setting and get_setting_bounded for each key in probes.setting_keys",
+     "rows": [
+      {"bounded_to_32_kib":"\"relaxed\"","bounded_to_64_bytes":"\"relaxed\"","key":"policy.profile","value":"\"relaxed\""},
+      {"bounded_to_32_kib":"30","bounded_to_64_bytes":"30","key":"retention.evidence_days","value":"30"},
+      {"bounded_to_32_kib":"365","bounded_to_64_bytes":"365","key":"retention.audit_days","value":"365"},
+      {"bounded_to_32_kib":"1700000000","bounded_to_64_bytes":"1700000000","key":"retention.watermark_ts","value":"1700000000"},
+      {"bounded_to_32_kib":"{\"ts\":1700000000,\"evidence_rows\":3,\"requests\":1}","bounded_to_64_bytes":"{\"ts\":1700000000,\"evidence_rows\":3,\"requests\":1}","key":"retention.last_run","value":"{\"ts\":1700000000,\"evidence_rows\":3,\"requests\":1}"},
+      {"bounded_to_32_kib":"1700000000","bounded_to_64_bytes":"1700000000","key":"retention.clock_guard","value":"1700000000"},
+      {"bounded_to_32_kib":"{\"repositories\":[{\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"root\":\"/Users/ünï/pam-répo\"},{\"root\":\"/tmp/it's a \\\"repo\\\"\"}],\"version\":1}","bounded_to_64_bytes":{"refused":"unexpected_value:setting"},"key":"flows.scope_policy","value":"{\"repositories\":[{\"note\":\"välue 'single' \\\"double\\\" \\\\ back\\nnewline\\ttab ✓ 日本語\",\"root\":\"/Users/ünï/pam-répo\"},{\"root\":\"/tmp/it's a \\\"repo\\\"\"}],\"version\":1}"},
+      {"bounded_to_32_kib":"","bounded_to_64_bytes":"","key":"setting.empty","value":""},
+      {"bounded_to_32_kib":{"bytes":32768,"head":"éééééééééééééééééééééééééééééééééééééééééééééééé","sha256":"4f3213f6f3cb2bba2973ec02c8222e88161cdc2208dbd3d3634f43e12e6388ff"},"bounded_to_64_bytes":{"refused":"unexpected_value:setting"},"key":"setting.large","value":{"bytes":32768,"head":"éééééééééééééééééééééééééééééééééééééééééééééééé","sha256":"4f3213f6f3cb2bba2973ec02c8222e88161cdc2208dbd3d3634f43e12e6388ff"}},
+      {"bounded_to_32_kib":"2","bounded_to_64_bytes":"2","key":"setting.overwritten","value":"2"},
+      {"bounded_to_32_kib":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","bounded_to_64_bytes":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語","key":"kéy 'q' \"d\" ✓","value":"välue 'single' \"double\" \\ back\nnewline\ttab ✓ 日本語"},
+      {"bounded_to_32_kib":null,"bounded_to_64_bytes":null,"key":"wal.only","value":null},
+      {"bounded_to_32_kib":null,"bounded_to_64_bytes":null,"key":"missing.key","value":null}
+     ]
+    }
+   },
+   "raw": {
+    "freelist_count": 12,
+    "page_count": 137,
+    "schema_objects": ["index:audit_request_idx","index:evidence_kind_ts_idx","index:evidence_request_idx","index:evidence_ts_idx","index:evidence_view_request_idx","index:grant_capability_idx","index:model_job_state_idx","index:request_created_idx","index:request_idempotency_idx","index:request_state_idx","index:request_updated_idx","index:sqlite_autoindex_caller_1","index:sqlite_autoindex_connector_1","index:sqlite_autoindex_correlation_membership_1","index:sqlite_autoindex_correlation_step_1","index:sqlite_autoindex_correlation_target_1","index:sqlite_autoindex_evidence_1","index:sqlite_autoindex_evidence_read_allowance_1","index:sqlite_autoindex_evidence_view_1","index:sqlite_autoindex_evidence_view_2","index:sqlite_autoindex_flow_journal_1","index:sqlite_autoindex_landing_session_1","index:sqlite_autoindex_model_job_1","index:sqlite_autoindex_request_1","index:sqlite_autoindex_request_budget_1","index:sqlite_autoindex_setting_1","table:approval","table:audit","table:caller","table:connector","table:correlation_membership","table:correlation_step","table:correlation_target","table:evidence","table:evidence_read_allowance","table:evidence_view","table:flow_journal","table:grant","table:landing_session","table:model_job","table:request","table:request_budget","table:setting","trigger:audit_append_only","trigger:evidence_view_immutable"],
+    "tables": {
+     "approval": {
+      "count": 6,
+      "row_digests": ["fb2bd54870e1bb9a","c0fb417c00744a02","2281ffb87f8e0907","0a329d88b4f019e6","26ec3b026ea64a8e","e8af947aeca1e82b"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"capability\")||'|'||quote(\"requested_ts\")||'|'||quote(\"resolved_ts\")||'|'||quote(\"resolution\")||'|'||quote(\"note\")) FROM \"approval\" ORDER BY rowid"
+     },
+     "audit": {
+      "count": 18,
+      "row_digests": ["95863f2a8672ba00","fad5a85da4caf62c","b6b4d4aa310e4bad","34f0e58c390e7ea1","dc517fa5eb08109d","4b33f17068155f49","4550472d43625d93","163b3539fe4840da","3695cc7231fd260d","4dad0b384b95737a","37ad8e49ca0a5be9","1bb065df42f22f5b","c6af26987f8e93a3","fcb72587716ce5d6","a198f4b03f46d996","917f194578c7a94a","8c63ceba2f129101","f64beb4a52a2e5b3"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"action\")||'|'||quote(\"decision\")||'|'||quote(\"actor\")||'|'||quote(\"detail\")||'|'||quote(\"ts\")) FROM \"audit\" ORDER BY rowid"
+     },
+     "caller": {
+      "count": 3,
+      "row_digests": ["da4b663d4ba87020","7f4a24099fc3c55d","10eb4dcd640f0254"],
+      "rows_sql": "SELECT hex(quote(\"agent\")||'|'||quote(\"repo\")||'|'||quote(\"first_seen\")||'|'||quote(\"last_seen\")) FROM \"caller\" ORDER BY rowid"
+     },
+     "connector": {
+      "count": 4,
+      "row_digests": ["8f72e3e3259a97e8","6042e35a6e416efb","240e525d01367210","202c6c3805801609"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"enabled\")||'|'||quote(\"base_url\")||'|'||quote(\"username\")||'|'||quote(\"last_test_status\")||'|'||quote(\"last_test_detail\")||'|'||quote(\"last_test_ts\")||'|'||quote(\"updated_ts\")) FROM \"connector\" ORDER BY rowid"
+     },
+     "correlation_membership": {
+      "count": 1,
+      "row_digests": ["6769922af44d24f1"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"step_id\")||'|'||quote(\"members_json\")) FROM \"correlation_membership\" ORDER BY rowid"
+     },
+     "correlation_step": {
+      "count": 2,
+      "row_digests": ["47bcbcc1c1ba78fe","6117daa5121509d2"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"step_id\")||'|'||quote(\"canonical_json\")) FROM \"correlation_step\" ORDER BY rowid"
+     },
+     "correlation_target": {
+      "count": 1,
+      "row_digests": ["3bc778cfcefdfd24"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"canonical_json\")) FROM \"correlation_target\" ORDER BY rowid"
+     },
+     "evidence": {
+      "count": 12,
+      "row_digests": ["b863bf90b4159083","e8fe4e76d658b9a6","186f068b5ad14725","5ffd7e64321bd6de","089ccc27eaa06565","0dfa1df487453ff5","bc42543b8c06d4e1","4652f482f85ec50a","b40712682e12e860","54e505cf623f66e6","6374d6892fd22271","58fa47a0a0f7142f"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"request_id\")||'|'||quote(\"kind\")||'|'||quote(\"content\")||'|'||quote(\"path\")||'|'||quote(\"content_hash\")||'|'||quote(\"ts\")||'|'||quote(\"meta_json\")) FROM \"evidence\" ORDER BY rowid"
+     },
+     "evidence_read_allowance": {
+      "count": 3,
+      "row_digests": ["e3929a5e88ac8913","5363d158c84f2a33","525f8ebef18574e1"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"repository\")||'|'||quote(\"started_at\")||'|'||quote(\"expires_at\")||'|'||quote(\"remaining_bytes\")||'|'||quote(\"remaining_pages\")) FROM \"evidence_read_allowance\" ORDER BY rowid"
+     },
+     "evidence_view": {
+      "count": 10,
+      "row_digests": ["ec1304b0aafb7dcc","22bab91f9c6ef9e0","1a8d631e90aeb38e","b9327290b963fbf7","6b22a6a2f920bc40","9639c28f833e262a","8991c83983739e43","9d1c7a059127588e","cc94a82392b4465a","339a5ff00a35e86d"],
+      "rows_sql": "SELECT hex(quote(\"evidence_id\")||'|'||quote(\"request_id\")||'|'||quote(\"repository\")||'|'||quote(\"origin_json\")||'|'||quote(\"identity_json\")||'|'||quote(\"map_json\")||'|'||quote(\"view_id\")||'|'||quote(\"view_sha256\")||'|'||quote(\"view_bytes\")||'|'||quote(\"view_blob\")||'|'||quote(\"expired_at\")) FROM \"evidence_view\" ORDER BY rowid"
+     },
+     "flow_journal": {
+      "count": 7,
+      "row_digests": ["1d43f8750561a482","6a1ef294dcb15803","04d52e3831c1c98f","bf39d0bd38bf36d0","d8961ea49bc611ca","8b1cdb86db642f4f","cf20266a75a3a448"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"schema_version\")||'|'||quote(\"flow_digest\")||'|'||quote(\"repository\")||'|'||quote(\"input_fingerprint\")||'|'||quote(\"revision\")||'|'||quote(\"state\")||'|'||quote(\"step_id\")||'|'||quote(\"attempt\")||'|'||quote(\"effectful\")||'|'||quote(\"checkpoint_json\")||'|'||quote(\"evidence_refs_json\")) FROM \"flow_journal\" ORDER BY rowid"
+     },
+     "grant": {
+      "count": 10,
+      "row_digests": ["24c63264d0d15228","669b6a825260183f","56f8e87da6600e68","8173fb09c4c74b28","ad6f73ff332fef27","1d52fded9a55eb69","dfc36736b81e2e76","a12c7b1d9e30798f","b030b9a3870071a3","7a931c78386a54b1"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"capability\")||'|'||quote(\"scope\")||'|'||quote(\"granted_ts\")||'|'||quote(\"revoked_ts\")||'|'||quote(\"revoked_seq\")) FROM \"grant\" ORDER BY rowid"
+     },
+     "landing_session": {
+      "count": 2,
+      "row_digests": ["1f811154392f7cc4","a1a086bf9214e253"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"revision\")||'|'||quote(\"document\")) FROM \"landing_session\" ORDER BY rowid"
+     },
+     "model_job": {
+      "count": 5,
+      "row_digests": ["ff78dacaffaa9ef8","b21b600149780f69","ef2031083be96c7a","9085d92529300e14","cebc71f36c85caec"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"kind\")||'|'||quote(\"model_id\")||'|'||quote(\"source\")||'|'||quote(\"state\")||'|'||quote(\"bytes_done\")||'|'||quote(\"bytes_total\")||'|'||quote(\"detail\")||'|'||quote(\"created_ts\")||'|'||quote(\"updated_ts\")) FROM \"model_job\" ORDER BY rowid"
+     },
+     "request": {
+      "count": 37,
+      "row_digests": ["751b708ce6cbe31d","6d63831602670a80","3ef5a9b2aba8b6ad","1195d9ecbb2f15b2","ecc564092eda7d53","554f38295fd73907","9ce4ea8795d5077a","c1e74d66ba9f0854","cda6575cce501a5c","4e0e4e5d98364886","e34e2c4d1188ad34","e8ba035b4bdf67e9","6de211602e04018e","fd4fdb8f19cf1e74","51f452511b8cd47d","8635301f94187ed1","54cdb79c41a9c579","3eb6c191ce8883fb","7a9ed02e9af10291","33d90e6714957747","8cf1dfb22def649b","b9e182d85dd83b9c","2a096cc89c657d5f","caccf8e35f30400c","eb383d87e19231e7","914c3f365c906e89","c8eb0829f44647cb","dc03936884f86eb4","d7a448058daa31d3","94686de541d0c7cc","2f6891e74e6dfbdd","918fb5c0f1c6d6a2","144d169da3f58d66","e2fa0703fd9f3582","e492f38a137667e4","633d6c1213dcb744","e934d9fce7c31ec4"],
+      "rows_sql": "SELECT hex(quote(\"id\")||'|'||quote(\"capability\")||'|'||quote(\"repo\")||'|'||quote(\"caller_agent\")||'|'||quote(\"args_json\")||'|'||quote(\"state\")||'|'||quote(\"outcome\")||'|'||quote(\"created_ts\")||'|'||quote(\"updated_ts\")||'|'||quote(\"idempotency_key\")||'|'||quote(\"expires_at_ms\")||'|'||quote(\"authorization_revision\")||'|'||quote(\"queue_authorized\")||'|'||quote(\"resume_at_ms\")||'|'||quote(\"ingress\")||'|'||quote(\"peer_uid\")||'|'||quote(\"peer_pid\")||'|'||quote(\"relayed\")) FROM \"request\" ORDER BY rowid"
+     },
+     "request_budget": {
+      "count": 2,
+      "row_digests": ["bd229808224df69e","bfe7e325ceb1f72c"],
+      "rows_sql": "SELECT hex(quote(\"request_id\")||'|'||quote(\"attempts\")||'|'||quote(\"http_calls\")||'|'||quote(\"http_bytes\")||'|'||quote(\"command_bytes\")) FROM \"request_budget\" ORDER BY rowid"
+     },
+     "setting": {
+      "count": 11,
+      "row_digests": ["977e79596d3b0fa3","294259385b2c1f18","010eb5737a7ff47e","5c69efeb309d2473","63c801a45ca6a10f","16381926cb147811","99149bb5fec3a030","4e0dc8040b17aea7","8af54aa7bc9a1db1","23150d0cc65438be","0e25ee1d724fa464"],
+      "rows_sql": "SELECT hex(quote(\"key\")||'|'||quote(\"value\")) FROM \"setting\" ORDER BY rowid"
+     }
+    },
+    "user_version": 13
+   }
+  }
+ },
+ "written_by": "turso 0.7 through pam_store::Store at schema 13; write-ahead log moved into the main file by the engine's own TRUNCATE checkpoint"
+}

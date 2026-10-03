@@ -359,13 +359,14 @@ impl AdminService {
                 &origin,
             )
             .await;
-        if inserted.is_err() {
-            // No row, so nothing can be audited; answer legibly.
+        if let Err(error) = inserted {
+            // No row, so nothing can be audited; answer legibly, with the
+            // store's own sentence: this plane is the human's.
             return Response::Refusal {
                 retryable: true,
                 id: id.clone(),
                 cause: CAUSE_INTERNAL_ERROR.to_owned(),
-                detail: "the daemon could not record the admin request".to_owned(),
+                detail: format!("the daemon could not record the admin request: {error}"),
                 recovery: RECOVERY_INTERNAL.to_owned(),
             };
         }
@@ -1012,14 +1013,30 @@ impl AdminService {
                 },
             )
             .await;
-        if written == Written::Parked {
-            return Response::refusal(
-                envelope.id.clone(),
-                CAUSE_INTERNAL_ERROR,
-                "the admin operation ran but its audit row could not be recorded yet; \
-                 it is queued to be recorded",
-                RECOVERY_DEADLINE,
-            );
+        match written {
+            Written::Durable => {}
+            Written::Parked { .. } => {
+                return Response::refusal(
+                    envelope.id.clone(),
+                    CAUSE_INTERNAL_ERROR,
+                    "the admin operation ran but its audit row could not be recorded yet; \
+                     it is queued to be recorded",
+                    RECOVERY_DEADLINE,
+                );
+            }
+            // The store's own sentence, as on every admin refusal: the
+            // daemon is leaving and the row will not be recorded by it.
+            Written::Closed => {
+                return Response::refusal(
+                    envelope.id.clone(),
+                    CAUSE_INTERNAL_ERROR,
+                    format!(
+                        "the admin operation ran but its audit row was not recorded: {}",
+                        StoreError::Closed
+                    ),
+                    RECOVERY_INTERNAL,
+                );
+            }
         }
         Response::Result {
             id: envelope.id.clone(),

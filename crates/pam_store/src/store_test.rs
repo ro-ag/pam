@@ -1,5 +1,4 @@
 use sha2::{Digest, Sha256};
-use turso::params;
 
 use crate::{
     Actor, ApprovalResolution, AuditEntry, CompressionStats, ConnectorPatch, Decision,
@@ -46,17 +45,10 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 13);
+    assert_eq!(store.schema_version().await.unwrap(), 14);
 
-    // WAL is the engine's native journal mode.
-    let mut rows = store
-        .lock()
-        .await
-        .unwrap()
-        .query("PRAGMA journal_mode", ())
-        .await
-        .unwrap();
-    let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    // A file-backed store runs in write-ahead logging mode.
+    let mode: String = store.raw_scalar("PRAGMA journal_mode", ()).await.unwrap();
     assert_eq!(mode.to_lowercase(), "wal");
 }
 
@@ -183,12 +175,9 @@ async fn queued_recovery_pages_preserve_timestamp_then_id_order() {
         insert_demo_request(&store, &id).await;
         let created = 100 + number / 7;
         store
-            .lock()
-            .await
-            .unwrap()
-            .execute(
+            .raw_execute(
                 "UPDATE request SET created_ts = ?2 WHERE id = ?1",
-                params![id.as_str(), created],
+                (id.clone(), created),
             )
             .await
             .unwrap();
@@ -257,12 +246,9 @@ async fn stuck_recovery_filters_states_and_rejects_oversized_payloads() {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].id, "stuck");
         store
-            .lock()
-            .await
-            .unwrap()
-            .execute(
+            .raw_execute(
                 "UPDATE request SET args_json = ?1 WHERE id = 'stuck'",
-                params![format!("\0{}", "é".repeat(200))],
+                (format!("\0{}", "é".repeat(200)),),
             )
             .await
             .unwrap();
@@ -302,12 +288,9 @@ async fn queued_recovery_rejects_each_oversized_text_field_before_materializatio
         insert_demo_request(&store, "legacy").await;
         let oversized = format!("\0{}", "é".repeat(200));
         store
-            .lock()
-            .await
-            .unwrap()
-            .execute(
+            .raw_execute(
                 &format!("UPDATE request SET {column} = ?1 WHERE id = 'legacy'"),
-                params![oversized],
+                (oversized,),
             )
             .await
             .unwrap();
@@ -367,17 +350,13 @@ async fn audit_append_works() {
         .await
         .unwrap();
 
-    let mut rows = store
-        .lock()
-        .await
-        .unwrap()
-        .query(
+    let count: i64 = store
+        .raw_scalar(
             "SELECT count(*) FROM audit WHERE request_id = ?1",
             ["req_1"],
         )
         .await
         .unwrap();
-    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 2);
 }
 
@@ -447,12 +426,9 @@ async fn active_grant_tracks_insert_and_revocation() {
     // A revoked row (GUI-side administration, no helper yet) stops
     // counting; history stays in the table.
     store
-        .lock()
-        .await
-        .unwrap()
-        .execute(
+        .raw_execute(
             "UPDATE \"grant\" SET revoked_ts = granted_ts WHERE capability = ?1",
-            params!["release"],
+            ("release",),
         )
         .await
         .unwrap();
@@ -461,17 +437,13 @@ async fn active_grant_tracks_insert_and_revocation() {
     // Re-grant is a new row, and the old one is preserved.
     store.insert_grant("release").await.unwrap();
     assert!(store.active_grant("release").await.unwrap());
-    let mut rows = store
-        .lock()
-        .await
-        .unwrap()
-        .query(
+    let count: i64 = store
+        .raw_scalar(
             "SELECT count(*) FROM \"grant\" WHERE capability = ?1",
-            params!["release"],
+            ("release",),
         )
         .await
         .unwrap();
-    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 2);
 }
 
@@ -503,27 +475,26 @@ async fn setting_round_trip() {
 async fn grant_table_insert_works_despite_keyword_name() {
     let store = Store::open_in_memory().await.unwrap();
     store
-        .lock()
-        .await
-        .unwrap()
-        .execute(
+        .raw_execute(
             "INSERT INTO \"grant\" (capability, granted_ts) VALUES (?1, ?2)",
-            params!["release", 1_756_684_800_i64],
+            ("release", 1_756_684_800_i64),
         )
         .await
         .unwrap();
 
-    let mut rows = store
-        .lock()
-        .await
-        .unwrap()
-        .query("SELECT capability, scope, revoked_ts FROM \"grant\"", ())
+    let row: (String, String, Option<i64>) = store
+        .raw(|conn| {
+            conn.query_row(
+                "SELECT capability, scope, revoked_ts FROM \"grant\"",
+                (),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
         .await
         .unwrap();
-    let row = rows.next().await.unwrap().unwrap();
-    assert_eq!(row.get::<String>(0).unwrap(), "release");
-    assert_eq!(row.get::<String>(1).unwrap(), "global");
-    assert_eq!(row.get::<Option<i64>>(2).unwrap(), None);
+    assert_eq!(row.0, "release");
+    assert_eq!(row.1, "global");
+    assert_eq!(row.2, None);
 }
 
 #[tokio::test]
@@ -1524,20 +1495,13 @@ async fn age_request(store: &Store, id: &str, ts: i64) {
         // no prune filter reads their timestamp, so they keep theirs.
         "UPDATE evidence SET ts = ?2 WHERE request_id = ?1",
     ] {
-        store
-            .lock()
-            .await
-            .unwrap()
-            .execute(sql, params![id, ts])
-            .await
-            .unwrap();
+        store.raw_execute(sql, (id.to_owned(), ts)).await.unwrap();
     }
 }
 
 /// One counting query, straight through the connection.
 async fn count(store: &Store, sql: &str) -> i64 {
-    let mut rows = store.lock().await.unwrap().query(sql, ()).await.unwrap();
-    rows.next().await.unwrap().unwrap().get(0).unwrap()
+    store.raw_scalar(sql, ()).await.unwrap()
 }
 
 #[tokio::test]

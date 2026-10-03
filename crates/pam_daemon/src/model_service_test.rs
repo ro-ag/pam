@@ -5,9 +5,11 @@ use pam_store::Store;
 use serde_json::json;
 
 use crate::model_service::{
-    JOB_RUNNING, ModelService, ModelServiceError, ModelUnavailable, SETTING_DEFAULT_HEAVY,
-    SETTING_DEFAULT_LIGHT, Tier, should_unload,
+    CAUSE_DAEMON_RESTART, DOWNLOAD_POLL, JOB_FAILED, JOB_RUNNING, ModelService, ModelServiceError,
+    ModelUnavailable, SETTING_DEFAULT_HEAVY, SETTING_DEFAULT_LIGHT, SHUTDOWN_WAIT, Tier,
+    should_unload,
 };
+use crate::test_log::Captured;
 
 /// A service over a fresh in-memory store, pointed at `dir`.
 async fn service(dir: &std::path::Path) -> Arc<ModelService> {
@@ -962,6 +964,141 @@ async fn a_verify_job_makes_the_private_copy_and_a_cancelled_one_leaves_nothing(
         service.find("qwen/big").await.unwrap().unwrap().verified,
         None
     );
+}
+
+/// The daemon closes its store as the last step of shutdown. A download or a
+/// verification still running then used to be left to its detached follower,
+/// which found the store closed, logged that, and left the job row `running`
+/// for the next boot to fail. `shutdown` stops the transfers and waits for
+/// their followers, so the verdicts are written while the store still takes
+/// them and nothing meets a closed store.
+#[tokio::test]
+async fn shutdown_stops_running_transfers_and_their_followers_before_the_store_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let service = ModelService::new(Arc::clone(&store)).await.unwrap();
+    service.set_models_dir(dir.path()).await.unwrap();
+    service.set_engine_base(dir.path().join("base"));
+
+    // A verification that is still hashing when the shutdown comes (sparse:
+    // it costs no disk, and its clone costs none either).
+    let big = dir.path().join("qwen").join("big.gguf");
+    std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(768 * 1024 * 1024)
+        .unwrap();
+    let entry = service.find("qwen/big").await.unwrap().unwrap();
+    let mut jobs = vec![service.start_verify(entry).await.unwrap()];
+
+    // And, where there is a curl to run, a download an origin trickles out
+    // for minutes.
+    let origin = pam_model::testing::serve_slowly(
+        vec![7_u8; 1024 * 1024],
+        "\"etag-slow\"",
+        512,
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    let downloading = pam_model::download::curl_path().is_ok();
+    if downloading {
+        jobs.push(
+            service
+                .start_download(
+                    DownloadRequest {
+                        url: origin.url("slow.gguf"),
+                        dest: dir.path().join("qwen").join("slow.gguf"),
+                        expected_size: None,
+                        expected_sha256: None,
+                        license_id: None,
+                    },
+                    "qwen/slow",
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let rows = store.list_model_jobs(10).await.unwrap();
+    assert_eq!(rows.len(), jobs.len());
+    assert!(rows.iter().all(|row| row.state == JOB_RUNNING), "{rows:?}");
+
+    let (log, logging) = Captured::start();
+    let started = std::time::Instant::now();
+    service.shutdown().await;
+    assert!(
+        started.elapsed() < SHUTDOWN_WAIT,
+        "the followers were waited out, not joined: {:?}",
+        started.elapsed()
+    );
+
+    // The followers have ended: their verdicts are on the rows, read here
+    // through the store before it closes, and their transfers are forgotten.
+    let rows = store.list_model_jobs(10).await.unwrap();
+    assert_eq!(rows.len(), jobs.len());
+    for row in &rows {
+        assert_eq!(row.state, JOB_FAILED, "{row:?}");
+        let detail: serde_json::Value =
+            serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["cause"], CAUSE_DAEMON_RESTART, "{row:?}");
+        assert_eq!(
+            detail["detail"], "the daemon stopped while this job was running",
+            "{row:?}"
+        );
+    }
+    assert!(!service.cancel_verify(&jobs[0]));
+    if downloading {
+        assert!(!service.cancel_download(&jobs[1]).await);
+    }
+    // Nothing of the cancelled verification is left in the private store.
+    assert!(
+        std::fs::read_dir(service.weights_dir()).map_or(0, Iterator::count) == 0,
+        "the cancelled verification left a private copy"
+    );
+
+    store.close().await.unwrap();
+    // Long enough for a follower that was still alive to poll once more and
+    // meet the closed store.
+    tokio::time::sleep(DOWNLOAD_POLL * 3).await;
+    drop(logging);
+    let text = log.text();
+    assert!(!text.contains("the store is closed"), "{text}");
+    assert!(!text.contains("not recorded"), "{text}");
+    assert!(!text.contains("did not stop in time"), "{text}");
+
+    // A second shutdown has nothing to do and returns at once.
+    service.shutdown().await;
+}
+
+/// The wait for the followers is bounded: one that has not ended in time is
+/// reported and left running, and the shutdown returns.
+#[tokio::test]
+async fn shutdown_leaves_a_follower_that_does_not_stop_in_time_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path()).await;
+    service.set_engine_base(dir.path().join("base"));
+    let big = dir.path().join("qwen").join("big.gguf");
+    std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(768 * 1024 * 1024)
+        .unwrap();
+    let entry = service.find("qwen/big").await.unwrap().unwrap();
+    let job = service.start_verify(entry).await.unwrap();
+
+    // No time at all: the follower cannot have recorded its verdict yet.
+    let (log, logging) = Captured::start();
+    let started = std::time::Instant::now();
+    service.shutdown_within(std::time::Duration::ZERO).await;
+    drop(logging);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let text = log.text();
+    assert!(text.contains("WARN"), "{text}");
+    assert!(text.contains("did not stop in time"), "{text}");
+    assert!(text.contains("left=1") || text.contains("left=2"), "{text}");
+
+    // Left, not aborted: it still records why its job ended.
+    let row = finished_job(&service, &job).await;
+    assert_eq!(row["state"], JOB_FAILED, "{row}");
 }
 
 /// Polls `admin.models.status` until job `id` leaves `running`, and returns its row.

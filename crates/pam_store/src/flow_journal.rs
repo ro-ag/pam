@@ -139,21 +139,21 @@ impl OwnedCheckpoint {
     }
 }
 
-/// Test-only fault injection: the request id whose next checkpointed journal
+/// Test-only fault injection: the request ids whose next checkpointed journal
 /// write fails between the journal statement and the checkpoint insert, as a
-/// crash there would interrupt it. Keyed by request so parallel tests do not
-/// trip each other.
+/// crash there would interrupt it. One entry per request, so tests that arm it
+/// in parallel neither disarm nor trip each other.
 #[cfg(test)]
-pub(crate) static CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+pub(crate) static CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn injected_crash(request_id: &str) -> Result<(), StoreError> {
     let mut armed = CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if armed.as_deref() == Some(request_id) {
-        *armed = None;
+    if let Some(index) = armed.iter().position(|id| id == request_id) {
+        armed.swap_remove(index);
         return Err(StoreError::Unavailable {
             detail: "injected crash between the journal write and its checkpoint".to_owned(),
         });

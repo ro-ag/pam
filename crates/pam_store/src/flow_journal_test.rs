@@ -333,7 +333,10 @@ use crate::store::CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT;
 
 /// Arms the injected crash for `request_id`'s next checkpointed write.
 fn crash_next_checkpoint_of(request_id: &str) {
-    *CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT.lock().unwrap() = Some(request_id.to_owned());
+    CRASH_BETWEEN_JOURNAL_AND_CHECKPOINT
+        .lock()
+        .unwrap()
+        .push(request_id.to_owned());
 }
 
 async fn checkpoint_ids(store: &Store, request_id: &str) -> Vec<String> {

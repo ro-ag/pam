@@ -268,19 +268,27 @@ fn schannel_text_is_matched_only_on_fixed_tokens() {
     // The chain-trust flag spellings of the windows-2025 runner's build.
     for (text, want) in [
         (
-            "CERT_TRUST_REVOCATION_STATUS_UNKNOWN",
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_REVOCATION_STATUS_UNKNOWN",
             "tls_revocation_unavailable",
         ),
         (
-            "CERT_TRUST_IS_OFFLINE_REVOCATION",
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_OFFLINE_REVOCATION",
             "tls_revocation_unavailable",
         ),
-        ("CERT_TRUST_IS_PARTIAL_CHAIN", "tls_untrusted_issuer"),
-        ("CERT_TRUST_IS_UNTRUSTED_ROOT", "tls_untrusted_issuer"),
-        ("CERT_TRUST_IS_NOT_TIME_VALID", "tls_expired"),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_PARTIAL_CHAIN",
+            "tls_untrusted_issuer",
+        ),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_UNTRUSTED_ROOT",
+            "tls_untrusted_issuer",
+        ),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_NOT_TIME_VALID",
+            "tls_expired",
+        ),
     ] {
-        let line = format!("curl: (60) schannel: CertGetCertificateChain trust error {text}");
-        assert_eq!(case(60, &line), want, "{text}");
+        assert_eq!(case(60, text), want, "{text}");
     }
     assert_eq!(
         case(

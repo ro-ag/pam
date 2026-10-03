@@ -26,7 +26,9 @@ use crate::network_service::{
     FixedManagedNetwork, ManagedNetwork, NetworkService, PROXY_CREDENTIAL_ID, ProxyEntry,
     SETTING_KEY,
 };
-use crate::network_service_test::{ca_pin_path, load_policy, normalized_digest, test_ca_pem};
+use crate::network_service_test::load_policy;
+#[cfg(not(windows))]
+use crate::network_service_test::{ca_pin_path, normalized_digest, test_ca_pem};
 use crate::secrets::{FakeSecretBackend, SecretBackend, SecretStore, account_for};
 use crate::test_log::Captured;
 use crate::transport::EventPublisher;
@@ -1495,6 +1497,7 @@ async fn a_policy_default_is_open_for_the_human_to_replace() {
 
 /// A managed CA bundle: locked, used from the loader's private copy, kept
 /// when the human saves another field, refused for edit.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_managed_ca_bundle_is_locked_used_and_survives_other_saves() {
     let pem = test_ca_pem();
@@ -1550,6 +1553,7 @@ async fn a_managed_ca_bundle_is_locked_used_and_survives_other_saves() {
 /// A failed import of the managed bundle closes the consumers with the
 /// cause, shows it on the screen, and refuses the Test; the human's other
 /// fields remain saveable.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_failed_managed_ca_import_closes_the_network_and_the_screen_says_why() {
     let pem = test_ca_pem();

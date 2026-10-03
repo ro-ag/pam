@@ -618,7 +618,9 @@ mod windows {
             ("inherited", Some(UntrustedReason::ParentWritable)),
             ("owner_user", Some(UntrustedReason::WritableByUser)),
             ("delete_only", Some(UntrustedReason::WritableByUser)),
-            ("delete_child", Some(UntrustedReason::ParentWritable)),
+            // Windows answers a DELETE open on a file from the folder's
+            // FILE_DELETE_CHILD too, so the file probe is the one that fires.
+            ("delete_child", Some(UntrustedReason::WritableByUser)),
             ("junction", Some(UntrustedReason::Symlink)),
             ("symlink", Some(UntrustedReason::Symlink)),
             ("busy", Some(UntrustedReason::Busy)),

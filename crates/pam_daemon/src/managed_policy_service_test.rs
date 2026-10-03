@@ -89,16 +89,19 @@ const RELAXED: &str =
     r#"{"version":1,"revision":"loose","security":{"profile":{"locked":"relaxed"}}}"#;
 
 /// One certificate block `normalize_pem` accepts.
+#[cfg_attr(windows, allow(dead_code))]
 const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
 
 /// Where the CA bundle documents pin their file.
 const CA_PATH: &str = "/Library/Application Support/PAM/ca/corp-root.pem";
 
+#[cfg_attr(windows, allow(dead_code))]
 fn pem_digest() -> String {
     let normalized = pam_net::normalize_pem(PEM.as_bytes()).expect("the fixture is a bundle");
     sha256_hex(normalized.pem.as_bytes())
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn ca_document(sha256: &str, revision: &str) -> String {
     json!({
         "version": 1,
@@ -156,6 +159,7 @@ impl Fake {
         self.set(SourceRead::Trusted(text.as_bytes().to_vec()));
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn set_referenced(&self, read: SourceRead) {
         *self.referenced.lock().unwrap() = Some(read);
     }
@@ -224,6 +228,7 @@ impl Fixture {
         PolicyHandle::load(Arc::clone(&self.store), source, self.base.path()).await
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn net_dir(&self) -> PathBuf {
         self.base.path().join(crate::network_service::NET_DIR)
     }
@@ -944,7 +949,46 @@ async fn the_poll_stops_when_the_shutdown_sender_drops() {
 }
 
 // --- The managed CA bundle ------------------------------------------------------
+//
+// The tests below import a pinned bundle, which Windows does not do (it trusts a
+// private CA through its certificate store), so they run off Windows only; the
+// Windows rule has its own test after them.
 
+/// A bundle a Windows policy pins is a rejected leaf with no effect: it is not
+/// held, takes nothing from a last-good copy and never closes the network.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_pinned_ca_bundle_on_windows_is_rejected_and_never_closes_the_network() {
+    let document = json!({
+        "version": 1,
+        "revision": "ca-win",
+        "network": { "ca_bundle": { "locked": {
+            "path": r"C:\ProgramData\PAM\ca\corp-root.pem",
+            "sha256": "a".repeat(64),
+        } } }
+    })
+    .to_string();
+    let fx = Fixture::new(trusted(&document)).await;
+    let handle = fx.boot().await;
+
+    assert!(handle.network_closed().is_none());
+    assert!(
+        handle
+            .managed_network()
+            .is_none_or(|managed| managed.ca_bundle.is_none())
+    );
+    let status = handle.status();
+    assert_eq!(status.rejected_leaves, 1);
+    let row = status
+        .keys
+        .iter()
+        .find(|row| row.key == "network.ca_bundle")
+        .expect("the key is reported");
+    assert_eq!(row.state, "rejected");
+    assert_eq!(row.code, Some("network_ca_unsupported_on_windows"));
+}
+
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_pinned_ca_bundle_is_imported_through_the_trust_check_and_the_digest() {
     let sha = pem_digest();
@@ -971,6 +1015,7 @@ async fn a_pinned_ca_bundle_is_imported_through_the_trust_check_and_the_digest()
     assert_eq!(hooks.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_ca_digest_mismatch_with_no_last_good_closes_the_network() {
     let fx = Fixture::new(trusted(&ca_document(&"a".repeat(64), "ca-bad"))).await;
@@ -1002,6 +1047,7 @@ async fn a_ca_digest_mismatch_with_no_last_good_closes_the_network() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn an_untrusted_ca_bundle_closes_the_network() {
     let fx = Fixture::new(trusted(&ca_document(&pem_digest(), "ca1"))).await;
@@ -1011,6 +1057,7 @@ async fn an_untrusted_ca_bundle_closes_the_network() {
     assert_eq!(closed.code, "writable_by_user");
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_failing_new_ca_pin_falls_back_to_the_last_good_pin() {
     let sha = pem_digest();
@@ -1032,6 +1079,7 @@ async fn a_failing_new_ca_pin_falls_back_to_the_last_good_pin() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_busy_ca_bundle_uses_the_private_copy_that_matches_the_pin() {
     let sha = pem_digest();

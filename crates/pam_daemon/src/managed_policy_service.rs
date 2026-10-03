@@ -250,6 +250,7 @@ impl FileSource {
     /// A file at `path` under `rules`. Test builds only: production has no
     /// way to name another path.
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     #[must_use]
     pub(crate) fn at(path: impl Into<PathBuf>, rules: TrustRules) -> Self {
         Self {

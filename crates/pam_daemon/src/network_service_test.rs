@@ -953,6 +953,7 @@ impl PolicySource for Scripted {
 }
 
 /// Where a policy pins its bundle: an absolute path on this platform.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn ca_pin_path() -> &'static str {
     if cfg!(windows) {
         r"C:\ProgramData\PAM\ca\corp-root.pem"
@@ -961,10 +962,12 @@ pub(crate) fn ca_pin_path() -> &'static str {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn test_ca_pem() -> Vec<u8> {
     std::fs::read(pam_net::testing::test_ca()).expect("the fixture CA")
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn normalized_digest(pem: &[u8]) -> String {
     sha256_hex(
         pam_net::normalize_pem(pem)
@@ -1095,6 +1098,7 @@ async fn a_policy_default_is_used_until_the_human_saves_a_value() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_failed_ca_import_closes_connector_calls_and_downloads_with_the_cause() {
     let fixture = fixture().await;
@@ -1157,6 +1161,7 @@ async fn a_rejected_proxy_with_no_last_good_value_closes_the_network() {
 
 /// The loader imported the pinned bundle; the service re-hashes that private
 /// copy on every spawn and never imports a second time.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_managed_ca_bundle_is_the_loaders_private_copy_checked_on_every_spawn() {
     let fixture = fixture().await;

@@ -86,7 +86,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 4 | High | The GUI's polling creates unbounded request and audit rows, and no index supports the hot list query | `bridge.rs:325-335`, `queue.rs:321`, `store.rs` | fixed: indexes (schema 12) and ledger-free `status`; admission ignores expired rows |
 | 5 | Medium | The grant revocation revision is a global count; any revoke orphans every older ticket's results and evidence | `store.rs:704-757`, `evidence_service.rs:175-182` | fixed: scoped to the grants a request depends on; since task 222 `request.flow_id` is written at admission (schema 17) and a step revocation voids only that flow's tickets. Revoking is per capability, so it ends that step's grant for every repository |
 | 6 | Medium | `update_request_state` can resurrect a terminal request | `store.rs:1055-1062` | fixed: returns `AlreadyTerminal` and writes nothing |
-| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched, the read connection built (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)); chunked view storage done (schema 20, task 228: 64 KiB chunks, a page of a 32 MiB view 3.8 ms to 0.17 ms in release); a delayed first prune is still open |
+| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched, the read connection built (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)); chunked view storage done (schema 20, task 228: 64 KiB chunks, a page of a 32 MiB view 3.8 ms to 0.17 ms in release); since plan 56 the first scheduled prune waits two minutes after boot (`FIRST_PRUNE_DELAY`) |
 | 8 | Medium | "One audit row per operation, refusals included" is not structural: pre-admission refusals leave no row | `migrations.rs:153`, `daemon.rs:792-963` | fixed: the `refusal` table (schema 18) holds them, coalesced and bounded, and `admin.activity.list` interleaves them; what is still unrecorded is listed in the audit contract |
 | 9 | Medium | Immutability of audit and evidence is by convention only | `migrations.rs`, `store.rs:1265-1289` | fixed: triggers make `audit` append-only and `evidence_view` immutable except retention's tombstone; since task 228 one terminal audit row per request by a partial unique index (schema 19), served bytes re-hashed per chunk (`evidence_corrupt`), and `evidence_view.source_id` a foreign key with a CHECK that a live view has its evidence (schema 20) |
 | 10 | Medium | Retention is irreversible, runs on an unvalidated wall clock, and its settings flow is non-atomic | `retention.rs:200-216`, `store.rs:2075-2089` | fixed: an out-of-range stored window reads as forever, both windows save in one transaction; since task 221 a clock guard with a watermark refuses to prune after a forward clock jump and `admin.retention.get` reports it |
@@ -276,8 +276,9 @@ Not done, with the reason. Items marked done were closed by plan 55 (PR 170) or 
 - **`watch_target_changed` raw results readable through `${steps.*}`** and builtin
   descriptions that over-promise `git fetch`: unreachable from shipped recipes, and
   description text only.
-- **A delayed first prune** (store 7) and **compaction reversibility and keyword
-  set** (store 15): code outside the store's files.
+- **A delayed first prune** (store 7). **Done** (plan 56): two minutes after boot.
+- **Compaction reversibility and keyword set** (store 15): code outside the
+  store's files.
 - **The branch of the integrity check that fails after a successful open** (store
   11): no such file could be constructed, so it is untested.
 - **A dedicated `client_version_mismatch` message in the client and a Settings

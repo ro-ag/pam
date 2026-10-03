@@ -258,19 +258,35 @@ async fn prune_applies_both_windows_and_records_the_run() {
     assert!(store.get_request("r1").await.unwrap().is_none());
 }
 
-#[tokio::test]
-async fn scheduler_prunes_on_its_first_tick_and_stops_on_shutdown() {
+#[tokio::test(start_paused = true)]
+async fn scheduler_waits_out_the_first_delay_then_prunes_and_stops_on_shutdown() {
     let (store, service) = service().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let task = service.clone().run_scheduler(Duration::from_hours(1), rx);
+    let first_delay = Duration::from_mins(2);
+    let task = service
+        .clone()
+        .run_scheduler(first_delay, Duration::from_hours(1), rx);
 
+    // Just short of the delay: nothing has run, so boot recovery and the
+    // first requests have the store to themselves.
+    tokio::time::sleep(Duration::from_secs(119)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        service.last_run().await.unwrap().is_none(),
+        "no prune before the first delay"
+    );
+
+    // Past it: the first scheduled pass runs.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while service.last_run().await.unwrap().is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the first tick prunes at once");
+    .expect("the first pass runs once the delay is over");
 
     tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), task)
@@ -278,6 +294,14 @@ async fn scheduler_prunes_on_its_first_tick_and_stops_on_shutdown() {
         .expect("stops on drain")
         .unwrap();
     drop(store);
+}
+
+/// The daemon's first prune waits, but not so long that a daemon running
+/// for minutes never prunes.
+#[test]
+fn the_first_prune_delay_is_short_against_the_interval() {
+    assert!(crate::retention::FIRST_PRUNE_DELAY > Duration::ZERO);
+    assert!(crate::retention::FIRST_PRUNE_DELAY * 10 <= crate::retention::PRUNE_INTERVAL);
 }
 
 #[tokio::test]

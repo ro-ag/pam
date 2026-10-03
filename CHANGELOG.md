@@ -181,6 +181,10 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- The daemon's first scheduled retention prune runs two minutes after boot
+  instead of at once, so a large first prune does not hold the store during
+  crash recovery and the first requests. Saving retention settings and Prune
+  now still prune immediately.
 - Guarded landing polls required checks with exponential backoff (about 5 s
   doubling to a 60 s cap, with jitter) until the request's own deadline,
   instead of a fixed 20 polls at 5 s: it never gives up while a poll fits, and

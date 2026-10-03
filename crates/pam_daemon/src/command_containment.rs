@@ -70,17 +70,7 @@ impl CommandContainment {
     ) -> Result<PreparedCommand, String> {
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let launcher = PathBuf::from("/usr/bin/sandbox-exec");
-            let metadata = std::fs::metadata(&launcher)
-                .map_err(|_| "macOS sandbox launcher is unavailable".to_owned())?;
-            if !metadata.is_file()
-                || metadata.uid() != 0
-                || metadata.permissions().mode() & 0o111 == 0
-                || metadata.permissions().mode() & 0o022 != 0
-            {
-                return Err("macOS sandbox launcher is not executable".to_owned());
-            }
+            let launcher = trusted_launcher()?;
             let (profile, program) = profile(self, program, cwd)?;
             let mut argv = vec![
                 "-p".into(),
@@ -107,6 +97,79 @@ impl CommandContainment {
         {
             let _ = (self, program, cwd, env);
             Err("command containment is supported only on macOS".to_owned())
+        }
+    }
+}
+
+/// The macOS system sandbox launcher, when it is the root-owned executable
+/// that no group or other account can replace. The same check gates every
+/// [`CommandContainment::prepare`] and the [`availability`] report.
+#[cfg(target_os = "macos")]
+fn trusted_launcher() -> Result<PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let launcher = PathBuf::from("/usr/bin/sandbox-exec");
+    let metadata = std::fs::metadata(&launcher)
+        .map_err(|_| "macOS sandbox launcher is unavailable".to_owned())?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o111 == 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("macOS sandbox launcher is not executable".to_owned());
+    }
+    Ok(launcher)
+}
+
+/// Whether this machine can contain command workloads at all: flow command
+/// steps and guarded landing's local Git run only when it can. Checked once
+/// per process (the launcher is a system file) and reported by `status`, so an
+/// agent and the GUI learn it before a run is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Availability {
+    /// True when the OS boundary can be installed.
+    pub available: bool,
+    /// The mechanism when available, or why not.
+    pub detail: String,
+}
+
+impl Availability {
+    /// The `containment` block of the `status` body.
+    #[must_use]
+    pub fn status_block(&self) -> serde_json::Value {
+        serde_json::json!({
+            "available": self.available,
+            "cause": (!self.available).then_some(CAUSE_UNAVAILABLE),
+            "detail": self.detail,
+            "affects": ["flow command steps", "guarded landing"],
+        })
+    }
+}
+
+/// This machine's [`Availability`], computed on first use.
+pub fn availability() -> &'static Availability {
+    static AVAILABILITY: std::sync::OnceLock<Availability> = std::sync::OnceLock::new();
+    AVAILABILITY.get_or_init(probe)
+}
+
+fn probe() -> Availability {
+    #[cfg(target_os = "macos")]
+    {
+        match trusted_launcher() {
+            Ok(_) => Availability {
+                available: true,
+                detail: "macOS system sandbox (/usr/bin/sandbox-exec)".to_owned(),
+            },
+            Err(reason) => Availability {
+                available: false,
+                detail: reason,
+            },
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Availability {
+            available: false,
+            detail: "command containment is supported only on macOS".to_owned(),
         }
     }
 }

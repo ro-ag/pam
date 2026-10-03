@@ -1,7 +1,8 @@
 # Managed read-only policy file — design and implementation plan
 
 Status: implemented; the Windows VM verification (T13 step 2) is done and recorded in
-[Evidence to record](#evidence-to-record); the owner's sudo pass is pending (T13).
+[Evidence to record](#evidence-to-record); the owner's macOS pass on the real
+install path is done and recorded there (item 7, 2026-10-03).
 Built on `feat/managed-policy` (T1–T12), 2026-10-02/03. What was built, and
 where it departs from the design below, is in [As built](#as-built-2026-10-03);
 where the two disagree, As built is the behavior. The administrator's guide is
@@ -1309,7 +1310,17 @@ otherwise.
    1, "Access is denied" (the daemon would report it unreadable; not measured
    at the daemon). `Copy-Item -Force` over the existing file keeps the
    destination's ACL (trusted).
-7. macOS: not part of this run.
+7. **Measured on macOS 26, 2026-10-03** (the owner's `sudo` pass, a scratch daemon
+   base, the built binary): the sample installed with `install -m 0644 -o root
+   -g wheel` under a `root:wheel 0755` `PAM` folder reads trusted (`pam policy
+   check --trust` exit 0: owner uid 0, mode 0644, every parent rule ok) and the
+   daemon reports `policy: active, rev 2026-10-02.1` within one poll;
+   `chmod g+w` is refused `writable_by_user` (mode 0664), exit 11; an ACL
+   `user:<owner> allow write` that the mode bits do not show is refused
+   `writable_by_user` by the write probe, exit 11; deleting the folder returns
+   the daemon to `policy: none (unmanaged)` within the absence-confirmation
+   window. Everything the pass created was removed. PAM itself ran as the user
+   throughout; `sudo` stood in for the MDM that installs the file.
 8. **Measured.** `prlctl exec ... --current-user` is available and runs as the
    interactive account (above).
 

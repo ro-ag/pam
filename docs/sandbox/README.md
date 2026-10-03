@@ -35,11 +35,11 @@ Where a harness has no setting for one of these, the profile says so and
 
 | Harness | File | Format | Status (verified 2026-10-02) |
 | --- | --- | --- | --- |
-| Claude Code | [`macos/claude-code.md`](macos/claude-code.md), [`claude-code.settings.json`](macos/claude-code.settings.json), [`claude-code.managed-settings.json`](macos/claude-code.managed-settings.json) | `settings.json` `sandbox` and `permissions` keys | documented format, cited |
-| Codex | [`macos/codex.config.toml`](macos/codex.config.toml) | `config.toml` permission profile | documented keys, cited; Beta page |
-| Gemini CLI | [`macos/gemini-cli.sandbox-macos-pam.sb`](macos/gemini-cli.sandbox-macos-pam.sb) | custom Seatbelt profile file | documented mechanism, source read |
-| Copilot CLI | [`macos/copilot-cli.md`](macos/copilot-cli.md) | `/sandbox config` dialog choices | no file format; `sandbox-exec` fallback |
-| anything else (Cursor, Aider, a shell, a wrapper) | [`macos/pam-agent.sb`](macos/pam-agent.sb) | `sandbox-exec` profile | fallback; the strongest |
+| Claude Code | [`macos/claude-code.md`](macos/claude-code.md), [`claude-code.settings.json`](macos/claude-code.settings.json), [`claude-code.managed-settings.json`](macos/claude-code.managed-settings.json) | `settings.json` `sandbox` and `permissions` keys | documented format, cited; format verified by syntax only (both variants parse, every path substituted) — the harness enforces it, `pam doctor` from inside is the evidence |
+| Codex | [`macos/codex.config.toml`](macos/codex.config.toml) | `config.toml` permission profile | documented keys, cited; Beta page; format verified by syntax only — `pam doctor` from inside is the evidence |
+| Gemini CLI | [`macos/gemini-cli.sandbox-macos-pam.sb`](macos/gemini-cli.sandbox-macos-pam.sb) | custom Seatbelt profile file | documented mechanism, source read; `pam doctor` under `sandbox-exec` with the launcher's `-D` names: **`established`** (`doctor_macos.rs`, macOS 26) |
+| Copilot CLI | [`macos/copilot-cli.md`](macos/copilot-cli.md) | `/sandbox config` dialog choices | no file format; dialog choices verified by reading only; the `pam-agent.sb` wrapper it falls back to is `established` (below) |
+| anything else (Cursor, Aider, a shell, a wrapper) | [`macos/pam-agent.sb`](macos/pam-agent.sb) | `sandbox-exec` profile | fallback; the strongest; `pam doctor` under it: **`established`**, exit 0, report recorded (`doctor_macos.rs`, macOS 26). Relay variant as commented (no read under `<base>`): `not_established`, `unverified = [daemon.signal]` — the pid in `run/daemon.lock` is unreadable; keep the `daemon.lock` read line to get `established` through the relay |
 | Windows | [`windows/README.md`](windows/README.md) | none | no supported configuration |
 
 `pam doctor --profile <name> [--base DIR]` prints the profile with `<base>`

@@ -6,6 +6,8 @@
 //! [`wire`]; a connection's `hello` is what tells a daemon and a client of
 //! different builds apart, not anything in the envelope.
 
+pub mod caller;
+pub mod doctor;
 mod envelope;
 mod event;
 mod response;
@@ -19,6 +21,10 @@ pub use response::{Outcome, Response};
 /// number ([`wire::WIRE_PROTOCOL`]). It is recorded, not judged; the hello is.
 pub const PROTOCOL_VERSION: u32 = wire::WIRE_PROTOCOL;
 
+#[cfg(test)]
+mod caller_test;
+#[cfg(test)]
+mod doctor_test;
 #[cfg(test)]
 mod envelope_test;
 #[cfg(test)]

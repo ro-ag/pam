@@ -6,10 +6,12 @@
 //!
 //! `agent`: parent-process chain walked upward (bounded, cycle-safe), each name matched lowercased
 //! by **prefix** against known agents (`claude`, `claude-code` → `claude`); nearest match wins,
-//! else the immediate parent's name, else `unknown`. `repo`: canonicalized cwd replaced by the repo
-//! top level on a `.git` entry (directory, or file for worktrees) found walking upward — pure
-//! filesystem walk, no `git`/`libgit2`; a stable project-identity marker is deliberately deferred.
-//! `pid`: the client's own process id.
+//! else the immediate parent's name, else `unknown`. The table and the rule live in
+//! [`pam_proto::caller`] because the daemon classifies the kernel peer's ancestry with the same
+//! ones; they are re-exported here. `repo`: canonicalized cwd replaced by the repo top level on a
+//! `.git` entry (directory, or file for worktrees) found walking upward — pure filesystem walk, no
+//! `git`/`libgit2`; a stable project-identity marker is deliberately deferred. `pid`: the client's
+//! own process id.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,20 +19,7 @@ use std::path::{Path, PathBuf};
 use pam_proto::Caller;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-/// Upper bound on how many ancestors the parent-process walk visits.
-const MAX_CHAIN_DEPTH: usize = 10;
-
-/// Known agent process-name prefixes and the canonical agent name each one
-/// reports as. Matched lowercased, nearest ancestor first.
-const KNOWN_AGENTS: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("github-copilot", "copilot"),
-    ("copilot", "copilot"),
-    ("codex", "codex"),
-    ("cursor", "cursor"),
-    ("gemini", "gemini"),
-    ("aider", "aider"),
-];
+pub use pam_proto::caller::{KNOWN_AGENTS, MAX_CHAIN_DEPTH, classify_chain};
 
 /// Detects the advisory identity of the current process.
 ///
@@ -43,30 +32,6 @@ pub fn detect_caller() -> Caller {
     let agent = classify_chain(&parent_chain(pid));
     let repo = detect_repo();
     Caller { agent, repo, pid }
-}
-
-/// Classifies a parent-process chain (nearest ancestor first) into an agent
-/// name.
-///
-/// Each name is lowercased and matched by prefix against the known-agent
-/// table; the first (nearest) match wins. Without a match, the first
-/// non-empty name in the chain — the immediate parent, typically a shell —
-/// is returned verbatim, and an effectively empty chain yields `unknown`.
-#[must_use]
-pub fn classify_chain(names: &[String]) -> String {
-    for name in names {
-        let lowered = name.to_lowercase();
-        for (prefix, canonical) in KNOWN_AGENTS {
-            if lowered.starts_with(prefix) {
-                return (*canonical).to_owned();
-            }
-        }
-    }
-    names
-        .iter()
-        .find(|name| !name.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Finds the repository top level containing `start`, if any.

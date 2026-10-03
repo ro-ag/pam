@@ -1684,6 +1684,115 @@ async fn a_pinned_run_refuses_a_flow_edited_after_it_was_inspected() {
     .await;
 }
 
+/// Typed inputs are enforced on the finished value at run time: a value
+/// that breaks its type is refused `input_invalid` before anything runs, and
+/// the refusal names the input and the rule but never echoes the value.
+/// Inspection and the list say each input's type.
+#[tokio::test]
+async fn a_typed_input_is_refused_at_run_and_inspection_shows_its_type() {
+    Box::pin(with_deadline(async {
+        let yaml = "schema: 1\nid: typed\nname: Typed\n\
+                    inputs:\n\
+                    \x20 count:\n    description: how many\n    type: int\n\
+                    \x20 mode:\n    description: which build\n    type: enum\n    values: [debug, release]\n    default: debug\n\
+                    steps:\n\
+                    \x20 - id: version\n    run: [git, --version]\n    env: {COUNT: \"${inputs.count}\", MODE: \"${inputs.mode}\"}\n";
+        let flows = FlowDaemon::spawn(&[("typed", yaml)]).await;
+        let mut client = flows.daemon.client().await;
+
+        let (cause, detail, recovery) = refusal_parts(
+            client
+                .request(&flows.run_envelope(
+                    "req_bad",
+                    "typed",
+                    &serde_json::json!({ "count": "lots-of-them" }),
+                ))
+                .await,
+        );
+        assert_eq!(cause, "input_invalid", "{detail}");
+        assert!(detail.contains("count"), "{detail}");
+        assert!(!detail.contains("lots-of-them"), "the value is never echoed: {detail}");
+        assert!(recovery.contains("count="), "{recovery}");
+        assert!(
+            flows.daemon.store().list_evidence("req_bad").await.unwrap().is_empty(),
+            "a refused input runs nothing"
+        );
+        let (cause, _, _) = refusal_parts(
+            client
+                .request(&flows.run_envelope(
+                    "req_bad_enum",
+                    "typed",
+                    &serde_json::json!({ "count": "2", "mode": "fast" }),
+                ))
+                .await,
+        );
+        assert_eq!(cause, "input_invalid");
+
+        let response = client
+            .request(&flows.run_envelope(
+                "req_good",
+                "typed",
+                &serde_json::json!({ "count": "2" }),
+            ))
+            .await;
+        let body = flows.full_report(&mut client, "req_good", response).await;
+        // The values that fit their types reached the run, the default too.
+        assert_eq!(body["inputs"]["count"], "2");
+        assert_eq!(body["inputs"]["mode"], "debug");
+        if !assert_unsupported_flow(&body) {
+            assert_eq!(step(&body, "version")["status"], "succeeded", "{body}");
+        }
+
+        let inspected = result_body(
+            client
+                .request(&envelope_for_repo(
+                    &flows.repo(),
+                    "req_inspect",
+                    CAP_FLOW_INSPECT,
+                    serde_json::json!({ "id": "typed" }),
+                    true,
+                ))
+                .await,
+        );
+        let input = |name: &str| {
+            inspected["inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|input| input["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("no input {name} in {inspected}"))
+        };
+        assert_eq!(input("count")["type"], "int");
+        assert_eq!(input("mode")["type"], "enum");
+        assert_eq!(input("mode")["values"], serde_json::json!(["debug", "release"]));
+        // The list pages; walk it to the library flow.
+        let mut offset = 0;
+        let entry = loop {
+            let listed = result_body(
+                client
+                    .request(&read_envelope(
+                        &format!("req_list_{offset}"),
+                        CAP_FLOW_LIST,
+                        serde_json::json!({ "offset": offset, "limit": 50 }),
+                    ))
+                    .await,
+            );
+            let page = listed["flows"].as_array().unwrap().clone();
+            if let Some(entry) = page.iter().find(|flow| flow["id"] == "typed") {
+                break entry.clone();
+            }
+            assert!(!page.is_empty(), "typed is not listed");
+            offset += page.len();
+        };
+        assert_eq!(entry["inputs"][0]["type"], "int");
+
+        flows.daemon.assert_invariant_clean().await;
+        flows.daemon.stop().await;
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn cancelling_during_the_approval_wait_is_not_an_uncertain_effect() {
     Box::pin(with_deadline(async {
@@ -1743,21 +1852,41 @@ async fn cancelling_during_the_approval_wait_is_not_an_uncertain_effect() {
 }
 
 #[tokio::test]
-async fn a_stateful_step_without_needs_does_not_follow_a_failure() {
+async fn a_stateful_step_without_needs_is_refused_and_one_that_needs_a_failed_step_is_skipped() {
     Box::pin(with_deadline(async {
-        let yaml = "schema: 1\nid: guarded\nname: Guarded\n\
+        // A stateful step after the first that names neither `needs` nor
+        // `when` no longer validates: the file must say what it follows.
+        let unsaid = "schema: 1\nid: guarded\nname: Guarded\n\
+                      steps:\n\
+                      \x20 - id: build\n    run: [pam-flow-helper, exit, '3']\n\
+                      \x20 - id: deploy\n    run: [git, --version]\n    effect: stateful\n";
+        // Said: `deploy` follows `build`, so it never follows its failure;
+        // read-only steps stay independent and `when: always` is the opt-in.
+        let said = "schema: 1\nid: guarded-needs\nname: Guarded\n\
                     steps:\n\
                     \x20 - id: build\n    run: [pam-flow-helper, exit, '3']\n\
                     \x20 - id: deploy\n    run: [git, --version]\n    effect: stateful\n\
+                    \x20   needs: [build]\n\
                     \x20 - id: report\n    run: [git, --version]\n\
                     \x20 - id: cleanup\n    run: [git, --version]\n    effect: stateful\n\
                     \x20   when: always\n";
-        let flows = FlowDaemon::spawn(&[("guarded", yaml)]).await;
+        let flows = FlowDaemon::spawn(&[("guarded", unsaid), ("guarded-needs", said)]).await;
         for id in ["deploy", "cleanup"] {
-            flows.grant(&step_capability("guarded", id)).await;
+            flows.grant(&step_capability("guarded-needs", id)).await;
         }
         let mut client = flows.daemon.client().await;
-        let body = flows.run(&mut client, "req_run", "guarded").await;
+        let (cause, detail, _) = refusal_parts(
+            client
+                .request(&flows.run_envelope("req_unsaid", "guarded", &serde_json::json!({})))
+                .await,
+        );
+        assert_eq!(cause, "flow_invalid");
+        assert!(
+            detail.contains("does not say what it depends on"),
+            "{detail}"
+        );
+
+        let body = flows.run(&mut client, "req_run", "guarded-needs").await;
         if assert_unsupported_flow(&body) {
             flows.daemon.stop().await;
             return;
@@ -1769,7 +1898,6 @@ async fn a_stateful_step_without_needs_does_not_follow_a_failure() {
             "skipped",
             "a change never follows a failure it did not opt into"
         );
-        // Read-only steps stay independent, and `when: always` is the opt-in.
         assert_eq!(step(&body, "report")["status"], "succeeded");
         assert_eq!(step(&body, "cleanup")["status"], "succeeded");
         flows.daemon.assert_invariant_clean().await;

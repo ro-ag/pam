@@ -992,3 +992,62 @@ fn inspection_reports_a_never_rule_as_policy_denied_on_every_profile() {
         crate::flow_contract::inspect_gate(Profile::Relaxed, true, CapabilityClass::Destructive)
     );
 }
+
+/// The one step of `steps` (a YAML step list) in a flow named `f`.
+fn only_step(steps: &str) -> pam_flow::Step {
+    let flow = pam_flow::parse(&format!("schema: 1\nid: f\nname: F\nsteps:\n{steps}"))
+        .expect("the fixture flow parses");
+    flow.steps.into_iter().next().expect("one step")
+}
+
+#[test]
+fn the_effect_digest_follows_what_runs_and_ignores_how_it_is_written() {
+    use crate::flow_service::{step_binding, step_effect_digest};
+    let base =
+        only_step("  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {A: x}\n");
+    let digest = step_effect_digest(&base);
+    assert_eq!(digest.len(), 64);
+    // Comments, block style, key order, a note and a timeout: the same step.
+    let same = only_step(
+        "  # tidied by hand\n  - id: s   # same\n    env:\n      A: x\n    effect: stateful\n    \
+         note: a note\n    run:\n      - git\n      - push\n",
+    );
+    assert_eq!(step_effect_digest(&same), digest);
+    // What runs changes the digest.
+    for changed in [
+        "  - id: s\n    run: [git, push, --force]\n    effect: stateful\n    env: {A: x}\n",
+        "  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {A: y}\n",
+        "  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {B: x}\n",
+        "  - id: s\n    run: [git, push]\n    env: {A: x}\n    approval: required\n",
+    ] {
+        assert_ne!(step_effect_digest(&only_step(changed)), digest, "{changed}");
+    }
+    // The digest reads the normalized step: a stateful step always asks, so
+    // saying so changes nothing.
+    let spelled_out = only_step(
+        "  - id: s\n    run: [git, push]\n    effect: stateful\n    env: {A: x}\n    approval: required\n",
+    );
+    assert_eq!(step_effect_digest(&spelled_out), digest);
+    let connector = |with: &str| {
+        step_effect_digest(&only_step(&format!(
+            "  - id: s\n    connector: github\n    call: run\n    with: {with}\n    role: observe\n"
+        )))
+    };
+    let call = connector("{repo: 'o/r', run_id: 1, run_attempt: 1}");
+    assert_eq!(connector("{run_attempt: 1, repo: 'o/r', run_id: 1}"), call);
+    assert_ne!(
+        connector("{repo: 'o/other', run_id: 1, run_attempt: 1}"),
+        call
+    );
+    assert_ne!(connector("{repo: 'o/r', run_id: 2, run_attempt: 1}"), call);
+    // The binding carries the gate class the step is evaluated under.
+    let flow = pam_flow::parse(
+        "schema: 1\nid: f\nname: F\nsteps:\n  - id: s\n    connector: github\n    call: run\n    \
+         with: {repo: 'o/r', run_id: 1, run_attempt: 1}\n    role: observe\n",
+    )
+    .unwrap();
+    let binding = step_binding(&flow, &flow.steps[0], Some("/r".to_owned()));
+    assert_eq!(binding.effect_class, "external");
+    assert_eq!(binding.effect_digest, call);
+    assert_eq!(binding.repository.as_deref(), Some("/r"));
+}

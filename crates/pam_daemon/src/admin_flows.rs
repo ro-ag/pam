@@ -10,11 +10,14 @@
 //! admitted, deduped, gated, laned and audited as an agent's would be. Starting a flow from the GUI
 //! is not privileged; only editing one is.
 //!
-//! A remembered step approval is a grant on `flow.step:<flow>/<step>` — a name, not what the step
-//! runs. Every op here that changes what a flow id answers to (`.save`, `.delete`) therefore
-//! revokes, in the same operation and before the library changes, the active grants of every step
-//! whose effective definition is no longer the one that was approved, and says which in its reply
-//! and audit row ([`GRANTS_REVOKED`]). An edited step asks a human again.
+//! A remembered step approval is a grant on `flow.step:<flow>/<step>`, bound to what the step runs
+//! (its effect digest, gate class and repository; see [`crate::flow_service::step_binding`]), so a
+//! step edited anywhere — here or in the file by hand — no longer matches it and asks again. Every
+//! op here that changes what a flow id answers to (`.save`, `.delete`) also revokes, in the same
+//! operation and before the library changes, the active grants of every step whose effective
+//! definition is no longer the one that was approved, and says which in its reply and audit row
+//! ([`GRANTS_REVOKED`]): the GUI edit leaves no stale row behind, and a revocation voids only that
+//! flow's tickets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -857,11 +860,11 @@ fn admin_entry_json(entry: &Entry) -> Value {
             "description": flow.description,
             "valid": true,
             "steps": flow.steps.len(),
-            "inputs": flow.inputs.iter().map(|(name, input)| json!({
+            "inputs": flow.inputs.iter().map(|(name, input)| crate::flow_service::input_json(input, json!({
                 "name": name,
                 "description": input.description,
                 "default": input.default,
-            })).collect::<Vec<Value>>(),
+            }))).collect::<Vec<Value>>(),
             "digest": pam_flow::digest(flow),
         }),
         Err(error) => json!({

@@ -70,8 +70,17 @@
 //!   the daemon to [`LifecyclePhase::Restarting`], triggering the drain; `pam daemon` re-spawns
 //!   the path recorded at boot ([`DaemonHandle::boot_image_path`]). A differing version with the
 //!   image unchanged is refused with [`CAUSE_CLIENT_VERSION_MISMATCH`], naming the daemon's
-//!   version and path, and the phase does not move. Neither refusal records a request row. While
-//!   the phase is `Restarting` every public request is answered [`CAUSE_DAEMON_OUTDATED`].
+//!   version and path, and the phase does not move. Neither refusal records a request row (both are
+//!   recorded as refusals, below). While the phase is `Restarting` every public request is answered
+//!   [`CAUSE_DAEMON_OUTDATED`].
+//! - **Refusals before admission** ([`crate::refusal_log`]): a refusal decided before a request row
+//!   exists (the dispatcher's capacity and rate refusals, the lifecycle gate, an unresolvable
+//!   repository or expired deadline, a refused admission, and on the transports a refused hello, a
+//!   malformed or oversized frame, the connection cap) has no audit row to hang on, so the site
+//!   reports it to the daemon's [`crate::refusal_log::RefusalLog`] (`Pipeline::record_refusal`)
+//!   and answers; the log coalesces, bounds and writes it off the reply path into the store's
+//!   `refusal` table, and `admin.activity.list` returns it on request. `status` carries the log's
+//!   `refusals` counters. The contract is in `docs/admin-boundary.md`.
 //! - **Replies**: `wait: true` parks the pipeline task on the [`CompletionRouter`] until execution
 //!   finishes; duplicate callers attached to the same request share the router entry and all get
 //!   the terminal [`Response`] (fan-out), with a short post-completion grace period for late
@@ -148,6 +157,7 @@ use crate::policy::{
     admission_pool, classify,
 };
 use crate::queue::{AdmitOutcome, CAUSE_CANCELLED, LeasedWork, QueueError, QueueManager};
+use crate::refusal_log::{Refusal, RefusalBackend, RefusalLimits, RefusalLog};
 use crate::retention::{PRUNE_INTERVAL, RetentionService};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
 use crate::secrets::{SecretBackend, SecretStore};
@@ -391,6 +401,8 @@ pub struct DaemonHandle {
     status: Arc<StatusCache>,
     /// The managed policy every service reads through.
     policy: Arc<PolicyHandle>,
+    /// Refusals decided before a request row exists ([`crate::refusal_log`]).
+    refusals: RefusalLog,
     #[cfg(test)]
     queue: Arc<QueueManager>,
     #[cfg(test)]
@@ -404,6 +416,13 @@ impl DaemonHandle {
     #[must_use]
     pub fn runtime_dir(&self) -> &RuntimeDir {
         &self.dirs
+    }
+
+    /// The log of refusals decided before a request row exists; a harness
+    /// calls [`RefusalLog::flush`] before it reads them from the store.
+    #[must_use]
+    pub fn refusals(&self) -> RefusalLog {
+        self.refusals.clone()
     }
 
     /// A handle to the daemon's store, for inspection.
@@ -547,6 +566,9 @@ impl DaemonHandle {
         }
         self.admin_transport.shutdown().await;
         self.transport.shutdown().await;
+        // A listener answers refusals until it is gone: what it recorded
+        // after the writer's last pass is written now, while the store takes it.
+        self.refusals.flush().await;
         // No admin call can start a transfer any more: stop the ones that
         // run and let their followers write their verdicts while the store
         // still takes them.
@@ -592,7 +614,18 @@ pub struct DaemonConfig {
     /// ([`FileSource::platform`]). Tests inject a scripted source, or one
     /// that never finds a file.
     pub policy_source: Option<Arc<dyn PolicySource>>,
+    /// Where the refusal log's writer puts rows; `None` writes to the
+    /// store. Given the daemon's store, a factory answers the backend, so a
+    /// test can stand a slow or failing disk between the log and the store
+    /// ([`crate::refusal_log`]).
+    pub refusal_backend: Option<RefusalBackendFactory>,
+    /// The refusal log's windows and bounds ([`RefusalLimits::default`]).
+    pub refusal_limits: RefusalLimits,
 }
+
+/// Builds the refusal log's backend over the daemon's store
+/// ([`DaemonConfig::refusal_backend`]).
+pub type RefusalBackendFactory = Arc<dyn Fn(Arc<Store>) -> Arc<dyn RefusalBackend> + Send + Sync>;
 
 impl std::fmt::Debug for DaemonConfig {
     /// Neither injected dependency is `Debug` — and a credential backend
@@ -609,6 +642,8 @@ impl std::fmt::Debug for DaemonConfig {
             .field("image_probe", &self.image_probe.is_some())
             .field("handler_grace", &self.handler_grace)
             .field("policy_source", &self.policy_source.is_some())
+            .field("refusal_backend", &self.refusal_backend.is_some())
+            .field("refusal_limits", &self.refusal_limits)
             .finish()
     }
 }
@@ -624,6 +659,8 @@ impl Default for DaemonConfig {
             image_probe: None,
             handler_grace: DEFAULT_HANDLER_GRACE,
             policy_source: None,
+            refusal_backend: None,
+            refusal_limits: RefusalLimits::default(),
         }
     }
 }
@@ -765,6 +802,19 @@ pub async fn run_daemon_with(
     // the one hub, and both move the one lifecycle phase.
     let hub = EventHub::new();
     let (phase, _) = watch::channel(LifecyclePhase::Serving);
+    let (dispatch_stop_tx, dispatch_stop_rx) = watch::channel(false);
+    // The log of refusals decided before a request row exists: both planes
+    // report into it, its writer runs as long as the dispatcher answers.
+    let refusal_backend = match config.refusal_backend {
+        Some(factory) => factory(Arc::clone(&store)),
+        None => Arc::clone(&store) as Arc<dyn RefusalBackend>,
+    };
+    let (refusals, refusal_writer) = RefusalLog::spawn(
+        refusal_backend,
+        Arc::new(SystemResolver),
+        config.refusal_limits,
+        dispatch_stop_rx.clone(),
+    );
     let transport = Transport::bind(
         &dirs,
         incoming_tx.clone(),
@@ -773,6 +823,7 @@ pub async fn run_daemon_with(
         Arc::clone(&hub),
         Arc::clone(&image),
         Arc::clone(&policy),
+        refusals.clone(),
     )?;
 
     let approvals = Arc::new(ApprovalService::new(
@@ -793,7 +844,6 @@ pub async fn run_daemon_with(
     // Drain stops the lease-granting side (executor loop, reaper);
     // dispatch keeps answering (with refusals) until the drain is done.
     let (drain_tx, drain_rx) = watch::channel(false);
-    let (dispatch_stop_tx, dispatch_stop_rx) = watch::channel(false);
     let admin = Arc::new(
         AdminService::new(
             Arc::clone(&store),
@@ -805,7 +855,8 @@ pub async fn run_daemon_with(
             incoming_tx.clone(),
             Arc::clone(&policy),
         )
-        .with_network(network),
+        .with_network(network)
+        .with_refusals(refusals.clone()),
     );
     // The boundary observer is registered before the admin listener is
     // bound, so the adapter finds the sink for this base when it binds.
@@ -834,6 +885,7 @@ pub async fn run_daemon_with(
     let status = StatusCache::new(Arc::clone(&models), Arc::clone(&secrets));
     status.attach_boundary(Arc::clone(&boundary));
     status.attach_policy(Arc::clone(&policy));
+    status.attach_refusals(refusals.clone());
     let admission = Admission::new();
     let router = CompletionRouter::new();
     let pipeline = Arc::new(Pipeline {
@@ -857,10 +909,12 @@ pub async fn run_daemon_with(
         // the same queue the maintenance loop retries.
         terminals: Arc::clone(&admin.terminals),
         handler_grace: config.handler_grace,
+        refusals: refusals.clone(),
     });
 
     let tasks = vec![
         admin_observer,
+        refusal_writer,
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
         RetentionService::new(Arc::clone(&store), Arc::clone(&policy))
             .run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
@@ -906,6 +960,7 @@ pub async fn run_daemon_with(
         admission,
         status,
         policy,
+        refusals,
         #[cfg(test)]
         queue,
         #[cfg(test)]
@@ -1052,6 +1107,9 @@ struct Pipeline {
     terminals: Arc<TerminalWriter>,
     /// See [`DaemonConfig::handler_grace`].
     handler_grace: Duration,
+    /// Where a request the dispatcher or the pipeline refuses before it has
+    /// a row is recorded ([`crate::refusal_log`]).
+    refusals: RefusalLog,
 }
 
 /// The dispatcher's admission pools (see the module docs). The rate
@@ -1250,9 +1308,9 @@ async fn dispatch_loop(
         let permit = match admitted {
             Ok(permit) => permit,
             Err(exhausted) => {
-                let _ = request
-                    .reply
-                    .send(exhausted_refusal(request.envelope.id, exhausted));
+                let refusal = exhausted_refusal(request.envelope.id.clone(), exhausted);
+                pipeline.record_refusal(request.origin, request.peer, &request.envelope, &refusal);
+                let _ = request.reply.send(refusal);
                 continue;
             }
         };
@@ -1379,9 +1437,17 @@ async fn executor_loop(pipeline: Arc<Pipeline>, mut shutdown: watch::Receiver<bo
     }
 }
 
+/// [`normalize_in_place`] for a caller that wants the envelope back.
+#[cfg(test)]
+pub(crate) async fn normalize_repository(mut envelope: Envelope) -> Result<Envelope, Response> {
+    normalize_in_place(&mut envelope).await?;
+    Ok(envelope)
+}
+
 /// Freeze an existing repository path before admission, dedupe and execution.
 /// Missing paths remain usable by global capabilities but cannot confer ownership.
-pub(crate) async fn normalize_repository(mut envelope: Envelope) -> Result<Envelope, Response> {
+/// The envelope stays with the caller, so a refusal can still say who was refused.
+async fn normalize_in_place(envelope: &mut Envelope) -> Result<(), Response> {
     let started = Instant::now();
     let budget = Duration::from_millis(envelope.deadline_ms).min(crate::queue::MAX_LEASE);
     let repo = envelope.caller.repo.clone();
@@ -1398,23 +1464,23 @@ pub(crate) async fn normalize_repository(mut envelope: Envelope) -> Result<Envel
                 // The blocking pool is busy or a worker died: neither
                 // says anything about the request itself.
                 retryable: true,
-                id: envelope.id,
+                id: envelope.id.clone(),
                 cause: error.cause().to_owned(),
                 detail: error.to_string(),
                 recovery: error.recovery().to_owned(),
             });
         }
-        Err(_) => return Err(repository_deadline_refusal(envelope.id)),
+        Err(_) => return Err(repository_deadline_refusal(envelope.id.clone())),
     };
     let remaining = budget.saturating_sub(started.elapsed());
     envelope.deadline_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
     if envelope.deadline_ms == 0 {
-        return Err(repository_deadline_refusal(envelope.id));
+        return Err(repository_deadline_refusal(envelope.id.clone()));
     }
     if let Some(repository) = normalized {
         envelope.caller.repo = repository;
     }
-    Ok(envelope)
+    Ok(())
 }
 
 fn repository_deadline_refusal(id: String) -> Response {
@@ -1590,6 +1656,26 @@ impl Pipeline {
         self.events.hub().unregister(id);
     }
 
+    /// Records a refusal decided before the request had a row: the cause and
+    /// detail the caller was answered with, the peer as the kernel reported
+    /// it and what the envelope claimed ([`crate::refusal_log`]). A response
+    /// that is not a refusal records nothing. Never waits for the store.
+    fn record_refusal(
+        &self,
+        origin: Origin,
+        peer: Option<PublicPeer>,
+        envelope: &Envelope,
+        response: &Response,
+    ) {
+        if let Response::Refusal { cause, detail, .. } = response {
+            let mut refusal = Refusal::from_origin(origin, cause, detail).claimed(envelope);
+            if let Some(peer) = peer {
+                refusal = refusal.peer(peer.identity);
+            }
+            self.refusals.record(&refusal);
+        }
+    }
+
     /// Tells the event hub what admission knows about a ticket whose
     /// lifecycle events are about to be published, so the administration
     /// plane's all-events stream can name it. The terminal event removes it
@@ -1658,6 +1744,7 @@ impl Pipeline {
         let id = envelope.id.clone();
 
         if let Some(refusal) = self.lifecycle_refusal(&envelope) {
+            self.record_refusal(origin, peer, &envelope, &refusal);
             guard.send(refusal);
             return;
         }
@@ -1683,13 +1770,11 @@ impl Pipeline {
             envelope.deadline_ms = envelope.deadline_ms.min(cap);
         }
 
-        let envelope = match normalize_repository(envelope).await {
-            Ok(envelope) => envelope,
-            Err(response) => {
-                guard.send(response);
-                return;
-            }
-        };
+        if let Err(response) = normalize_in_place(&mut envelope).await {
+            self.record_refusal(origin, peer, &envelope, &response);
+            guard.send(response);
+            return;
+        }
 
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.
@@ -1714,7 +1799,9 @@ impl Pipeline {
         let admitted = match self.queue.admit_from(&envelope, class, &recorded).await {
             Ok(admitted) => admitted,
             Err(error) => {
-                guard.send(queue_refusal(id, &error));
+                let refusal = queue_refusal(id, &error);
+                self.record_refusal(origin, peer, &envelope, &refusal);
+                guard.send(refusal);
                 return;
             }
         };

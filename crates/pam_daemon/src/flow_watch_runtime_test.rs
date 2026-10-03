@@ -749,7 +749,7 @@ async fn a_retry_after_beyond_the_request_deadline_blocks_after_committing_the_p
 }
 
 #[tokio::test]
-async fn an_unrelated_revocation_keeps_the_watch_stamp_and_a_flow_grant_revocation_voids_it() {
+async fn an_unrelated_revocation_keeps_the_watch_stamp_and_its_own_flows_revocation_voids_it() {
     let fx = Fixture::new(Answer::Pending, budget(Duration::from_secs(3600), 128)).await;
     let state = fx.state().await;
     let (profile, revision) = state.watch_stamp().await.unwrap();
@@ -764,8 +764,23 @@ async fn an_unrelated_revocation_keeps_the_watch_stamp_and_a_flow_grant_revocati
         state.watch_stamp().await.unwrap(),
         (profile.clone(), revision)
     );
-    // Revoking a flow step grant voids the ticket's admission: fail closed.
+    // Another flow's step grant is no more this run's than `echo` is: its
+    // revocation leaves the parked ticket and its stamp alone.
     fx.store.insert_grant("flow.step:other/step").await.unwrap();
     fx.store.revoke_grant("flow.step:other/step").await.unwrap();
+    assert_eq!(
+        state.watch_stamp().await.unwrap(),
+        (profile.clone(), revision)
+    );
+    // Revoking one of this flow's step grants voids the ticket's admission:
+    // fail closed.
+    fx.store
+        .insert_grant("flow.step:watched/wait")
+        .await
+        .unwrap();
+    fx.store
+        .revoke_grant("flow.step:watched/wait")
+        .await
+        .unwrap();
     assert!(state.watch_stamp().await.is_err());
 }

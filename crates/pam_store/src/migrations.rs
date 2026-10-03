@@ -81,7 +81,92 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 16,
         sql: SCHEMA_V16,
     },
+    Migration {
+        version: 17,
+        sql: SCHEMA_V17,
+    },
+    Migration {
+        version: 18,
+        sql: SCHEMA_V18,
+    },
 ];
+
+/// Migration 18: refusals that happen before a request row exists.
+///
+/// `audit.request_id` is NOT NULL with a foreign key to `request`, so a
+/// refusal decided before admission (the dispatcher's capacity or rate
+/// refusal, a repository that cannot be normalised, an elapsed deadline at
+/// admission, a malformed envelope, a refused hello, an oversized frame, the
+/// connection cap) could never have an audit row. `refusal` is where they
+/// live instead, one row per distinct refusal, not per attempt:
+///
+/// - `ts` is the first attempt and `last_ts` the latest of a run of identical
+///   refusals (same plane, cause, peer pid and capability) the daemon
+///   coalesced into the row; `count` is how many attempts the row stands for.
+/// - `peer_uid`, `peer_pid` and `peer_exe` are the daemon's own view of the
+///   connection (the kernel's, resolved off the reply path; NULL on Windows,
+///   where the public plane has no kernel peer, and when a resolution
+///   missed). `agent`, `repo`, `request_id` and `capability` are what the
+///   client claimed, when it got far enough to claim anything: attribution,
+///   never a key. `request_id` deliberately has no foreign key; there is no
+///   such request.
+/// - Every text column is bounded by its CHECK, and the writer truncates to
+///   the same bounds, so a refusal can always be recorded and none can grow
+///   the table.
+///
+/// The insert path keeps the newest 2,000 rows; the retention service's audit
+/// window removes older ones (`Store::prune_refusals_before`). Nothing
+/// authorizes anything from this table.
+const SCHEMA_V18: &str = "
+CREATE TABLE refusal (
+    id          INTEGER PRIMARY KEY,
+    ts          INTEGER NOT NULL,
+    last_ts     INTEGER NOT NULL,
+    ingress     TEXT NOT NULL CHECK (ingress IN ('public', 'admin')),
+    cause       TEXT NOT NULL CHECK (length(CAST(cause AS BLOB)) BETWEEN 1 AND 128),
+    detail      TEXT NOT NULL CHECK (length(CAST(detail AS BLOB)) <= 512),
+    count       INTEGER NOT NULL CHECK (count >= 1),
+    peer_uid    INTEGER,
+    peer_pid    INTEGER,
+    peer_exe    TEXT CHECK (peer_exe IS NULL OR length(CAST(peer_exe AS BLOB)) <= 1024),
+    agent       TEXT CHECK (agent IS NULL OR length(CAST(agent AS BLOB)) <= 256),
+    repo        TEXT CHECK (repo IS NULL OR length(CAST(repo AS BLOB)) <= 1024),
+    request_id  TEXT CHECK (request_id IS NULL OR length(CAST(request_id AS BLOB)) <= 128),
+    capability  TEXT CHECK (capability IS NULL OR length(CAST(capability AS BLOB)) <= 128)
+);
+CREATE INDEX refusal_ts_idx ON refusal (ts DESC, id DESC);
+";
+
+/// Migration 17: a flow step's grant is bound to what runs, and a flow run
+/// knows its flow.
+///
+/// - `grant.flow_id`, `grant.step_id`, `grant.effect_digest`,
+///   `grant.effect_class`, `grant.repository` and `grant.bound_ts`: the
+///   binding of a `flow.step:<flow>/<step>` grant, recorded when it is made —
+///   the step's effect digest (a hash of the normalized step's program,
+///   arguments, environment, effect, connector call or landing operation),
+///   the gate class it was granted under (`destructive` or `external`) and
+///   the canonical repository the approval was given for (NULL: every
+///   repository, which only a grant a human adds by hand in Settings can
+///   say). A bound grant authorizes a step only while all three still match.
+///   Every row written before this migration has a NULL `effect_digest`: an
+///   unbound legacy grant, which still authorizes and is bound to what runs
+///   the first time it is used (audited as `grant_bound`). Grants of any
+///   other capability never carry a binding.
+/// - `request.flow_id`: the flow a `flow.run` request names, recorded at
+///   admission, so revoking one flow's step grant voids only that flow's
+///   tickets. NULL for every other capability and for every row written
+///   before this migration, which a revocation of any flow's step grant
+///   still voids, as before: an unknown flow is never spared.
+const SCHEMA_V17: &str = r#"
+ALTER TABLE "grant" ADD COLUMN flow_id TEXT CHECK (flow_id IS NULL OR length(CAST(flow_id AS BLOB)) BETWEEN 1 AND 256);
+ALTER TABLE "grant" ADD COLUMN step_id TEXT CHECK (step_id IS NULL OR length(CAST(step_id AS BLOB)) BETWEEN 1 AND 256);
+ALTER TABLE "grant" ADD COLUMN effect_digest TEXT CHECK (effect_digest IS NULL OR length(CAST(effect_digest AS BLOB)) = 64);
+ALTER TABLE "grant" ADD COLUMN effect_class TEXT CHECK (effect_class IS NULL OR effect_class IN ('destructive', 'external'));
+ALTER TABLE "grant" ADD COLUMN repository TEXT CHECK (repository IS NULL OR length(CAST(repository AS BLOB)) BETWEEN 1 AND 4096);
+ALTER TABLE "grant" ADD COLUMN bound_ts INTEGER;
+ALTER TABLE request ADD COLUMN flow_id TEXT CHECK (flow_id IS NULL OR length(CAST(flow_id AS BLOB)) BETWEEN 1 AND 256);
+"#;
 
 /// Migration 16: the boundary self-check record.
 ///

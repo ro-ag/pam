@@ -95,6 +95,7 @@ pub mod public_transport;
 #[cfg(test)]
 mod public_transport_test;
 pub mod queue;
+pub mod refusal_log;
 pub mod retention;
 pub mod runtime_dir;
 pub mod secrets;
@@ -146,6 +147,8 @@ mod model_service_test;
 mod policy_test;
 #[cfg(test)]
 mod queue_test;
+#[cfg(test)]
+mod refusal_log_test;
 #[cfg(test)]
 mod retention_test;
 #[cfg(test)]

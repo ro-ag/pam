@@ -4,6 +4,10 @@
 //! `flow.run` classifies `NonDestructive`; each step that could change
 //! something is gated on its own under [`step_capability`]
 //! (`flow.step:<flow>/<step>`), which is what approvals show and remember.
+//! A remembered step is bound to what it runs ([`step_binding`]: the step's
+//! [`step_effect_digest`], its gate class and the run's canonical
+//! repository), so a step edited outside the GUI, or run in another
+//! repository, asks again (see [`crate::policy::PolicyGate::evaluate_step`]).
 //! A step is gated ([`pam_flow::Step::gated`]) when it is stateful or asks
 //! for approval (`Destructive`) or calls a connector (`External`); a
 //! read-only local command never touches the gate.
@@ -51,11 +55,11 @@ use pam_flow::{
     Vars, digest, is_shell, references, substitute, substitute_argv, to_normalized_yaml,
 };
 use pam_proto::Outcome;
-use pam_store::{RequestState, Store, StoreError};
+use pam_store::{GrantBinding, RequestState, Store, StoreError};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use crate::approval::{ApprovalOutcome, ApprovalService, StepSnapshot};
+use crate::approval::{ApprovalOutcome, ApprovalService, RememberScope, StepSnapshot};
 use crate::connector_service::{ConnectorService, InvokeError};
 use crate::daemon::{CAUSE_APPROVAL_DENIED, CAUSE_APPROVAL_TIMEOUT};
 use crate::executor::{CapabilityFailure, CapabilityOutput, ExecContext, outcome_str};
@@ -255,6 +259,77 @@ impl From<FlowRefusal> for CapabilityFailure {
 #[must_use]
 pub fn step_capability(flow: &str, step: &str) -> String {
     format!("{STEP_CAPABILITY_PREFIX}{flow}/{step}")
+}
+
+/// The gate class of a gated step: a connector call leaves the machine
+/// (`External`); every other gated step is `Destructive`.
+#[must_use]
+pub fn step_class(step: &Step) -> CapabilityClass {
+    if matches!(step.action, Action::Connector { .. }) {
+        CapabilityClass::External
+    } else {
+        CapabilityClass::Destructive
+    }
+}
+
+/// The effect digest of `step`: SHA-256 over what the step does, read off
+/// the parsed (normalized) step, never the file's bytes — the program and
+/// argument templates of a command, the environment it sets (names and
+/// value templates: a value such as `GIT_SSH_COMMAND` changes what runs),
+/// whether it is stateful and whether it always asks, the connector, call
+/// and argument templates of a connector step, the operation of a landing
+/// step. Formatting, comments, the note, the name and the step's place in
+/// the file change nothing; anything that changes what runs changes the
+/// digest, and a grant bound to the old one no longer covers the step.
+#[must_use]
+pub fn step_effect_digest(step: &Step) -> String {
+    let action = match &step.action {
+        Action::Command { argv } => json!(["command", argv]),
+        Action::Connector {
+            connector,
+            call,
+            with,
+        } => {
+            let with: Vec<Value> = with
+                .iter()
+                .map(|(name, value)| match value {
+                    ArgValue::Text(text) => json!([name, "text", text]),
+                    ArgValue::Int(number) => json!([name, "int", number]),
+                })
+                .collect();
+            json!(["connector", connector.as_str(), call, with])
+        }
+        Action::Landing { operation } => json!(["landing", operation]),
+    };
+    let env: Vec<Value> = step
+        .env
+        .iter()
+        .map(|(name, value)| json!([name, value]))
+        .collect();
+    // Positional and versioned: two different steps cannot encode alike,
+    // and a later encoding can never collide with this one.
+    let encoded = json!([
+        1,
+        action,
+        env,
+        step.effect == pam_flow::Effect::Stateful,
+        step.approval == pam_flow::Approval::Required,
+    ]);
+    pam_compact::sha256_hex(encoded.to_string().as_bytes())
+}
+
+/// What a grant of `step` of `flow` is bound to when it is given for
+/// `repository` (canonical; `None` for every repository): see
+/// [`pam_store::GrantBinding`].
+#[must_use]
+pub fn step_binding(flow: &Flow, step: &Step, repository: Option<String>) -> GrantBinding {
+    GrantBinding {
+        flow_id: flow.id.clone(),
+        step_id: step.id.clone(),
+        effect_digest: step_effect_digest(step),
+        effect_class: crate::policy::class_name(step_class(step)).to_owned(),
+        repository,
+    }
 }
 
 /// What a command step may run, and where its programs are found.
@@ -883,9 +958,15 @@ impl FlowService {
             _ => {}
         }
         let repo = PathBuf::from(&ctx.caller.repo);
-        if let Err(error) = self.approved_repo(&repo).await {
-            blockers.push(json!({"cause": error.cause, "recovery": RECOVERY_SCOPE}));
-        }
+        // The canonical repository a step's grant is bound to, when the
+        // scope admits it; otherwise no grant could cover a step here.
+        let canonical = match self.approved_repo(&repo).await {
+            Ok(canonical) => Some(canonical),
+            Err(error) => {
+                blockers.push(json!({"cause": error.cause, "recovery": RECOVERY_SCOPE}));
+                None
+            }
+        };
         let crate::flow_contract::InspectedInputs {
             vars,
             missing,
@@ -911,12 +992,20 @@ impl FlowService {
         };
         let (allowed, artifacts_root) = self.inspect_settings(&view).await?;
         let (steps, step_blockers) = self
-            .inspect_steps(flow, &vars, &repo, &allowed, artifacts_root, &view)
+            .inspect_steps(
+                flow,
+                &vars,
+                &repo,
+                canonical.as_deref(),
+                &allowed,
+                artifacts_root,
+                &view,
+            )
             .await?;
         blockers.extend(step_blockers);
         let model = self.inspect_model(flow).await?;
         let body = json!({"schema_version":1, "flow":{"id":flow.id,"digest":digest(flow)},
-            "inputs":flow.inputs.iter().map(|(name,input)| json!({"name":name,"type":"string","required":input.default.is_none()})).collect::<Vec<_>>(),
+            "inputs":flow.inputs.iter().map(|(name,input)| input_json(input, json!({"name":name,"required":input.default.is_none()}))).collect::<Vec<_>>(),
             "steps":steps, "correlation":correlation, "readiness":if blockers.is_empty(){"admission_required"}else{"blocked"},
             "blockers":blockers,"live":"unknown","model":model,
             "output_schema":"pam.flow.result.v1","admission_rechecked":true,"run_admission":run_admission});
@@ -1032,22 +1121,41 @@ impl FlowService {
         view: &PolicyView,
         flow: &Flow,
         step: &pam_flow::Step,
+        repo: Option<&Path>,
         item: &mut Value,
         blockers: &mut Vec<Value>,
     ) -> Result<(), FlowRefusal> {
         let capability = step_capability(&flow.id, &step.id);
-        let granted = self
+        let rows = self
             .store
-            .active_grant(&capability)
+            .active_grants(&capability)
             .await
             .map_err(|error| store_note(&error))?;
-        let class = if matches!(step.action, Action::Connector { .. }) {
-            CapabilityClass::External
+        let class = step_class(step);
+        // Inspection binds nothing: a legacy grant reads as present (the
+        // run binds it), a bound one that no longer covers the step as it
+        // is now — or this repository — reads as changed.
+        let binding = step_binding(
+            flow,
+            step,
+            repo.map(|path| path.to_string_lossy().into_owned()),
+        );
+        let state = crate::policy::match_step_grant(&rows, &binding);
+        let granted = matches!(
+            state,
+            crate::policy::StepGrant::Bound | crate::policy::StepGrant::Legacy(_)
+        );
+        let mut admission =
+            inspect_admission(view, self.gate.profile(), &capability, granted, class);
+        if let crate::policy::StepGrant::Changed(changed) = &state {
+            if admission != CAUSE_POLICY_DENIED {
+                admission = "approval_required";
+            }
+            item["grant"] = json!("changed");
+            item["grant_changed"] = json!(changed);
         } else {
-            CapabilityClass::Destructive
-        };
-        let admission = inspect_admission(view, self.gate.profile(), &capability, granted, class);
-        item["grant"] = json!(if granted { "present" } else { "missing" });
+            item["grant"] = json!(if granted { "present" } else { "missing" });
+        }
         item["admission"] = json!(admission);
         match admission {
             CAUSE_POLICY_DENIED => blockers.push(json!({"step": step.id, "cause": CAUSE_POLICY_DENIED, "recovery": crate::policy::RECOVERY_POLICY_DENIED})),
@@ -1058,11 +1166,13 @@ impl FlowService {
     }
 
     /// Read a recipe's step gates and local connector configuration without execution.
+    #[allow(clippy::too_many_arguments)] // The inspection's inputs, each read once up front.
     async fn inspect_steps(
         &self,
         flow: &Flow,
         vars: &Vars,
         repo: &Path,
+        canonical: Option<&Path>,
         allowed: &[String],
         artifacts_root: bool,
         view: &PolicyView,
@@ -1072,7 +1182,7 @@ impl FlowService {
         for step in &flow.steps {
             let mut item = json!({"id": step.id, "effect": step.effect, "role": step.role, "kind": step.kind(), "watch": step.watch, "live": "unknown"});
             if step.gated() {
-                self.inspect_step_gate(view, flow, step, &mut item, &mut blockers)
+                self.inspect_step_gate(view, flow, step, canonical, &mut item, &mut blockers)
                     .await?;
             }
             match &step.action {
@@ -1494,11 +1604,31 @@ impl FlowService {
                     )
                 })?
             };
+            // The declared type, on the finished value (a `${repo.*}`
+            // default included). The message names the input, the type and
+            // the rule, never the value.
+            input.check(name, &value).map_err(|error| {
+                FlowRefusal::new(
+                    CAUSE_INPUT_INVALID,
+                    error.to_string(),
+                    &format!("re-run with {name}=<a value that fits the declared type>"),
+                )
+            })?;
             vars.set(&format!("inputs.{name}"), value.clone());
             inputs.insert(name.clone(), value);
         }
         Ok((vars, inputs))
     }
+}
+
+/// `entry` (an input's JSON in a list or an inspection) with the input's
+/// declared `type`, and its `values` when it is an enum.
+pub(crate) fn input_json(input: &pam_flow::Input, mut entry: Value) -> Value {
+    entry["type"] = json!(input.kind.as_str());
+    if !input.values.is_empty() {
+        entry["values"] = json!(input.values);
+    }
+    entry
 }
 
 /// Refuses an allowlist entry that is not a bare, non-shell program name.
@@ -1781,11 +1911,11 @@ fn list_entry_json(entry: &Entry, full: bool) -> Value {
             "source": entry.source.as_str(),
             "valid": true,
             "steps": flow.steps.len(),
-            "inputs": flow.inputs.iter().map(|(name, input)| json!({
+            "inputs": flow.inputs.iter().map(|(name, input)| input_json(input, json!({
                 "name": name,
                 "description": input.description,
                 "default": input.default,
-            })).collect::<Vec<Value>>(),
+            }))).collect::<Vec<Value>>(),
         }),
         Err(error) => json!({
             "id": entry.id,
@@ -2272,17 +2402,20 @@ impl RunState<'_> {
         report: &mut StepReport,
     ) -> Result<Option<StepReport>, CapabilityFailure> {
         let name = step_capability(&self.flow.id, &step.id);
-        let class = if matches!(step.action, Action::Connector { .. }) {
-            CapabilityClass::External
-        } else {
-            CapabilityClass::Destructive
-        };
+        let class = step_class(step);
+        // What this step's grant must cover: the step as defined now, in
+        // this run's canonical repository.
+        let binding = step_binding(
+            self.flow,
+            step,
+            Some(self.repo.to_string_lossy().into_owned()),
+        );
         // One gate for every step: the daemon's live profile (see
         // `crate::policy`), which is also what the watch stamp hashes.
-        let decision = self
+        let (decision, changed) = self
             .service
             .gate
-            .evaluate_classified(&self.ctx.request_id, &name, class)
+            .evaluate_step(&self.ctx.request_id, &name, class, &binding)
             .await
             .map_err(failed)?;
         match decision {
@@ -2307,10 +2440,11 @@ impl RunState<'_> {
                 let outcome = self
                     .service
                     .approvals
-                    .request_approval_with(
+                    .request_step_approval(
                         &self.ctx.request_id,
                         &name,
-                        Some(snapshot),
+                        snapshot,
+                        RememberScope { binding, changed },
                         &mut self.cancel,
                     )
                     .await
@@ -2342,7 +2476,7 @@ impl RunState<'_> {
                             StepStatus::Blocked,
                             CAUSE_APPROVAL_TIMEOUT,
                             format!(
-                                "nobody answered the approval for step {:?} in time",
+                                "nobody answered the approval for step {:?} in time ({reason})",
                                 step.id
                             ),
                             RECOVERY_APPROVALS.to_owned(),

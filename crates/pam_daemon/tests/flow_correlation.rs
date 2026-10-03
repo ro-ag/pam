@@ -32,7 +32,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(yaml: &str, transport: Arc<dyn HttpTransport>) -> Self {
-        pam_flow::parse(yaml).expect("correlated recipe validates");
+        let flow = pam_flow::parse(yaml).expect("correlated recipe validates");
         let tmp = short_tempdir();
         let repos = vec![short_tempdir(), short_tempdir()];
         seed_relaxed(&tmp).await;
@@ -58,14 +58,22 @@ impl Fixture {
             config.http_transport = Some(transport);
         })
         .await;
-        for step in ["inspect", "after"] {
-            daemon
-                .store()
-                .insert_grant(&step_capability("correlated", step))
-                .await
-                .unwrap();
-        }
         let mut client = daemon.client().await;
+        // Granted the way a human does it in Settings: bound to the step as
+        // the library defines it, for every repository. (A grant remembered
+        // from one repository would not cover the second one.)
+        for step in flow.steps.iter().filter(|step| step.gated()) {
+            let mut request = envelope_for_repo(
+                ADMIN_REPO,
+                &format!("grant_{}", step.id),
+                "admin.grants.add",
+                json!({ "capability": step_capability("correlated", &step.id) }),
+                true,
+            );
+            ADMIN_CALLER_AGENT.clone_into(&mut request.caller.agent);
+            let response = client.request(&request).await;
+            assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        }
         for (id, base_url) in [
             ("github", "https://api.github.test/"),
             ("sonarqube", "https://sonar.test/"),

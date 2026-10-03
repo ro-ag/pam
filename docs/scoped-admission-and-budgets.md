@@ -61,12 +61,14 @@ atomic post-gate authorization write. A crash cannot convert an unapproved row
 into executable queued work. Placement requires the revision captured before
 gating to remain unchanged, including during an approval wait. The revision is
 scoped: a request is void only when a grant it depends on was revoked after its
-admission, meaning its own capability or, for a `flow.run` ticket, any
-`flow.step:` capability. Revocation invalidates those admissions even if the
-grant is subsequently restored; a revocation a request does not depend on
-leaves queued, parked and finished work alone. Because the store cannot tell
-which flow a run belongs to, a step revocation of any flow still voids every
-`flow.run` ticket.
+admission, meaning its own capability or, for a `flow.run` ticket, `flow.run`
+and the `flow.step:` capabilities of the flow it runs (the flow id is recorded on
+the request row at admission, schema 17). Revocation invalidates those admissions
+even if the grant is subsequently restored; a revocation a request does not
+depend on — another flow's step grant included — leaves queued, parked and
+finished work alone, and a parked watch's authorization stamp counts only its own
+flow's revocations. A `flow.run` row admitted before schema 17 names no flow and
+is still voided by a step revocation of any flow.
 
 Startup recovery reads pages of at most 16 rows and 8 MiB of text. SQL byte guards refuse oversized legacy fields before materializing them; the rows remain intact and startup gives an explicit backup/repair error. Recovery preserves the original expiry and rejects stale or legacy queued rows
 without authorization metadata. Running/interrupted work is not automatically

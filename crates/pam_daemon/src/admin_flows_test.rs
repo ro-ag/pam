@@ -879,7 +879,7 @@ fn two_step_yaml(id: &str, argument: &str, default: &str, note: &str) -> String 
         "schema: 1\nid: {id}\nname: Two steps {id}\n\
          inputs:\n  target:\n    description: what to build\n    default: {default}\n\
          steps:\n  - id: look\n    run: [git, status, --short]\n    note: {note}\n  \
-         - id: change\n    run: [make, {argument}, \"${{inputs.target}}\"]\n    effect: stateful\n"
+         - id: change\n    run: [make, {argument}, \"${{inputs.target}}\"]\n    effect: stateful\n    needs: [look]\n"
     )
 }
 

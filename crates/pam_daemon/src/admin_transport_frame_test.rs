@@ -31,6 +31,7 @@ use crate::ingress::PeerIdentity;
 use crate::lifecycle::LifecyclePhase;
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
+use crate::refusal_log::{RefusalBackend, RefusalLimits, RefusalLog};
 use crate::transport::EventPublisher;
 
 /// Bound on every test in the administration transport suites.
@@ -47,6 +48,12 @@ pub(super) const OWNER_PEER: PeerIdentity = PeerIdentity::Unix {
 };
 
 pub(super) async fn admin_service_over(store: &Arc<Store>) -> Arc<AdminService> {
+    Arc::new(admin_over(store).await)
+}
+
+/// The service itself, before it is shared: a test that attaches something
+/// to it does so here.
+async fn admin_over(store: &Arc<Store>) -> AdminService {
     let (events, _rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(store),
@@ -75,7 +82,7 @@ pub(super) async fn admin_service_over(store: &Arc<Store>) -> Arc<AdminService> 
         &logs,
     )
     .await;
-    Arc::new(AdminService::new(
+    AdminService::new(
         Arc::clone(store),
         approvals,
         models,
@@ -84,7 +91,7 @@ pub(super) async fn admin_service_over(store: &Arc<Store>) -> Arc<AdminService> 
         flows,
         crate::flow_service_test::closed_submit(),
         crate::managed_policy_service::PolicyHandle::none(),
-    ))
+    )
 }
 
 pub(super) async fn admin_service() -> Arc<AdminService> {
@@ -150,12 +157,34 @@ pub(super) struct Plane {
     pub(super) store: Arc<Store>,
     pub(super) stop: watch::Sender<bool>,
     probe: Arc<Flip>,
+    /// Where the plane records what it refuses before a request row exists.
+    refusals: RefusalLog,
+    _refusals_stop: watch::Sender<bool>,
+}
+
+/// The process table of a plane: nothing runs there.
+struct NoProcesses;
+
+impl crate::boundary::PeerResolver for NoProcesses {
+    fn resolve(&self, _pid: u32) -> crate::boundary::ResolvedPeer {
+        crate::boundary::ResolvedPeer::default()
+    }
 }
 
 impl Plane {
     pub(super) async fn new() -> Self {
         let store = Arc::new(Store::open_in_memory().await.unwrap());
-        let admin = admin_service_over(&store).await;
+        let (refusals_stop, refusals_stopped) = watch::channel(false);
+        let (refusals, _writer) = RefusalLog::spawn(
+            Arc::clone(&store) as Arc<dyn RefusalBackend>,
+            Arc::new(NoProcesses),
+            RefusalLimits {
+                flush_delay: Duration::from_millis(5),
+                ..RefusalLimits::default()
+            },
+            refusals_stopped,
+        );
+        let admin = Arc::new(admin_over(&store).await.with_refusals(refusals.clone()));
         let probe = Arc::new(Flip {
             replaced: AtomicBool::new(false),
         });
@@ -180,7 +209,18 @@ impl Plane {
             store,
             stop,
             probe,
+            refusals,
+            _refusals_stop: refusals_stop,
         }
+    }
+
+    /// The refusals the plane recorded, newest first.
+    async fn recorded(&self) -> Vec<pam_store::RefusalRow> {
+        self.refusals.flush().await;
+        self.store
+            .list_refusals(100, None, None, None)
+            .await
+            .unwrap()
     }
 
     /// The daemon's binary on disk is replaced from now on.
@@ -884,6 +924,112 @@ async fn the_admin_policy_keeps_serving_after_accept_errors() {
         assert!(rest(&mut stranger).await.is_empty());
         listener.shutdown().await;
         assert!(dialer.closed(), "shutdown closes the endpoint");
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// What the plane refuses before a request row exists is on record.
+// ---------------------------------------------------------------------------
+
+/// A client of another build is refused at its hello. No request row can hold
+/// that, so the refusal is recorded on the private plane, with the peer.
+#[tokio::test]
+async fn a_refused_hello_is_recorded_on_the_private_plane() {
+    bounded(async {
+        let plane = Plane::new().await;
+        let request = Envelope {
+            client_version: "9.9.9".to_owned(),
+            ..profile_get("req_other_build")
+        };
+        let mut client = plane.connect();
+        write(&mut client, &Frame::Hello(hello("9.9.9"))).await;
+        write(&mut client, &Frame::Request { envelope: request }).await;
+        assert_eq!(
+            read_error(&mut client).await.cause,
+            cause::CLIENT_VERSION_MISMATCH
+        );
+        drop(client);
+
+        let recorded = plane.recorded().await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].cause, cause::CLIENT_VERSION_MISMATCH);
+        assert_eq!(recorded[0].ingress, pam_store::RequestIngress::Admin);
+        assert_eq!(recorded[0].peer_uid, Some(OWNER));
+        assert_eq!(recorded[0].peer_pid, Some(77));
+        assert!(!plane.has_row("req_other_build").await);
+    })
+    .await;
+}
+
+/// Somebody other than the owner knocking on the private endpoint is the one
+/// refusal on this plane a human most wants to see.
+#[tokio::test]
+async fn a_peer_that_is_not_the_owner_is_recorded() {
+    bounded(async {
+        let plane = Plane::new().await;
+        let stranger = PeerIdentity::Unix {
+            uid: OWNER + 1,
+            gid: 20,
+            pid: Some(9_999),
+        };
+        let mut client = plane.connect_as(stranger);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty(), "nothing is written to such a peer");
+
+        let recorded = plane.recorded().await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].cause, "peer_not_admitted");
+        assert_eq!(recorded[0].ingress, pam_store::RequestIngress::Admin);
+        assert_eq!(
+            (recorded[0].peer_uid, recorded[0].peer_pid),
+            (Some(OWNER + 1), Some(9_999))
+        );
+    })
+    .await;
+}
+
+/// A first frame announcing more than a hello may carry, and a request this
+/// plane does not carry, are recorded with their cause.
+#[tokio::test]
+async fn an_oversized_frame_and_a_request_the_plane_does_not_carry_are_recorded() {
+    bounded(async {
+        let plane = Plane::new().await;
+        let mut client = plane.connect();
+        client
+            .write_all(&u32::try_from(MAX_REQUEST_BYTES + 1).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_error(&mut client).await.cause, cause::BAD_FRAME);
+        drop(client);
+
+        // A public capability on the private plane: validate_envelope refuses.
+        let mut stray = admin_envelope("req_stray", "status");
+        "claude".clone_into(&mut stray.caller.agent);
+        let mut client = plane.connect();
+        write(&mut client, &Frame::Hello(hello(&stray.client_version))).await;
+        write(&mut client, &Frame::Request { envelope: stray }).await;
+        let Frame::HelloAck(_) = read(&mut client).await else {
+            panic!("expected hello_ack");
+        };
+        let Frame::Reply { response } = read(&mut client).await else {
+            panic!("expected a reply");
+        };
+        assert_eq!(refusal_cause(&response), "bad_request");
+        drop(client);
+
+        let recorded = plane.recorded().await;
+        let causes: Vec<&str> = recorded.iter().map(|row| row.cause.as_str()).collect();
+        assert_eq!(recorded.len(), 2, "{causes:?}");
+        assert!(causes.contains(&"bad_frame"), "{causes:?}");
+        let bad_request = recorded
+            .iter()
+            .find(|row| row.cause == "bad_request")
+            .expect("the stray request is recorded");
+        assert_eq!(bad_request.agent.as_deref(), Some("claude"));
+        assert_eq!(bad_request.capability.as_deref(), Some("status"));
+        assert!(!plane.has_row("req_stray").await);
     })
     .await;
 }

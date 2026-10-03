@@ -254,7 +254,23 @@ function GrantRowView({
           </span>
         )}
       </td>
-      <td className="py-2.5 pr-3 font-data text-xs text-ink-muted">{grant.scope}</td>
+      <td className="py-2.5 pr-3 font-data text-xs text-ink-muted">
+        {grant.scope}
+        {grant.binding?.state === "bound" && (
+          <span
+            className="mt-1 block max-w-content font-data text-xs text-ink-faint"
+            title={`effect ${grant.binding.effect_digest} (${grant.binding.effect_class})`}
+          >
+            <SafeText value={grant.binding.repository ?? "every repository"} /> · step{" "}
+            <SafeText value={grant.binding.effect_digest} />
+          </span>
+        )}
+        {grant.binding?.state === "legacy" && (
+          <span className="mt-1 block max-w-content font-sans text-xs text-ink-faint">
+            unbound; binds to the step on its next run
+          </span>
+        )}
+      </td>
       <td
         className="py-2.5 pr-3 font-data text-xs text-ink-faint"
         title={exactTime(grant.granted_ts)}

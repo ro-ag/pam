@@ -30,6 +30,7 @@ use pam_store::{RequestIngress, RequestOrigin};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::refusal_log::RefusalLog;
 use crate::transport::IncomingRequest;
 
 /// Which plane a request arrived on.
@@ -159,13 +160,33 @@ pub enum IngressError {
 #[derive(Debug, Clone)]
 pub struct Ingress {
     incoming: mpsc::Sender<IncomingRequest>,
+    refusals: RefusalLog,
 }
 
 impl Ingress {
-    /// A seam over the dispatcher's request channel.
+    /// A seam over the dispatcher's request channel. It records no refusals
+    /// until [`Self::with_refusals`] gives it a log.
     #[must_use]
     pub fn new(incoming: mpsc::Sender<IncomingRequest>) -> Self {
-        Self { incoming }
+        Self {
+            incoming,
+            refusals: RefusalLog::disabled(),
+        }
+    }
+
+    /// The same seam, with the log the transport adapter reports its
+    /// pre-admission refusals to ([`crate::refusal_log`]).
+    #[must_use]
+    pub fn with_refusals(mut self, refusals: RefusalLog) -> Self {
+        self.refusals = refusals;
+        self
+    }
+
+    /// Where an adapter reports a refusal it decides before the daemon core
+    /// sees the request.
+    #[must_use]
+    pub fn refusals(&self) -> &RefusalLog {
+        &self.refusals
     }
 
     /// Hands one request to the daemon core. The receiver resolves with its

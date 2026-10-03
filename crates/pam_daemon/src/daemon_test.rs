@@ -1484,6 +1484,262 @@ mod live {
             "the store closes at the end of the shutdown"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Refusals decided before a request row exists are recorded
+    // (`crate::refusal_log`): the dispatcher's and the pipeline's sites.
+    // -----------------------------------------------------------------------
+
+    /// A disk that takes `delay` to write a refusal row.
+    #[derive(Debug)]
+    struct SlowDisk {
+        store: Arc<Store>,
+        delay: Duration,
+    }
+
+    impl crate::refusal_log::RefusalBackend for SlowDisk {
+        fn write(&self, writes: Vec<pam_store::RefusalWrite>) -> crate::refusal_log::Writing<'_> {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                self.store.write_refusals(writes).await
+            })
+        }
+    }
+
+    async fn recorded(live: &Live) -> Vec<pam_store::RefusalRow> {
+        live.handle.refusals().flush().await;
+        live.store()
+            .list_refusals(500, None, None, None)
+            .await
+            .expect("the refusal rows read")
+    }
+
+    /// The capacity refusal the stalled queue produces, on record with who
+    /// asked and what for, beside a request that never got a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capacity_refusal_is_recorded_with_who_asked_and_leaves_no_request_row() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let queue = live.handle.queue();
+        let stall = queue.stall().await;
+        let mut stuck = Vec::new();
+        for index in 0..CONTROL_SLOTS {
+            stuck.push(
+                live.submit_from(
+                    request(
+                        &format!("held_{index}"),
+                        "query",
+                        serde_json::json!({ "ticket": "none" }),
+                        true,
+                    ),
+                    Origin::Public,
+                    Some(kernel_peer(4242, false)),
+                )
+                .await,
+            );
+        }
+        eventually("the control pool is exhausted", || async {
+            live.handle.admission_available().control == 0
+        })
+        .await;
+
+        let mut refused = request(
+            "one_too_many",
+            "query",
+            serde_json::json!({ "ticket": "none" }),
+            true,
+        );
+        "claude".clone_into(&mut refused.caller.agent);
+        let response = live
+            .ask_from(refused, Origin::Public, Some(kernel_peer(4242, false)))
+            .await;
+        assert_eq!(refusal(&response), (CAUSE_REQUEST_CAPACITY, true));
+        assert!(
+            live.store()
+                .get_request("one_too_many")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let rows = recorded(&live).await;
+        let row = rows
+            .iter()
+            .find(|row| row.cause == CAUSE_REQUEST_CAPACITY)
+            .unwrap_or_else(|| panic!("no capacity row in {rows:?}"));
+        assert_eq!(row.ingress, pam_store::RequestIngress::Public);
+        assert_eq!(row.capability.as_deref(), Some("query"));
+        assert_eq!(row.agent.as_deref(), Some("claude"));
+        assert_eq!(row.repo.as_deref(), Some(REPO));
+        assert_eq!(row.request_id.as_deref(), Some("one_too_many"));
+        assert_eq!((row.peer_uid, row.peer_pid), (Some(501), Some(4242)));
+        assert_eq!(row.count, 1);
+
+        // `status` says what the log holds.
+        let status = live
+            .ask(request(
+                "status_after",
+                "status",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        let Response::Result { body, .. } = status else {
+            panic!("status answers a result");
+        };
+        assert!(
+            body["refusals"]["recorded"].as_u64().unwrap() >= 1,
+            "{body}"
+        );
+        assert_eq!(body["refusals"]["dropped"], 0);
+
+        drop(stall);
+        for answer in stuck {
+            tokio::time::timeout(PATIENCE, answer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        live.stop().await;
+    }
+
+    /// A thousand refusals are one row with the right count, and not one of
+    /// the replies waited for a disk that takes three seconds to write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_of_rate_refusals_is_one_row_and_no_reply_waits_for_the_write() {
+        let live = Live::start("relaxed", |config| {
+            config.refusal_backend = Some(Arc::new(|store| {
+                Arc::new(SlowDisk {
+                    store,
+                    delay: Duration::from_secs(3),
+                })
+            }));
+        })
+        .await;
+
+        let started = std::time::Instant::now();
+        let mut refused = 0_u64;
+        // One at a time, so the pool never fills and every refusal is the
+        // rate window's: the burst is then a single run.
+        for index in 0..1_000 {
+            let mut status = request(
+                &format!("burst_{index}"),
+                "status",
+                serde_json::json!({}),
+                true,
+            );
+            "poller".clone_into(&mut status.caller.agent);
+            let response = live
+                .ask_from(status, Origin::Public, Some(kernel_peer(777, false)))
+                .await;
+            if let Response::Refusal { cause, .. } = &response {
+                assert_eq!(cause, crate::daemon::CAUSE_REQUEST_RATE);
+                refused += 1;
+            }
+        }
+        let spent = started.elapsed();
+        assert!(
+            spent < Duration::from_secs(2),
+            "1,000 requests took {spent:?} with the refusal disk three seconds slow"
+        );
+        // The rate window admits tens of `status` a second; the rest were refused.
+        assert!(refused >= 900, "only {refused} of 1,000 were refused");
+        // The write is still in flight: the replies did not need it.
+        assert!(
+            live.store()
+                .list_refusals(10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(live.handle.refusals().recorded() >= refused);
+
+        let rows = recorded(&live).await;
+        let rate: Vec<_> = rows
+            .iter()
+            .filter(|row| row.cause == crate::daemon::CAUSE_REQUEST_RATE)
+            .collect();
+        assert_eq!(rate.len(), 1, "{rows:?}");
+        assert_eq!(rate[0].count, refused);
+        assert_eq!(rate[0].capability.as_deref(), Some("status"));
+        assert_eq!(rate[0].agent.as_deref(), Some("poller"));
+        assert_eq!(rate[0].peer_pid, Some(777));
+        live.stop().await;
+    }
+
+    /// A deadline that has already expired when admission starts is refused
+    /// before any row exists, on either plane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_expired_deadline_at_admission_is_recorded_on_the_plane_it_arrived_on() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let mut public = request("expired_public", "echo", serde_json::json!({}), true);
+        public.deadline_ms = 0;
+        let response = live
+            .ask_from(public, Origin::Public, Some(kernel_peer(4242, false)))
+            .await;
+        assert_eq!(refusal(&response), (CAUSE_DEADLINE_EXCEEDED, true));
+        let mut admin = request("expired_admin", "echo", serde_json::json!({}), true);
+        admin.deadline_ms = 0;
+        let response = live.ask_from(admin, Origin::Admin, None).await;
+        assert_eq!(refusal(&response), (CAUSE_DEADLINE_EXCEEDED, true));
+        assert!(
+            live.store()
+                .get_request("expired_public")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let rows = recorded(&live).await;
+        let on = |plane| {
+            rows.iter()
+                .find(|row| row.cause == CAUSE_DEADLINE_EXCEEDED && row.ingress == plane)
+                .unwrap_or_else(|| panic!("no {plane:?} deadline row in {rows:?}"))
+        };
+        let public = on(pam_store::RequestIngress::Public);
+        assert_eq!(public.capability.as_deref(), Some("echo"));
+        assert_eq!(public.request_id.as_deref(), Some("expired_public"));
+        assert_eq!(public.peer_pid, Some(4242));
+        let admin = on(pam_store::RequestIngress::Admin);
+        assert_eq!((admin.peer_uid, admin.peer_pid), (None, None));
+        live.stop().await;
+    }
+
+    /// The log is bounded: runs past its limit are counted as dropped, `status`
+    /// says so, and the caller is answered all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refusals_past_the_logs_bound_are_counted_in_status_and_still_answered() {
+        let live = Live::start("relaxed", |config| {
+            config.refusal_limits.max_runs = 2;
+        })
+        .await;
+        for (index, capability) in ["echo", "log.summarize", "release"].into_iter().enumerate() {
+            let mut envelope = request(
+                &format!("bounded_{index}"),
+                capability,
+                serde_json::json!({}),
+                true,
+            );
+            envelope.deadline_ms = 0;
+            let response = live.ask(envelope).await;
+            assert_eq!(refusal(&response), (CAUSE_DEADLINE_EXCEEDED, true));
+        }
+        let rows = recorded(&live).await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let status = live
+            .ask(request(
+                "status_bounded",
+                "status",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        let Response::Result { body, .. } = status else {
+            panic!("status answers a result");
+        };
+        assert_eq!(body["refusals"]["dropped"], 1, "{body}");
+        assert_eq!(body["refusals"]["recorded"], 2, "{body}");
+        live.stop().await;
+    }
 }
 
 mod cancel_plane {

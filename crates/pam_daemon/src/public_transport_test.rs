@@ -13,10 +13,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pam_proto::wire::{End, Frame, MAX_FRAME_BYTES, Via, cause};
+use pam_proto::wire::{End, Frame, Hello, MAX_FRAME_BYTES, Via, WIRE_PROTOCOL, cause};
 use pam_proto::{Envelope, Event, Outcome, Response};
-use pam_store::{Actor, AuditEntry, Decision, RequestState, Store};
-use tokio::io::DuplexStream;
+use pam_store::{Actor, AuditEntry, Decision, RefusalRow, RequestState, Store};
+use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -32,6 +32,7 @@ use crate::lifecycle::LifecyclePhase;
 use crate::public_transport::{
     CAUSE_RESPONSE_BUDGET, FollowTimes, LEGACY_LOG_INTERVAL, LegacyLog, PublicPolicy, reply_body,
 };
+use crate::refusal_log::{RefusalBackend, RefusalLimits, RefusalLog};
 use crate::transport::IncomingRequest;
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -57,6 +58,19 @@ struct Rig {
     buffer: usize,
     /// The managed policy the follow path reads.
     managed: Arc<crate::managed_policy_service::PolicyHandle>,
+    /// Where the policy records what it refuses before the core sees it.
+    refusals: RefusalLog,
+    /// Ends the refusal log's writer with the rig.
+    _refusals_stop: watch::Sender<bool>,
+}
+
+/// The process table of a rig: nothing runs there.
+struct NoProcesses;
+
+impl crate::boundary::PeerResolver for NoProcesses {
+    fn resolve(&self, _pid: u32) -> crate::boundary::ResolvedPeer {
+        crate::boundary::ResolvedPeer::default()
+    }
 }
 
 impl Rig {
@@ -64,11 +78,34 @@ impl Rig {
         Self::under(follow, None).await
     }
 
+    /// [`Self::new`] over a listener with `limits`.
+    async fn limited(limits: Limits) -> Self {
+        Self::build(FollowTimes::DEFAULT, None, limits).await
+    }
+
+    /// The refusals the policy recorded, newest first, once the writer has
+    /// had them.
+    async fn recorded(&self) -> Vec<RefusalRow> {
+        self.refusals.flush().await;
+        self.store
+            .list_refusals(100, None, None, None)
+            .await
+            .expect("the refusal rows read")
+    }
+
     /// [`Self::new`] whose follow path reads the managed policy from
     /// `source`; `None` is no policy.
     async fn under(
         follow: FollowTimes,
         source: Option<Arc<crate::policy_test::SwitchablePolicy>>,
+    ) -> Self {
+        Self::build(follow, source, Limits::PUBLIC).await
+    }
+
+    async fn build(
+        follow: FollowTimes,
+        source: Option<Arc<crate::policy_test::SwitchablePolicy>>,
+        limits: Limits,
     ) -> Self {
         let store = Arc::new(Store::open_in_memory().await.expect("a store"));
         let managed = match &source {
@@ -92,13 +129,23 @@ impl Rig {
         let (phase, _) = watch::channel(LifecyclePhase::Serving);
         let (stop, _) = watch::channel(false);
         let hub = EventHub::new();
+        let (refusals_stop, refusals_stopped) = watch::channel(false);
+        let (refusals, _writer) = RefusalLog::spawn(
+            Arc::clone(&store) as Arc<dyn RefusalBackend>,
+            Arc::new(NoProcesses),
+            RefusalLimits {
+                flush_delay: Duration::from_millis(5),
+                ..RefusalLimits::default()
+            },
+            refusals_stopped,
+        );
         let policy = PublicPolicy::with_limits(
-            Ingress::new(incoming),
+            Ingress::new(incoming).with_refusals(refusals.clone()),
             Arc::clone(&store),
             phase.clone(),
             Arc::clone(&hub),
             ImageWatch::capture(Arc::new(FsProbe)),
-            Limits::PUBLIC,
+            limits,
             follow,
             Arc::clone(&managed),
         );
@@ -113,6 +160,8 @@ impl Rig {
             repo,
             buffer: 64 * 1024,
             managed: managed_for_rig,
+            refusals,
+            _refusals_stop: refusals_stop,
         }
     }
 
@@ -746,7 +795,7 @@ async fn a_connection_over_the_cap_is_told_and_a_freed_slot_is_reusable() {
     };
     let (incoming, mut core) = mpsc::channel(4);
     let policy = PublicPolicy::with_limits(
-        Ingress::new(incoming),
+        Ingress::new(incoming).with_refusals(rig.refusals.clone()),
         Arc::clone(&rig.store),
         rig.phase.clone(),
         Arc::clone(&rig.hub),
@@ -781,6 +830,12 @@ async fn a_connection_over_the_cap_is_told_and_a_freed_slot_is_reusable() {
         panic!("expected error connection_capacity_exhausted, got {answer:?}");
     };
     assert_eq!(error.cause, cause::CONNECTION_CAPACITY_EXHAUSTED);
+    // The refusal is on record: no request row could have held it.
+    let recorded = rig.recorded().await;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].cause, cause::CONNECTION_CAPACITY_EXHAUSTED);
+    assert_eq!(recorded[0].ingress, pam_store::RequestIngress::Public);
+    assert_eq!(recorded[0].peer_pid, Some(std::process::id()));
 
     // One goes away; the next connection is served to its reply.
     drop(first);
@@ -824,6 +879,305 @@ async fn a_connection_over_the_cap_is_told_and_a_freed_slot_is_reusable() {
     drop(second);
     listener.shutdown().await;
     assert!(!path.exists(), "the socket file is unlinked at shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Refusals decided before a request row exists are on record.
+// ---------------------------------------------------------------------------
+
+/// The one recorded refusal of a rig, asserted to be alone.
+fn only(rows: &[RefusalRow]) -> &RefusalRow {
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    &rows[0]
+}
+
+/// The peer a scripted connection claims, as the row must carry it.
+fn assert_peer_is_recorded(row: &RefusalRow) {
+    assert_eq!(row.ingress, pam_store::RequestIngress::Public);
+    assert_eq!(row.peer_uid, Some(501));
+    assert_eq!(row.peer_pid, Some(4242));
+}
+
+fn hello_of(version: &str, proto: u32) -> Hello {
+    Hello {
+        proto,
+        version: version.to_owned(),
+        via: Via::Direct,
+    }
+}
+
+async fn write_body(client: &mut DuplexStream, body: &[u8]) {
+    framed::write_frame(client, body, MAX_FRAME_BYTES)
+        .await
+        .expect("the frame is written");
+}
+
+async fn write_frame_of(client: &mut DuplexStream, frame: &Frame) {
+    write_body(client, &frame.encode().expect("the frame encodes")).await;
+}
+
+/// The cause of the `error` frame the daemon answers with.
+async fn error_cause(client: &mut DuplexStream) -> String {
+    match frame(client).await {
+        Err(DialError::Refused(error)) => error.cause,
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_client_of_another_build_is_recorded_and_no_request_row_is_written() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    let envelope = rig.envelope("req_other_build", "echo", serde_json::json!({}));
+    let answered = framed::call(
+        &mut client,
+        &hello_of("0.0.0-other", WIRE_PROTOCOL),
+        &envelope,
+        MAX_FRAME_BYTES,
+    )
+    .await;
+    let Err(DialError::Refused(error)) = answered else {
+        panic!("expected the version refusal, got {answered:?}");
+    };
+    assert_eq!(error.cause, cause::CLIENT_VERSION_MISMATCH);
+    serving.await.unwrap();
+
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, cause::CLIENT_VERSION_MISMATCH);
+    assert_peer_is_recorded(row);
+    assert!(row.detail.contains("0.0.0-other"), "{}", row.detail);
+    // The point of the table: there was never a request to hold an audit row.
+    assert!(
+        rig.store
+            .get_request("req_other_build")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_hello_of_another_protocol_is_recorded() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    let envelope = rig.envelope("req_proto", "echo", serde_json::json!({}));
+    let answered = framed::call(
+        &mut client,
+        &hello_of(env!("CARGO_PKG_VERSION"), WIRE_PROTOCOL + 7),
+        &envelope,
+        MAX_FRAME_BYTES,
+    )
+    .await;
+    let Err(DialError::Refused(error)) = answered else {
+        panic!("expected the protocol refusal, got {answered:?}");
+    };
+    assert_eq!(error.cause, cause::PROTOCOL_MISMATCH);
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, cause::PROTOCOL_MISMATCH);
+    assert_peer_is_recorded(row);
+}
+
+#[tokio::test]
+async fn an_oversized_frame_is_recorded_whether_it_is_the_hello_or_the_request() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+
+    // A first frame announcing more than a hello may carry.
+    let (mut client, serving) = rig.connect();
+    client
+        .write_all(&5_000_u32.to_be_bytes())
+        .await
+        .expect("the header is written");
+    assert_eq!(error_cause(&mut client).await, cause::BAD_FRAME);
+    drop(client);
+    serving.await.unwrap();
+
+    // A request frame announcing more than the request limit, behind a good
+    // hello: the length is judged from the header, nothing is allocated.
+    let (mut client, serving) = rig.connect();
+    write_frame_of(
+        &mut client,
+        &Frame::Hello(hello_of(env!("CARGO_PKG_VERSION"), WIRE_PROTOCOL)),
+    )
+    .await;
+    let too_long = u32::try_from(MAX_FRAME_BYTES + 1).unwrap();
+    client.write_all(&too_long.to_be_bytes()).await.unwrap();
+    assert!(matches!(frame(&mut client).await, Ok(Frame::HelloAck(_))));
+    assert_eq!(error_cause(&mut client).await, cause::BAD_FRAME);
+    drop(client);
+    serving.await.unwrap();
+
+    let recorded = rig.recorded().await;
+    // The same cause, peer and capability: one row, counted twice.
+    let row = only(&recorded);
+    assert_eq!(row.cause, cause::BAD_FRAME);
+    assert_eq!(row.count, 2);
+    assert_peer_is_recorded(row);
+    assert!(row.detail.contains("outside 1..="), "{}", row.detail);
+}
+
+#[tokio::test]
+async fn a_pre_migration_greeting_is_recorded_though_it_is_closed_unanswered() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    let mut greeting = vec![0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F, 3, 0];
+    greeting.resize(64, 0);
+    client.write_all(&greeting).await.unwrap();
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, "legacy_client");
+    assert_peer_is_recorded(row);
+}
+
+#[tokio::test]
+async fn a_peer_that_never_says_hello_is_recorded_at_the_handshake_timeout() {
+    let rig = Rig::limited(Limits {
+        handshake: Duration::from_millis(150),
+        ..Limits::PUBLIC
+    })
+    .await;
+    let (mut client, serving) = rig.connect();
+    assert_eq!(error_cause(&mut client).await, cause::HANDSHAKE_TIMEOUT);
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, cause::HANDSHAKE_TIMEOUT);
+    assert_peer_is_recorded(row);
+}
+
+#[tokio::test]
+async fn a_connection_that_opens_and_closes_without_a_byte_is_not_a_refusal() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (client, serving) = rig.connect();
+    drop(client);
+    serving.await.unwrap();
+    assert!(rig.recorded().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_envelope_that_does_not_parse_is_recorded_with_the_id_it_named() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    framed::open_encoded(
+        &mut client,
+        &hello_of(env!("CARGO_PKG_VERSION"), WIRE_PROTOCOL),
+        br#"{"t":"request","envelope":{"id":"req_garbled"}}"#,
+    )
+    .await
+    .expect("the hello is acknowledged");
+    let Ok(Frame::Reply { response }) = frame(&mut client).await else {
+        panic!("expected a reply");
+    };
+    assert_eq!(refusal(&response).0, "bad_request");
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, "bad_request");
+    assert_eq!(row.request_id.as_deref(), Some("req_garbled"));
+    assert_peer_is_recorded(row);
+    assert!(
+        rig.store
+            .get_request("req_garbled")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_frame_of_the_wrong_type_is_recorded() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    framed::open_encoded(
+        &mut client,
+        &hello_of(env!("CARGO_PKG_VERSION"), WIRE_PROTOCOL),
+        br#"{"t":"events"}"#,
+    )
+    .await
+    .expect("the hello is acknowledged");
+    assert_eq!(error_cause(&mut client).await, cause::BAD_FRAME);
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, cause::BAD_FRAME);
+    assert!(row.detail.contains("events"), "{}", row.detail);
+}
+
+#[tokio::test]
+async fn an_envelope_over_its_field_limits_is_recorded_with_what_it_claimed() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    let mut envelope = rig.envelope("req_wide", "echo", serde_json::json!({}));
+    envelope.capability = "c".repeat(200);
+    envelope.caller.agent = "claude".to_owned();
+    let response = call(&mut client, &envelope).await.expect("a reply");
+    assert_eq!(refusal(&response).0, "bad_request");
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, "bad_request");
+    assert_eq!(row.agent.as_deref(), Some("claude"));
+    assert_eq!(row.request_id.as_deref(), Some("req_wide"));
+    // What the client claimed is clipped to the column's bound, not refused.
+    assert_eq!(row.capability.as_deref().map(str::len), Some(128));
+}
+
+#[tokio::test]
+async fn an_admin_operation_on_the_public_socket_is_recorded_with_its_capability() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    let (mut client, serving) = rig.connect();
+    let mut envelope = rig.envelope("req_admin", "admin.grants.list", serde_json::json!({}));
+    envelope.caller.agent = "pam-gui".to_owned();
+    let response = call(&mut client, &envelope).await.expect("a reply");
+    assert_eq!(refusal(&response).0, crate::admin::CAUSE_ADMIN_DENIED);
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, crate::admin::CAUSE_ADMIN_DENIED);
+    assert_eq!(row.capability.as_deref(), Some("admin.grants.list"));
+    // The label is a claim, recorded as one; the plane is what the daemon saw.
+    assert_eq!(row.agent.as_deref(), Some("pam-gui"));
+    assert_peer_is_recorded(row);
+}
+
+#[tokio::test]
+async fn a_request_while_the_daemon_leaves_serving_is_recorded() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    rig.phase.send_replace(LifecyclePhase::Draining);
+    let (mut client, serving) = rig.connect();
+    let envelope = rig.envelope("req_draining", "echo", serde_json::json!({}));
+    let response = call(&mut client, &envelope).await.expect("a reply");
+    assert_eq!(refusal(&response).0, CAUSE_DAEMON_SHUTTING_DOWN);
+    serving.await.unwrap();
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.cause, CAUSE_DAEMON_SHUTTING_DOWN);
+    assert_eq!(row.capability.as_deref(), Some("echo"));
+}
+
+/// A client that keeps getting refused is one row, not a row per attempt.
+#[tokio::test]
+async fn a_client_refused_over_and_over_is_one_row_with_the_count() {
+    let rig = Rig::new(FollowTimes::DEFAULT).await;
+    for n in 0..40 {
+        let (mut client, serving) = rig.connect();
+        let envelope = rig.envelope(
+            &format!("req_loop_{n}"),
+            "admin.models.list",
+            serde_json::json!({}),
+        );
+        let response = call(&mut client, &envelope).await.expect("a reply");
+        assert_eq!(refusal(&response).0, crate::admin::CAUSE_ADMIN_DENIED);
+        serving.await.unwrap();
+    }
+    let recorded = rig.recorded().await;
+    let row = only(&recorded);
+    assert_eq!(row.count, 40);
+    // The first attempt's id is the one kept.
+    assert_eq!(row.request_id.as_deref(), Some("req_loop_0"));
 }
 
 // ---------------------------------------------------------------------------

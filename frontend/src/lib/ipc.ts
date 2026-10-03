@@ -612,6 +612,37 @@ export interface GrantRow {
   revoked_ts: number | null;
   /** The managed policy's `never` rules cover it: kept, but it does not authorize. */
   blocked_by_policy?: boolean;
+  /**
+   * What a flow step's grant is bound to; `legacy` is an unbound grant its next run binds.
+   * Null for any other capability.
+   */
+  binding?: GrantBinding | null;
+}
+
+/** A flow step grant's binding: the step as it was when granted, in one repository (or all). */
+export type GrantBinding =
+  | { state: "legacy" }
+  | {
+      state: "bound";
+      flow: string;
+      step: string;
+      /** The canonical repository; null for every repository. */
+      repository: string | null;
+      /** The first 12 characters of the step's effect digest. */
+      effect_digest: string;
+      effect_class: string;
+      bound_ts: number | null;
+    };
+
+/** What remembering a flow step's approval records, and what changed since an earlier grant. */
+export interface RememberScope {
+  flow: string;
+  step: string;
+  repository: string | null;
+  effect_digest: string;
+  effect_class: string;
+  /** Why an earlier grant of this step no longer covers it; null when there was none. */
+  changed: string | null;
 }
 
 /** What the managed policy says about grants; each is null unless that key is in force. */
@@ -647,6 +678,8 @@ export interface PendingApproval {
    * it verbatim; without it the card shows only the request as submitted.
    */
   resolved?: ResolvedStep | null;
+  /** What Remember records for a gated flow step: this step as it is now, in this repository. */
+  remember?: RememberScope | null;
 }
 
 /** The resolved program, arguments, directory and environment names of a gated flow step. */
@@ -679,8 +712,10 @@ export type RequestStateName =
 /** The five truth verdicts a finished request can report. */
 export type OutcomeName = "solved" | "changed" | "verified" | "unresolved" | "blocked";
 
-/** One `admin.activity.list` row; timestamps are unix seconds. */
+/** One `admin.activity.list` request row; timestamps are unix seconds. */
 export interface ActivityRow {
+  /** Absent on a daemon from before refusals were listed; always `"request"` otherwise. */
+  kind?: "request";
   id: string;
   capability: string;
   repo: string;
@@ -691,6 +726,46 @@ export interface ActivityRow {
   outcome: string | null;
   created_ts: number;
   updated_ts: number;
+}
+
+/**
+ * A refusal the daemon decided before a request row existed (capacity, rate, a malformed or
+ * oversized frame, a refused hello, an expired deadline at admission, the connection cap, the
+ * drain). `admin.activity.list` returns these, interleaved by time, only when asked
+ * (`include_refusals`). Timestamps are unix seconds: `created_ts` is the first attempt and
+ * `updated_ts` the latest of the `count` identical attempts the row stands for.
+ *
+ * Every `agent`, `repo`, `capability` and `request_id` is what the client *claimed*, bounded and
+ * attribution only; the `peer_*` fields are the daemon's own view of the connection (null where the
+ * platform reports none, and `peer_exe` null when the daemon could not resolve it). All of it is
+ * text a client chose: render it through `SafeText`.
+ */
+export interface RefusalEntry {
+  kind: "refusal";
+  /** `refusal_<n>`; never a request id. */
+  id: string;
+  cause: string;
+  detail: string;
+  count: number;
+  capability: string | null;
+  repo: string | null;
+  agent: string | null;
+  /** The request id the client supplied; no such request exists. */
+  request_id: string | null;
+  created_ts: number;
+  updated_ts: number;
+  ingress: "public" | "admin";
+  peer_uid: number | null;
+  peer_pid: number | null;
+  peer_exe: string | null;
+}
+
+/** One entry of an `admin.activity.list` that asked for refusals. */
+export type ActivityEntry = ActivityRow | RefusalEntry;
+
+/** True for a refusal decided before admission. */
+export function isRefusal(entry: ActivityEntry): entry is RefusalEntry {
+  return entry.kind === "refusal";
 }
 
 /** One observed agent+repo pair; timestamps are unix seconds. */
@@ -772,18 +847,27 @@ export function approvalsResolve(
  * whole tide and sieving it client-side.
  */
 export function activityList(
-  filters: {
-    limit?: number;
-    repo?: string;
-    agent?: string;
-    state?: RequestStateName;
-    capability?: string;
-    /** Drop the GUI's own `admin.*` and `status` polling from the list. */
-    hide_probes?: boolean;
-  } = {},
-): Promise<{ requests: ActivityRow[] }> {
+  filters: ActivityFilters & { include_refusals: true },
+): Promise<{ requests: ActivityEntry[] }>;
+export function activityList(
+  filters?: ActivityFilters & { include_refusals?: false },
+): Promise<{ requests: ActivityRow[] }>;
+export function activityList(
+  filters: ActivityFilters & { include_refusals?: boolean } = {},
+): Promise<{ requests: ActivityEntry[] }> {
   return adminCall("admin.activity.list", filters);
 }
+
+/** The filters every `admin.activity.list` call may carry. */
+export type ActivityFilters = {
+  limit?: number;
+  repo?: string;
+  agent?: string;
+  state?: RequestStateName;
+  capability?: string;
+  /** Drop the GUI's own `admin.*` and `status` polling from the list. */
+  hide_probes?: boolean;
+};
 
 export function callersList(): Promise<{ callers: CallerRow[] }> {
   return adminCall("admin.callers.list");

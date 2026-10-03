@@ -16,7 +16,11 @@
 //!   ([`ACTION_GRANT_FROM_APPROVAL`]), regardless of profile/class; the policy matrix decides its
 //!   meaning — under relaxed it makes the next gate evaluation an outright allow, under
 //!   standard/strict a granted destructive/external capability still needs per-operation approval,
-//!   so the grant is harmless there.
+//!   so the grant is harmless there. A flow step's wait carries the [`GrantBinding`] of what it
+//!   is about to run ([`ApprovalService::request_step_approval`]), and remembering it records
+//!   exactly that: this step as defined now, in this repository — a grant for that repository
+//!   re-pointed at it, or a new one ([`GrantChange::Bind`]). An edited step, or another
+//!   repository, asks again.
 //! - **Managed policy over remember**: a remembered approval adds a grant, so it is refused
 //!   wherever the managed policy refuses one ([`remember_refusal`]): `security.grants.remember:
 //!   deny`, `security.grants.manual: deny`, a never-grant rule matching the capability, or either
@@ -59,7 +63,8 @@ use std::time::Duration;
 
 use pam_proto::Event;
 use pam_store::{
-    Actor, ApprovalResolution, AuditEntry, Decision, PendingApproval, Store, StoreError,
+    Actor, ApprovalResolution, AuditEntry, Decision, GrantBinding, GrantChange, PendingApproval,
+    Store, StoreError,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -235,6 +240,44 @@ struct PendingWait {
     /// The capability the wait is for.
     capability: String,
     snapshot: Option<StepSnapshot>,
+    /// What a remembered answer binds the step's grant to, and what changed
+    /// since an earlier grant, when one no longer covers the step.
+    remember: Option<RememberScope>,
+}
+
+/// What remembering a flow step's approval records, shown on its card
+/// (`remember` of an `admin.approvals.pending` entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RememberScope {
+    /// The binding the grant gets: this step as defined now, in this
+    /// repository.
+    pub binding: GrantBinding,
+    /// Why an earlier grant of this step no longer covers it, when that is
+    /// why the step asks (see [`crate::policy::StepGrant::Changed`]).
+    pub changed: Option<String>,
+}
+
+impl RememberScope {
+    /// The card's view: the flow, the step, the repository, a digest prefix
+    /// and the change, if any.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "flow": self.binding.flow_id,
+            "step": self.binding.step_id,
+            "repository": self.binding.repository,
+            "effect_digest": digest_prefix(&self.binding.effect_digest),
+            "effect_class": self.binding.effect_class,
+            "changed": self.changed,
+        })
+    }
+}
+
+/// The first 12 characters of an effect digest: enough to tell two step
+/// definitions apart on a card.
+#[must_use]
+pub fn digest_prefix(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
 }
 
 /// The approval service. One per daemon; see the module docs.
@@ -315,6 +358,44 @@ impl ApprovalService {
         snapshot: Option<StepSnapshot>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<ApprovalOutcome, StoreError> {
+        self.wait_for_approval(request_id, capability, snapshot, None, cancel)
+            .await
+    }
+
+    /// [`Self::request_approval_with`] for a gated flow step whose grant is
+    /// bound to what it runs: a remembered answer records `remember`'s
+    /// binding ([`GrantChange::Bind`]), never a bare name.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request_approval`].
+    pub async fn request_step_approval(
+        &self,
+        request_id: &str,
+        capability: &str,
+        snapshot: StepSnapshot,
+        remember: RememberScope,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<ApprovalOutcome, StoreError> {
+        self.wait_for_approval(
+            request_id,
+            capability,
+            Some(snapshot),
+            Some(remember),
+            cancel,
+        )
+        .await
+    }
+
+    async fn wait_for_approval(
+        &self,
+        request_id: &str,
+        capability: &str,
+        snapshot: Option<StepSnapshot>,
+        remember_scope: Option<RememberScope>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<ApprovalOutcome, StoreError> {
+        let binding = remember_scope.as_ref().map(|scope| scope.binding.clone());
         self.store
             .insert_approval_waiting(request_id, capability)
             .await?;
@@ -329,6 +410,7 @@ impl ApprovalService {
                     tx,
                     capability: capability.to_owned(),
                     snapshot,
+                    remember: remember_scope,
                 },
             );
             rx
@@ -372,8 +454,14 @@ impl ApprovalService {
         // must get NotFound instead of a dead channel.
         self.pending.lock().await.remove(request_id);
 
-        self.record_resolution(request_id, capability, outcome, remember_refused)
-            .await?;
+        self.record_resolution(
+            request_id,
+            capability,
+            binding.as_ref(),
+            outcome,
+            remember_refused,
+        )
+        .await?;
         // Only now is the human's answer true: the resolution is durable.
         // A failed write above returned early and dropped the channel, so
         // the resolver is told the approval is not pending.
@@ -472,6 +560,16 @@ impl ApprovalService {
             .and_then(|wait| wait.snapshot.clone())
     }
 
+    /// What remembering `request_id`'s pending flow step approval would
+    /// record, when the wait has a binding.
+    pub async fn remember_scope(&self, request_id: &str) -> Option<RememberScope> {
+        self.pending
+            .lock()
+            .await
+            .get(request_id)
+            .and_then(|wait| wait.remember.clone())
+    }
+
     /// The GUI's pending list: every unresolved approval, joined with
     /// its request, oldest first.
     ///
@@ -486,10 +584,12 @@ impl ApprovalService {
     /// outcome (see the module docs for the exact decision/actor per
     /// outcome). `remember_refused` records that the human asked to
     /// remember and the managed policy made it a one-time approval.
+    /// `binding` is what a remembered flow step grant is bound to.
     async fn record_resolution(
         &self,
         request_id: &str,
         capability: &str,
+        binding: Option<&GrantBinding>,
         outcome: ApprovalOutcome,
         remember_refused: bool,
     ) -> Result<(), StoreError> {
@@ -534,11 +634,23 @@ impl ApprovalService {
             detail["note"] = serde_json::Value::String(note.to_owned());
         }
         let detail = detail.to_string();
-        let grant_detail = serde_json::json!({ "capability": capability }).to_string();
+        let mut grant_detail = serde_json::json!({ "capability": capability });
+        if let Some(binding) = binding {
+            grant_detail["flow"] = serde_json::json!(binding.flow_id);
+            grant_detail["step"] = serde_json::json!(binding.step_id);
+            grant_detail["repository"] = serde_json::json!(binding.repository);
+            grant_detail["effect_digest"] = serde_json::json!(binding.effect_digest);
+            grant_detail["effect_class"] = serde_json::json!(binding.effect_class);
+        }
+        let grant_detail = grant_detail.to_string();
+        let change = match binding {
+            Some(binding) => GrantChange::Bind(capability, binding),
+            None => GrantChange::Add(capability),
+        };
         // One transaction: the resolution, its audit row and (remembered)
         // the grant with its own audit row.
         self.store
-            .resolve_approval_audited(
+            .resolve_approval_with_grant(
                 request_id,
                 resolution,
                 note,
@@ -549,7 +661,7 @@ impl ApprovalService {
                     detail: Some(&detail),
                 },
                 remember.then_some((
-                    capability,
+                    change,
                     AuditEntry {
                         action: ACTION_GRANT_FROM_APPROVAL,
                         decision: Decision::Allow,

@@ -377,6 +377,27 @@ this binary does not have. Approving a flow step is also pinned to the
 resolved command shown on the card (`expected_digest`); a flow edited while the
 approval waited refuses as `flow_changed` and the approval stays pending.
 
+A remembered flow step is bound to what runs, not to its name. The
+`flow.step:<flow>/<step>` grant records the step's effect digest (a hash of the
+normalized step: program and argument templates, environment names and value
+templates, stateful and approval flags, connector call and argument templates,
+landing operation; never the YAML bytes, so formatting and comments change
+nothing), its gate class and the canonical repository the approval was given
+for. It authorizes the step only while all three match: a flow file edited by
+hand or restored from a backup, or a run in another repository, asks again
+(`approval_required`, on every profile) and the card and the refusal say what
+changed ("the step's command changed since it was approved", "the step was
+approved for <repository>, not for <this one>"). Remembering it again re-points
+that repository's grant at the step as it is now. A flow step granted by hand
+in Settings (`admin.grants.add`) is bound to the library's definition of the
+step for every repository, or for the canonical `repository` the op names; a
+step the library does not hold is refused `flow_step_unknown`. Grants made
+before the binding existed are unbound legacy grants: they authorize as before
+and are bound to what runs the first time they are used (a `grant_bound` audit
+row). The managed policy's never-grant and manual-grant rules apply first.
+`admin.grants.list` shows each binding (flow, step, repository, digest prefix)
+or `legacy`.
+
 ## Global target authority
 
 **Authority is per operating-system user.** GUI grants, approvals, profiles and
@@ -391,7 +412,9 @@ executable and ancestry are defeated by a copied binary or a renamed parent, the
 session relay collapses every client to `pam listen`, and on Windows there is
 no peer identity at all. No harness hands PAM a per-session credential it could
 verify. A grant keyed to any of these would be label-keyed authority with a GUI
-that implies otherwise, so PAM has none.
+that implies otherwise, so PAM has none. (A flow step's grant is bound to a
+repository, but that is the canonical repository the ticket acts on, which the
+scope approves, not who asked.)
 
 Binding a ticket to its original canonical repository prevents relabeling that
 ticket under another root. It does not isolate agents or keep evidence
@@ -491,7 +514,8 @@ operations.
 applies at once (the reply says `"applies": "now"`); the gate, the profile the
 GUI shows and the authorization stamps of parked watch and landing runs all read
 that one value. Revoking a grant or editing a flow can still end tickets that
-were admitted before it.
+were admitted before it; revoking a flow step's grant ends only that flow's
+tickets.
 
 A client whose version differs from the daemon's never restarts the daemon by
 what it says. The daemon re-reads its own executable's file facts (cached for
@@ -506,6 +530,86 @@ A GUI left open across an upgrade from 0.4.x still sends that version's bare
 request frame. The private endpoint recognises it and answers in the old shape
 with a `client_outdated` refusal telling the human to quit and reopen PAM; the
 operation is not run.
+
+## The audit contract: request rows and refusal rows
+
+The ledger promises one audit trail per operation, refusals included. That
+promise has two halves, because an audit row needs a request row (`audit.request_id`
+is required and points at `request`), and some refusals are decided before any
+request row exists.
+
+**A request row** is written for every operation the daemon admits: a public
+request that passed admission, an administration operation, and the daemon's own
+bookkeeping (a policy load, a crash recovery). It ends in exactly one terminal
+audit row, whatever the ending: done, refused at the gate, refused by approval
+or by the capability itself, failed, cancelled, or timed out. `status` is the one
+public operation that writes nothing (a poll leaves no row, so the GUI's polling
+cannot grow the ledger). The Activity screen lists request rows, and each
+opens into its audit trail.
+
+**A refusal row** (table `refusal`, schema 18) is written for a refusal decided
+*before* admission, where there is no request row to hang an audit row on:
+
+| Cause | Where it is decided |
+| --- | --- |
+| `request_capacity_exhausted`, `request_rate_exhausted` | the dispatcher, either plane |
+| `deadline_exceeded` | the request's deadline had already expired when admission began |
+| `internal_error`, `store_overloaded`, `queue_*_limit` | the repository could not be resolved, or the queue refused the admission |
+| `daemon_shutting_down`, `daemon_outdated` | the daemon is draining or restarting |
+| `bad_request` | the envelope does not parse, or its fields exceed their limits |
+| `admin_denied` | an `admin.*` operation on the public socket |
+| `client_version_mismatch`, `daemon_outdated`, `protocol_mismatch` | the connection's hello (both planes) |
+| `bad_frame` | a malformed, mistyped or oversized frame (the detail names the length) |
+| `handshake_timeout` | the hello and the request frame did not arrive in time |
+| `legacy_client` | a pre-migration client greeted in ZMTP and was closed unanswered |
+| `connection_capacity_exhausted` | the listener's connection cap (both planes) |
+| `follower_capacity_exhausted` | every follower slot is taken |
+| `peer_not_admitted` | the private endpoint's peer is not the owner |
+
+Each row carries the plane (`ingress`), the peer's uid, pid and executable as the
+daemon saw them (empty on Windows' public plane, which has no kernel peer, and
+the executable is empty when the daemon could not resolve it in time), and what
+the client *claimed*: its agent label, repository, capability and request id,
+each bounded. The claims are attribution like `caller.agent`, never a key: the
+request id names no request, and nothing is authorized from a refusal row.
+
+A refusal row stands for a *run* of attempts. Identical refusals (same plane,
+cause, peer pid and capability) within ten seconds are one row with a `count`, so
+a client that is refused a thousand times is one row and a few writes, not a
+thousand rows. The row's first attempt orders it in the Activity list and its
+latest attempt is shown beside the count. The daemon never waits for the write:
+the refusal is answered first and recorded by a background writer, and the
+number of distinct runs it will hold is bounded. A refusal that arrives with that
+bound full is answered all the same and counted in `status` as
+`refusals.dropped` (`refusals.recorded` counts what was accepted and
+`refusals.pending` what the store does not have yet). The newest 2,000 rows are
+kept, and the retention audit window removes older ones in its pass (a refusal
+row is audit record; it is not counted in the prune report).
+
+`admin.activity.list` returns refusal rows, newest first and interleaved with
+request rows by time, when it is called with `include_refusals: true`; every row
+then carries a `kind` (`request` or `refusal`). They answer to the same
+`repo`, `agent` and `capability` filters, to `state: "refused"` and to no other
+state, and count against the same `limit`. Callers that do not ask get request
+rows only. The Activity screen asks, and shows them in their own section above
+the lanes (cause, attempts, who), with every string the client chose rendered
+through the same safe text component as an approval.
+
+**What is still not recorded.**
+
+- A connection that closes, or is reset, before it sends a byte, and a hello
+  that is abandoned halfway: nobody was refused.
+- On Windows, a connection the acceptor drops before the framed layer sees a
+  byte: a peer that is not loopback, a failed or timed-out nonce proof, and a
+  connection over the cap of 32 handshakes pending at once. (On the private
+  plane a failed proof is counted as a boundary observation,
+  `admin_handshake_failed`; on the public plane it is only logged.)
+- A refusal beyond the writer's bound while a flood lasts (counted in
+  `status`, as above), and one the daemon decides while it is already past its
+  final write at shutdown.
+- A refusal after a request row exists. Those have their audit rows.
+- The reply that stands in for a result over the frame limit
+  (`response_budget_exhausted`): its request has a row and a terminal audit row.
 
 ## What verification establishes
 
@@ -532,7 +636,8 @@ At most 32 native connections are served at once (an event subscriber holds one
 for its lifetime), the hello and the request frame together must arrive within
 five seconds, and request deadlines are between one millisecond and five
 minutes. A connection over the cap is told `connection_capacity_exhausted`
-rather than dropped. The request
+rather than dropped, and the refusal is recorded (see [the audit
+contract](#the-audit-contract-request-rows-and-refusal-rows)). The request
 clock starts before ledger insertion; waiting for bookkeeping cannot grant a
 fresh execution deadline. A terminal write that fails is retried, then parked in
 a bounded queue that the maintenance loop retries every second and once more

@@ -108,12 +108,13 @@ impl RunState<'_> {
         if !row.authorization_current {
             return Err(failure());
         }
-        // Stamp the scoped count of revocations a flow run depends on, so an
-        // unrelated revoke does not kill a parked watch.
+        // Stamp the scoped count of revocations this flow's run depends on
+        // (`flow.run` and this flow's step grants), so neither an unrelated
+        // revoke nor another flow's step revocation kills a parked watch.
         let revision = self
             .service
             .store
-            .grant_revocation_revision_for(crate::flow_service::CAP_FLOW_RUN)
+            .grant_revocation_revision_for_flow(&self.flow.id)
             .await
             .map_err(|_| failure())?;
         Ok((pam_compact::sha256_hex(profile.as_bytes()), revision))

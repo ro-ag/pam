@@ -9,7 +9,10 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
 }
 
 #[tokio::test]
@@ -67,8 +70,8 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 16
-        }
+            supported
+        } if supported == migrations::latest_version()
     ));
     let message = err.to_string();
     assert!(message.contains("999"), "unhelpful message: {message}");
@@ -91,7 +94,10 @@ async fn v1_database_upgrades_to_v2() {
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -119,7 +125,10 @@ async fn v3_database_gains_meta_json() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
     assert!(
         evidence_columns(&store)
             .await
@@ -155,7 +164,10 @@ async fn v4_database_upgrades_to_v5() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
 
     let count: i64 = store
         .raw_scalar(
@@ -292,7 +304,10 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     build_v11_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
 
     // Revocations are numbered in order; the two that share a second share
     // the higher number, so a request admitted between them is voided
@@ -422,7 +437,10 @@ async fn v12_database_gains_the_request_origin_columns() {
     build_v12_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
 
     for id in ["old_queued", "old_done", "old_admin"] {
         let row = store.get_request(id).await.unwrap().unwrap();
@@ -494,7 +512,7 @@ async fn v12_database_gains_the_request_origin_columns() {
 /// row. The boundary migration's version (14) is above every version a
 /// binary on the previous engine knows (11 in release 0.4.3, 13 in the last
 /// development build), so such a binary is the "older binary" of this test;
-/// the database it is handed is at the latest version (16).
+/// the database it is handed is at the latest version.
 #[tokio::test]
 async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
     let dir = tempfile::tempdir().unwrap();
@@ -503,6 +521,7 @@ async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
     store.set_setting("kept", "yes").await.unwrap();
     store.close().await.unwrap();
     assert_eq!(migrations::ENGINE_BOUNDARY, 14);
+    let latest = migrations::latest_version();
 
     let mut conn = Connection::open(&path).unwrap();
     for known in [11, 13] {
@@ -511,20 +530,20 @@ async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
         assert!(
             matches!(
                 error,
-                StoreError::VersionTooNew { found: 16, supported } if supported == i64::try_from(known).unwrap()
+                StoreError::VersionTooNew { found, supported } if found == latest && supported == i64::try_from(known).unwrap()
             ),
             "{error:?}"
         );
         assert_eq!(
             error.to_string(),
             format!(
-                "database schema version 16 is newer than this binary supports (max {known}); \
+                "database schema version {latest} is newer than this binary supports (max {known}); \
                  upgrade pam instead of downgrading the database"
             )
         );
     }
     // Refusing changed nothing.
-    assert_eq!(migrations::current_version(&conn).unwrap(), 16);
+    assert_eq!(migrations::current_version(&conn).unwrap(), latest);
     let kept: String = conn
         .query_row("SELECT value FROM setting WHERE key = 'kept'", (), |row| {
             row.get(0)
@@ -592,7 +611,10 @@ async fn v14_database_admits_import_jobs_and_keeps_its_rows() {
     build_v14_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
 
     let jobs = store.list_model_jobs(10).await.unwrap();
     let by_id = |id: &str| jobs.iter().find(|job| job.id == id).expect(id).clone();
@@ -691,7 +713,10 @@ async fn v15_database_gains_the_boundary_tables_and_the_peer_columns() {
     build_v15_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        migrations::latest_version()
+    );
 
     let row = store.get_request("old_public").await.unwrap().unwrap();
     assert_eq!(row.origin.peer_pid, Some(77));

@@ -13,6 +13,11 @@
 //!   rewritten, so removing the policy restores what the human had. A save outside the bounds is
 //!   refused ([`RetentionRefusal::Policy`]) before anything is written, and the clock-jump guard below
 //!   applies to a policy-forced window exactly as to a chosen one.
+//! - **Refusals are audit**: the refusals the daemon decided before a request row existed
+//!   ([`crate::refusal_log`]) leave with the audit window (their latest attempt older than the
+//!   cutoff), in the same pass, after the request records; the table is also bounded by count.
+//!   They are not counted in the [`PruneReport`] or the clock-jump census: the guard protects what
+//!   cannot be rebuilt, and they are a bounded, coalesced trail.
 //! - **Evidence first, audit last**: a pass prunes evidence before records, and never removes a
 //!   request's [`KEEP_KIND`] row while the request is still there (the verdict makes activity
 //!   history readable). The verdict leaves — with its request, audit rows, and approval — only when
@@ -673,9 +678,18 @@ impl RetentionService {
         };
         let records = match settings.audit_days {
             Some(days) => {
-                self.store
-                    .prune_requests_before(cutoff(now_ts, days))
-                    .await?
+                let before = cutoff(now_ts, days);
+                let records = self.store.prune_requests_before(before).await?;
+                // The refusals decided before a request row existed are part
+                // of the audit record and leave with the same window.
+                let refusals = self.store.prune_refusals_before(before).await?;
+                if refusals > 0 {
+                    tracing::info!(
+                        refusals,
+                        "retention pruned refusals older than the audit window"
+                    );
+                }
+                records
             }
             None => RequestPrune::default(),
         };

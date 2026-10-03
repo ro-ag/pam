@@ -8,6 +8,15 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- Refusals decided before a request row exists (capacity, rate, a malformed or
+  oversized frame, a refused hello, an expired deadline at admission, the
+  connection cap, the drain) are recorded in a new `refusal` table (schema 18)
+  and shown in Activity under "Refused before admission": cause, how many
+  attempts, who knocked (the kernel's view of the peer, and what the client
+  claimed). Identical refusals within ten seconds are one row with a count, the
+  write never delays the reply, and `status` reports `refusals.dropped` when a
+  flood outruns the log. `admin.activity.list` takes `include_refusals`. See
+  [the audit contract](docs/admin-boundary.md#the-audit-contract-request-rows-and-refusal-rows).
 - `pam flow run --digest <sha256>` runs a flow only if it still has the digest
   `pam flow inspect` reported; a flow edited in between refuses as
   `flow_changed`. `pam flow inspect` now prints the digest on its first line.
@@ -166,6 +175,25 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- Flow inputs take an optional `type:` (`string`, the default, `int`, `sha`,
+  `ref`, `path` or `enum` with `values:`). A typed value that does not fit is
+  refused with the input name, the type and the rule broken, before it reaches
+  an argument, an environment value or a connector call; the value is never
+  echoed. `ref` follows `git check-ref-format` (and refuses a leading `-`),
+  `path` is relative and normalized, `sha` is 40 or 64 lowercase hex digits and
+  `int` a decimal up to 2^53 - 1. An untyped input behaves as before. The
+  starter flows type their revision, build, run, job, page and branch inputs,
+  so their digests changed.
+- A step's `env:` may no longer set `PATH`, `HOME`, `TMPDIR`/`TMP`/`TEMP`, any
+  `GIT_*` name except `GIT_AUTHOR_*`, `GIT_COMMITTER_*` and `GIT_OPTIONAL_LOCKS`,
+  `LD_*`, `DYLD_*`, `XDG_*`, `CARGO_HOME` and the other `CARGO_*`, `RUSTUP_*` and
+  `RUSTC*` names that move or replace the toolchain, `PAM_ARTIFACTS`, or an
+  interpreter hook such as `NODE_OPTIONS`. A stateful step that is not the first
+  step and names neither `needs` nor `when` is refused at validation: add
+  `needs: [...]` or `when: always`. **A flow in your library that does either
+  needs an edit**: `pam flow inspect` and the GUI list show its refusal, and
+  `pam flow run` refuses it as `flow_invalid` with the same message.
+
 - A proxy locked by policy with `auth: none` (or pinned direct) also locks the
   proxy password; with `basic` or `anyauth` the password stays the human's to
   type in Settings › Network, because a policy file never carries a secret.
@@ -318,6 +346,22 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Security
 
+- A remembered flow step approval is bound to what the step runs: the step's
+  effect digest (computed from the normalized step, so reformatting or comments
+  change nothing), its gate class and the canonical repository it was approved
+  for. A flow file edited by hand or restored from a backup, or the same step
+  run in another repository, asks a human again on every profile, and the
+  approval card and the step's refusal say what changed. Remembering it again
+  re-points that repository's grant. A flow step granted by hand in Settings is
+  bound to the library's step for every repository (or a named one); a step the
+  library does not hold is refused `flow_step_unknown`. `admin.grants.list`
+  shows each binding (flow, step, repository, digest prefix) or `legacy`, and
+  the approval card says Remember keeps the step for this repository and this
+  exact step. Never-grant and manual-grant policy rules still apply first.
+- Revoking one flow's step grant ends only that flow's tickets (the flow id is
+  recorded on the request at admission), not every `flow.run` ticket; a parked
+  watch of another flow keeps its authorization stamp.
+
 - The curl launcher cannot render any option that weakens TLS verification:
   no `insecure`, `proxy-insecure`, `ssl-no-revoke`, `ssl-revoke-best-effort`
   or an outside `capath`, for a target or for a proxy, in production or in
@@ -465,6 +509,14 @@ All notable changes to pam are documented in this file. The format follows
   command's own runtime, and a test starts the compiled binary.
 
 ### Compatibility
+
+- Schema 17 adds the grant binding columns and `request.flow_id`. Flow step
+  grants made before the upgrade are unbound legacy grants: they keep
+  authorizing, and the first run that uses one binds it to the step as it runs
+  then, in that run's repository, with a `grant_bound` audit row, so upgrading
+  never stops a working flow and the binding applies from that first use. A
+  `flow.run` ticket admitted before the upgrade names no flow and is still ended
+  by a step revocation of any flow.
 
 - The first start after upgrading copies the state database, its write-ahead
   log and its `-shm` file (those that exist) into

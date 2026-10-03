@@ -92,12 +92,17 @@ impl Transport {
     /// [`RuntimeDir::public_control`] (Windows), serving from `store`,
     /// `phase`, `image` and the managed policy `managed` (a follow
     /// re-authorizes under its effective scopes). Valid requests arrive on `incoming`; events go
-    /// through `hub`. Must be called inside a tokio runtime and while holding
-    /// the daemon's instance lock: stale socket files are removed.
+    /// through `hub`; a request or connection the listener refuses before the core sees it is
+    /// reported to `refusals` ([`crate::refusal_log`]). Must be called inside a tokio runtime and
+    /// while holding the daemon's instance lock: stale socket files are removed.
     ///
     /// # Errors
     ///
     /// [`TransportError::Listen`] when the endpoint cannot be bound.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the public plane's collaborators; a builder would only rename them"
+    )]
     pub fn bind(
         dirs: &RuntimeDir,
         incoming: mpsc::Sender<IncomingRequest>,
@@ -106,11 +111,12 @@ impl Transport {
         hub: Arc<EventHub>,
         image: Arc<ImageWatch>,
         managed: Arc<crate::managed_policy_service::PolicyHandle>,
+        refusals: crate::refusal_log::RefusalLog,
     ) -> Result<Self, TransportError> {
         remove_superseded(dirs);
         let acceptor = bind_public(dirs)?;
         let policy = PublicPolicy::new(
-            Ingress::new(incoming),
+            Ingress::new(incoming).with_refusals(refusals),
             store,
             phase,
             Arc::clone(&hub),

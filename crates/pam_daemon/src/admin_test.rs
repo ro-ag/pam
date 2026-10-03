@@ -768,6 +768,224 @@ async fn activity_list_refuses_an_unknown_state_filter() {
     .unwrap();
 }
 
+fn refusal_write(
+    cause: &str,
+    ts: i64,
+    agent: Option<&str>,
+    repo: Option<&str>,
+    capability: Option<&str>,
+    count: u64,
+) -> pam_store::RefusalWrite {
+    pam_store::RefusalWrite::Insert(pam_store::RefusalRecord {
+        ts,
+        last_ts: ts + 3,
+        ingress: pam_store::RequestIngress::Public,
+        cause: cause.to_owned(),
+        detail: format!("{cause} detail"),
+        count,
+        peer_uid: Some(501),
+        peer_pid: Some(4242),
+        peer_exe: Some("/usr/local/bin/pam".to_owned()),
+        agent: agent.map(str::to_owned),
+        repo: repo.map(str::to_owned),
+        request_id: Some("req_never_admitted".to_owned()),
+        capability: capability.map(str::to_owned),
+    })
+}
+
+fn wall_clock() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn activity_list_leaves_refusals_out_unless_asked_and_marks_requests() {
+    timeout(DEADLINE, async {
+        let (store, admin, _events) = service().await;
+        store
+            .insert_request("req_k1", "echo", "/repo/a", "claude", "{}", None)
+            .await
+            .unwrap();
+        store
+            .write_refusals(vec![refusal_write(
+                "request_capacity_exhausted",
+                wall_clock(),
+                Some("claude"),
+                Some("/repo/a"),
+                Some("echo"),
+                3,
+            )])
+            .await
+            .unwrap();
+
+        let body = expect_result(
+            admin
+                .handle(&admin_envelope(
+                    "req_k2",
+                    OP_ACTIVITY_LIST,
+                    // The list op's own request row is a probe; hide it.
+                    serde_json::json!({ "hide_probes": true }),
+                ))
+                .await,
+            Outcome::Verified,
+        );
+        let requests = body["requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 1, "{body}");
+        assert_eq!(requests[0]["kind"], "request");
+        assert_eq!(requests[0]["id"], "req_k1");
+    })
+    .await
+    .unwrap();
+}
+
+/// Distinct ids for the list op's own request rows.
+static ACTIVITY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `admin.activity.list` with `args`, the list op's own request row hidden as
+/// the probe it is (which is also what proves a refusal is never taken for one).
+async fn activity(admin: &AdminService, mut args: serde_json::Value) -> Vec<serde_json::Value> {
+    args["hide_probes"] = serde_json::json!(true);
+    let id = format!(
+        "req_il_{}",
+        ACTIVITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let body = expect_result(
+        admin
+            .handle(&admin_envelope(&id, OP_ACTIVITY_LIST, args))
+            .await,
+        Outcome::Verified,
+    );
+    body["requests"].as_array().unwrap().clone()
+}
+
+/// `kind:cause` for a refusal, `kind:id` for a request.
+fn kinds_of(rows: &[serde_json::Value]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "{}:{}",
+                row["kind"].as_str().unwrap(),
+                row["cause"].as_str().or(row["id"].as_str()).unwrap()
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn activity_list_interleaves_refusals_with_requests_by_time() {
+    timeout(DEADLINE, async {
+        let (store, admin, _events) = service().await;
+        let now = wall_clock();
+        store
+            .insert_request("req_i1", "echo", "/repo/a", "claude", "{}", None)
+            .await
+            .unwrap();
+        store
+            .write_refusals(vec![
+                refusal_write("bad_frame", now - 100, None, None, None, 1),
+                refusal_write(
+                    "request_rate_exhausted",
+                    now + 100,
+                    Some("claude"),
+                    Some("/repo/a"),
+                    Some("status"),
+                    1_000,
+                ),
+            ])
+            .await
+            .unwrap();
+
+        let list = |args: serde_json::Value| activity(&admin, args);
+        let kinds = |rows: &[serde_json::Value]| kinds_of(rows);
+
+        // Newest first across both kinds.
+        let all = list(serde_json::json!({ "include_refusals": true })).await;
+        assert_eq!(
+            kinds(&all),
+            [
+                "refusal:request_rate_exhausted",
+                "request:req_i1",
+                "refusal:bad_frame"
+            ]
+        );
+        let newest = &all[0];
+        assert_eq!(newest["count"], 1_000);
+        assert_eq!(newest["capability"], "status");
+        assert_eq!(newest["agent"], "claude");
+        assert_eq!(newest["repo"], "/repo/a");
+        assert_eq!(newest["ingress"], "public");
+        assert_eq!(newest["peer_uid"], 501);
+        assert_eq!(newest["peer_pid"], 4242);
+        assert_eq!(newest["peer_exe"], "/usr/local/bin/pam");
+        assert_eq!(newest["request_id"], "req_never_admitted");
+        assert_eq!(newest["created_ts"], now + 100);
+        assert_eq!(newest["updated_ts"], now + 103);
+        assert!(newest["id"].as_str().unwrap().starts_with("refusal_"));
+        // A refusal that claimed nothing says so with nulls.
+        assert!(all[2]["agent"].is_null() && all[2]["repo"].is_null());
+
+        // The limit applies to the merged list.
+        let top = list(serde_json::json!({ "include_refusals": true, "limit": 2 })).await;
+        assert_eq!(
+            kinds(&top),
+            ["refusal:request_rate_exhausted", "request:req_i1"]
+        );
+
+        // The existing filters narrow both kinds; a refusal that never
+        // claimed an agent or a repository matches no filter on it.
+        let claude = list(serde_json::json!({ "include_refusals": true, "agent": "claude" })).await;
+        assert_eq!(
+            kinds(&claude),
+            ["refusal:request_rate_exhausted", "request:req_i1"]
+        );
+        let status =
+            list(serde_json::json!({ "include_refusals": true, "capability": "status" })).await;
+        assert_eq!(kinds(&status), ["refusal:request_rate_exhausted"]);
+        let repo = list(serde_json::json!({ "include_refusals": true, "repo": "/repo/a" })).await;
+        assert_eq!(repo.len(), 2);
+
+        // A refusal is a refused request that never got a row: the
+        // `refused` lens shows it, no other state does.
+        let refused =
+            list(serde_json::json!({ "include_refusals": true, "state": "refused" })).await;
+        assert_eq!(
+            kinds(&refused),
+            ["refusal:request_rate_exhausted", "refusal:bad_frame"]
+        );
+        for state in ["queued", "done", "failed", "running"] {
+            let rows = list(serde_json::json!({ "include_refusals": true, "state": state })).await;
+            assert!(
+                rows.iter().all(|row| row["kind"] == "request"),
+                "{state}: {rows:?}"
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn activity_list_refuses_a_non_bool_include_refusals() {
+    timeout(DEADLINE, async {
+        let (_store, admin, _events) = service().await;
+        let response = admin
+            .handle(&admin_envelope(
+                "req_l5",
+                OP_ACTIVITY_LIST,
+                serde_json::json!({ "include_refusals": "yes" }),
+            ))
+            .await;
+        expect_refusal(response, CAUSE_INVALID_ADMIN_ARGS);
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn callers_list_returns_the_observed_registry() {
     timeout(DEADLINE, async {
@@ -1719,12 +1937,13 @@ async fn grants_add_refuses_never_rules_and_manual_deny_but_revoke_stays_open() 
         )
         .await;
 
-        // A capability no rule matches is granted as before.
+        // A capability no rule matches is granted as before (a flow step's
+        // grant needs a step to bind to: the builtin's).
         expect_result(
             fx.op(
                 "req_ga2",
                 OP_GRANTS_ADD,
-                serde_json::json!({ "capability": "flow.step:ship/push" }),
+                serde_json::json!({ "capability": "flow.step:guarded-land/push" }),
             )
             .await,
             Outcome::Changed,
@@ -1754,7 +1973,7 @@ async fn grants_add_refuses_never_rules_and_manual_deny_but_revoke_stays_open() 
             fx.op(
                 "req_ga4",
                 OP_GRANTS_REVOKE,
-                serde_json::json!({ "capability": "flow.step:ship/push" }),
+                serde_json::json!({ "capability": "flow.step:guarded-land/push" }),
             )
             .await,
             Outcome::Changed,
@@ -1773,6 +1992,114 @@ async fn grants_add_refuses_never_rules_and_manual_deny_but_revoke_stays_open() 
             )
             .await,
             crate::managed_policy::CAUSE_POLICY_FROZEN,
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A flow step granted by hand is bound to the step as the library defines
+/// it (every repository unless one is named), the list shows the binding, a
+/// legacy row reads as legacy, and a step the library does not hold is
+/// refused: there is nothing to bind to.
+#[tokio::test]
+async fn grants_add_binds_a_flow_step_to_its_definition_and_the_list_shows_it() {
+    timeout(DEADLINE, async {
+        let fx = managed(None, Profile::Standard).await;
+        let detail = expect_refusal(
+            fx.op(
+                "req_unknown",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "flow.step:no-such-flow/push" }),
+            )
+            .await,
+            crate::admin::CAUSE_FLOW_STEP_UNKNOWN,
+        );
+        assert!(detail.contains("no-such-flow"), "{detail}");
+        assert!(
+            !fx.store
+                .active_grant("flow.step:no-such-flow/push")
+                .await
+                .unwrap()
+        );
+        expect_refusal(
+            fx.op(
+                "req_relative",
+                OP_GRANTS_ADD,
+                serde_json::json!({
+                    "capability": "flow.step:guarded-land/push",
+                    "repository": "relative/dir",
+                }),
+            )
+            .await,
+            CAUSE_INVALID_ADMIN_ARGS,
+        );
+
+        let body = expect_result(
+            fx.op(
+                "req_bound",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "flow.step:guarded-land/push" }),
+            )
+            .await,
+            Outcome::Changed,
+        );
+        assert_eq!(body["binding"]["flow"], "guarded-land");
+        assert_eq!(body["binding"]["step"], "push");
+        assert_eq!(body["binding"]["repository"], serde_json::Value::Null);
+        assert_eq!(body["binding"]["effect_class"], "destructive");
+        let rows = fx
+            .store
+            .active_grants("flow.step:guarded-land/push")
+            .await
+            .unwrap();
+        let flow = pam_flow::parse(pam_flow::builtin_yaml("guarded-land").unwrap()).unwrap();
+        let step = flow.steps.iter().find(|step| step.id == "push").unwrap();
+        assert_eq!(
+            rows[0].binding,
+            Some(crate::flow_service::step_binding(&flow, step, None))
+        );
+        // The same definition again is a duplicate.
+        expect_refusal(
+            fx.op(
+                "req_again",
+                OP_GRANTS_ADD,
+                serde_json::json!({ "capability": "flow.step:guarded-land/push" }),
+            )
+            .await,
+            CAUSE_ALREADY_GRANTED,
+        );
+
+        fx.store
+            .insert_grant("flow.step:guarded-land/merge")
+            .await
+            .unwrap();
+        let list = expect_result(
+            fx.op("req_list", OP_GRANTS_LIST, serde_json::json!({}))
+                .await,
+            Outcome::Verified,
+        );
+        let row = |capability: &str| {
+            list["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["capability"] == capability)
+                .cloned()
+                .unwrap()
+        };
+        let bound = row("flow.step:guarded-land/push");
+        assert_eq!(bound["binding"]["state"], "bound");
+        assert_eq!(bound["binding"]["step"], "push");
+        assert_eq!(
+            bound["binding"]["effect_digest"].as_str().unwrap().len(),
+            12,
+            "a digest prefix, not the whole digest"
+        );
+        assert_eq!(bound["scope"], "global");
+        assert_eq!(
+            row("flow.step:guarded-land/merge")["binding"]["state"],
+            "legacy"
         );
     })
     .await

@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use pam_store::{Actor, AuditEntry, Decision, RequestState, Store, StoreError};
+use pam_store::{
+    Actor, AuditEntry, Decision, RefusalRecord, RefusalWrite, RequestIngress, RequestState, Store,
+    StoreError,
+};
 
 use crate::retention::{
     CAUSE_CLOCK_JUMP, CensusSource, GuardPolicy, KEEP_KIND, MAX_DAYS, PassCensus, PassOutcome,
@@ -1137,4 +1140,67 @@ async fn the_clock_jump_guard_still_holds_back_a_policy_forced_window() {
         store.get_request("old").await.unwrap().is_some(),
         "nothing was deleted"
     );
+}
+
+fn refusal_at(cause: &str, ts: i64) -> RefusalWrite {
+    RefusalWrite::Insert(RefusalRecord {
+        ts,
+        last_ts: ts,
+        ingress: RequestIngress::Public,
+        cause: cause.to_owned(),
+        detail: String::new(),
+        count: 1,
+        peer_uid: None,
+        peer_pid: None,
+        peer_exe: None,
+        agent: None,
+        repo: None,
+        request_id: None,
+        capability: None,
+    })
+}
+
+/// The refusals decided before a request row existed are audit record: the
+/// audit window removes them (by their latest attempt), the evidence window
+/// and no window leave them alone.
+#[tokio::test]
+async fn refusals_leave_with_the_audit_window_and_only_with_it() {
+    let (store, service) = service().await;
+    let now = crate::retention::now_ts();
+    store
+        .write_refusals(vec![
+            refusal_at("old", now - 60 * DAY),
+            refusal_at("fresh", now - DAY),
+        ])
+        .await
+        .unwrap();
+
+    service.prune(now).await.unwrap();
+    assert_eq!(store.refusal_rows().await.unwrap(), 2, "no window");
+
+    service
+        .set_settings(RetentionPatch {
+            evidence_days: Some(Some(7)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    service.prune(now).await.unwrap();
+    assert_eq!(
+        store.refusal_rows().await.unwrap(),
+        2,
+        "evidence window only"
+    );
+
+    service
+        .set_settings(RetentionPatch {
+            audit_days: Some(Some(30)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    service.prune(now).await.unwrap();
+    let kept = store.list_refusals(10, None, None, None).await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].cause, "fresh");
 }

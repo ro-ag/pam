@@ -1321,6 +1321,32 @@ describe("managed policy in Settings", () => {
       expect(screen.getByRole("button", { name: "Revoke" })).toBeInTheDocument();
     });
 
+    it("shows what a flow step grant is bound to, and a legacy one as unbound", async () => {
+      mocks.grantsList.mockResolvedValue({
+        grants: [
+          grant({
+            id: 1,
+            capability: "flow.step:bound/change",
+            scope: "repository",
+            binding: {
+              state: "bound",
+              flow: "bound",
+              step: "change",
+              repository: "/Users/dev/pam",
+              effect_digest: "0123456789ab",
+              effect_class: "destructive",
+              bound_ts: nowSec - 30,
+            },
+          }),
+          grant({ id: 2, capability: "flow.step:bound/push", binding: { state: "legacy" } }),
+        ],
+      });
+      renderSettings("security");
+      expect(await screen.findByText("/Users/dev/pam")).toBeInTheDocument();
+      expect(screen.getByText("0123456789ab")).toBeInTheDocument();
+      expect(screen.getByText(/binds to the step on its next run/)).toBeInTheDocument();
+    });
+
     it("lists what the policy never allows", async () => {
       mocks.grantsList.mockResolvedValue({
         grants: [],

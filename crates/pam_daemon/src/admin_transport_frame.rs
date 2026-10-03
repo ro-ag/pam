@@ -37,6 +37,7 @@ use pam_proto::wire::{
     Via, WIRE_PROTOCOL, cause, salvage_envelope_id,
 };
 use pam_proto::{Envelope, Response};
+use pam_store::RequestIngress;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
@@ -47,6 +48,7 @@ use crate::framed::{self, DialError, HandshakeError, Limits, Policy, WRITE_TIMEO
 use crate::image::ImageWatch;
 use crate::ingress::PeerIdentity;
 use crate::lifecycle::LifecyclePhase;
+use crate::refusal_log::{self, CAUSE_BAD_REQUEST, Refusal};
 
 /// Largest request frame the plane reads.
 pub(super) const MAX_REQUEST_BYTES: usize = MAX_FRAME_BYTES;
@@ -122,15 +124,87 @@ impl AdminPolicy {
         })
     }
 
+    /// Records a refusal on this plane before any request row exists
+    /// ([`crate::refusal_log`]).
+    fn refuse(&self, peer: &PeerIdentity, cause: &str, detail: &str) {
+        self.admin
+            .refusals()
+            .record(&Refusal::new(RequestIngress::Admin, cause, detail).peer(*peer));
+    }
+
+    /// [`Self::refuse`] for a handshake that was refused, not abandoned.
+    fn refuse_handshake(&self, peer: &PeerIdentity, error: &HandshakeError) {
+        if let Some((cause, detail)) = refusal_log::of_handshake(error) {
+            self.refuse(peer, cause, &detail);
+        }
+    }
+
+    /// Answers the one frame a connection sent behind its hello: a request,
+    /// the all-events stream, or a refusal of whatever else it was.
+    async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+        body: &[u8],
+        peer: &PeerIdentity,
+        stop: watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        match Frame::decode(body) {
+            Ok(Frame::Request { envelope }) => self.request(stream, &envelope, peer).await,
+            Ok(Frame::Events) => {
+                events_stream::serve(stream, &self.hub, self.lifecycle.phase.subscribe(), stop)
+                    .await;
+                Ok(())
+            }
+            // An envelope that does not parse concerns a request: it is
+            // answered as one, naming the id when there is one to salvage.
+            Err(FrameError::Invalid { t, detail }) if t == "request" => {
+                let id = salvage_envelope_id(body).unwrap_or_else(|| "unknown".to_owned());
+                let refusal = crate::transport::bad_request(id.clone(), &detail);
+                self.refuse(peer, CAUSE_BAD_REQUEST, &detail);
+                write_reply(stream, &id, &refusal).await
+            }
+            Ok(other) => {
+                let detail = format!(
+                    "the administration plane serves request and events, got {}",
+                    other.type_name()
+                );
+                self.refuse(peer, cause::BAD_FRAME, &detail);
+                refuse_bad_frame(stream, &detail).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.refuse(peer, cause::BAD_FRAME, &error.to_string());
+                refuse_bad_frame(stream, &error.to_string()).await;
+                Ok(())
+            }
+        }
+    }
+
     /// Runs one parsed `request` and writes its `reply`.
     async fn request<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: &mut S,
         envelope: &Envelope,
+        peer: &PeerIdentity,
     ) -> io::Result<()> {
         let response = if let Err(error) = validate_envelope(envelope) {
-            crate::transport::bad_request(envelope.id.clone(), &error.to_string())
+            let detail = error.to_string();
+            self.admin.refusals().record(
+                &Refusal::new(RequestIngress::Admin, CAUSE_BAD_REQUEST, &detail)
+                    .peer(*peer)
+                    .claimed(envelope),
+            );
+            crate::transport::bad_request(envelope.id.clone(), &detail)
         } else if !crate::transport::envelope_within_limits(envelope) {
+            self.admin.refusals().record(
+                &Refusal::new(
+                    RequestIngress::Admin,
+                    CAUSE_BAD_REQUEST,
+                    "an envelope field exceeds its length limit",
+                )
+                .peer(*peer)
+                .claimed(envelope),
+            );
             crate::transport::bad_request(
                 envelope.id.chars().take(128).collect(),
                 "an envelope field exceeds its length limit",
@@ -154,6 +228,14 @@ where
         Limits::ADMIN
     }
 
+    fn connection_refused(&self, peer: PeerIdentity) {
+        self.refuse(
+            &peer,
+            cause::CONNECTION_CAPACITY_EXHAUSTED,
+            "the administration listener was serving its maximum number of connections",
+        );
+    }
+
     async fn serve(
         self: Arc<Self>,
         mut stream: S,
@@ -161,6 +243,11 @@ where
         stop: watch::Receiver<bool>,
     ) {
         if !self.admission.admits(&peer) {
+            self.refuse(
+                &peer,
+                "peer_not_admitted",
+                "the peer is not the user the private admin endpoint belongs to",
+            );
             // Who knocked is worth a line: a wrong uid on the owner-only
             // endpoint is either a misconfiguration or someone probing it.
             // Nothing is written to, or read from, such a peer.
@@ -178,10 +265,16 @@ where
             match framed::read_hello_within(&mut stream, deadline, limits.request_bytes).await {
                 Ok(hello) => hello,
                 Err(HandshakeError::Untyped(body)) => {
+                    self.refuse(
+                        &peer,
+                        CAUSE_CLIENT_OUTDATED,
+                        "a pre-migration window sent an untyped first frame",
+                    );
                     answer_outdated_client(&mut stream, &body).await;
                     return;
                 }
                 Err(error) => {
+                    self.refuse_handshake(&peer, &error);
                     tracing::debug!(%error, "private admin connection ended at the hello");
                     return;
                 }
@@ -205,6 +298,7 @@ where
                 peer_pid = peer.pid(),
                 "refused a hello on the private admin plane"
             );
+            self.refuse(&peer, &refusal.cause, &refusal.detail);
             return;
         }
         let ack = HelloAck {
@@ -217,45 +311,12 @@ where
             match framed::accept_hello(&mut stream, ack, limits.request_bytes, deadline).await {
                 Ok(body) => body,
                 Err(error) => {
+                    self.refuse_handshake(&peer, &error);
                     tracing::debug!(%error, "private admin connection ended before its request");
                     return;
                 }
             };
-        let served = match Frame::decode(&body) {
-            Ok(Frame::Request { envelope }) => self.request(&mut stream, &envelope).await,
-            Ok(Frame::Events) => {
-                events_stream::serve(
-                    &mut stream,
-                    &self.hub,
-                    self.lifecycle.phase.subscribe(),
-                    stop,
-                )
-                .await;
-                Ok(())
-            }
-            // An envelope that does not parse concerns a request: it is
-            // answered as one, naming the id when there is one to salvage.
-            Err(FrameError::Invalid { t, detail }) if t == "request" => {
-                let id = salvage_envelope_id(&body).unwrap_or_else(|| "unknown".to_owned());
-                let refusal = crate::transport::bad_request(id.clone(), &detail);
-                write_reply(&mut stream, &id, &refusal).await
-            }
-            Ok(other) => {
-                refuse_bad_frame(
-                    &mut stream,
-                    &format!(
-                        "the administration plane serves request and events, got {}",
-                        other.type_name()
-                    ),
-                )
-                .await;
-                Ok(())
-            }
-            Err(error) => {
-                refuse_bad_frame(&mut stream, &error.to_string()).await;
-                Ok(())
-            }
-        };
+        let served = self.dispatch(&mut stream, &body, &peer, stop).await;
         if let Err(error) = served {
             tracing::debug!(kind = ?error.kind(), "private admin connection ended");
         }

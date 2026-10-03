@@ -64,6 +64,12 @@ pub use store::{
     SETTING_ADMIN_CONTACTS_EXPECTED_TOTAL, SETTING_ADMIN_CONTACTS_TOTAL,
     SETTING_PUBLIC_UNKNOWN_TOTAL,
 };
+pub use store::{FLOW_STEP_PREFIX, GrantBinding, SCOPE_REPOSITORY};
+pub use store::{
+    MAX_AGENT_BYTES, MAX_CAPABILITY_BYTES, MAX_CAUSE_BYTES, MAX_DETAIL_BYTES, MAX_PEER_EXE_BYTES,
+    MAX_REFUSAL_LIST_LIMIT, MAX_REFUSALS, MAX_REPO_BYTES, MAX_REQUEST_ID_BYTES, RefusalRecord,
+    RefusalRow, RefusalWrite, bounded,
+};
 
 #[cfg(test)]
 mod backup_test;
@@ -94,6 +100,9 @@ mod upgrade_test;
 mod flow_results_test;
 
 #[cfg(test)]
+mod grant_binding_test;
+
+#[cfg(test)]
 mod correlation_test;
 
 #[cfg(test)]
@@ -118,3 +127,6 @@ mod landing_session_test;
 
 #[cfg(test)]
 mod boundary_test;
+
+#[cfg(test)]
+mod refusal_test;

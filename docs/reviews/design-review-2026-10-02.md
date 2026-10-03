@@ -48,7 +48,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 11 | Medium | The `echo` test hook is a production lane-hog primitive reachable by any caller | `executor.rs:368-378` | fixed: delay over 60 s or arguments over 64 KiB refused (`echo_limit_exceeded`) |
 | 12 | Medium | The admin listener dies silently on a transient accept error and shares the public admission pools; a local process can hold the Windows pending-handshake slots | `admin_transport_unix.rs:186`, `admin_transport_windows.rs:214` | partly fixed: accept errors retried with backoff and admin-submitted requests have their own pool (Unix tested; the Windows file was edited without a Windows compile); the pending-handshake exhaustion is deferred to the new listener |
 | 13 | Medium-low | Two sources of truth for the policy profile; `admin.profile.set` applied at the next start | `policy.rs:173-195`, `admin.rs:395-421` | fixed: the gate holds the live profile and `admin.profile.set` swaps it (`"applies": "now"`) |
-| 14 | Low-medium | Audit gaps for refusals; every `status` poll writes a request row, an audit row and a caller row | `daemon.rs:911-1010`, `admin.rs:285-306` | partly fixed: `status` is ledger-free; pre-admission refusals still leave no row (needs an owner decision, store and evidence finding 8) |
+| 14 | Low-medium | Audit gaps for refusals; every `status` poll writes a request row, an audit row and a caller row | `daemon.rs:911-1010`, `admin.rs:285-306` | fixed: `status` is ledger-free, and refusals decided before admission are recorded in their own table and listed in Activity (see [the audit contract](../admin-boundary.md#the-audit-contract-request-rows-and-refusal-rows)) |
 | 15 | Low (plausible) | Approval resolve can report success for an approval recorded as timed out | `approval.rs:159-211` | fixed: `resolve` waits for the waiter's acknowledgement, sent after the resolution is durable |
 
 ## Flows and landing
@@ -87,7 +87,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 5 | Medium | The grant revocation revision is a global count; any revoke orphans every older ticket's results and evidence | `store.rs:704-757`, `evidence_service.rs:175-182` | partly fixed: scoped to the grants a request depends on; any flow's step revocation still voids every `flow.run` ticket (needs an owner decision: a column written at admission) |
 | 6 | Medium | `update_request_state` can resurrect a terminal request | `store.rs:1055-1062` | fixed: returns `AlreadyTerminal` and writes nothing |
 | 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched; chunked view storage, a read connection (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)) and a delayed first prune are deferred |
-| 8 | Medium | "One audit row per operation, refusals included" is not structural: pre-admission refusals leave no row | `migrations.rs:153`, `daemon.rs:792-963` | needs owner decision |
+| 8 | Medium | "One audit row per operation, refusals included" is not structural: pre-admission refusals leave no row | `migrations.rs:153`, `daemon.rs:792-963` | fixed: the `refusal` table (schema 18) holds them, coalesced and bounded, and `admin.activity.list` interleaves them; what is still unrecorded is listed in the audit contract |
 | 9 | Medium | Immutability of audit and evidence is by convention only | `migrations.rs`, `store.rs:1265-1289` | partly fixed: triggers make `audit` append-only and `evidence_view` immutable except retention's tombstone; a unique terminal audit row, re-hashing served bytes and a view-to-evidence key are deferred |
 | 10 | Medium | Retention is irreversible, runs on an unvalidated wall clock, and its settings flow is non-atomic | `retention.rs:200-216`, `store.rs:2075-2089` | partly fixed: an out-of-range stored window reads as forever, both windows save in one transaction; a forward clock jump still prunes early (needs an owner decision) |
 | 11 | Medium | A beta engine under the audit and authorization spine: no integrity check, no backup, no fallback, engine types leak | `migrations.rs`, `store.rs:592`, `lib.rs` | partly fixed: boot `quick_check` (files up to 256 MiB), on-demand check, corruption mapped to a legible error; backup, export and an alternate backend need an owner decision (decided 2026-10-02: SQLite, [spec](../specs/2026-10-02-sqlite-store.md); backup in its T2) |
@@ -199,10 +199,14 @@ From the fix reports:
 - Bind a grant to a flow digest, step and effect class, so a flow file edited
   outside the admin surface cannot keep its approvals, and decide whether a grant
   should be bound to a repository or to input values (a store migration).
+  **Done 2026-10-03 (ptrack task 222, schema 17)**: a flow step's grant is bound
+  to the step's effect digest (from the normalized step), its gate class and the
+  canonical repository, not to input values; a mismatch asks again and says what
+  changed; legacy grants bind on first use. See
+  [the administration boundary](../admin-boundary.md#confirmation-in-the-gui-bridge).
 - Narrow a flow step revocation to the flow's own tickets, which needs the flow id
-  recorded on the request row at admission.
-- Record refusals that happen before admission (a new table, daemon call sites and
-  a GUI surface).
+  recorded on the request row at admission. **Done 2026-10-03 (task 222)**:
+  `request.flow_id`; rows admitted before it still fail closed.
 - Pin the credentialed git broker to a root-owned Git, which would refuse a
   Homebrew Git, against an explicit GUI-set path.
 - Replace the fixed 20 x 5 s landing poll budget with backoff to the request

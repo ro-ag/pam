@@ -45,7 +45,10 @@ async fn open_creates_parent_dir_schema_and_wal() {
 
     let store = Store::open(&path).await.unwrap();
     assert!(path.exists());
-    assert_eq!(store.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        store.schema_version().await.unwrap(),
+        crate::migrations::latest_version()
+    );
 
     // A file-backed store runs in write-ahead logging mode.
     let mode: String = store.raw_scalar("PRAGMA journal_mode", ()).await.unwrap();

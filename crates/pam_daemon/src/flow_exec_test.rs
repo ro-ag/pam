@@ -139,7 +139,7 @@ fn outcome_is_verified_when_a_verify_step_succeeded() {
 fn outcome_is_changed_when_a_stateful_step_succeeded() {
     let flow = flow_with(
         "  - id: prove\n    run: [git, status]\n    role: verify\n\
-         \x20 - id: push\n    run: [git, push]\n    effect: stateful\n",
+         \x20 - id: push\n    run: [git, push]\n    effect: stateful\n    needs: [prove]\n",
     );
     assert_eq!(
         outcome_for(
@@ -175,7 +175,7 @@ fn outcome_is_unresolved_when_a_step_failed() {
 fn a_blocked_step_outranks_a_failed_one() {
     let flow = flow_with(
         "  - id: test\n    run: [cargo, test]\n\
-         \x20 - id: push\n    run: [git, push]\n    effect: stateful\n",
+         \x20 - id: push\n    run: [git, push]\n    effect: stateful\n    needs: [test]\n",
     );
     assert_eq!(
         outcome_for(
@@ -203,7 +203,7 @@ fn a_blocked_step_outranks_a_failed_one() {
 fn a_skipped_stateful_step_does_not_make_the_run_changed() {
     let flow = flow_with(
         "  - id: prove\n    run: [git, status]\n    role: verify\n\
-         \x20 - id: push\n    run: [git, push]\n    effect: stateful\n",
+         \x20 - id: push\n    run: [git, push]\n    effect: stateful\n    needs: [prove]\n",
     );
     assert_eq!(
         outcome_for(
@@ -506,11 +506,11 @@ fn effects_list_every_state_change_that_ran_whatever_the_outcome() {
     use crate::flow_exec::{EFFECT_APPLIED, EFFECT_POSSIBLY_APPLIED, effects_for, effects_note};
     let flow = flow_with(
         "  - id: look\n    run: [git, status]\n\
-         \x20 - id: applied\n    run: [git, status]\n    effect: stateful\n\
+         \x20 - id: applied\n    run: [git, status]\n    effect: stateful\n    needs: [look]\n\
          \x20 - id: half\n    run: [git, status]\n    effect: stateful\n    when: always\n\
          \x20 - id: unspawned\n    run: [git, status]\n    effect: stateful\n    when: always\n\
          \x20 - id: unresolved-argument\n    run: [git, status]\n    effect: stateful\n    when: always\n\
-         \x20 - id: skipped\n    run: [git, status]\n    effect: stateful\n\
+         \x20 - id: skipped\n    run: [git, status]\n    effect: stateful\n    needs: [look]\n\
          \x20 - id: denied\n    run: [git, status]\n    effect: stateful\n    when: always\n",
     );
     let ran = |id: &str, status: StepStatus, cause: Option<&str>, attempts: u8| {

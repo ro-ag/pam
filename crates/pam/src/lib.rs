@@ -217,13 +217,14 @@ fn plain_document(bytes: &[u8]) -> Option<Value> {
 
 /// The production trust check on the file where it sits ([`PolicyTrust`]).
 fn policy_trust(path: &Path) -> PolicyTrust {
-    let checked_path = trust_check_path(path);
+    let fixed_path = managed_policy_trust::policy_path();
+    let checked_path = trust_check_path(path, &fixed_path);
     let outcome =
         managed_policy_trust::verify_and_read(&checked_path, &TrustRules::production()).map(drop);
     PolicyTrust {
         observed: observed_owner_and_mode(&checked_path),
         checked_path,
-        fixed_path: managed_policy_trust::policy_path(),
+        fixed_path,
         outcome,
     }
 }
@@ -231,9 +232,14 @@ fn policy_trust(path: &Path) -> PolicyTrust {
 /// The path the trust check judges: absolute, the parent directory
 /// resolved (without a verbatim `\\?\` prefix on Windows), the file name
 /// kept as named. A parent that cannot be resolved leaves the absolute path
-/// as is, and the check then says why.
-fn trust_check_path(path: &Path) -> PathBuf {
+/// as is, and the check then says why. The fixed policy path is never
+/// resolved: a link anywhere in it is what the daemon refuses, so a
+/// compliance check of the installed file must see it too.
+fn trust_check_path(path: &Path, fixed: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if same_path(&absolute, fixed) {
+        return absolute;
+    }
     let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
         return absolute;
     };
@@ -244,6 +250,20 @@ fn trust_check_path(path: &Path) -> PathBuf {
         managed_policy::without_verbatim_prefix(&parent.to_string_lossy()).into_owned(),
     );
     parent.join(name)
+}
+
+/// The same path as spelled, without a verbatim prefix; Windows names are
+/// compared without regard to case.
+fn same_path(left: &Path, right: &Path) -> bool {
+    let key = |path: &Path| {
+        let text = managed_policy::without_verbatim_prefix(&path.to_string_lossy()).into_owned();
+        if cfg!(windows) {
+            text.to_ascii_lowercase()
+        } else {
+            text
+        }
+    };
+    key(left) == key(right)
 }
 
 /// The owner uid and permission bits `lstat` reports for `path`.

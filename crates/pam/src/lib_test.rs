@@ -57,7 +57,6 @@ mod policy_file {
     use std::path::Path;
 
     use pam_daemon::managed_policy::{MAX_POLICY_BYTES, TargetPlatform, Verdict};
-    use pam_daemon::managed_policy_trust::UntrustedReason;
 
     use crate::{PolicyBytes, PolicyContent, check_policy_file, read_policy_bytes};
 
@@ -127,6 +126,33 @@ mod policy_file {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
+    /// The fixed path is judged as named, so a link in it reaches the daemon's
+    /// own check; any other path has its parent resolved.
+    #[test]
+    fn only_the_fixed_path_is_judged_unresolved() {
+        use std::path::Component;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("PAM")).unwrap();
+        let named = dir
+            .path()
+            .join("PAM")
+            .join("..")
+            .join("PAM")
+            .join("policy.json");
+        let absolute = std::path::absolute(&named).unwrap();
+        assert_eq!(crate::trust_check_path(&named, &absolute), absolute);
+        let other = dir.path().join("other.json");
+        let resolved = crate::trust_check_path(&named, &other);
+        assert!(
+            resolved
+                .components()
+                .all(|part| part != Component::ParentDir),
+            "{}",
+            resolved.display()
+        );
+    }
+
     #[test]
     fn a_byte_order_mark_is_read_as_the_daemon_reads_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -172,6 +198,8 @@ mod policy_file {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_policy_is_judged_as_a_symlink() {
+        use pam_daemon::managed_policy_trust::UntrustedReason;
+
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real.json");
         std::fs::write(&target, br#"{"version":1}"#).unwrap();

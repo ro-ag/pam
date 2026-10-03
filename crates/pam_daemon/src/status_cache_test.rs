@@ -190,6 +190,22 @@ async fn a_stale_snapshot_with_a_running_refresher_is_answered_without_waiting()
     assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
 }
 
+/// The `containment` block rides in every `status`, before any refresh: it is
+/// the process-wide availability report, no snapshot part.
+#[tokio::test]
+async fn the_containment_block_reports_this_machines_availability() {
+    let fx = fixture().await;
+    let body = fx.cache.body(&fx.store, Instant::now()).await;
+    assert_eq!(
+        body["containment"],
+        crate::command_containment::availability().status_block()
+    );
+    assert_eq!(
+        body["containment"]["available"],
+        cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/sandbox-exec").is_file()
+    );
+}
+
 /// The `boundary` block rides in every `status`: the never-checked shape
 /// with no observer attached, the observer's census once one is.
 #[tokio::test]

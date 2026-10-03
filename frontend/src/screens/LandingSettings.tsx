@@ -17,6 +17,7 @@ import {
   type LandingRepository,
   type LandingRequiredCheck,
 } from "../lib/landing";
+import { ContainmentNotice } from "./ContainmentNotice";
 
 const key = ["landing-policy"];
 const field = fieldClasses;
@@ -468,6 +469,7 @@ export function LandingSettings() {
   return (
     <section aria-label="landing policy" className="space-y-3 border-t border-line pt-4">
       <h3 className="text-sm font-medium text-ink">Landing policy</h3>
+      <ContainmentNotice subject="landing" />
       <p className="text-sm text-ink-muted">
         Approve exact landing recipes here. New entries permit no mutations until you select
         permissions and save. Existing connector access is still required.

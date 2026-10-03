@@ -41,6 +41,9 @@
 //! revision, short digest, load time and rejected-leaf count, never a value or a reason. It is
 //! held in memory and swapped by the policy's own reloads, so the poll reads no file and no row.
 //!
+//! The `containment` block is [`crate::command_containment::availability`]: whether this machine can
+//! contain command workloads (flow command steps, guarded landing), checked once per process.
+//!
 //! The `refusals` block is the attached [`crate::refusal_log::RefusalLog`]'s counters: `recorded` (refusals
 //! decided before any request row existed and accepted for recording), `dropped` (not recorded, because a
 //! flood outran the log's bound; the caller was still answered) and `pending` (not yet written to the
@@ -318,6 +321,9 @@ impl StatusCache {
                 crate::boundary::never_checked_block,
                 |boundary| boundary.status_block(),
             ),
+            // Whether flow command steps and guarded landing can run on this
+            // machine; computed once per process, no I/O on the poll.
+            "containment": crate::command_containment::availability().status_block(),
             "policy": self.policy.get().map_or_else(
                 || PolicyHandle::none().status().public_json(),
                 |policy| policy.status().public_json(),

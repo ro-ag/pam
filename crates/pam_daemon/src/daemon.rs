@@ -7,8 +7,9 @@
 //! [`run_daemon`] wires transport, policy gate, queue manager, and store into tokio tasks: a
 //! dispatcher spawning one pipeline task per request (`Pipeline::handle`), an executor loop
 //! leasing queued work through [`BuiltinCapability`] dispatch, the queue's lease reaper, and the
-//! retention pruner ([`crate::retention`]), which prunes on its first tick (so a boot prunes right
-//! after crash recovery) and every [`PRUNE_INTERVAL`] after. **Ordering**: dedupe + row insert
+//! retention pruner ([`crate::retention`]), which prunes [`FIRST_PRUNE_DELAY`] after boot (so the
+//! first prune does not compete with crash recovery and the first requests) and every
+//! [`PRUNE_INTERVAL`] after. **Ordering**: dedupe + row insert
 //! happen atomically in [`QueueManager::admit`] (audit needs the row to exist), the gate runs next,
 //! and only an allowed request reaches [`QueueManager::place_in_lane`]. Admission inserts the row
 //! `running`; it becomes `queued` only through the atomic post-gate authorization write inside
@@ -158,7 +159,7 @@ use crate::policy::{
 };
 use crate::queue::{AdmitOutcome, CAUSE_CANCELLED, LeasedWork, QueueError, QueueManager};
 use crate::refusal_log::{Refusal, RefusalBackend, RefusalLimits, RefusalLog};
-use crate::retention::{PRUNE_INTERVAL, RetentionService};
+use crate::retention::{FIRST_PRUNE_DELAY, PRUNE_INTERVAL, RetentionService};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
 use crate::secrets::{SecretBackend, SecretStore};
 use crate::status_cache::StatusCache;
@@ -916,8 +917,11 @@ pub async fn run_daemon_with(
         admin_observer,
         refusal_writer,
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
-        RetentionService::new(Arc::clone(&store), Arc::clone(&policy))
-            .run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
+        RetentionService::new(Arc::clone(&store), Arc::clone(&policy)).run_scheduler(
+            FIRST_PRUNE_DELAY,
+            PRUNE_INTERVAL,
+            drain_rx.clone(),
+        ),
         Arc::clone(&status).spawn(drain_rx.clone()),
         // Stops when the drain starts; joined, like the rest, before the
         // store closes.

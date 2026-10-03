@@ -43,6 +43,23 @@ Grab the latest packaged build from the
 macOS 12+ on Apple Silicon, and Windows 10/11 on amd64 and arm64. Linux and
 Intel Macs are not supported.
 
+Not everything runs on both. Where a row says no, PAM refuses that step or
+landing with the named cause; it never runs it uncontained.
+
+| Capability | macOS | Windows |
+| --- | --- | --- |
+| Daemon, CLI, desktop app, approvals, audit | yes | yes |
+| Connectors, and flows built from connector and model steps | yes | yes |
+| Flow command steps (`cargo`, `npm`, scripts) | yes, inside the macOS system sandbox | no: `command_containment_unavailable` |
+| Guarded landing (its local Git runs in the same containment) | yes | no: `command_containment_unavailable` |
+| Local models through the llama.cpp engine | yes | yes (CPU engine) |
+| Managed policy file | yes | yes |
+| `pam doctor` sandbox boundary | `established` with a supported harness profile | always `not_established`; see [docs/sandbox/windows](docs/sandbox/windows/README.md) |
+
+`pam status` prints the command-step row for the machine it runs on (the
+`commands:` line, `containment` in `--json`), and the desktop app shows it under
+Settings › Daemon, on Home and on the Flows screen when command steps cannot run.
+
 ## Quickstart
 
 ```sh
@@ -78,7 +95,7 @@ then `pam status` outside the sandbox.
 | Subcommand | What it does |
 | --- | --- |
 | `pam playbook` | The agent guide as static text: the discover/run/read loop, refusal handling, exit codes, and the sandbox case. No daemon needed. |
-| `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). It is served from a snapshot refreshed in the background: `snapshot.stale` says when a part is out of date, `active_requests` does not count the poll itself, and a poll leaves no request or audit row. |
+| `pam status [--json]` | The daemon's health snapshot (starts the daemon lazily, like every client command). It is served from a snapshot refreshed in the background: `snapshot.stale` says when a part is out of date, `active_requests` does not count the poll itself, and a poll leaves no request or audit row. The `commands:` line (`containment` in `--json`) says whether flow command steps and guarded landing can run on this machine. |
 | `pam echo [args-json] [--wait\|--no-wait] [--deadline-ms N] [--json]` | Diagnostic: mirrors a JSON object back through the daemon. `--no-wait` prints a ticket instead; the last of `--wait`/`--no-wait` wins. A delay over 60 s or arguments over 64 KiB are refused. |
 | `pam cancel <ticket> [--json]` | Cancels a queued or running request. Run it from the repository the ticket was submitted from: another repository's ticket answers `not_found`. |
 | `pam wait <ticket> [--timeout-ms N] [--json]` | Follows the ticket on one connection and blocks quietly until it ends, then prints the durable result the stream ended with; a ticket that already finished is answered at once. Transient daemon refusals are retried and a dropped connection is resumed after the last event seen, until the timeout (default 10 minutes), when it exits `1` and keeps the request running; exit `3` means the daemon refused (policy, or a daemon of another build). With `--json` the refusal or timeout is a `kind: refusal` object on stdout. Run it from the repository the ticket was submitted from. |

@@ -507,8 +507,12 @@ mod live {
         .await;
 
         // ...and a waiting request with a short deadline queues behind it.
+        // The deadline leaves the test time to wedge the queue first: the
+        // queue's own sweep (every 500 ms) expires a queued row past its
+        // deadline as `lease_expired`, and on a loaded runner a 500 ms
+        // deadline let that sweep win before the wedge was in place.
         let mut waiting = request("wedged", "echo", serde_json::json!({ "n": 2 }), true);
-        waiting.deadline_ms = 500;
+        waiting.deadline_ms = 3_000;
         let answer = live.submit(waiting).await;
         eventually("the waiter is queued", || async {
             state_of(&store, "wedged").await == Some(RequestState::Queued)
@@ -519,7 +523,7 @@ mod live {
         // The queue wedges. At its deadline the handler tries to expire
         // the request through the queue and blocks there.
         let stall = queue.stall().await;
-        let response = tokio::time::timeout(Duration::from_secs(5), answer)
+        let response = tokio::time::timeout(Duration::from_secs(10), answer)
             .await
             .expect("the caller is answered although the handler is wedged")
             .unwrap();

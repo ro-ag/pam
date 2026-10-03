@@ -84,12 +84,12 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 2 | High | The 16 KiB `map_json` cap against a 100,000-segment map makes failing logs lose their views and the ticket `unavailable` | `evidence_views.rs:6`, `127-137` | fixed: its own bound (8,192 segments, 1 MiB), deterministic coarsening, a notice view when preparation fails |
 | 3 | High | Security-relevant mutations are not atomic with their audit row; terminal and audit writes discard errors | `admin.rs:449-482`, `753-805` | fixed: single-transaction store methods adopted by the daemon |
 | 4 | High | The GUI's polling creates unbounded request and audit rows, and no index supports the hot list query | `bridge.rs:325-335`, `queue.rs:321`, `store.rs` | fixed: indexes (schema 12) and ledger-free `status`; admission ignores expired rows |
-| 5 | Medium | The grant revocation revision is a global count; any revoke orphans every older ticket's results and evidence | `store.rs:704-757`, `evidence_service.rs:175-182` | partly fixed: scoped to the grants a request depends on; any flow's step revocation still voids every `flow.run` ticket (needs an owner decision: a column written at admission) |
+| 5 | Medium | The grant revocation revision is a global count; any revoke orphans every older ticket's results and evidence | `store.rs:704-757`, `evidence_service.rs:175-182` | fixed: scoped to the grants a request depends on; since task 222 `request.flow_id` is written at admission (schema 17) and a step revocation voids only that flow's tickets. Revoking is per capability, so it ends that step's grant for every repository |
 | 6 | Medium | `update_request_state` can resurrect a terminal request | `store.rs:1055-1062` | fixed: returns `AlreadyTerminal` and writes nothing |
-| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched, the read connection built (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)); chunked view storage done (schema 20, task 228: 64 KiB chunks, a page of a 32 MiB view 3.8 ms to 0.17 ms in release); a delayed first prune is still open |
+| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched, the read connection built (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)); chunked view storage done (schema 20, task 228: 64 KiB chunks, a page of a 32 MiB view 3.8 ms to 0.17 ms in release); since plan 56 the first scheduled prune waits two minutes after boot (`FIRST_PRUNE_DELAY`) |
 | 8 | Medium | "One audit row per operation, refusals included" is not structural: pre-admission refusals leave no row | `migrations.rs:153`, `daemon.rs:792-963` | fixed: the `refusal` table (schema 18) holds them, coalesced and bounded, and `admin.activity.list` interleaves them; what is still unrecorded is listed in the audit contract |
 | 9 | Medium | Immutability of audit and evidence is by convention only | `migrations.rs`, `store.rs:1265-1289` | fixed: triggers make `audit` append-only and `evidence_view` immutable except retention's tombstone; since task 228 one terminal audit row per request by a partial unique index (schema 19), served bytes re-hashed per chunk (`evidence_corrupt`), and `evidence_view.source_id` a foreign key with a CHECK that a live view has its evidence (schema 20) |
-| 10 | Medium | Retention is irreversible, runs on an unvalidated wall clock, and its settings flow is non-atomic | `retention.rs:200-216`, `store.rs:2075-2089` | partly fixed: an out-of-range stored window reads as forever, both windows save in one transaction; a forward clock jump still prunes early (needs an owner decision) |
+| 10 | Medium | Retention is irreversible, runs on an unvalidated wall clock, and its settings flow is non-atomic | `retention.rs:200-216`, `store.rs:2075-2089` | fixed: an out-of-range stored window reads as forever, both windows save in one transaction; since task 221 a clock guard with a watermark refuses to prune after a forward clock jump and `admin.retention.get` reports it |
 | 11 | Medium | A beta engine under the audit and authorization spine: no integrity check, no backup, no fallback, engine types leak | `migrations.rs`, `store.rs:592`, `lib.rs` | partly fixed: boot `quick_check` (files up to 256 MiB), on-demand check, corruption mapped to a legible error; backup, export and an alternate backend need an owner decision (decided 2026-10-02: SQLite, [spec](../specs/2026-10-02-sqlite-store.md); backup in its T2) |
 | 12 | Low | Evidence range edge cases: end-of-view reads error, a NULL blob pages forever | `evidence_views.rs:223-244` | fixed |
 | 13 | Low | Crash-window leftovers: ghost pending approvals, orphan checkpoints, unrecoverable journal | `lifecycle.rs:218-246`, `store.rs:1595` | fixed: finished requests' approvals are hidden and the approval insert is atomic; since task 228 journal and checkpoint are one transaction (journal first) and boot recovery removes checkpoints without a journal (`flow.checkpoint_orphaned`) ([workflow recovery](../workflow-recovery.md#durable-boundary)) |
@@ -127,7 +127,7 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | --- | --- | --- | --- | --- |
 | 1 | High | The GUI beacon feeds on its own status polls: a self-sustaining refetch loop that eats the control budget (likely cause of issue 35) | `useDaemonStatus.ts:66-72` | fixed: throttled refreshes, own requests filtered from the event stream, per-command timeouts, backoff while the daemon is busy or down |
 | 2 | High | Any public-socket peer can drain, cancel and restart the daemon by lying about `client_version` | `daemon.rs:915-935` | fixed (daemon core, finding 2); the client waits out the handover |
-| 3 | High when it applies | A plain build of `pam gui` loads `http://127.0.0.1:1420` with the full admin bridge | `build.rs:4-9`, `Cargo.toml:9-13` | deferred (known development-only caveat; recorded in the admin boundary) |
+| 3 | High when it applies | A plain build of `pam gui` loads `http://127.0.0.1:1420` with the full admin bridge | `build.rs:4-9`, `Cargo.toml:9-13` | fixed (task 229): a build without the embedded frontend refuses to start `pam gui` unless `PAM_GUI_DEV=1` asks for the development server (`pam_gui::frontend`) |
 | 4 | Medium-high | `pam wait` and `subscribe` turn a transient refusal into exit 3 and abort on protocol noise | `client.rs:664-674` | fixed |
 | 5 | Medium | The daemon-ready probe is true during boot when a stale `pam.sock` exists | `client.rs:237-242` | fixed (the reviewer's premise that the first connect does not retry was partly wrong: a dead socket parked every command for 30 s, now 5 s) |
 | 6 | Medium | Lazy start runs the daemon as a plain child of the caller: environment, directory, process group | `client.rs:279-288`, `main.rs:857` | fixed: environment allowlist, `/` as the directory, own process group, reaper thread (the Windows creation flags are untested) |
@@ -269,30 +269,34 @@ From the fix reports:
 
 ## Deferred
 
-Not done, with the reason.
+Not done, with the reason. Items marked done were closed by plan 55 (PR 170) or later.
 
-- **Windows pending-handshake slots** (daemon core 12): the Windows listener is
-  replaced by the new transport.
+- **Windows pending-handshake slots** (daemon core 12): the Windows listener was
+  replaced by the framed transport (plan 49), which has its own bounds.
 - **`watch_target_changed` raw results readable through `${steps.*}`** and builtin
   descriptions that over-promise `git fetch`: unreachable from shipped recipes, and
   description text only.
-- **A delayed first prune** (store 7) and **compaction reversibility and keyword
-  set** (store 15): code outside the store's files.
+- **A delayed first prune** (store 7). **Done** (plan 56): two minutes after boot.
+- **Compaction reversibility and keyword set** (store 15): code outside the
+  store's files.
 - **The branch of the integrity check that fails after a successful open** (store
   11): no such file could be constructed, so it is untested.
 - **A dedicated `client_version_mismatch` message in the client and a Settings
-  surface in the GUI**: the cause is an ordinary refusal today.
-- **Unifying the two trusted-curl path checks** (model 9): the two crates share no
-  dependency. **Done 2026-10-02**: the leaf crate `pam_net` owns the one check
-  and the one launcher.
-- **A per-request credential cache** (model 12).
-- **The development-build GUI URL** (client 3): a known development-only caveat.
-- **A GUI label on model summaries**: the CLI labels them, the GUI step summary does
-  not.
-- **Not run:** anything on Windows, including the daemon's admin listener edit and
-  the client's spawn creation flags (CI-only today); the opt-in real-engine test
-  that would confirm `--api-key-file` on the pinned build; the new containment and
-  process-group tests on any host but macOS.
+  surface in the GUI**. **Done** (task 229).
+- **Unifying the two trusted-curl path checks** (model 9). **Done 2026-10-02**: the
+  leaf crate `pam_net` owns the one check and the one launcher.
+- **A per-request credential cache, and a bound on keychain writes** (model 12):
+  reads are bounded at 20 s; writes are not.
+- **The development-build GUI URL** (client 3). **Done** (task 229, `PAM_GUI_DEV=1`).
+- **A GUI label on model summaries**. **Done** (task 220): the step summary carries
+  the same untrusted-summary label as the CLI.
+- **A measurement of the summary prompt contract**: the qualification badge
+  certifies the capability bench, not the summary prompt (plan 55 decision, task
+  220).
+- **Not run:** the opt-in real-engine test that would confirm `--api-key-file` on
+  the pinned build. Windows is no longer unverified: plans 48 to 55 ran the
+  workspace suite in a Windows 11 ARM64 VM and on both Windows CI targets, and
+  command containment is reported unavailable there (`status.containment`, plan 56).
 
 ## Verification
 

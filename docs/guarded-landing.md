@@ -10,6 +10,11 @@ checkpoint (#94) is what still separates it from a supported claim. Inspection
 reports `landing_permission_missing` for any stage the GUI policy has not
 granted, sync included.
 
+Guarded landing runs on macOS only. Its local Git (checkout, checks, sync) runs
+inside [command containment](command-containment.md), which Windows does not
+have, so on Windows a landing refuses `command_containment_unavailable` before
+any local Git starts. `pam status` and Settings › Daemon say so ahead of time.
+
 ## Configure and inspect
 
 In **Settings → Flows → Landing**, configure the canonical local repository,

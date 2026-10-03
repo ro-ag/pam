@@ -29,8 +29,9 @@
 //!   evidence is not that violation: a finite audit window still bounds the evidence under it
 //!   regardless of the evidence window's own value; only two finite windows in the wrong order can
 //!   go wrong, and either select must be settable first.
-//! - **When a pass runs**: [`RetentionService::run_scheduler`] prunes on its first tick (immediate,
-//!   so a boot prunes right after crash recovery) and every [`PRUNE_INTERVAL`] after; a settings
+//! - **When a pass runs**: [`RetentionService::run_scheduler`] prunes [`FIRST_PRUNE_DELAY`] after
+//!   boot (not at once, so a large first prune does not compete with crash recovery, the first
+//!   status polls and the first requests for the store) and every [`PRUNE_INTERVAL`] after; a settings
 //!   save and the GUI's Prune now button also prune at once ([`crate::admin_retention`]). Every
 //!   pass writes [`SETTING_LAST_RUN`], even a no-op one.
 //! - **Forward clock jump**: age is read off the wall clock, and a clock that jumps forward (a bad
@@ -102,6 +103,11 @@ const SECS_PER_DAY: i64 = 86_400;
 
 /// How often the scheduler prunes once the daemon is up.
 pub const PRUNE_INTERVAL: Duration = Duration::from_hours(1);
+
+/// How long after boot the first scheduled prune waits: long enough for crash recovery and the
+/// first burst of status polls and requests to have the store, short enough that a daemon which
+/// runs for minutes still prunes. A human's Prune now and a settings save never wait.
+pub const FIRST_PRUNE_DELAY: Duration = Duration::from_mins(2);
 
 /// Refusal cause: the two windows break the evidence-≤-audit rule, or a
 /// window is out of range.
@@ -742,21 +748,22 @@ impl RetentionService {
         }
     }
 
-    /// Spawns the background pruner: one pass now — the interval's first
-    /// tick fires immediately, which is how boot pruning happens — and
-    /// one every `interval` until `shutdown` changes (or its sender
-    /// drops).
+    /// Spawns the background pruner: one pass `first_delay` after it
+    /// starts (the daemon passes [`FIRST_PRUNE_DELAY`]), then one every
+    /// `interval`, until `shutdown` changes (or its sender drops).
     ///
     /// A failed pass is logged and retried on the next tick; retention is
     /// housekeeping, and a store hiccup must not take the daemon with it.
     #[must_use]
     pub fn run_scheduler(
         self,
+        first_delay: Duration,
         interval: Duration,
         mut shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let mut ticker =
+                tokio::time::interval_at(tokio::time::Instant::now() + first_delay, interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 tokio::select! {

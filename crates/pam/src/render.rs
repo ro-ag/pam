@@ -954,7 +954,7 @@ pub fn render_ticket(ticket: &str, position: u64) -> String {
 pub fn render_status(body: &serde_json::Value) -> String {
     let field = |name: &str| body.get(name).map_or_else(|| "?".to_owned(), render_scalar);
     format!(
-        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  boundary:        {}\n  policy:          {}\n  playbook:        pam playbook (the agent guide)",
+        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  boundary:        {}\n  commands:        {}\n  policy:          {}\n  playbook:        pam playbook (the agent guide)",
         field("daemon_version"),
         field("protocol"),
         body.get("uptime_s")
@@ -964,8 +964,45 @@ pub fn render_status(body: &serde_json::Value) -> String {
         render_model(body.get("model")),
         render_keyring(body.get("keyring")),
         render_boundary(body.get("boundary")),
+        render_containment(body.get("containment")),
         render_policy(body.get("policy")),
     )
+}
+
+/// The `commands:` line from the `status.containment` block: whether this
+/// machine can contain command workloads, which flow command steps and
+/// guarded landing need. `contained (<mechanism>)` when it can; otherwise
+/// `unavailable: <reason>; <affected> refuse command_containment_unavailable`.
+/// A daemon that publishes no block is an older build and renders `?`.
+fn render_containment(containment: Option<&Value>) -> String {
+    let Some(containment) = containment.filter(|block| block.is_object()) else {
+        return "?".to_owned();
+    };
+    let detail = terminal_safe(field(containment, "detail"));
+    match containment.get("available").and_then(Value::as_bool) {
+        Some(true) => format!("contained ({detail})"),
+        Some(false) => {
+            let affects: Vec<String> = containment
+                .get("affects")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(terminal_safe)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let affects = if affects.is_empty() {
+                "command workloads".to_owned()
+            } else {
+                affects.join(" and ")
+            };
+            let cause = terminal_safe(field(containment, "cause"));
+            format!("unavailable: {detail}; {affects} refuse {cause}")
+        }
+        None => "?".to_owned(),
+    }
 }
 
 /// The `policy:` line from the public `status.policy` block, which carries

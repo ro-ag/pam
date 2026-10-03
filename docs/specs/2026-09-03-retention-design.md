@@ -32,7 +32,11 @@ spec deferred the pruning half here.
 - **Schedule** (owner decision): the daemon prunes at boot (after crash
   recovery), every hour after that, right after a settings save, and on
   demand from a "Prune now" button. The last run's figures are stored
-  and shown.
+  and shown. Amended 2026-10-03 (design review store 7): the boot prune
+  runs two minutes after boot (`FIRST_PRUNE_DELAY`) rather than on the
+  first instant, so a large first prune does not hold the store while
+  crash recovery, the first status polls and the first requests need it.
+  Save and Prune now still run at once.
 - **No VACUUM.** Freed pages are reused by the engine; the panel reports
   rows and blob bytes removed, not file size.
 
@@ -118,8 +122,8 @@ impl RetentionService {
   pass when `audit_days` is set. A pass that removed nothing is still a
   run: `last_run` is written every time with `ts = now`. Errors
   propagate; the scheduler logs them and keeps ticking.
-- `run_scheduler`: `tokio::time::interval` (first tick immediate, so
-  boot prunes) with `MissedTickBehavior::Delay`, `select!` against the
+- `run_scheduler`: `tokio::time::interval_at` (first tick
+  `FIRST_PRUNE_DELAY` after boot, since 2026-10-03) with `MissedTickBehavior::Delay`, `select!` against the
   drain watch like `QueueManager::run_reaper`. Logs at info when a pass
   removed anything, at debug otherwise.
 

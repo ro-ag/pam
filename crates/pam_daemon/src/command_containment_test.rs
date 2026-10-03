@@ -580,3 +580,40 @@ fn an_unresolvable_git_pointer_refuses_the_stateful_profile() {
         );
     }
 }
+
+/// The availability report matches the platform contract: macOS reports the
+/// system sandbox when its launcher passes the same check `prepare` uses,
+/// every other platform is unavailable with the stable cause. The `status`
+/// block always names what is affected.
+#[test]
+fn availability_follows_the_platform_and_names_what_it_affects() {
+    let availability = crate::command_containment::availability();
+    let block = availability.status_block();
+    assert_eq!(block["available"], availability.available);
+    assert_eq!(
+        block["affects"],
+        serde_json::json!(["flow command steps", "guarded landing"])
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(!availability.available);
+    if availability.available {
+        assert_eq!(block["cause"], serde_json::Value::Null);
+        assert!(availability.detail.contains("/usr/bin/sandbox-exec"));
+    } else {
+        assert_eq!(
+            block["cause"],
+            crate::command_containment::CAUSE_UNAVAILABLE
+        );
+        assert!(!availability.detail.is_empty());
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        availability.detail,
+        "command containment is supported only on macOS"
+    );
+    // Computed once: the same report on every call.
+    assert!(std::ptr::eq(
+        availability,
+        crate::command_containment::availability()
+    ));
+}

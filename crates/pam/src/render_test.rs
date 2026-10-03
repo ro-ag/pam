@@ -1141,6 +1141,51 @@ fn status_prints_the_boundary_summary_and_the_last_report() {
 }
 
 #[test]
+fn status_prints_whether_command_workloads_can_be_contained() {
+    let line = |containment: serde_json::Value| {
+        render_status(&serde_json::json!({
+            "daemon_version": "0.1.0",
+            "containment": containment,
+        }))
+        .lines()
+        .find_map(|line| line.strip_prefix("  commands:        ").map(str::to_owned))
+        .expect("a commands line")
+    };
+    assert_eq!(
+        line(serde_json::json!({
+            "available": true,
+            "cause": null,
+            "detail": "macOS system sandbox (/usr/bin/sandbox-exec)",
+            "affects": ["flow command steps", "guarded landing"],
+        })),
+        "contained (macOS system sandbox (/usr/bin/sandbox-exec))"
+    );
+    assert_eq!(
+        line(serde_json::json!({
+            "available": false,
+            "cause": "command_containment_unavailable",
+            "detail": "command containment is supported only on macOS",
+            "affects": ["flow command steps", "guarded landing"],
+        })),
+        "unavailable: command containment is supported only on macOS; flow command steps and \
+         guarded landing refuse command_containment_unavailable"
+    );
+    // A terminal escape in a daemon-supplied detail is neutralised.
+    let hostile = line(serde_json::json!({
+        "available": false,
+        "cause": "command_containment_unavailable",
+        "detail": "bad\u{1b}[2Jlauncher",
+        "affects": [],
+    }));
+    assert!(!hostile.contains('\u{1b}'), "{hostile}");
+    assert!(hostile.contains("command workloads refuse"), "{hostile}");
+
+    // An older daemon publishes no block at all.
+    let missing = render_status(&serde_json::json!({ "daemon_version": "0.1.0" }));
+    assert!(missing.contains("commands:        ?"), "{missing}");
+}
+
+#[test]
 fn status_prints_one_policy_line_per_state() {
     let line = |policy: serde_json::Value| {
         render_status(&serde_json::json!({

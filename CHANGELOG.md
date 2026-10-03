@@ -8,6 +8,12 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Added
 
+- `status` carries a `containment` block saying whether this machine can
+  contain command workloads, and `pam status` prints it on a `commands:` line.
+  On Windows it reports that flow command steps and guarded landing refuse
+  `command_containment_unavailable`; the desktop app says the same under
+  Settings › Daemon, on Home, on the Flows screen and in the landing settings.
+  README lists what runs on each platform.
 - Refusals decided before a request row exists (capacity, rate, a malformed or
   oversized frame, a refused hello, an expired deadline at admission, the
   connection cap, the drain) are recorded in a new `refusal` table (schema 18)
@@ -175,6 +181,10 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- The daemon's first scheduled retention prune runs two minutes after boot
+  instead of at once, so a large first prune does not hold the store during
+  crash recovery and the first requests. Saving retention settings and Prune
+  now still prune immediately.
 - Guarded landing polls required checks with exponential backoff (about 5 s
   doubling to a 60 s cap, with jitter) until the request's own deadline,
   instead of a fixed 20 polls at 5 s: it never gives up while a poll fits, and

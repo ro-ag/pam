@@ -59,6 +59,13 @@ use crate::migrations::{self, Migration};
 /// shell, a backup tool) before it answers busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the closing checkpoint waits for another connection's lock. The
+/// fold at close is best effort (a log it cannot fold stays for the next
+/// open, nothing is lost), so it must not hold a daemon's shutdown for the
+/// whole [`BUSY_TIMEOUT`]: on Windows a lock still held by another
+/// connection made every such close wait the full five seconds.
+const CLOSE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Largest string or blob the connection accepts. Evidence blobs and views
 /// run to 64 MiB; nothing the store writes comes near twice that.
 const MAX_VALUE_BYTES: i32 = 128 * 1024 * 1024;
@@ -450,6 +457,11 @@ fn open_reader(path: &str) -> Result<Connection, StoreError> {
 /// is what a killed process leaves, a main file plus a log the next open
 /// replays. Nothing committed is lost either way.
 pub(crate) fn shut(conn: Connection, fold_log: bool) -> Result<(), StoreError> {
+    // The fold is best effort: wait briefly for a lock, never the statement
+    // timeout (see CLOSE_BUSY_TIMEOUT).
+    if fold_log && let Err(error) = conn.busy_timeout(CLOSE_BUSY_TIMEOUT) {
+        tracing::warn!(%error, "the closing checkpoint keeps the statement busy timeout");
+    }
     // With the log empty, let the close delete it and its index.
     if fold_log
         && checkpoint(&conn, "at close")

@@ -269,3 +269,36 @@ async fn close_with_another_connection_mid_read_still_closes_and_loses_nothing()
     assert_eq!(request_count(&store).await, 6);
     store.close().await.unwrap();
 }
+
+/// The closing checkpoint is best effort, so a lock another connection holds
+/// costs a close a short wait, never the five-second statement timeout: a
+/// daemon's shutdown on Windows used to stall exactly that long.
+#[tokio::test]
+async fn close_does_not_sit_out_the_statement_busy_timeout_behind_another_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    finished_requests(&store, "before", 3).await;
+
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN").unwrap();
+    let _: i64 = other
+        .query_row("SELECT COUNT(*) FROM request", (), |row| row.get(0))
+        .unwrap();
+    finished_requests(&store, "after", 3).await;
+
+    // The store keeps its own busy timeout: nothing here lowers it.
+    let started = std::time::Instant::now();
+    store.close().await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "close waited {took:?} behind another connection's read"
+    );
+
+    other.execute_batch("COMMIT").unwrap();
+    drop(other);
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(request_count(&store).await, 6);
+    store.close().await.unwrap();
+}

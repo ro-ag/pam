@@ -1,6 +1,7 @@
 # Managed read-only policy file — design and implementation plan
 
-Status: implemented; Windows ACL matrix and the owner's sudo pass pending (T13).
+Status: implemented; the Windows VM verification (T13 step 2) is done and recorded in
+[Evidence to record](#evidence-to-record); the owner's sudo pass is pending (T13).
 Built on `feat/managed-policy` (T1–T12), 2026-10-02/03. What was built, and
 where it departs from the design below, is in [As built](#as-built-2026-10-03);
 where the two disagree, As built is the behavior. The administrator's guide is
@@ -215,6 +216,12 @@ write disposition changes nothing.
    (0x40)`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER` must FAIL; for `%ProgramData%`
    itself, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC` must FAIL (the folder's
    default ACL lets `Users` add subfolders but not remove or re-ACL them).
+   Measured 2026-10-03: a directory open without `FILE_FLAG_BACKUP_SEMANTICS`
+   fails with access denied whatever the token holds, so omitting the flag
+   would read as "safe". Also, `FILE_DELETE_CHILD` on the folder satisfies a
+   `DELETE` open on the files inside it, so a token with only that right is
+   refused by the file probe (`writable_by_user`) before the folder probe runs
+   (`parent_writable`). Either way it is untrusted.
 4. The file is read through the opened handle with `share_mode(FILE_SHARE_READ)`,
    so no writer holds it open during the read. A sharing violation (an MDM
    agent mid-write) is a transient `busy`: the previous view stays and the next
@@ -236,8 +243,12 @@ guide):
 - A daemon running elevated (a user who runs PAM "as administrator") holds every
   right and reads **untrusted**, as a root-run daemon does on macOS.
 
-Every rule above is a hypothesis about Windows behaviour. The Windows VM task
-(T13) proves each one before it is relied on (see [Evidence to record](#evidence-to-record)).
+Every rule above was a hypothesis about Windows behaviour. The Windows VM task
+(T13) proved each one on 2026-10-03; the corrections it forced are marked
+"measured" in the rules and listed in [Evidence to record](#evidence-to-record).
+The CLI's `--trust` judges the fixed path exactly as spelled, never with its
+parent resolved, because resolving it would hide a junction at
+`%ProgramData%\PAM` that the daemon refuses.
 
 ### File format
 
@@ -707,7 +718,11 @@ Move-Item -Force $tmp "$dir\policy.json"
 
 (`Set-Content -Encoding UTF8` in Windows PowerShell 5.1 writes a byte-order
 mark; PAM tolerates one, but write without it.) The `icacls` flags and the
-inheritance behaviour are asserted in T13 before this text ships.
+inheritance behaviour were measured in T13 (2026-10-03). The temporary file
+must be created inside `$dir`, as above: `Move-Item` keeps the ACL the file
+had where it was made, so a file moved in from another folder arrives without
+the locked ACL (from `C:\Windows\Temp` it carried no `Users` entry at all and
+the daemon's user could not read it).
 
 ### Validate before the push, check after
 
@@ -780,7 +795,7 @@ on each touched crate (memento `clippy-before-full-gate`).
 | --- | --- |
 | Trust matrix, macOS (`managed_policy_trust_test.rs`) | A temp root is owned by the test user, so the *production* rule (root-owned) correctly refuses every temp file; the matrix therefore runs under `TrustRules::owned_by(uid)`, and the root-owned positive case uses a real root-owned file, `/private/etc/hosts` (`root:wheel 0644`, ancestors `/private`, `/private/etc` root-owned and `0755`), under the production rule. Cases: production rule accepts `/private/etc/hosts`; production rule refuses a test-owned file; `owned_by(uid)` accepts a `0444` file in a `0555` directory and refuses `/private/etc/hosts`; mode `0644`/`0664`/`0666` file (the write probe and the mode rule each); setuid bit; the path is a symlink to a good file; a directory symlink in the chain; a parent `0775`/`0777`; a sticky parent (refused); the path is a directory; empty file; exactly 64 KiB; 64 KiB + 1; a swap of the file between the stat and the open (dev/ino mismatch, driven by a test seam that renames between the two); a file that vanishes mid-check. |
 | Trust, what cannot run without root (macOS) | A root-owned file at the real `/Library/Application Support/PAM/policy.json`; an extended ACL granting the user write on a root-owned file; the install scripts. Covered by the owner's one manual pass in T13 (`sudo install ...`, then `pam policy check --installed`, a `chmod g+w` negative, a `chmod +a` ACL negative). |
-| Trust matrix, Windows VM (`managed_policy_trust_test.rs`, `#[cfg(windows)]`, fixtures from `PAM_TRUST_FIXTURES`, required when `PAM_REQUIRE_WIN_ACL_FIXTURES=1`, the pattern of `PAM_REQUIRE_TLS_FIXTURE`) | `prlctl exec` runs as SYSTEM, which holds every right: run as SYSTEM, every file is **untrusted**, which proves the probe is sensitive. The matrix runs as the logged-in unprivileged user (`prlctl exec "Windows 11" --current-user`), with fixture folders built from SYSTEM by `icacls`: locked ACL -> trusted; `Users:(OI)(CI)M` -> untrusted; `Users:(OI)(CI)(W)` on the folder only; the default inherited ProgramData subfolder ACL -> untrusted (the case the delivery script exists for); owner set to the user (`/setowner`) -> untrusted via `WRITE_DAC`; `DELETE` only; `FILE_DELETE_CHILD` only; a junction as `PAM`; a symlink file; a file held open by a writer (busy, not untrusted). |
+| Trust matrix, Windows VM (`managed_policy_trust_test.rs`, `#[cfg(windows)]`, fixtures from `PAM_TRUST_FIXTURES`, required when `PAM_REQUIRE_WIN_ACL_FIXTURES=1`, the pattern of `PAM_REQUIRE_TLS_FIXTURE`) | `prlctl exec` runs as SYSTEM, which holds every right: run as SYSTEM, every file is **untrusted**, which proves the probe is sensitive. The matrix runs as the logged-in unprivileged user (`prlctl exec "Windows 11" --current-user`), with fixture folders built from SYSTEM by `icacls`: locked ACL -> trusted; `Users:(OI)(CI)M` -> untrusted; `Users:(OI)(CI)(W)` on the folder only; the default inherited ProgramData subfolder ACL -> untrusted (the case the delivery script exists for); owner set to the user (`/setowner`) -> untrusted via `WRITE_DAC`; `DELETE` only; `FILE_DELETE_CHILD` only (refused by the file probe: `writable_by_user`, measured); a junction as `PAM`; a symlink file; a file held open by a writer (busy, not untrusted). |
 | Grammar (`managed_policy_test.rs`) | Unknown key at every depth; duplicate key at top, in a section, in a leaf; wrong type per leaf; `locked` with another mode; `default` + bounds; BOM; CRLF; exactly 64 KiB / +1; 256 / 257 list entries; control characters; a `reason` over 200; version `0`, `2`, missing; digest equals SHA-256 of the raw bytes (BOM included); every sample under `docs/managed-policy/` parses with no rejected leaf (`managed_policy_samples_test.rs`) so the documentation cannot rot. |
 | Merge and precedence (`managed_policy_test.rs`) | One table per function: profile `floor` against all nine user x floor pairs and `locked`; numeric clamp including `None`/forever and `max` with `forever`; `allow` intersection, empty intersection, shells rejected in the policy list; path-prefix by component (`/Users` does not cover `/UsersX`); `never` globs; `never_classes`; `max_permissions` AND; `connector_wide` narrowing; `default` used only when the user has no value and never replaces one; retention pair that breaks evidence <= audit rejected as a leaf; user rows never mutated (compare store before/after every read). |
 | Locked-key refusals through the real admin ops (`admin_*_test.rs`, one file per surface) | Per key of the table: the op refuses `setting_locked` / `policy_not_allowed` / `policy_frozen`; the store row is byte-identical afterwards; the reply detail contains the reason, the contact and `(policy <digest12>, rev ...)`; the audit has the terminal `admin`/`refuse` row **and** a `policy.locked_write` row with the full digest; a request inside the bounds succeeds; removing the policy restores the user's value; grants: `manual: deny`, `remember: deny` (a plain approval works, `remember: true` refuses), `never` (an active grant is inert at the gate on every profile and at a flow step, the public refusal is `policy_denied` with no rule text); `engine_source` `mirror_only` without a mirror never opens a socket (a fake origin sees zero requests), `import_only` refuses install and accepts import; retention `max` refuses forever and the clock-jump guard still holds on a forced window; connectors: `allowed_base_hosts` drops a scope and refuses configure. |
@@ -1193,12 +1208,13 @@ design sections are to the tree it was written against and have moved.
 
 ### Open items
 
-- **T13, Windows VM:** compile and run the `cfg(windows)` halves (`cargo test
-  -p pam_daemon` with `PAM_REQUIRE_WIN_ACL_FIXTURES=1`): the trust probes, the
-  ACL fixture matrix as the unprivileged user and the all-untrusted run as
-  SYSTEM, the verbatim-prefix path in the follow test, the delivery script end
-  to end, and the [evidence](#evidence-to-record) facts. Any contradicted rule
-  corrects this document before merge.
+- **T13, Windows VM: done 2026-10-03** (branch `win-fix/policy`): the `cfg(windows)`
+  halves, the ACL fixture matrix as the interactive user and the all-untrusted
+  run as SYSTEM, the delivery script end to end, the daemon against the real
+  file, and the [evidence](#evidence-to-record) facts. What the OS contradicted
+  is corrected in the rules above. Not done: a run as a true standard user (the
+  VM's interactive account is a UAC-filtered administrator) and a run as an
+  elevated administrator other than SYSTEM.
 - **T13, owner's macOS pass with `sudo`:** install a sample at the real path;
   `pam policy check "/Library/Application Support/PAM/policy.json" --trust`
   exits `0` and `pam status` shows `active`; `chmod g+w` exits `11` and the GUI
@@ -1237,3 +1253,88 @@ appended here (a contradicted fact corrects the text above before merge):
    the production rule; `chmod g+w` and an added ACL are each refused.
 8. `prlctl exec ... --current-user` is available on the VM image and runs as the
    unprivileged logged-in user.
+
+### Recorded 2026-10-03: Windows VM (T13 step 2)
+
+Host: Parallels "Windows 11", ARM64, Windows 10.0.26200.8873, Rust 1.98.1,
+tree `cd43846` plus the fixes on `win-fix/policy`. The interactive account
+(`prlctl exec --current-user`, item 8) is `rodrigoagur2864\rodox`, a member of
+`Administrators` whose medium-integrity token carries that group deny-only (UAC
+filtered); it is not a standard user. Every row is measured unless it says
+otherwise.
+
+1. **Measured.** A fresh `%ProgramData%\PAM` (`icacls`): `SYSTEM` and
+   `Administrators` `(I)(OI)(CI)(F)`, `CREATOR OWNER` `(I)(OI)(CI)(IO)(F)`,
+   `Users` `(I)(OI)(CI)(RX)` and `Users` `(I)(CI)(WD,AD,WEA,WA)`, so `Users` can
+   add files and subfolders. After the delivery script the folder shows only
+   `Users:(OI)(CI)(RX)`, `Administrators:(OI)(CI)(F)`, `SYSTEM:(OI)(CI)(F)`;
+   `policy.json` and a later `ca` subfolder carry the same three inherited
+   (`(I)`); owner `BUILTIN\Administrators`.
+2. **Measured, one rule corrected.** On the locked ACL the interactive account
+   is trusted (exit 0). Each fixture (`Users` modify on the file; write on the
+   folder only, with and without inheritance; the default ProgramData subfolder
+   ACL; owner set to the account; `DELETE` only; `FILE_DELETE_CHILD` only)
+   reads untrusted with the expected code, except that `FILE_DELETE_CHILD`
+   reports `writable_by_user`, not `parent_writable`, because that folder right
+   also grants `DELETE` on the files in it (rules above). A directory open
+   without `FILE_FLAG_BACKUP_SEMANTICS` fails with error 5 for every right; with
+   it, the right is granted or not as the ACL says. A probe open with each of the
+   six file rights leaves length, modified, accessed and created times and the
+   content unchanged. `the_acl_fixture_matrix` (all ten cases, `busy` included)
+   passes as the interactive account.
+3. **Measured.** `is_symlink()` is true for a symbolic link to a file and for a
+   junction: a junction as `%ProgramData%\PAM` reads `symlink` (the folder). A
+   junction *at the file path* never reaches the trust check from the CLI:
+   `pam policy check` exits 1 ("not a regular file") because it follows the link
+   to read the content; the daemon's `verify_and_read` judges the link first.
+   Correction: the CLI used to resolve the parent folder before the trust check,
+   so a junction at `%ProgramData%\PAM` pointing at a locked folder read
+   trusted from `pam policy check` while the daemon refuses it; the fixed path is
+   now judged as spelled (`trust_check_path`).
+4. **Measured.** A writer holding the file with `FileShare` `Read` or
+   `ReadWrite` gives `busy` (exit 11) as the account; the unprivileged probes
+   fail with access denied before any sharing check, so the sharing violation
+   comes from the final read open. With `FileShare.None` the daemon check gives
+   `busy` (matrix `busy` case) but `pam policy check` exits 1 ("used by another
+   process", os error 32) because its own content read opens the file first.
+   Retry later. As SYSTEM the probe itself can hit the violation first
+   ("holds it exclusively") or, with a `ReadWrite`-sharing writer, succeed and
+   read `writable_by_user`.
+5. **Measured.** `Set-Content -Encoding UTF8` in Windows PowerShell 5.1 writes
+   `EF BB BF`; the policy parses (trusted, exit 0) and its digest equals
+   `Get-FileHash` SHA-256 of the file including the BOM.
+6. **Measured.** `Move-Item -Force` of a temporary file made inside the folder
+   keeps the inherited locked ACL (trusted). A file moved in from
+   `C:\Windows\Temp` keeps its own ACL (no `Users` entry): `pam policy check` exits
+   1, "Access is denied" (the daemon would report it unreadable; not measured
+   at the daemon). `Copy-Item -Force` over the existing file keeps the
+   destination's ACL (trusted).
+7. macOS: not part of this run.
+8. **Measured.** `prlctl exec ... --current-user` is available and runs as the
+   interactive account (above).
+
+Run as SYSTEM (every right held): every case is untrusted, as the spec intends
+for an elevated daemon: the locked delivery reads `writable_by_user` (the file
+probe opens `FILE_WRITE_DATA`), a symlink or junction reads `symlink`, and a
+writer that excludes sharing reads `busy`; `the_acl_fixture_matrix` with
+`PAM_TRUST_FIXTURES_ELEVATED=1` passes. The consequence is the one the spec
+states: PAM must not run as SYSTEM or elevated if it is to honour a policy.
+
+Daemon against the real file, `PAM_BASE_DIR=C:\pampol`, started by `pam status`
+as the interactive account, policy at `%ProgramData%\PAM\policy.json` (locked
+profile `strict`, `grants.never` `flow.step:*/deploy`): `pam status --json`
+reports `policy.state: active`, revision, digest prefix `f94aac30ddb6` (equal
+to the file's SHA-256); `admin.profile.set` to `relaxed` and `standard` is
+refused `setting_locked`, `admin.grants.add flow.step:x/deploy` is refused
+`policy_not_allowed`, `admin.policy.get/reload` answer (the admin plane was
+driven by `pam_client::client::send_admin` from a scratch test, as no CLI
+command sends admin ops). Granting the account write on the file and reloading
+reads `last_good`; removing the ACE and reloading reads `active`. Deleting the
+file reads `none (unmanaged)` about 110 s later (two 60 s polls).
+
+Windows-only test breakage found and fixed: nine CA-bundle import tests pinned
+a bundle on a Windows host and failed against the intended rule
+(`network_ca_unsupported_on_windows`); they run off Windows only and a Windows
+test (`a_pinned_ca_bundle_on_windows_is_rejected_and_never_closes_the_network`)
+asserts the rejected, never-held, network-open behaviour. A `pam` lib test
+import was unused on Windows (clippy `-D warnings`).

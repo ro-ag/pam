@@ -107,6 +107,13 @@ Users. Write the file without a byte-order mark as above; PAM tolerates one
 (Windows PowerShell 5.1 `Set-Content -Encoding UTF8` writes it), but the digest
 then differs from the file you checked.
 
+Create the temporary file inside the PAM folder, as above, never in another
+folder: `Move-Item` keeps the permissions the file had where it was made, so a
+file moved in from, say, `C:\Windows\Temp` arrives without the locked ACL and
+`Users` cannot read it. While a writer holds the file open, PAM reports it busy
+and keeps its previous view; `pam policy check` exits `1` ("used by another
+process") in that case, so retry.
+
 ## Checking it
 
 `pam policy check` reads the file you name exactly as the daemon would. It needs

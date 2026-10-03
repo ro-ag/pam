@@ -51,10 +51,10 @@ pub use store::{
     EvidenceRow, EvidenceViewInsert, EvidenceViewMeta, FlowJournal, FlowJournalBegin,
     FlowJournalIdentity, FlowJournalState, FlowResultMeta, GrantChange, GrantChangeOutcome,
     GrantRow, LandingSession, MAX_EVIDENCE_MAP_BYTES, MAX_EVIDENCE_MAP_SEGMENTS, MAX_EXPIRY_BATCH,
-    MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_LIST_LIMIT, ModelJobRow,
-    OUTCOME_ADMIN_DENIED, PendingApproval, RequestBudgetCharge, RequestBudgetUsage, RequestIngress,
-    RequestOrigin, RequestPrune, RequestRow, RequestState, RequestStatusMeta, RetentionCensus,
-    Store,
+    MAX_FLOW_CHECKPOINT_BYTES, MAX_FLOW_JOURNAL_EVIDENCE, MAX_LIST_LIMIT,
+    MAX_POLICY_LAST_GOOD_BYTES, ModelJobRow, OUTCOME_ADMIN_DENIED, PendingApproval,
+    RequestBudgetCharge, RequestBudgetUsage, RequestIngress, RequestOrigin, RequestPrune,
+    RequestRow, RequestState, RequestStatusMeta, RetentionCensus, SETTING_POLICY_LAST_GOOD, Store,
 };
 pub use store::{
     BoundaryCensus, BoundaryObservationInsert, BoundaryObservationRow, BoundaryPeer,

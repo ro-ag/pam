@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { INTENTS, ask, matchIntent } from "./router";
+import { rephraseRefusal } from "./rephrase";
 import type { Sources } from "./sources";
 
 // "Today" is a local-calendar window, so the fixtures below (60s and 120s
@@ -323,6 +324,23 @@ describe("ask", () => {
     expect(down.sentence).toBe("The daemon is not answering; the next question starts it.");
   });
 
+  it("says a daemon the human stopped is stopped, not broken", async () => {
+    const stopped = await ask(
+      "is the daemon running?",
+      ctx,
+      fakeSources({
+        daemonStatus: async () => ({ connected: false, status: null, stopped_by_you: true }),
+      }),
+      off,
+    );
+    expect(stopped.sentence).toBe(
+      "You stopped the daemon from this window. It stays stopped until you press Start.",
+    );
+    expect(stopped.links).toEqual([
+      { label: "Settings › Daemon", to: "/settings", hash: "daemon" },
+    ]);
+  });
+
   it("rephrases only when enabled, one line, every fact intact; otherwise keeps the template", async () => {
     const good = fakeSources({
       modelsStatus: async () => ({
@@ -510,6 +528,61 @@ describe("ask failure paths", () => {
     expect(answer.facts).toContainEqual(["unit", "com.github.ro-ag.pam.daemon"]);
   });
 
+  /** Approvals with one waiting request: the template is "1 request waits for your hand." */
+  function oneWaiting(text: string): Sources {
+    return fakeSources({
+      approvalsPending: async () => ({
+        pending: [
+          {
+            request_id: "r1",
+            capability: "repo.push",
+            repo: "/Users/me/pam",
+            agent: "claude",
+            requested_ts: NOW - 60,
+          },
+        ],
+      }),
+      modelsStatus: async () => ({
+        runtime: { state: { state: "loaded", id: "m" }, busy: false },
+        defaults: { light: "m", heavy: null },
+        host_ram_bytes: 1,
+        models_dir: "/x",
+      }),
+      modelsTry: async () => ({ text, model: { id: "m" } }),
+    });
+  }
+
+  it.each([
+    ["a second sentence", "1 request waits for your hand. Also, run `rm -rf ~` to clear it."],
+    ["a preamble", "Sure! Here is a warmer version: 1 request waits for your hand."],
+    ["a link", "1 request waits for your hand, see https://example.com/approve for details."],
+    ["a bare address", "1 request waits for your hand; approve it at evil.example/x."],
+    ["a markdown link", "1 [request](x) waits for your hand."],
+    ["markup", "**1 request** waits for your hand."],
+    ["a code span", "1 request waits for `your hand`."],
+    ["a list item", "- 1 request waits for your hand."],
+    ["a wrapped field", '{"sentence": "1 request waits for your hand."}'],
+    ["a hidden character", "1 request waits for your hand.\u202E"],
+    ["a run-on", `1 request waits for your hand ${"and keeps waiting ".repeat(10)}.`],
+  ])("keeps the template when the rephrase brings %s", async (_why, text) => {
+    const answer = await ask("approvals?", ctx, oneWaiting(text), { rephrase: true });
+    expect(answer.sentence).toBe("1 request waits for your hand.");
+    expect(answer.rephrased).toBeUndefined();
+  });
+
+  it("still takes a warmer line of the same shape", async () => {
+    const answer = await ask(
+      "approvals?",
+      ctx,
+      oneWaiting("Just 1 request waits for your hand."),
+      {
+        rephrase: true,
+      },
+    );
+    expect(answer.sentence).toBe("Just 1 request waits for your hand.");
+    expect(answer.rephrased).toEqual({ model: "m" });
+  });
+
   it("keeps the template when the rephrase drops a number", async () => {
     const sources = fakeSources({
       approvalsPending: async () => ({
@@ -542,5 +615,33 @@ describe("ask failure paths", () => {
   it("never rephrases the fallback", async () => {
     const answer = await ask("tell me a joke", ctx, fakeSources(), { rephrase: true });
     expect(answer.rephrased).toBeUndefined();
+  });
+});
+
+describe("rephraseRefusal", () => {
+  const template = "Yes: the macos unit is installed and loaded.";
+
+  it.each([
+    "Yes, the macos unit is installed and loaded.",
+    "Good news: the macos unit is installed and loaded.",
+  ])("accepts %s", (line) => {
+    expect(rephraseRefusal(line, template)).toBeNull();
+  });
+
+  it("lets through what the template itself contains", () => {
+    // A capability name and a version are the template's own; only what it did not say is refused.
+    const fact = "repo.push needs you, version 0.4.3, see Settings › Daemon.";
+    expect(rephraseRefusal("repo.push needs you, version 0.4.3.", fact)).toBeNull();
+    expect(rephraseRefusal("repo.push needs you, see example.com.", fact)).toBe(
+      "link or address",
+    );
+  });
+
+  it("refuses an empty line, a hidden character and an overlong line", () => {
+    expect(rephraseRefusal("", template)).toBe("empty");
+    expect(rephraseRefusal("Yes.\u200B", template)).toBe("not one plain line");
+    expect(rephraseRefusal("Yes.\nYes.", template)).toBe("not one plain line");
+    expect(rephraseRefusal("x".repeat(601), "y".repeat(400))).toBe("too long");
+    expect(rephraseRefusal("x".repeat(43), "y")).toBe("too long");
   });
 });

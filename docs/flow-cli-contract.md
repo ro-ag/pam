@@ -160,6 +160,13 @@ stdout — the same shape as every other refusal — whose `id` is the ticket;
 an observation timeout uses cause `follow_timeout`. Exit codes are the same
 either way. Client-side failures (no daemon, transport) stay on stderr.
 
+`pam subscribe --json` keeps stdout machine-only: one compact JSON object per
+event on its own line as it arrives (`{"kind":"queued"}`,
+`{"kind":"progress","pct":40,"note":"…"}`, `{"kind":"done"}`), then the durable
+terminal response exactly as `pam wait --json` prints it. stdout is a stream of
+concatenated JSON values (`jq` reads it directly); the human `[queued]` lines
+are not printed at all with `--json`.
+
 See [agent workflow](agent-workflow-contract.md), [evidence retrieval](evidence-retrieval.md)
 and [admission budgets](scoped-admission-and-budgets.md). Embedded
 [exact job watches](job-watches.md) use the same run/wait/result commands; guarded

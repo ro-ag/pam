@@ -75,6 +75,7 @@ describe("Beacon", () => {
     ["connected", "daemon connected", "bg-beacon-green"],
     ["pending", "daemon approval pending", "bg-beacon-amber"],
     ["down", "daemon unreachable", "bg-beacon-red"],
+    ["stopped", "daemon stopped by you", "bg-line-strong"],
   ] as const)("renders the %s state", (state, label, tokenClass) => {
     render(<Beacon state={state} />);
     const beacon = screen.getByRole("status", { name: label });

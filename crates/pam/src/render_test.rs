@@ -7,9 +7,9 @@ use crate::client::RequestError;
 use crate::render::{
     CAUSE_FOLLOW_TIMEOUT, DoctorDelivery, EXIT_BLOCKED, EXIT_BOUNDARY, EXIT_REFUSED,
     EXIT_UNRESOLVED, doctor_delivery, doctor_exit_code, exit_code, flow_run_args,
-    parse_flow_inputs, render_doctor_json, render_doctor_reply, render_event, render_flow_inspect,
-    render_flow_list, render_flow_result, render_flow_show, render_follow_failure, render_json,
-    render_refusal, render_status, render_ticket,
+    parse_flow_inputs, render_doctor_json, render_doctor_reply, render_event, render_event_line,
+    render_flow_inspect, render_flow_list, render_flow_result, render_flow_show,
+    render_follow_failure, render_json, render_refusal, render_status, render_ticket,
 };
 
 fn result(outcome: Outcome) -> Response {
@@ -1454,4 +1454,41 @@ mod policy_check {
         );
         assert!(text.contains("Corp\\u{202e}evil"), "{text}");
     }
+}
+
+#[test]
+fn a_json_event_line_is_one_compact_object_and_never_the_human_text() {
+    let lines = [
+        (Event::Queued, r#"{"kind":"queued"}"#),
+        (Event::Started, r#"{"kind":"started"}"#),
+        (
+            Event::Progress {
+                pct: Some(40),
+                note: "halfway".to_owned(),
+            },
+            r#"{"kind":"progress","pct":40,"note":"halfway"}"#,
+        ),
+        (Event::ApprovalPending, r#"{"kind":"approval_pending"}"#),
+        (Event::Done, r#"{"kind":"done"}"#),
+        (Event::Refused, r#"{"kind":"refused"}"#),
+    ];
+    for (event, expected) in lines {
+        let line = render_event_line(&event, true);
+        assert_eq!(line, expected);
+        assert!(!line.contains('\n'), "one event is one line: {line}");
+        assert_eq!(
+            render_event_line(&event, false),
+            render_event(&event),
+            "without --json the human line is unchanged"
+        );
+    }
+    // Text the model or an agent chose is JSON-escaped, never a second line.
+    let hostile = Event::Progress {
+        pct: None,
+        note: "line one\nline two \"quoted\"".to_owned(),
+    };
+    let line = render_event_line(&hostile, true);
+    assert!(!line.contains('\n'));
+    let back: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+    assert_eq!(back["note"], "line one\nline two \"quoted\"");
 }

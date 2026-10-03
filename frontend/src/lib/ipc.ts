@@ -438,9 +438,17 @@ export interface DaemonStatusReply {
   status: StatusBody | null;
   /** The base directory the bridge resolved (`$PAM_BASE_DIR` or `~/.pam`); absent on an older bridge. */
   base_dir?: string;
+  /**
+   * True while the daemon is down because the human pressed Stop in this window and has not
+   * pressed Start: the polls look but never start it. Absent on an older bridge.
+   */
+  stopped_by_you?: boolean;
 }
 
-/** Daemon health; ensures (lazily starts) the daemon as a side effect. */
+/**
+ * Daemon health; ensures (lazily starts) the daemon as a side effect, unless the human stopped
+ * it from this window ({@link daemonStop}) and has not started it again ({@link daemonStart}).
+ */
 export function daemonStatus(): Promise<DaemonStatusReply> {
   return bridged<DaemonStatusReply>("daemon_status", undefined, STATUS_TIMEOUT_MS);
 }
@@ -450,9 +458,17 @@ export interface DaemonStopReply {
   pid: number | null;
 }
 
-/** Stops the daemon; the next status poll lazily restarts it. */
+/**
+ * Stops the daemon and keeps it stopped: the bridge's status poll and admin calls stop starting
+ * it until {@link daemonStart} or a restart of the window.
+ */
 export function daemonStop(): Promise<DaemonStopReply> {
   return bridged<DaemonStopReply>("daemon_stop", undefined, STOP_TIMEOUT_MS);
+}
+
+/** Lets the bridge start the daemon again and starts it; answers like {@link daemonStatus}. */
+export function daemonStart(): Promise<DaemonStatusReply> {
+  return bridged<DaemonStatusReply>("daemon_start", undefined, STATUS_TIMEOUT_MS);
 }
 
 // --- login-start service ---------------------------------------------------
@@ -1911,7 +1927,15 @@ export function flowsGet(id: string): Promise<FlowDetail> {
 export function flowsSave(
   id: string,
   yaml: string,
-  options: { create_only?: boolean; allow_builtin_override?: boolean } = {},
+  options: {
+    create_only?: boolean;
+    allow_builtin_override?: boolean;
+    /**
+     * The digest of the flow the editor opened. The daemon refuses `flow_changed` when the flow
+     * now has another digest (someone saved in between) and writes nothing.
+     */
+    expected_digest?: string;
+  } = {},
 ): Promise<FlowListEntry & GrantRevocation> {
   return adminCall("admin.flows.save", { id, yaml, ...options });
 }

@@ -28,7 +28,21 @@ export function revokedNotice(reply: GrantRevocation | null | undefined): string
     : `${count} steps changed. Their remembered approval was removed and they will ask again.`;
 }
 
-export type LibraryDraft = { id: string; yaml: string; dirty: boolean; saveDisabled?: boolean };
+export type LibraryDraft = {
+  id: string;
+  yaml: string;
+  dirty: boolean;
+  saveDisabled?: boolean;
+  /** The digest of the flow when the draft was opened; a save is pinned to it. */
+  baseDigest?: string | null;
+};
+
+/** What a save of the editor's draft sends: pinned to the digest the draft was opened from. */
+function saveDraftOf(draft: LibraryDraft) {
+  return draft.baseDigest
+    ? flowsSave(draft.id, draft.yaml, { expected_digest: draft.baseDigest })
+    : flowsSave(draft.id, draft.yaml);
+}
 type Mode = "new" | "duplicate" | "rename" | "delete";
 
 function FlowDialog({
@@ -146,6 +160,34 @@ export function useFlowLibraryControls({
     onDiscard();
     onSelected(flowId);
   }
+  /**
+   * The failure of a draft save. A `flow_changed` refusal is a conflict, not a mistake: someone
+   * else saved this flow since it was opened, so the way out is to load their version (the
+   * human's edits are replaced, and the note says so).
+   */
+  function failureNote(label: string) {
+    if (!failure) return null;
+    const conflict = failure.cause === "flow_changed" && selected !== null;
+    return (
+      <FailureNote failure={failure} label={label}>
+        {conflict && (
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={busy}
+            onClick={() => {
+              const current = selected.id;
+              setPending(null);
+              setFailure(null);
+              void refresh(current);
+            }}
+          >
+            Reload the saved flow (discards your edits)
+          </Button>
+        )}
+      </FailureNote>
+    );
+  }
   function open(next: Mode) {
     requestNavigation(() => {
       setFailure(null);
@@ -243,7 +285,7 @@ export function useFlowLibraryControls({
   const saveDraft = (current: LibraryDraft) =>
     void perform(async () => {
       if (!current.dirty || current.id !== selected?.id || current.saveDisabled) return;
-      announce(await flowsSave(current.id, current.yaml));
+      announce(await saveDraftOf(current));
       await refresh(current.id);
     });
   const cancelMode = () => {
@@ -478,7 +520,7 @@ export function useFlowLibraryControls({
               any errors in the editor.
             </p>
           )}
-          {failure && <FailureNote failure={failure} label="flow" />}
+          {failureNote("flow")}
           <div className="flex gap-2">
             <Button
               size="sm"
@@ -487,7 +529,7 @@ export function useFlowLibraryControls({
                 if (!draft || draft.saveDisabled) return;
                 const proceed = pending.proceed;
                 const saved = await perform(async () => {
-                  announce(await flowsSave(draft.id, draft.yaml));
+                  announce(await saveDraftOf(draft));
                   await refresh(draft.id);
                 });
                 if (saved) {
@@ -517,7 +559,7 @@ export function useFlowLibraryControls({
           </div>
         </FlowDialog>
       )}
-      {!mode && !pending && failure && <FailureNote failure={failure} label="flow library" />}
+      {!mode && !pending && failureNote("flow library")}
     </>
   );
   return {

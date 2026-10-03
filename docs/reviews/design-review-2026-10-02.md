@@ -59,17 +59,17 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | --- | --- | --- | --- | --- |
 | 1 | High | Stateful steps may write `.git/hooks` and `.git/config` of the real checkout | `command_containment.rs:224-239` | fixed: Git's control surface (the `.git` entry, hooks, config, commondir, in submodule and worktree directories and through gitfile redirects) is denied for writes; objects, index, refs and logs stay writable |
 | 2 | High | Approval and grants bind to a name (`flow.step:<flow>/<step>`), not to what runs | `flow_service.rs:238`, `policy.rs:246-263`, `approval.rs:278-285` | partly fixed: saving or deleting a flow revokes grants of changed steps, `flow.run` can be pinned to a digest, an approval is pinned to the resolved command; a flow edited outside the admin surface keeps its grants, and a grant is still global (needs an owner decision: store migration) |
-| 3 | High | Guarded landing can strand a ticket after the irreversible merge, with no flow path to finish | `flow_landing_runtime.rs:19-20`, `729-752` | partly fixed: a new ticket finishes a landing whose PR is already merged at the frozen head; the fixed 20 x 5 s polling budget is deferred (needs an owner decision) |
-| 4 | Medium | The credentialed, uncontained git broker is resolved from user-writable PATH-first directories | `flow_landing_runtime.rs:216-231`, `landing_git.rs:155-188` | needs owner decision |
+| 3 | High | Guarded landing can strand a ticket after the irreversible merge, with no flow path to finish | `flow_landing_runtime.rs:19-20`, `729-752` | fixed: a new ticket finishes a landing whose PR is already merged at the frozen head; since ptrack task 224 PR and main verification back off from 5 s, doubling to a 60 s cap with jitter, until the request deadline ([guarded landing](../guarded-landing.md#durable-effects-and-bounded-waiting)) |
+| 4 | Medium | The credentialed, uncontained git broker is resolved from user-writable PATH-first directories | `flow_landing_runtime.rs:216-231`, `landing_git.rs:155-188` | fixed (task 224): never looked up on `PATH`; an explicit `git_path` (GUI or managed `landing.git_path`) else a fixed allowlist, each refused unless the file and every ancestor are owned by root or the daemon's user and not group/other-writable; the pin is recorded at freeze and checked before every Git process ([guarded landing](../guarded-landing.md#configure-and-inspect)) |
 | 5 | Medium | Substituted values reach argv with no argument-shape guard | `validate.rs:839-860`, `vars.rs:95-113` | partly fixed: a substituted value that would become an option blocks the step; typed inputs are an owner decision |
 | 6 | Medium | Effect intent is journaled before the approval gate, so a cancel during the approval wait reads as `flow_effect_uncertain` | `flow_service.rs:1666-1676` | fixed: the intent is journaled after the gate allows the step (a narrow window between arming and spawn remains) |
 | 7 | Medium | Default `when: needs_succeeded` is vacuously true, so later steps run after a failure | `flow_service.rs:1753-1766` | partly fixed: a stateful step with no `needs` no longer runs after a failure; a read-only step with no `needs` stays independent, by design (an owner may prefer a stricter validation) |
 | 8 | Medium | Timeout and cancel kill only the child pid | `flow_exec.rs:456-476` | fixed: the whole process group is killed on timeout, cancel, output limit and abandonment (a `setsid` descendant escapes) |
 | 9 | Medium | The verdict hides that an effect happened, and a landing prefix reads as a full landing | `flow_exec.rs:192-222`, `flow_contract.rs:100-290` | fixed: `effects` beside the outcome; the claim that an all-skipped run is `solved` is not a bug |
-| 10 | Medium-low | PR create and merge rejections are recorded as uncertain; merge method is hard-coded | `flow_landing_runtime.rs:360-412`, `github_landing.rs:369` | deferred (needs a typed rejection in the connector crate; the merge method default is an owner decision) |
+| 10 | Medium-low | PR create and merge rejections are recorded as uncertain; merge method is hard-coded | `flow_landing_runtime.rs:360-412`, `github_landing.rs:369` | fixed (task 224): typed `ConnectorError::Rejected` for 405/409/422, so the intent is `rejected` and the step blocks; the merge method is a landing setting (`squash` default, managed `landing.merge_method`) |
 | 11 | Medium-low | `${...}` in `env:` is validated but never substituted; env can override isolation variables | `validate.rs:786-799`, `flow_service.rs:2137` | partly fixed: substituted at run time; reserving `PATH`, `HOME` and `GIT_CONFIG_*` is an owner decision |
 | 12 | Low (plausible) | The daemon writes into an agent-writable `.git` after a stale layout check (symlink swap) | `landing_git.rs:565-650`, `1113-1251` | partly fixed: each directory is walked and checked immediately before each write; a swap in the instants between walk and write remains |
-| 13 | Low | Required PR and main checks are matched by name only | `github_landing.rs:385-465` | deferred |
+| 13 | Low | Required PR and main checks are matched by name only | `github_landing.rs:385-465` | fixed (task 224): checks can be pinned as `{ name, app_id }`; a same-named check from another app or a commit status never satisfies a pinned one; name-only checks show "Unpinned app" |
 | 14 | Low | Stringly-typed, duplicated state machines | `flow_landing_runtime.rs:39-44`, `landing_session.rs:97-108`, `flow_contract.rs:391-409` | deferred |
 | 15 | Low | The compact result drops the last steps first | `flow_contract.rs:292-304` | fixed: succeeded and skipped observations are dropped first |
 | c1 | Carry-over | `github_owner_name` matches the first `github.com` anywhere in the origin URL (reported in the 2026-09-16 flow review) | `flow_service.rs:1413` | fixed: the host must be exactly `github.com` |
@@ -86,13 +86,13 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 4 | High | The GUI's polling creates unbounded request and audit rows, and no index supports the hot list query | `bridge.rs:325-335`, `queue.rs:321`, `store.rs` | fixed: indexes (schema 12) and ledger-free `status`; admission ignores expired rows |
 | 5 | Medium | The grant revocation revision is a global count; any revoke orphans every older ticket's results and evidence | `store.rs:704-757`, `evidence_service.rs:175-182` | partly fixed: scoped to the grants a request depends on; any flow's step revocation still voids every `flow.run` ticket (needs an owner decision: a column written at admission) |
 | 6 | Medium | `update_request_state` can resurrect a terminal request | `store.rs:1055-1062` | fixed: returns `AlreadyTerminal` and writes nothing |
-| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched; chunked view storage, a read connection (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)) and a delayed first prune are deferred |
+| 7 | Medium | Head-of-line blocking: hashing, large blobs and unbatched sweeps run while holding the connection lock | `store.rs:1837`, `evidence_views.rs:141-165`, `1985-2075` | partly fixed: hashing moved before the lock, prunes batched, the read connection built (T7 of the [SQLite plan](../specs/2026-10-02-sqlite-store.md)); chunked view storage done (schema 20, task 228: 64 KiB chunks, a page of a 32 MiB view 3.8 ms to 0.17 ms in release); a delayed first prune is still open |
 | 8 | Medium | "One audit row per operation, refusals included" is not structural: pre-admission refusals leave no row | `migrations.rs:153`, `daemon.rs:792-963` | fixed: the `refusal` table (schema 18) holds them, coalesced and bounded, and `admin.activity.list` interleaves them; what is still unrecorded is listed in the audit contract |
-| 9 | Medium | Immutability of audit and evidence is by convention only | `migrations.rs`, `store.rs:1265-1289` | partly fixed: triggers make `audit` append-only and `evidence_view` immutable except retention's tombstone; a unique terminal audit row, re-hashing served bytes and a view-to-evidence key are deferred |
+| 9 | Medium | Immutability of audit and evidence is by convention only | `migrations.rs`, `store.rs:1265-1289` | fixed: triggers make `audit` append-only and `evidence_view` immutable except retention's tombstone; since task 228 one terminal audit row per request by a partial unique index (schema 19), served bytes re-hashed per chunk (`evidence_corrupt`), and `evidence_view.source_id` a foreign key with a CHECK that a live view has its evidence (schema 20) |
 | 10 | Medium | Retention is irreversible, runs on an unvalidated wall clock, and its settings flow is non-atomic | `retention.rs:200-216`, `store.rs:2075-2089` | partly fixed: an out-of-range stored window reads as forever, both windows save in one transaction; a forward clock jump still prunes early (needs an owner decision) |
 | 11 | Medium | A beta engine under the audit and authorization spine: no integrity check, no backup, no fallback, engine types leak | `migrations.rs`, `store.rs:592`, `lib.rs` | partly fixed: boot `quick_check` (files up to 256 MiB), on-demand check, corruption mapped to a legible error; backup, export and an alternate backend need an owner decision (decided 2026-10-02: SQLite, [spec](../specs/2026-10-02-sqlite-store.md); backup in its T2) |
 | 12 | Low | Evidence range edge cases: end-of-view reads error, a NULL blob pages forever | `evidence_views.rs:223-244` | fixed |
-| 13 | Low | Crash-window leftovers: ghost pending approvals, orphan checkpoints, unrecoverable journal | `lifecycle.rs:218-246`, `store.rs:1595` | partly fixed: finished requests' approvals are hidden and the approval insert is atomic; journal-before-checkpoint and orphan checkpoint rows are deferred |
+| 13 | Low | Crash-window leftovers: ghost pending approvals, orphan checkpoints, unrecoverable journal | `lifecycle.rs:218-246`, `store.rs:1595` | fixed: finished requests' approvals are hidden and the approval insert is atomic; since task 228 journal and checkpoint are one transaction (journal first) and boot recovery removes checkpoints without a journal (`flow.checkpoint_orphaned`) ([workflow recovery](../workflow-recovery.md#durable-boundary)) |
 | 14 | Low | Version skew: a stale client makes a newer daemon drain and restart | `migrations.rs:91-96`, `daemon.rs:915-935` | fixed (daemon core, finding 2) |
 | 15 | Low | Compaction: "reversible" depends on retained, optional artifacts; the failure keyword set is narrow | `log_service.rs:287-323`, `pam_compact` | deferred (recorded only) |
 | x | Found while fixing | Boot recovery came within 8 KiB of a 2 MiB test-thread stack in a debug build | `store.rs` recovery queries | fixed: three deep expressions flattened; a test pins a 1.5 MiB budget |
@@ -135,11 +135,11 @@ What the changes mean for users and agents is in `CHANGELOG.md` under
 | 8 | Medium | The approval card shows the submitted args, not what will run, and trusts unauthenticated strings | `Approvals.tsx:147-160` | fixed: resolved-command snapshot pinned by digest, one token per argument, hidden characters escaped |
 | 9 | Medium | The webview is a full-admin root: `admin_call` and `request_capability` are generic passthroughs | `bridge.rs:355-372` | partly fixed: a typed confirmation checked in Rust for relaxed, grant and remember, and `request_capability` removed; a compromised webview can still supply the phrase, and a native dialog is an owner decision |
 | 10 | Medium | `pam service install` pins whatever binary and environment the caller has, and `status` cannot detect a stale pin | `main.rs:134-510` | fixed: refusals for temp, build and writable binaries, explicit `--base-dir`, `pinned_exe` and `stale` in the report |
-| 11 | Medium | Session relay: an accept error kills the relay; no connection bounds; chmod and bind follow symlinks | `relay.rs:168-211` | partly fixed: accept errors retried, 64 connections per socket, bounded dial; the symlink hardening of `prepare` is deferred |
+| 11 | Medium | Session relay: an accept error kills the relay; no connection bounds; chmod and bind follow symlinks | `relay.rs:168-211` | fixed: accept errors retried, 64 connections per socket, bounded dial, and `prepare` refuses a symlinked or foreign directory, a symlinked, foreign or non-socket `pam.sock` entry and replaces only a stale socket it owns (the same-user check-then-bind race is narrowed, not closed: std has no `bindat`; documented in the relay doc) |
 | 12 | Medium | A synchronous request that times out leaves work running with no request id printed | `main.rs:598`, `701` | fixed: the id and the `pam wait` recovery are printed; a random idempotency key was rejected on purpose because it would defeat the daemon's shape dedupe |
 | 13 | Low-medium | The version handshake is semver-string only and its retry does not land on the new daemon | `client.rs:496-500` | fixed |
 | 14 | Low-medium | The audit actor trusts a forgeable label, and the real GUI never gets it | `executor.rs:402-406` | fixed (daemon core, finding 5; the GUI cancels through `admin.requests.cancel`) |
-| 15 | Low (plausible) | Smaller issues: (a) Ask Pam rephrase accepts extra text, (b) `flows.save` has no expected digest, (c) Stop daemon is a no-op while the GUI polls, (d) `kill` is resolved through `PATH`, (e) `subscribe --json` interleaves text, (f) `detect_caller` per poll | `rephrase.ts:40-60`, `ipc.ts:1206`, `client.rs:789-797` | partly fixed: (d) fixed with an absolute `kill`; (a), (b), (c), (f) deferred; (e) is doc-declared |
+| 15 | Low (plausible) | Smaller issues: (a) Ask Pam rephrase accepts extra text, (b) `flows.save` has no expected digest, (c) Stop daemon is a no-op while the GUI polls, (d) `kill` is resolved through `PATH`, (e) `subscribe --json` interleaves text, (f) `detect_caller` per poll | `rephrase.ts:40-60`, `ipc.ts:1206`, `client.rs:789-797` | fixed: (a) the rephrase must have the template's shape; (b) `admin.flows.save` takes `expected_digest` and refuses `flow_changed`; (c) Stop keeps the daemon down until the human presses Start; (d) absolute `kill` (the test helper too); (e) `subscribe --json` writes JSON only; (f) the caller identity is detected once per process |
 
 ## Owner decisions recorded
 
@@ -208,11 +208,18 @@ From the fix reports:
   recorded on the request row at admission. **Done 2026-10-03 (task 222)**:
   `request.flow_id`; rows admitted before it still fail closed.
 - Pin the credentialed git broker to a root-owned Git, which would refuse a
-  Homebrew Git, against an explicit GUI-set path.
+  Homebrew Git, against an explicit GUI-set path. **Done 2026-10-03 (ptrack task
+  224)**: an explicit `git_path` or a fixed allowlist, owned by root or the
+  daemon's user with no group/other write on the file or any ancestor; a
+  Homebrew Git qualifies only when its directories are not group-writable, which
+  a default Homebrew is not.
 - Replace the fixed 20 x 5 s landing poll budget with backoff to the request
-  deadline (changes `docs/guarded-landing.md`).
+  deadline (changes `docs/guarded-landing.md`). **Done 2026-10-03 (task 224)**.
 - Make the merge method a landing policy field and choose its default; require
-  `{ name, app_id }` for required checks.
+  `{ name, app_id }` for required checks. **Done 2026-10-03 (task 224)**:
+  `squash` by default, lockable by the managed `landing.merge_method`; pinned
+  checks are `{ name, app_id }`, name-only checks still run labelled "Unpinned
+  app".
 - Add typed flow inputs (`ref`, `sha`, `path`, `int`); reserve `PATH`, `HOME` and
   `GIT_CONFIG_*` in step `env:`; or refuse at validation a non-first stateful step
   with neither `needs` nor `when`.
@@ -244,12 +251,14 @@ From the fix reports:
   change in framing drops the "qualified" badge.
 - Whether the AWS adapter stays, is contained, or is deleted.
 - A native confirmation dialog for authority-expanding admin operations (the
-  bridge's typed phrase does not stop a compromised webview), and whether Stop
-  daemon should stay a no-op while the GUI is open. Still open; on a managed
-  machine the policy narrows it: a key the policy locks or bounds (a `strict`
-  profile, `grants.manual: deny`, `grants.remember: deny`, never-grant rules)
-  is refused by the daemon whatever the webview sends, so a compromised webview
-  cannot widen it (2026-10-03, plan 54).
+  bridge's typed phrase does not stop a compromised webview). Still open; on a
+  managed machine the policy narrows it: a key the policy locks or bounds (a
+  `strict` profile, `grants.manual: deny`, `grants.remember: deny`, never-grant
+  rules) is refused by the daemon whatever the webview sends, so a compromised
+  webview cannot widen it (2026-10-03, plan 54). Whether Stop daemon should stay a
+  no-op while the GUI is open is **decided and done (2026-10-03, ptrack task
+  229)**: Stop keeps the daemon down until the human presses Start or the window is
+  restarted, and the window's polls only look.
 
 ## Deferred
 
@@ -259,8 +268,6 @@ Not done, with the reason.
   handler deadline and the separate pools bound its effect.
 - **Windows pending-handshake slots** (daemon core 12): the Windows listener is
   replaced by the new transport.
-- **Typed connector rejections** (flows 10) and **check identity** (flows 13): both
-  need changes in the connector crate and the GUI landing form together.
 - **One shared effect-intent type and a pure `inspect_gate`** (flows 14), and a
   `StepExecutor` split of `flow_service.rs`: structural; the `match step.action`
   repetition is unchanged. The same holds for the single request state machine
@@ -268,11 +275,8 @@ Not done, with the reason.
 - **`watch_target_changed` raw results readable through `${steps.*}`** and builtin
   descriptions that over-promise `git fetch`: unreachable from shipped recipes, and
   description text only.
-- **Chunked view storage, a second read connection, a delayed first prune** (store
-  7), **a unique terminal audit row, served-byte re-hashing, a view-to-evidence
-  key** (store 9), **journal-before-checkpoint and orphan checkpoint rows** (store
-  13) and **compaction reversibility and keyword set** (store 15): schema
-  redesigns or code outside the store's files.
+- **A delayed first prune** (store 7) and **compaction reversibility and keyword
+  set** (store 15): code outside the store's files.
 - **The branch of the integrity check that fails after a successful open** (store
   11): no such file could be constructed, so it is untested.
 - **A dedicated `client_version_mismatch` message in the client and a Settings
@@ -282,8 +286,6 @@ Not done, with the reason.
   and the one launcher.
 - **A per-request credential cache** (model 12).
 - **The development-build GUI URL** (client 3): a known development-only caveat.
-- **Relay `prepare` symlink hardening** (client 11), and client 15 items (a),
-  (b), (c) and (f).
 - **A GUI label on model summaries**: the CLI labels them, the GUI step summary does
   not.
 - **Not run:** anything on Windows, including the daemon's admin listener edit and

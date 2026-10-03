@@ -541,11 +541,12 @@ request row exists.
 **A request row** is written for every operation the daemon admits: a public
 request that passed admission, an administration operation, and the daemon's own
 bookkeeping (a policy load, a crash recovery). It ends in exactly one terminal
-audit row, whatever the ending: done, refused at the gate, refused by approval
-or by the capability itself, failed, cancelled, or timed out. `status` is the one
-public operation that writes nothing (a poll leaves no row, so the GUI's polling
-cannot grow the ledger). The Activity screen lists request rows, and each
-opens into its audit trail.
+audit row (enforced by the schema since version 19: the terminal row is flagged
+and a second one for the same request is refused), whatever the ending: done,
+refused at the gate, refused by approval or by the capability itself, failed,
+cancelled, or timed out. `status` is the one public operation that writes
+nothing (a poll leaves no row, so the GUI's polling cannot grow the ledger).
+The Activity screen lists request rows, and each opens into its audit trail.
 
 **A refusal row** (table `refusal`, schema 18) is written for a refusal decided
 *before* admission, where there is no request row to hang an audit row on:

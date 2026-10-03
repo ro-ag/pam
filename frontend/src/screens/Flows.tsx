@@ -197,9 +197,17 @@ interface Draft {
   spec: FlowSpec | null;
   error: FlowIssue | null;
   dirty: boolean;
+  /** The flow's digest when the draft was loaded: what a save is pinned to. */
+  baseDigest: string | null;
 }
 
-const EMPTY_DRAFT: Draft = { yaml: "", spec: null, error: null, dirty: false };
+const EMPTY_DRAFT: Draft = {
+  yaml: "",
+  spec: null,
+  error: null,
+  dirty: false,
+  baseDigest: null,
+};
 
 /**
  * The lifted draft and its round trip through `admin.flows.normalize`.
@@ -244,6 +252,8 @@ function useFlowDraft(entry: FlowListEntry) {
       spec,
       error: spec ? null : { path: "yaml", message: fileError ?? "this flow will not parse" },
       dirty: false,
+      // An invalid file has no digest: nothing to pin, and the save is what repairs it.
+      baseDigest: spec && data.digest ? data.digest : null,
     });
   }, [entry.id, fileError, detail.data, cancel]);
 
@@ -263,6 +273,7 @@ function useFlowDraft(entry: FlowListEntry) {
                 spec: reply.flow,
                 error: null,
                 dirty: prev.dirty,
+                baseDigest: prev.baseDigest,
               }
             : { ...prev, error: reply.error },
         );
@@ -439,8 +450,18 @@ function FlowDetailPane({
         yaml: draft.yaml,
         dirty: draft.dirty,
         saveDisabled: normalizing || draft.error !== null || draft.spec === null,
+        baseDigest: draft.baseDigest,
       }),
-    [entry.id, draft.yaml, draft.dirty, draft.error, draft.spec, normalizing, onDraft],
+    [
+      entry.id,
+      draft.yaml,
+      draft.dirty,
+      draft.error,
+      draft.spec,
+      draft.baseDigest,
+      normalizing,
+      onDraft,
+    ],
   );
   const [selection, setSelection] = useState<Selection>({ kind: "none" });
   const [run, setRun] = useState<FlowRunState | null>(null);
@@ -550,7 +571,13 @@ function FlowDetailPane({
               disabled={busy || saveDisabled}
               onClick={() => {
                 if (!busy && !saveDisabled && !isLocked())
-                  onSave({ id: entry.id, yaml: draft.yaml, dirty: draft.dirty, saveDisabled });
+                  onSave({
+                    id: entry.id,
+                    yaml: draft.yaml,
+                    dirty: draft.dirty,
+                    saveDisabled,
+                    baseDigest: draft.baseDigest,
+                  });
               }}
             >
               {busy ? "Saving…" : "Save"}

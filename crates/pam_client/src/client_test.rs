@@ -1979,3 +1979,82 @@ async fn a_daemon_that_still_greets_in_zmtp_after_the_takeover_ends_the_call() {
     );
     assert_eq!(old.connections(), 2);
 }
+
+// --- the non-starting requests ---------------------------------------------------
+
+/// With nobody holding the instance lock, a request that must not start the daemon sends
+/// nothing and says so: `None`, and no runtime directory appears (the ensure step would have
+/// created one and spawned a daemon).
+#[tokio::test]
+async fn a_request_that_must_not_start_the_daemon_finds_none_and_starts_none() {
+    let tmp = short_tempdir();
+    let sent = crate::client::send_request_if_running(
+        tmp.path(),
+        "status",
+        serde_json::json!({}),
+        true,
+        1_000,
+    )
+    .await
+    .expect("no daemon is an answer, not an error");
+    assert!(sent.is_none());
+    assert!(
+        !tmp.path().join("run").exists(),
+        "nothing touched the runtime directory"
+    );
+
+    let admin = crate::client::send_admin_if_running(
+        tmp.path(),
+        "admin.profile.get",
+        serde_json::json!({}),
+        1_000,
+    )
+    .await
+    .expect("no daemon is an answer, not an error");
+    assert!(admin.is_none());
+    assert!(!tmp.path().join("run").exists());
+}
+
+/// The same entry points keep the structural guards of their starting twins.
+#[tokio::test]
+async fn the_non_starting_requests_keep_the_channel_guards() {
+    let tmp = short_tempdir();
+    let public = crate::client::send_request_if_running(
+        tmp.path(),
+        "admin.grants.add",
+        serde_json::json!({}),
+        true,
+        1_000,
+    )
+    .await
+    .expect_err("admin capabilities never go on the public socket");
+    assert!(matches!(public, RequestError::AdminOnly { .. }));
+    let admin =
+        crate::client::send_admin_if_running(tmp.path(), "echo", serde_json::json!({}), 1_000)
+            .await
+            .expect_err("only admin operations go on the private channel");
+    assert!(matches!(admin, RequestError::NotAdmin { .. }));
+}
+
+/// With a daemon holding the lock the request is exchanged as usual, and the ensure step is
+/// never part of it: a request the daemon answers is `Some`, and the daemon saw one request.
+#[tokio::test]
+async fn a_running_daemon_answers_a_request_that_must_not_start_it() {
+    let tmp = short_tempdir();
+    let (_daemon, seen) = answering(tmp.path(), |request| {
+        Some(result_for(request, serde_json::json!({"alive": true})))
+    });
+    let sent = crate::client::send_envelope_if_running(
+        tmp.path(),
+        &crate::request::build_envelope("status", serde_json::json!({}), true, 1_000, None),
+        &options(),
+    )
+    .await
+    .expect("the daemon answers")
+    .expect("a daemon holds the lock");
+    match sent {
+        Response::Result { body, .. } => assert_eq!(body["alive"], true),
+        other => panic!("expected a result, got {other:?}"),
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}

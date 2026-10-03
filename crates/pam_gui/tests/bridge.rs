@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use pam_client::client;
 use pam_daemon::policy::CAUSE_UNKNOWN_CAPABILITY;
-use pam_gui::bridge::{expect_result, is_disconnect, is_known_admin_op};
+use pam_gui::bridge::{HumanStop, expect_result, is_disconnect, is_known_admin_op, poll_status};
 use pam_gui::events::{AdminConnect, EventPayload, EventSink, PayloadEvent, pump};
 use pam_proto::wire::Ingress;
 use pam_proto::{Event, Response};
@@ -55,6 +55,41 @@ async fn daemon_status_call_answers_the_status_body() {
         );
     }
     daemon.stop().await;
+}
+
+/// The human's Stop against a real daemon: while it runs the poll reads it as usual (a raised
+/// flag only forbids starting), and once it has stopped the poll reports "stopped by you" and
+/// leaves it stopped — the instance lock stays free, no successor appears.
+#[tokio::test]
+async fn a_stopped_daemon_stays_stopped_while_the_gui_polls() {
+    let daemon = TestDaemon::spawn().await;
+    let base = daemon.base_dir();
+    let stop = HumanStop::new();
+    stop.raise();
+
+    let reply = with_deadline(poll_status(&base, &stop))
+        .await
+        .expect("a live daemon answers the poll");
+    assert!(
+        reply.connected,
+        "a raised flag does not hide a running daemon"
+    );
+    assert!(!reply.stopped_by_you);
+
+    let tmp = daemon.stop().await;
+    for _ in 0..3 {
+        let reply = with_deadline(poll_status(&base, &stop))
+            .await
+            .expect("a stopped daemon is an answer");
+        assert!(!reply.connected);
+        assert!(reply.stopped_by_you);
+        assert_eq!(
+            client::probe_daemon(&base).expect("probe"),
+            client::DaemonStatus::NotRunning,
+            "the poll did not start a successor"
+        );
+    }
+    drop(tmp);
 }
 
 /// `admin_call`'s happy path: a whitelisted op goes through

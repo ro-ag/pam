@@ -927,6 +927,43 @@ pub async fn send_request_patient(
     }
 }
 
+/// [`send_request`] that never starts a daemon: `Ok(None)` when nobody holds the instance lock
+/// (nothing was sent), otherwise the request exchanged as [`send_request`] does, but with no
+/// ensure step, so a daemon that exits in between is a connect error and not a spawn. Under the
+/// session override (`$PAM_SOCKET_DIR`) the relay is the transport and the base's lock says
+/// nothing, so the request is simply sent. For a caller whose human stopped the daemon on
+/// purpose: its polls must not bring the daemon back.
+pub async fn send_request_if_running(
+    base_dir: &Path,
+    capability: &str,
+    args: serde_json::Value,
+    wait: bool,
+    deadline_ms: u64,
+) -> Result<Option<Response>, RequestError> {
+    if capability.starts_with(ADMIN_PREFIX) {
+        return Err(RequestError::AdminOnly {
+            capability: capability.to_owned(),
+        });
+    }
+    let envelope = build_envelope(capability, args, wait, deadline_ms, None);
+    send_envelope_if_running(base_dir, &envelope, &DialOptions::from_env()).await
+}
+
+/// [`send_request_if_running`] with the dial options injected.
+pub(crate) async fn send_envelope_if_running(
+    base_dir: &Path,
+    envelope: &Envelope,
+    options: &DialOptions,
+) -> Result<Option<Response>, RequestError> {
+    if options.session_dir.is_none() && matches!(probe_daemon(base_dir)?, DaemonStatus::NotRunning)
+    {
+        return Ok(None);
+    }
+    send_envelope_with(base_dir, envelope, options, || async { Ok(()) })
+        .await
+        .map(Some)
+}
+
 /// Sends one **GUI-only** admin operation (`admin.*`) to the daemon — the path `pam gui`
 /// administers the daemon through (grants, approvals, profile, activity), deliberately separate
 /// from [`send_request`], which refuses `admin.*` outright. The native administration channel
@@ -945,12 +982,23 @@ pub async fn send_admin(
     args: serde_json::Value,
     deadline_ms: u64,
 ) -> Result<Response, RequestError> {
+    let envelope = admin_envelope(op, args, deadline_ms)?;
+    exchange_admin(base_dir, &envelope).await
+}
+
+/// The envelope of one admin operation: a fresh id, the administration caller identity and a
+/// synchronous request.
+fn admin_envelope(
+    op: &str,
+    args: serde_json::Value,
+    deadline_ms: u64,
+) -> Result<Envelope, RequestError> {
     if !op.starts_with(ADMIN_PREFIX) {
         return Err(RequestError::NotAdmin {
             capability: op.to_owned(),
         });
     }
-    let envelope = Envelope {
+    Ok(Envelope {
         v: PROTOCOL_VERSION,
         id: new_request_id(),
         capability: op.to_owned(),
@@ -964,8 +1012,28 @@ pub async fn send_admin(
         idempotency_key: None,
         deadline_ms,
         wait: true,
-    };
-    exchange_admin(base_dir, &envelope).await
+    })
+}
+
+/// [`send_admin`] that never starts a daemon: `Ok(None)` when nobody holds the instance lock
+/// (nothing was sent), otherwise the one exchange on the private channel, as [`send_admin`]
+/// makes it but without the ensure step, so a daemon that exits in between is a connect error
+/// and not a spawn. For a caller whose human stopped the daemon on purpose: its polls must not
+/// bring the daemon back.
+pub async fn send_admin_if_running(
+    base_dir: &Path,
+    op: &str,
+    args: serde_json::Value,
+    deadline_ms: u64,
+) -> Result<Option<Response>, RequestError> {
+    let envelope = admin_envelope(op, args, deadline_ms)?;
+    if matches!(probe_daemon(base_dir)?, DaemonStatus::NotRunning) {
+        return Ok(None);
+    }
+    pam_daemon::admin_transport::exchange(base_dir, &envelope)
+        .await
+        .map(Some)
+        .map_err(|source| RequestError::AdminTransport { source })
 }
 
 /// The two steps of [`send_admin`] for an envelope already built: ensure the

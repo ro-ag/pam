@@ -24,8 +24,8 @@ use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
 use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
-    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_INVALID,
-    CAUSE_PROGRAM_NOT_ALLOWED,
+    CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_ARTIFACTS_ROOT_INVALID, CAUSE_FLOW_CHANGED,
+    CAUSE_FLOW_INVALID, CAUSE_PROGRAM_NOT_ALLOWED,
 };
 use crate::log_service::LogService;
 use crate::model_service::ModelService;
@@ -303,6 +303,163 @@ async fn saving_invalid_yaml_names_the_path_that_is_wrong() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// The flow `id` as another window's save leaves it: same id, a different step.
+fn edited_yaml(id: &str) -> String {
+    format!(
+        "schema: 1\nid: {id}\nname: Local flow\ndescription: looks around\n\
+         steps:\n  - id: look\n    run: [git, log, --oneline]\n"
+    )
+}
+
+#[tokio::test]
+async fn a_save_pinned_to_the_digest_it_opened_lands_and_one_pinned_to_a_stale_digest_does_not() {
+    let (tmp, _store, admin, _ingress) = service().await;
+    let created = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_create",
+                OP_FLOWS_SAVE,
+                json!({ "id": "local", "yaml": flow_yaml("local"), "create_only": true }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    let opened = created["digest"].as_str().expect("a digest").to_owned();
+
+    // Window A saves against what it opened.
+    let by_a = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_a",
+                OP_FLOWS_SAVE,
+                json!({ "id": "local", "yaml": edited_yaml("local"), "expected_digest": opened }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+    assert_ne!(
+        by_a["digest"], created["digest"],
+        "the save changed the flow"
+    );
+
+    // Window B opened the same flow before A saved: its save must not overwrite A's.
+    let before = std::fs::read_to_string(tmp.path().join("flows/local.yaml")).expect("the file");
+    let response = admin
+        .handle(&admin_envelope(
+            "req_b",
+            OP_FLOWS_SAVE,
+            json!({
+                "id": "local",
+                "yaml": flow_yaml("local").replace("Local flow", "Local flow B"),
+                "expected_digest": opened,
+            }),
+        ))
+        .await;
+    match response {
+        Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        } => {
+            assert_eq!(cause, CAUSE_FLOW_CHANGED);
+            assert!(detail.contains("someone saved it"), "{detail}");
+            assert!(recovery.contains("reload"), "{recovery}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("flows/local.yaml")).expect("the file"),
+        before,
+        "the refused save wrote nothing"
+    );
+
+    // Reloaded, B's save goes through.
+    let current = by_a["digest"].as_str().expect("a digest");
+    body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_b2",
+                OP_FLOWS_SAVE,
+                json!({
+                    "id": "local",
+                    "yaml": flow_yaml("local").replace("Local flow", "Local flow B"),
+                    "expected_digest": current,
+                }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_save_of_a_flow_that_is_gone_refuses_and_a_null_pin_means_no_pin() {
+    let (tmp, _store, admin, _ingress) = service().await;
+    let response = admin
+        .handle(&admin_envelope(
+            "req_gone",
+            OP_FLOWS_SAVE,
+            json!({ "id": "local", "yaml": flow_yaml("local"), "expected_digest": "0".repeat(64) }),
+        ))
+        .await;
+    match response {
+        Response::Refusal { cause, detail, .. } => {
+            assert_eq!(cause, CAUSE_FLOW_CHANGED);
+            assert!(detail.contains("deleted or no longer parses"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(!tmp.path().join("flows/local.yaml").exists());
+
+    body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_null",
+                OP_FLOWS_SAVE,
+                json!({ "id": "local", "yaml": flow_yaml("local"), "expected_digest": null }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
+}
+
+#[tokio::test]
+async fn a_pin_that_is_not_a_digest_string_is_an_argument_error_and_a_builtin_can_be_pinned() {
+    let (_tmp, _store, admin, _ingress) = service().await;
+    let response = admin
+        .handle(&admin_envelope(
+            "req_bad",
+            OP_FLOWS_SAVE,
+            json!({ "id": "local", "yaml": flow_yaml("local"), "expected_digest": 7 }),
+        ))
+        .await;
+    assert_eq!(cause_of(response), CAUSE_INVALID_ADMIN_ARGS);
+
+    // The editor opens a builtin and saves a shadow of it pinned to the builtin's digest.
+    let opened = body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_get",
+                OP_FLOWS_GET,
+                json!({ "id": "after-merge-checks" }),
+            ))
+            .await,
+        Outcome::Verified,
+    );
+    let digest = opened["digest"].as_str().expect("a digest").to_owned();
+    let yaml = opened["yaml"].as_str().expect("the text").to_owned();
+    body_of(
+        admin
+            .handle(&admin_envelope(
+                "req_shadow",
+                OP_FLOWS_SAVE,
+                json!({ "id": "after-merge-checks", "yaml": yaml, "expected_digest": digest }),
+            ))
+            .await,
+        Outcome::Changed,
+    );
 }
 
 #[tokio::test]

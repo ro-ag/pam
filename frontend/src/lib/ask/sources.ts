@@ -9,7 +9,12 @@
  * wrappers satisfy them without either side importing the other.
  */
 export interface Sources {
-  daemonStatus(): Promise<{ connected: boolean; status: Record<string, unknown> | null }>;
+  daemonStatus(): Promise<{
+    connected: boolean;
+    status: Record<string, unknown> | null;
+    /** The human stopped the daemon from this window and has not started it again. */
+    stopped_by_you?: boolean;
+  }>;
   approvalsPending(): Promise<{
     pending: Array<{
       request_id: string;

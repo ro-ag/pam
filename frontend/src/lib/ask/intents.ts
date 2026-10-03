@@ -361,6 +361,15 @@ async function daemonStatus(_args: Args, sources: Sources): Promise<Answer> {
   } catch (error) {
     return failedRead("daemon_status", "the daemon", error);
   }
+  if (!health.connected && health.stopped_by_you === true) {
+    return {
+      intent: "daemon_status",
+      sentence:
+        "You stopped the daemon from this window. It stays stopped until you press Start.",
+      facts: [],
+      links,
+    };
+  }
   if (!health.connected || !health.status) {
     return {
       intent: "daemon_status",

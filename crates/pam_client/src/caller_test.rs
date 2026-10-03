@@ -64,3 +64,21 @@ fn detect_caller_reports_self() {
     assert!(!caller.agent.is_empty());
     assert!(!caller.repo.is_empty());
 }
+
+#[test]
+fn every_envelope_reuses_one_detection() {
+    // Request after request, as the GUI's status poll does: the process ancestry and the working
+    // directory are looked at once, not on every envelope.
+    let first = crate::request::build_envelope("status", serde_json::json!({}), true, 1_000, None);
+    for _ in 0..50 {
+        let next =
+            crate::request::build_envelope("status", serde_json::json!({}), true, 1_000, None);
+        assert_eq!(next.caller, first.caller);
+    }
+    assert_eq!(
+        crate::caller::DETECTIONS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the caller identity is detected once per process"
+    );
+    assert_eq!(first.caller, detect_caller(), "and it is the real identity");
+}

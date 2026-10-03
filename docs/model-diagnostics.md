@@ -29,7 +29,12 @@ reservation, preventing identical IDs in different directories from being confus
 Ask PAM remains deterministic by default. Optional rephrasing only uses the
 configured light model when that exact artifact is already loaded and available.
 The returned identity must match the request and existing factual checks must
-pass before a rewrite receives attribution. Disabled rewriting makes no inference
+pass before a rewrite receives attribution. A rewrite is a field, not a channel:
+it must have the template's shape (one plain line, bounded to twice the
+template's length plus a small allowance and 600 characters at most, no more
+sentences than the template, no list or heading marker, no markdown or code
+characters and no link, address or dotted name the template did not already
+contain) or the template is shown instead. Disabled rewriting makes no inference
 call. Any refusal, timeout, identity mismatch or rejected rewrite leaves the
 original deterministic answer available without model attribution.
 

@@ -1,6 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef } from "react";
-import { approvalsPending, daemonStatus, type PamEventPayload } from "../../lib/ipc";
+import {
+  approvalsPending,
+  daemonStart,
+  daemonStatus,
+  type DaemonStatusReply,
+  type PamEventPayload,
+} from "../../lib/ipc";
 import { backoffRefetchInterval, isBusyRefusal } from "../../lib/polling";
 import { useEventRefresh } from "../../lib/useEventRefresh";
 import type { BeaconState } from "./Beacon";
@@ -68,6 +74,9 @@ export function isBeaconEvent(payload: PamEventPayload): boolean {
  * driven; the interval (which backs off while the daemon refuses or is
  * unreachable) is its only trigger.
  *
+ * A daemon the human stopped from this window (`stopped_by_you`) reads "stopped" at once: the
+ * bridge's polls no longer start it, and the toolbar offers Start.
+ *
  * A daemon that answers "busy" (`request_capacity_exhausted` and friends)
  * is alive: that reply is neither a hit nor a miss, so it never turns the
  * beacon red.
@@ -105,6 +114,11 @@ export function useDaemonStatus(): BeaconState {
   const lastGood = useRef<BeaconState | null>(null);
 
   if (settledAt === 0) return "connecting";
+  // The human's own Stop is a state, not a miss: no grace period, no red.
+  if (!connected && status.data?.stopped_by_you === true) {
+    lastGood.current = null;
+    return "stopped";
+  }
   if (connected) {
     // The pending count is best-effort: a failed read keeps green.
     const next: BeaconState = (pending.data?.pending.length ?? 0) > 0 ? "pending" : "connected";
@@ -115,4 +129,21 @@ export function useDaemonStatus(): BeaconState {
     return lastGood.current;
   lastGood.current = null;
   return "down";
+}
+
+/**
+ * The human's Start after a Stop: lets the bridge start the daemon again (`daemon_start`), puts
+ * its answer straight into the shared status query so the beacon, Home and Settings agree at
+ * once, and refetches everything that hangs off the daemon.
+ */
+export function useStartDaemon(onDone?: (reply: DaemonStatusReply) => void) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => daemonStart(),
+    onSuccess: (reply) => {
+      queryClient.setQueryData(DAEMON_STATUS_KEY, reply);
+      onDone?.(reply);
+    },
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ["daemon"] }),
+  });
 }

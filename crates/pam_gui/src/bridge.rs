@@ -17,7 +17,11 @@
 //! against mistakes and blind one-click flows, not against a hostile frontend.
 //! **[`daemon_status`] never errors on an unreachable
 //! daemon** — it answers `{ connected: false }` and lazily starts the daemon via `send_request`
-//! (status is read-only, not an admin op). `send_request` refuses `admin.*` structurally, so the
+//! (status is read-only, not an admin op) — until the human presses Stop: [`daemon_stop`] then
+//! raises [`HumanStop`], and while it is up every poll and admin call of this process uses a
+//! non-starting probe (`pam_client::client::send_request_if_running`), so the daemon stays down
+//! until the human presses Start ([`daemon_start`]) or the GUI is restarted. The reply says
+//! `stopped_by_you` so the beacon and Settings can say so. `send_request` refuses `admin.*` structurally, so the
 //! GUI sends no other public capability: cancelling a run is the admin op `admin.requests.cancel`,
 //! on the private channel like every other human act.
 //! The GUI's own status polls publish no events (the daemon keeps none for control requests), so
@@ -25,7 +29,8 @@
 //! Daemon refusals pass through verbatim; client-side errors are mapped onto the same shape here.
 //! The envelope carries the GUI process's own advisory (not authenticated) caller identity.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pam_client::client::{self, ClientError, RequestError};
@@ -389,7 +394,44 @@ pub struct DaemonStatusReply {
     /// The base directory the bridge resolved (`$PAM_BASE_DIR` or
     /// `~/.pam`), so the GUI shows the live value instead of the rule.
     pub base_dir: String,
+    /// True when the daemon is down because the human pressed Stop in this window and has not
+    /// pressed Start since: the polls do not restart it, and the GUI says "stopped by you".
+    /// Always false while the daemon answers.
+    pub stopped_by_you: bool,
 }
+
+/// Whether the human stopped the daemon from this window. A flag of the GUI process, not of the
+/// daemon: it is raised by [`daemon_stop`], lowered by [`daemon_start`], and gone when the GUI
+/// restarts. While it is up the bridge never starts the daemon.
+#[derive(Debug, Default)]
+pub struct HumanStop(AtomicBool);
+
+impl HumanStop {
+    /// A flag that is down.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Raises the flag: the human wants the daemon down.
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Lowers the flag: the human wants the daemon back.
+    pub fn lower(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the human's stop is in force.
+    #[must_use]
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// The process-wide flag the Tauri commands share.
+static HUMAN_STOP: HumanStop = HumanStop::new();
 
 /// Daemon health for the beacon and the status views: ensures the daemon
 /// (lazy start) and asks the ordinary read-only `status` capability.
@@ -399,35 +441,76 @@ pub struct DaemonStatusReply {
 #[tauri::command]
 pub async fn daemon_status() -> Result<DaemonStatusReply, BridgeError> {
     let base = resolve_base_dir()?;
-    let sent = tokio::time::timeout(
-        STATUS_CLIENT_TIMEOUT,
-        client::send_request(
-            &base,
-            "status",
-            serde_json::json!({}),
-            true,
-            STATUS_DEADLINE_MS,
-            None,
-        ),
-    )
+    poll_status(&base, &HUMAN_STOP).await
+}
+
+/// One status poll. Starts the daemon lazily unless `stop` is raised, in which case it only
+/// looks: a daemon that is down answers `connected: false` with `stopped_by_you`, and one the
+/// human (or an agent's lazy start) brought back is read as usual.
+///
+/// # Errors
+///
+/// A refusal from the daemon, or a client-side failure that is not "nobody is answering".
+pub async fn poll_status(base: &Path, stop: &HumanStop) -> Result<DaemonStatusReply, BridgeError> {
+    let stopped = stop.is_raised();
+    let sent = tokio::time::timeout(STATUS_CLIENT_TIMEOUT, async {
+        if stopped {
+            client::send_request_if_running(
+                base,
+                "status",
+                serde_json::json!({}),
+                true,
+                STATUS_DEADLINE_MS,
+            )
+            .await
+        } else {
+            client::send_request(
+                base,
+                "status",
+                serde_json::json!({}),
+                true,
+                STATUS_DEADLINE_MS,
+                None,
+            )
+            .await
+            .map(Some)
+        }
+    })
     .await
     .unwrap_or(Err(RequestError::ReplyTimeout {
         waited: STATUS_CLIENT_TIMEOUT,
     }));
     let base_dir = base.display().to_string();
     match sent {
-        Ok(response) => Ok(DaemonStatusReply {
+        Ok(Some(response)) => Ok(DaemonStatusReply {
             connected: true,
             status: Some(expect_result(response)?),
             base_dir,
+            stopped_by_you: false,
+        }),
+        Ok(None) => Ok(DaemonStatusReply {
+            connected: false,
+            status: None,
+            base_dir,
+            stopped_by_you: true,
         }),
         Err(err) if is_disconnect(&err) => Ok(DaemonStatusReply {
             connected: false,
             status: None,
             base_dir,
+            stopped_by_you: stopped,
         }),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Starts the daemon the human stopped: lowers the stop flag and polls status, which starts the
+/// daemon lazily as it always did. Answers like [`daemon_status`].
+#[tauri::command]
+pub async fn daemon_start() -> Result<DaemonStatusReply, BridgeError> {
+    let base = resolve_base_dir()?;
+    HUMAN_STOP.lower();
+    poll_status(&base, &HUMAN_STOP).await
 }
 
 /// What the human must type to authorise `op` with `args`, or `None` when the op does not expand
@@ -523,9 +606,37 @@ pub async fn admin_call(
     }
     check_confirmation(&op, &args, confirmation.as_deref())?;
     let base = resolve_base_dir()?;
-    let response = client::send_admin(&base, &op, args, deadline_for(&op))
-        .await
-        .map_err(BridgeError::from)?;
+    forward_admin(&base, &HUMAN_STOP, &op, args).await
+}
+
+/// Sends one allowlisted, confirmed admin op. While the human's stop is in force the daemon is
+/// not started for it: a daemon that is down answers `daemon_stopped_by_you`, naming Start.
+///
+/// # Errors
+///
+/// `daemon_stopped_by_you`, or whatever the exchange failed with.
+pub async fn forward_admin(
+    base: &Path,
+    stop: &HumanStop,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, BridgeError> {
+    let response = if stop.is_raised() {
+        client::send_admin_if_running(base, op, args, deadline_for(op))
+            .await
+            .map_err(BridgeError::from)?
+            .ok_or_else(|| {
+                BridgeError::new(
+                    "daemon_stopped_by_you",
+                    format!("{op} needs the daemon, and you stopped it from this window"),
+                    "Press Start in Settings › Daemon (or in the toolbar), then try again.",
+                )
+            })?
+    } else {
+        client::send_admin(base, op, args, deadline_for(op))
+            .await
+            .map_err(BridgeError::from)?
+    };
     expect_result(response)
 }
 
@@ -539,11 +650,25 @@ pub struct DaemonStopReply {
 }
 
 /// Stops the daemon: SIGTERM to the lock holder, bounded wait for the
-/// drain (shared mechanics with `pam daemon stop`). The next
-/// [`daemon_status`] poll lazily restarts it.
+/// drain (shared mechanics with `pam daemon stop`). The human's stop stays in
+/// force ([`HumanStop`]) until [`daemon_start`] or a restart of the GUI: the
+/// polls look but never start. A stop that could not be sent leaves the flag
+/// down, since the daemon is still running.
 #[tauri::command]
 pub async fn daemon_stop() -> Result<DaemonStopReply, BridgeError> {
     let base = resolve_base_dir()?;
+    // Raised before the signal, so no poll between the signal and the drain's end starts a
+    // successor.
+    HUMAN_STOP.raise();
+    let stopped = stop_daemon_for_human(base).await;
+    if stopped.is_err() {
+        HUMAN_STOP.lower();
+    }
+    stopped
+}
+
+/// The stop itself, off the async workers.
+async fn stop_daemon_for_human(base: PathBuf) -> Result<DaemonStopReply, BridgeError> {
     // stop_daemon blocks (signal + lock-poll wait); keep it off the
     // async workers.
     let stopped =

@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => ({
   subscribeEvents: vi.fn(),
   daemonStatus: vi.fn(),
   daemonStop: vi.fn(),
+  daemonStart: vi.fn(),
   approvalsPending: vi.fn(),
   profileGet: vi.fn(),
   profileSet: vi.fn(),
@@ -132,6 +133,12 @@ beforeEach(() => {
     base_dir: "/Users/me/.pam",
   });
   mocks.daemonStop.mockResolvedValue({ outcome: "stopped", pid: 42 });
+  mocks.daemonStart.mockResolvedValue({
+    connected: true,
+    status: { daemon_version: "0.10.1", protocol: 1, uptime_s: 1, active_requests: 0 },
+    base_dir: "/Users/me/.pam",
+    stopped_by_you: false,
+  });
   mocks.serviceStatus.mockResolvedValue({
     platform: "macos",
     exe: "/Applications/pam.app/Contents/MacOS/pam",
@@ -735,10 +742,42 @@ describe("daemon", () => {
     expect(mocks.daemonStop).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "stop it?" }));
     await waitFor(() => expect(mocks.daemonStop).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText(/stopped · pid 42/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/stopped · pid 42 · stays down until you press Start/),
+    ).toBeInTheDocument();
+    // Stop is not a restart: nothing starts the daemon again behind the human's back.
+    expect(mocks.daemonStart).not.toHaveBeenCalled();
   });
 
-  it("restarts only after the two-tap confirm, and says what stop answered", async () => {
+  it("shows a stopped daemon as stopped by you and starts it only when asked", async () => {
+    mocks.daemonStatus.mockResolvedValue({
+      connected: false,
+      status: null,
+      base_dir: "/x",
+      stopped_by_you: true,
+    });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("stopped by you")).toBeInTheDocument();
+    expect(card.queryByText("unreachable")).not.toBeInTheDocument();
+    expect(card.getByText(/It stays stopped until you press Start/)).toBeInTheDocument();
+    expect(card.queryByText(/the next status poll starts it lazily/)).not.toBeInTheDocument();
+    expect(mocks.daemonStart).not.toHaveBeenCalled();
+
+    fireEvent.click(card.getByRole("button", { name: "Start daemon" }));
+    await waitFor(() => expect(mocks.daemonStart).toHaveBeenCalledTimes(1));
+    expect(await card.findByText("started")).toBeInTheDocument();
+  });
+
+  it("does not offer Start for a daemon that is merely unreachable", async () => {
+    mocks.daemonStatus.mockResolvedValue({ connected: false, status: null, base_dir: "/x" });
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("unreachable")).toBeInTheDocument();
+    expect(card.queryByRole("button", { name: "Start daemon" })).not.toBeInTheDocument();
+  });
+
+  it("restarts only after the two-tap confirm: stop, then start", async () => {
     renderSettings("daemon");
     const restart = await screen.findByRole("button", { name: "Restart" });
     await waitFor(() => expect(restart).toBeEnabled());
@@ -746,13 +785,23 @@ describe("daemon", () => {
     expect(mocks.daemonStop).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
     await waitFor(() => expect(mocks.daemonStop).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mocks.daemonStart).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/restarted · was pid 42/)).toBeInTheDocument();
+    // The sentence under the buttons says what each of the two is.
     expect(
-      await screen.findByText(/stopped · pid 42 · the next status poll starts it again/),
+      screen.getByText(/Stop keeps the daemon down until you press Start. Restart stops it/),
     ).toBeInTheDocument();
-    // The sentence under the buttons says what a restart is.
-    expect(
-      screen.getByText(/Restart stops the daemon; the next status poll/),
-    ).toBeInTheDocument();
+  });
+
+  it("does not start a daemon that is still draining", async () => {
+    mocks.daemonStop.mockResolvedValue({ outcome: "still_draining", pid: 42 });
+    renderSettings("daemon");
+    const restart = await screen.findByRole("button", { name: "Restart" });
+    await waitFor(() => expect(restart).toBeEnabled());
+    fireEvent.click(restart);
+    fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
+    expect(await screen.findByText(/still draining · pid 42/)).toBeInTheDocument();
+    expect(mocks.daemonStart).not.toHaveBeenCalled();
   });
 
   it("keeps Stop and Restart closed while the daemon is unreachable", async () => {
@@ -812,7 +861,7 @@ describe("daemon", () => {
   });
 
   it.each([
-    ["not_running", null, /was not running/],
+    ["not_running", null, /was not running · stays down until you press Start/],
     ["still_draining", 42, /still draining · pid 42 · finishing in-flight work/],
   ] as const)("reports a %s stop outcome in words", async (outcome, pid, expected) => {
     mocks.daemonStop.mockResolvedValue({ outcome, pid });
@@ -831,9 +880,8 @@ describe("daemon", () => {
     await waitFor(() => expect(restart).toBeEnabled());
     fireEvent.click(restart);
     fireEvent.click(screen.getByRole("button", { name: "restart it?" }));
-    expect(
-      await screen.findByText(/was not running · the next status poll starts it/),
-    ).toBeInTheDocument();
+    await waitFor(() => expect(mocks.daemonStart).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/restarted/)).toBeInTheDocument();
   });
 
   it("renders the daemon's refusal when removing the login unit fails", async () => {

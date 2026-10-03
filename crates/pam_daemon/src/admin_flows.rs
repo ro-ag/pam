@@ -34,13 +34,22 @@ use crate::admin::{
 };
 use crate::daemon::DAEMON_VERSION;
 use crate::flow_service::{
-    ArtifactsRootPatch, CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_INVALID, FlowRefusal,
-    RECOVERY_FLOW_EDIT, STEP_CAPABILITY_PREFIX, SettingsPatch, check_settings_patch,
+    ArtifactsRootPatch, CAP_FLOW_INSPECT, CAP_FLOW_RUN, CAUSE_FLOW_CHANGED, CAUSE_FLOW_INVALID,
+    FlowRefusal, RECOVERY_FLOW_EDIT, STEP_CAPABILITY_PREFIX, SettingsPatch, check_settings_patch,
 };
 use crate::managed_policy::{PolicyView, WriteRefusal};
 use crate::managed_policy_service::audit_locked_write;
 use crate::scope_policy::{CAUSE_SCOPE_INVALID, RECOVERY_SCOPE, ScopePolicy};
 use crate::transport::IncomingRequest;
+
+/// Serializes the check-then-write of `admin.flows.save` and `admin.flows.delete`, so an
+/// `expected_digest` is compared with the flow the write would replace and not with one a
+/// concurrent save has since replaced. (The library serializes its own writes; this closes the
+/// gap between reading the digest and writing.)
+static FLOW_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Recovery for a save pinned to a digest the flow no longer has.
+const RECOVERY_SAVE_CHANGED: &str = "reload the flow in Pam → Flows, review what the other save changed, and make your edit again; nothing was written";
 
 /// `admin.flows.list` → every flow, builtins and library merged.
 pub const OP_FLOWS_LIST: &str = "admin.flows.list";
@@ -49,8 +58,12 @@ pub const OP_FLOWS_LIST: &str = "admin.flows.list";
 /// digest and parsed shape.
 pub const OP_FLOWS_GET: &str = "admin.flows.get";
 
-/// `admin.flows.save { id, yaml }` → the saved flow's list entry, plus
-/// [`GRANTS_REVOKED`] and [`REAPPROVAL_REQUIRED`].
+/// `admin.flows.save { id, yaml, create_only?, allow_builtin_override?,
+/// expected_digest? }` → the saved flow's list entry, plus [`GRANTS_REVOKED`]
+/// and [`REAPPROVAL_REQUIRED`]. `expected_digest` pins the save to the flow
+/// the human opened: when the flow the id answers to now has another digest
+/// (someone saved in between, or deleted it, or it no longer parses) the save
+/// refuses `flow_changed` and writes nothing.
 pub const OP_FLOWS_SAVE: &str = "admin.flows.save";
 
 /// `admin.flows.delete { id }` → `{ id, revealed_builtin, grants_revoked,
@@ -356,6 +369,9 @@ impl AdminService {
         let yaml = required_str(args, "yaml", OP_FLOWS_SAVE)?;
         let create_only = save_flag(args, "create_only")?;
         let allow_builtin_override = save_flag(args, "allow_builtin_override")?;
+        let expected_digest = expected_digest(args)?;
+        // Held to the end: the digest is checked against the flow this write replaces.
+        let _serialized = FLOW_WRITES.lock().await;
         if allow_builtin_override && !create_only {
             return Err(AdminRefusal {
                 cause: CAUSE_INVALID_ADMIN_ARGS,
@@ -370,6 +386,25 @@ impl AdminService {
         let previous_flow = previous
             .as_ref()
             .and_then(|entry| entry.parsed.as_ref().ok());
+        if let Some(expected) = expected_digest {
+            let current = previous_flow.map(pam_flow::digest);
+            if current.as_deref() != Some(expected) {
+                return Err(AdminRefusal {
+                    cause: CAUSE_FLOW_CHANGED,
+                    detail: match current {
+                        Some(_) => format!(
+                            "flow {id:?} was changed since you opened it (someone saved it in \
+                             between); nothing was saved"
+                        ),
+                        None => format!(
+                            "flow {id:?} was deleted or no longer parses since you opened it; \
+                             nothing was saved"
+                        ),
+                    },
+                    recovery: RECOVERY_SAVE_CHANGED,
+                });
+            }
+        }
         // A save the library is certain to refuse changes nothing, so it must
         // not cost the existing flow its approvals either.
         let candidate = pam_flow::parse(yaml).ok().filter(|flow| flow.id == id);
@@ -418,6 +453,7 @@ impl AdminService {
     /// the grants of every step that differs from it are revoked first.
     async fn flows_delete(&self, args: &Value) -> Result<AdminOk, AdminRefusal> {
         let id = required_str(args, "id", OP_FLOWS_DELETE)?;
+        let _serialized = FLOW_WRITES.lock().await;
         let library = self.flows.library();
         let previous = library
             .get(id)
@@ -966,6 +1002,22 @@ fn optional_string(args: &Value, key: &str, op: &str) -> Result<ArtifactsRootPat
         Some(_) => Err(AdminRefusal {
             cause: CAUSE_INVALID_ADMIN_ARGS,
             detail: format!("{op} needs {key:?} to be a string or null"),
+            recovery: RECOVERY_FIX_ARGS,
+        }),
+    }
+}
+
+/// The digest the save is pinned to: `None` when absent or null, otherwise the string given.
+fn expected_digest(args: &Value) -> Result<Option<&str>, AdminRefusal> {
+    match args.get("expected_digest") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(digest)) => Ok(Some(digest)),
+        Some(_) => Err(AdminRefusal {
+            cause: CAUSE_INVALID_ADMIN_ARGS,
+            detail: format!(
+                "{OP_FLOWS_SAVE} needs expected_digest to be the digest string the flow was \
+                 listed with"
+            ),
             recovery: RECOVERY_FIX_ARGS,
         }),
     }

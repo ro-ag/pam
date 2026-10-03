@@ -1540,7 +1540,7 @@ async fn an_engine_killed_from_outside_is_reported_and_the_next_request_reloads(
         .unwrap();
     let pid = service.engine_server().unwrap().model().unwrap().pid;
     assert!(
-        std::process::Command::new("kill")
+        std::process::Command::new("/bin/kill")
             .args(["-9", &pid.to_string()])
             .status()
             .unwrap()
@@ -1629,7 +1629,7 @@ async fn an_engine_a_dead_daemon_left_behind_is_stopped_but_a_stranger_is_not() 
         .unwrap();
     let orphan = first.engine_server().unwrap().model().unwrap().pid;
     let alive = |pid: u32| {
-        std::process::Command::new("kill")
+        std::process::Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
             .stderr(std::process::Stdio::null())
             .status()
@@ -1754,7 +1754,7 @@ async fn an_engine_recorded_in_the_old_run_directory_layout_is_reaped_and_the_le
     let engine = first.engine_server().unwrap();
     let orphan = engine.model().unwrap().pid;
     let alive = |pid: u32| {
-        std::process::Command::new("kill")
+        std::process::Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
             .stderr(std::process::Stdio::null())
             .status()

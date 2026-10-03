@@ -13,7 +13,11 @@ import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
 import { SafeText } from "../components/ui/SafeText";
 import { Section } from "../components/ui/Section";
-import { DAEMON_STATUS_KEY, statusRefetchInterval } from "../components/shell/useDaemonStatus";
+import {
+  DAEMON_STATUS_KEY,
+  statusRefetchInterval,
+  useStartDaemon,
+} from "../components/shell/useDaemonStatus";
 import { formatBytes } from "../lib/bytes";
 import { cn } from "../lib/cn";
 import { backoffRefetchInterval } from "../lib/polling";
@@ -23,6 +27,7 @@ import {
   HARNESS_PROFILES,
   boundaryStatus,
   daemonStatus,
+  daemonStart,
   daemonStop,
   harnessProfileFor,
   grantsAdd,
@@ -686,18 +691,49 @@ function DaemonPanel({ active }: { active: boolean }) {
     onError: (error) => setFailure(toBridgeFailure(error)),
     onSettled: refreshSoon,
   });
-  /** The stop op's answer in words; a restart adds what happens next. */
-  const stopNote = (reply: DaemonStopReply, restarting: boolean): string => {
-    const again = restarting ? " · the next status poll starts it again" : "";
+  /** Stop, then Start: the bridge keeps a stopped daemon down, so a restart asks for both. */
+  const restart = useMutation({
+    mutationFn: async () => {
+      const stopped = await daemonStop();
+      // A daemon still draining holds the instance lock: starting now would only meet it.
+      const started = stopped.outcome === "still_draining" ? null : await daemonStart();
+      return { stopped, started };
+    },
+    onMutate: () => {
+      setFailure(null);
+      setNote(null);
+    },
+    onSuccess: ({ stopped, started }) => {
+      if (started) {
+        queryClient.setQueryData(DAEMON_STATUS_KEY, started);
+        setNote(
+          started.connected
+            ? `restarted${stopped.pid === null ? "" : ` · was pid ${stopped.pid}`}`
+            : "stopped, but the new daemon is not answering yet · see the daemon log",
+        );
+      } else {
+        setNote(stopNote(stopped));
+      }
+    },
+    onError: (error) => setFailure(toBridgeFailure(error)),
+    onSettled: refreshSoon,
+  });
+  const start = useStartDaemon((reply) =>
+    setNote(
+      reply.connected
+        ? "started"
+        : "start requested, but the daemon is not answering yet · see the daemon log",
+    ),
+  );
+  /** The stop op's answer in words. A stopped daemon stays down until Start. */
+  const stopNote = (reply: DaemonStopReply): string => {
     switch (reply.outcome) {
       case "stopped":
-        return `stopped · pid ${reply.pid ?? "?"}${restarting ? again : " · stays down until something asks for it"}`;
+        return `stopped · pid ${reply.pid ?? "?"} · stays down until you press Start`;
       case "still_draining":
-        return `still draining · pid ${reply.pid ?? "?"} · finishing in-flight work${again}`;
+        return `still draining · pid ${reply.pid ?? "?"} · finishing in-flight work · press Start once it has exited`;
       case "not_running":
-        return restarting
-          ? "was not running · the next status poll starts it"
-          : "was not running";
+        return "was not running · stays down until you press Start";
     }
   };
 
@@ -756,6 +792,9 @@ function DaemonPanel({ active }: { active: boolean }) {
         : serviceState.unit;
 
   const connected = status.data?.connected === true;
+  // The human pressed Stop in this window: the bridge no longer starts the daemon behind the
+  // poll's back, and this panel says so and offers Start.
+  const stoppedByYou = !connected && status.data?.stopped_by_you === true;
   const body = status.data?.status;
   const uptime = body?.["uptime_s"];
   const bridgeDown = status.isError ? toBridgeFailure(status.error) : null;
@@ -780,6 +819,8 @@ function DaemonPanel({ active }: { active: boolean }) {
         {status.data &&
           (connected ? (
             <Badge tone="success">running</Badge>
+          ) : stoppedByYou ? (
+            <Badge tone="neutral">stopped by you</Badge>
           ) : (
             <Badge tone="danger">unreachable</Badge>
           ))}
@@ -847,7 +888,13 @@ function DaemonPanel({ active }: { active: boolean }) {
       {serviceNote && <p className="font-data text-xs text-ink-muted">{serviceNote}</p>}
       {serviceFailure && <FailureNote failure={serviceFailure} label="start at login" />}
 
-      {!bridgeDown && status.data && !connected && (
+      {!bridgeDown && stoppedByYou && (
+        <p className="font-sans text-sm text-ink-muted">
+          Stopped by you. It stays stopped until you press Start; nothing in this window starts
+          it behind your back.
+        </p>
+      )}
+      {!bridgeDown && status.data && !connected && !stoppedByYou && (
         <p className="font-sans text-sm text-ink-muted">
           The daemon is not answering; the next status poll starts it lazily.
         </p>
@@ -862,31 +909,27 @@ function DaemonPanel({ active }: { active: boolean }) {
           title={!connected && !mismatch ? "The daemon is not running" : undefined}
           onConfirm={() =>
             stop.mutate(undefined, {
-              onSuccess: (reply) => setNote(stopNote(reply, false)),
+              onSuccess: (reply) => setNote(stopNote(reply)),
             })
           }
         />
-        {/* There is no start op — stopping and then polling status IS the
-            restart, because status ensures (lazily starts) the daemon. */}
+        {stoppedByYou && (
+          <Button size="sm" disabled={start.isPending} onClick={() => start.mutate()}>
+            Start daemon
+          </Button>
+        )}
         <ConfirmButton
           label="Restart"
           confirmLabel="restart it?"
           variant="secondary"
-          busy={stop.isPending}
+          busy={restart.isPending}
           disabled={!connected && !mismatch}
           title={!connected && !mismatch ? "The daemon is not running" : undefined}
-          onConfirm={() =>
-            stop.mutate(undefined, {
-              onSuccess: (reply) => {
-                setNote(stopNote(reply, true));
-                refreshSoon();
-              },
-            })
-          }
+          onConfirm={() => restart.mutate()}
         />
       </div>
       <p className="font-sans text-xs text-ink-muted">
-        Restart stops the daemon; the next status poll starts it again.
+        Stop keeps the daemon down until you press Start. Restart stops it and starts it again.
       </p>
 
       {note && <p className="font-data text-xs text-ink-muted">{note}</p>}

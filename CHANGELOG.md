@@ -175,6 +175,42 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- Guarded landing polls required checks with exponential backoff (about 5 s
+  doubling to a 60 s cap, with jitter) until the request's own deadline,
+  instead of a fixed 20 polls at 5 s: it never gives up while a poll fits, and
+  the deadline bounds the count. A deadline with no room left refuses
+  `request_deadline_exhausted`. See [guarded landing](docs/guarded-landing.md#durable-effects-and-bounded-waiting).
+- The landing merge method is a setting (`merge_method`: `squash`, the default,
+  `merge` or `rebase`) instead of a hard-coded squash. `merge` refuses
+  `landing_merge_method_forbidden` before journalling when GitHub reports the
+  repository forbids it. The managed policy can lock or default it
+  (`landing.merge_method`).
+- Required landing checks can be pinned to the GitHub App that reports them
+  (`{ name, app_id }`, written `name @app-id` in the form); a same-named check
+  from another app no longer satisfies a pinned check. Name-only checks still
+  work and the form marks them "Unpinned app". A fully pinned list reads check
+  runs only.
+- GitHub refusing a landing PR creation or merge (405, 409, 422: a PR already
+  exists, no commits, merge conflict, required status checks expected, method
+  not allowed, head modified, not mergeable) blocks the step with a typed cause
+  and recovery and settles the intent `rejected`; it no longer reads as an
+  uncertain effect. A lost answer or a server error still does.
+- Settings › Daemon: Stop now keeps the daemon stopped. The window's status polls
+  and admin calls no longer start it behind the human's back; the beacon reads
+  "Stopped by you" with a Start button beside it, Settings shows "stopped by you"
+  with Start daemon, and Ask Pam says so. The stop holds until Start is pressed or
+  the window is restarted. Restart is now Stop then Start. (A command-line `pam`
+  still starts a stopped daemon lazily, as before.)
+- `pam subscribe --json` writes only JSON to stdout: one compact object per event
+  as it arrives, then the terminal response. Before, the human `[queued]` lines
+  were printed first and made the output unparseable.
+- The GUI saves a flow pinned to the digest it opened. A flow saved by someone
+  else (another window, the CLI's library file) in between refuses
+  `flow_changed` and writes nothing; the editor keeps the draft and offers
+  "Reload the saved flow". `admin.flows.save` takes `expected_digest`.
+- Ask Pam's optional rephrase is held to the template's shape: one plain line,
+  bounded in length, no more sentences, no markdown, link, address or list marker
+  it did not start with. Anything else shows the deterministic answer.
 - Flow inputs take an optional `type:` (`string`, the default, `int`, `sha`,
   `ref`, `path` or `enum` with `values:`). A typed value that does not fit is
   refused with the input name, the type and the rule broken, before it reaches
@@ -346,6 +382,16 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Security
 
+- The credentialed landing Git is no longer resolved through `PATH` and the
+  flow search path. It is the explicitly configured Git path (Settings → Flows →
+  Landing, or the managed policy's `landing.git_path`) or the first qualifying
+  entry of a fixed allowlist (the active Xcode or Command Line Tools Git, never
+  the `xcrun` shim, then Homebrew's; Git for Windows under Program Files), and
+  every candidate and the directories above it must be owned by root or the
+  daemon's user and writable by no group or other user. None qualifying refuses
+  `landing_git_untrusted`. The freeze records the path and `git --version` in
+  the landing session, a later stage that resolves another Git refuses
+  `landing_git_changed`, and the Git broker re-checks it before each process.
 - A remembered flow step approval is bound to what the step runs: the step's
   effect digest (computed from the normalized step, so reformatting or comments
   change nothing), its gate class and the canonical repository it was approved
@@ -443,6 +489,23 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Fixed
 
+- Evidence pages are served from the 64 KiB chunks they cover instead of
+  the whole stored view, and every byte served is checked against its
+  chunk's recorded SHA-256 first: a page of a 32 MiB view went from 3.8 ms
+  to 0.17 ms (release build), and bytes changed on disk are refused as
+  `evidence_corrupt` rather than returned under the view's digest. A view
+  now references its evidence row, so it cannot point at evidence that is
+  missing; at most one terminal audit row per request is enforced by the
+  schema; and a flow's protected checkpoint is written in one transaction
+  with the journal row that names it, so a crash can no longer leave a
+  journal without its checkpoint or a checkpoint without its journal. Boot
+  recovery closes checkpoints an older daemon left without a journal, with a
+  `flow.checkpoint_orphaned` audit row each (schemas 19 and 20).
+- The client detects its own identity (process ancestry, working directory) once
+  per process instead of on every request, so the GUI's status polls stop
+  re-walking the process tree.
+- The client's `kill` was already the absolute `/bin/kill`; the test helper that
+  stops a daemon now uses it too.
 - On Windows a daemon started lazily by a command no longer inherits that
   command's output pipe, so a program capturing `pam`'s output (an agent
   harness) gets its answer instead of waiting until the daemon exits. The
@@ -510,6 +573,13 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Compatibility
 
+- Schemas 19 and 20 flag each request's terminal audit row and move every
+  evidence view into chunks. The upgrade checks each view against its
+  digest as it moves it: a view whose evidence row is missing becomes a
+  retention tombstone and one whose bytes do not match is kept but refuses
+  reads as `evidence_corrupt`; each is reported in an `evidence.view_orphaned`
+  or `evidence.view_corrupt` audit row on its request. The upgrade copies the
+  database first, as every migration does.
 - Schema 17 adds the grant binding columns and `request.flow_id`. Flow step
   grants made before the upgrade are unbound legacy grants: they keep
   authorizing, and the first run that uses one binds it to the step as it runs

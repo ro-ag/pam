@@ -3,8 +3,9 @@ use pam_proto::{Outcome, Response};
 use serde_json::json;
 
 use crate::bridge::{
-    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_NETWORK, CONFIRM_RELAXED, admin_call,
-    check_confirmation, deadline_for, is_disconnect, is_known_admin_op, required_confirmation,
+    ADMIN_OPS, BridgeError, CONFIRM_GRANT, CONFIRM_NETWORK, CONFIRM_RELAXED, HumanStop, admin_call,
+    check_confirmation, deadline_for, forward_admin, is_disconnect, is_known_admin_op, poll_status,
+    required_confirmation,
 };
 
 #[test]
@@ -534,4 +535,58 @@ async fn cancel_goes_through_the_private_admin_op_and_nothing_goes_public() {
             .expect_err("a public capability is not an admin op");
         assert_eq!(error.cause, "unknown_admin_op", "{name}");
     }
+}
+
+#[test]
+fn the_human_stop_is_raised_by_stop_and_lowered_by_start() {
+    let stop = HumanStop::new();
+    assert!(!stop.is_raised(), "a fresh window has not stopped anything");
+    stop.raise();
+    assert!(stop.is_raised());
+    stop.raise();
+    assert!(stop.is_raised(), "raising twice changes nothing");
+    stop.lower();
+    assert!(!stop.is_raised());
+}
+
+/// Pressing Stop must keep the daemon down while the beacon polls: with the flag raised a poll
+/// of a base nobody serves reports "stopped by you" and starts nothing (a starting poll would
+/// have created the run directory and spawned a daemon).
+#[tokio::test]
+async fn a_poll_after_the_human_stop_looks_and_never_starts() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let stop = HumanStop::new();
+    stop.raise();
+    for _ in 0..3 {
+        let reply = poll_status(base.path(), &stop)
+            .await
+            .expect("a stopped daemon is an answer, not an error");
+        assert!(!reply.connected);
+        assert!(reply.status.is_none());
+        assert!(reply.stopped_by_you, "the reply says the human did this");
+        assert!(
+            !base.path().join("run").exists(),
+            "the poll started nothing and created nothing"
+        );
+    }
+    let value = serde_json::to_value(poll_status(base.path(), &stop).await.unwrap()).unwrap();
+    assert_eq!(
+        value["stopped_by_you"], true,
+        "the frontend reads this member"
+    );
+}
+
+/// The admin calls behind the other screens are polls too: after Stop they say how to get the
+/// daemon back instead of bringing it back.
+#[tokio::test]
+async fn an_admin_call_after_the_human_stop_names_start_and_starts_nothing() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let stop = HumanStop::new();
+    stop.raise();
+    let error = forward_admin(base.path(), &stop, "admin.grants.list", json!({}))
+        .await
+        .expect_err("nothing is running to answer it");
+    assert_eq!(error.cause, "daemon_stopped_by_you");
+    assert!(error.recovery.contains("Start"), "{}", error.recovery);
+    assert!(!base.path().join("run").exists(), "nothing was started");
 }

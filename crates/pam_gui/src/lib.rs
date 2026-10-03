@@ -61,6 +61,7 @@ pub fn run(context: tauri::Context) -> tauri::Result<()> {
             bridge::daemon_status,
             bridge::admin_call,
             bridge::daemon_stop,
+            bridge::daemon_start,
             events::events_subscribe,
             logs::read_daemon_log,
             service::service_status,

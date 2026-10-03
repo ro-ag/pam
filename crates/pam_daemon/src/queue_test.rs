@@ -1468,8 +1468,12 @@ async fn reconciling_a_leased_row_releases_its_lane_and_signals_the_holder() {
         let store = Arc::new(Store::open_in_memory().await.unwrap());
         let queue =
             QueueManager::new(Arc::clone(&store)).with_reconcile_grace(Duration::from_secs(1));
+        // The deadline only has to be shorter than the follower's: the
+        // reconciler below is handed a clock past this row's recorded expiry,
+        // so no real time has to pass (a 50 ms deadline used to expire under
+        // load between admission and lane placement).
         let mut short = envelope("held", REPO_A, serde_json::json!({}), None);
-        short.deadline_ms = 50;
+        short.deadline_ms = 30_000;
         enqueue(&queue, &short).await;
         let work = queue.take_next(REPO_A).await.unwrap().unwrap();
         enqueue(
@@ -1482,9 +1486,17 @@ async fn reconciling_a_leased_row_releases_its_lane_and_signals_the_holder() {
             "lane busy"
         );
 
-        // Long past the deadline and the grace, as the reaper would see it
-        // if its own lease sweep had been failing.
-        let later = wall_now_ms() + 10_000;
+        // Past the deadline and the grace, as the reaper would see it if its
+        // own lease sweep had been failing; still inside the follower's
+        // 60 s deadline, which was recorded after this one.
+        let expires = store
+            .get_request("held")
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at_ms
+            .unwrap();
+        let later = expires + 2_000;
         assert_eq!(queue.reconcile_expired(later).await.unwrap(), 1);
         assert!(*work.cancel.borrow(), "the holder is told to stop");
         assert!(queue.leased_ids().await.is_empty());

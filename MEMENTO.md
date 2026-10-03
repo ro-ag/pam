@@ -290,3 +290,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+## pam-slow-follow-completion-race
+- kind: habit
+- scope: project
+- rule: Slow-follower integration tests must end requests only after the reader observes the published tail; a short echo timer can finish during attachment or publishing on Windows CI.
+- fix: Use an echo and deadline beyond the enclosing harness bound, read through the final published sequence, then cancel explicitly and assert the terminal event and durable cancelled outcome. A forced 3 s scheduling delay failed the original and passed the fix; Windows ARM workspace and 20 repetitions passed.
+- hits: 2026-10-03
+- cost: 0
+- status: watching
+

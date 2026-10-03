@@ -10,6 +10,7 @@ inputs:
   repository:
     description: explicit repository; no inferred latest execution
   commit:
+    type: sha
     description: explicit commit; no inferred latest execution
   project:
     description: explicit project; no inferred latest execution

@@ -10,16 +10,21 @@ inputs:
   repository:
     description: exact HTTPS source clone URL, including its .git suffix when present
   commit:
+    type: sha
     description: full 40 or 64 hexadecimal source commit
   repo:
     description: workflow repository owner/name on GitHub
   run_id:
+    type: int
     description: explicit positive workflow run ID; never latest
   run_attempt:
+    type: int
     description: explicit positive attempt number
   job_id:
+    type: int
     description: explicit positive job ID listed on the selected run attempt page
   page:
+    type: int
     description: explicit jobs page containing the selected job
     default: "1"
 correlation:

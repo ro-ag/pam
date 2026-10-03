@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use super::duration::format_duration;
+use super::input_type::InputType;
 use super::schema::{Action, Approval, ConnectorId, Effect, Flow, OutputPolicy, Role, When};
 use super::validate::{
     FlowError, MAX_FILE_BYTES, connector_calls, is_sensitive_arg, is_shell, looks_secret_like,
@@ -824,4 +825,218 @@ fn an_input_name_may_not_start_with_a_dash() {
     );
     assert_eq!(path, "inputs.-bad");
     assert!(message.contains("does not start with"), "{message}");
+}
+
+/// A one-input flow whose step reads the input as an argument.
+fn typed(input_yaml: &str) -> String {
+    format!(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  subject:\n    description: x\n{input_yaml}\
+         steps:\n  - id: look\n    run: [git, log, '${{inputs.subject}}']\n"
+    )
+}
+
+#[test]
+fn an_input_without_a_type_is_a_string_and_renders_as_before() {
+    let flow = good(&typed(""));
+    let input = &flow.inputs["subject"];
+    assert_eq!(input.kind, InputType::String);
+    assert!(input.values.is_empty());
+    assert!(input.check("subject", "--anything goes").is_ok());
+    let yaml = crate::to_normalized_yaml(&flow);
+    assert!(!yaml.contains("type:"), "{yaml}");
+    assert!(!yaml.contains("values:"), "{yaml}");
+}
+
+#[test]
+fn every_input_type_declares_and_round_trips() {
+    for (declaration, kind) in [
+        ("    type: string\n", InputType::String),
+        ("    type: int\n", InputType::Int),
+        ("    type: sha\n", InputType::Sha),
+        ("    type: ref\n", InputType::Ref),
+        ("    type: path\n", InputType::Path),
+        (
+            "    type: enum\n    values: [debug, release]\n",
+            InputType::Enum,
+        ),
+    ] {
+        let flow = good(&typed(declaration));
+        assert_eq!(flow.inputs["subject"].kind, kind, "{declaration}");
+        let again = good(&crate::to_normalized_yaml(&flow));
+        assert_eq!(again, flow, "{declaration}");
+        assert_eq!(crate::digest(&again), crate::digest(&flow));
+    }
+}
+
+#[test]
+fn a_typed_input_changes_the_digest() {
+    let plain = good(&typed(""));
+    let typed_int = good(&typed("    type: int\n"));
+    assert_ne!(crate::digest(&plain), crate::digest(&typed_int));
+}
+
+#[test]
+fn an_unknown_input_type_is_refused_with_the_choices() {
+    let (path, message) = bad(&typed("    type: url\n"));
+    assert_eq!(path, "inputs.subject.type");
+    assert!(message.contains("unknown variant `url`"), "{message}");
+    for name in ["string", "int", "sha", "ref", "path", "enum"] {
+        assert!(message.contains(name), "{message}");
+    }
+}
+
+#[test]
+fn enum_declarations_are_checked() {
+    for (declaration, message) in [
+        ("    type: enum\n", "non-empty"),
+        ("    type: enum\n    values: []\n", "non-empty"),
+        ("    type: enum\n    values: [a, a]\n", "repeats"),
+        ("    type: int\n    values: [a]\n", "belongs to"),
+        ("    values: [a]\n", "belongs to"),
+    ] {
+        let (path, text) = bad(&typed(declaration));
+        assert_eq!(path, "inputs.subject.values", "{declaration}");
+        assert!(text.contains(message), "{declaration}: {text}");
+    }
+}
+
+#[test]
+fn a_literal_default_must_satisfy_its_type() {
+    for (declaration, accepted) in [
+        ("    type: int\n    default: '1'\n", true),
+        ("    type: int\n    default: 'one'\n", false),
+        ("    type: ref\n    default: main\n", true),
+        ("    type: ref\n    default: 'HEAD@{1}'\n", false),
+        ("    type: path\n    default: docs/a.md\n", true),
+        ("    type: path\n    default: ../../etc\n", false),
+        ("    type: enum\n    values: [a, b]\n    default: b\n", true),
+        (
+            "    type: enum\n    values: [a, b]\n    default: c\n",
+            false,
+        ),
+        ("    type: string\n    default: '--anything'\n", true),
+    ] {
+        let yaml = typed(declaration);
+        if accepted {
+            good(&yaml);
+        } else {
+            let (path, message) = bad(&yaml);
+            assert_eq!(path, "inputs.subject.default", "{declaration}");
+            assert!(message.starts_with("input `subject` must be "), "{message}");
+        }
+    }
+}
+
+#[test]
+fn a_default_that_reads_the_repository_is_checked_at_run_time_not_here() {
+    // `${repo.path}` is absolute, which a `path` input refuses once filled in.
+    let flow = good(&typed("    type: path\n    default: '${repo.path}'\n"));
+    let input = &flow.inputs["subject"];
+    assert!(input.check("subject", "/Users/me/repo").is_err());
+    assert!(input.check("subject", "crates").is_ok());
+}
+
+#[test]
+fn a_typed_input_refuses_a_mismatched_value_naming_input_type_and_rule() {
+    let flow = good(&typed("    type: sha\n"));
+    let error = flow.inputs["subject"]
+        .check("subject", &format!("--upload-pack={}", "a".repeat(26)))
+        .expect_err("not a sha");
+    assert_eq!(
+        error.to_string(),
+        "input `subject` must be a full lowercase hexadecimal object id: only lowercase \
+         hexadecimal digits (0-9, a-f) are allowed"
+    );
+    assert_eq!(error.input, "subject");
+}
+
+#[test]
+fn reserved_environment_names_are_refused_with_the_reason_and_the_list() {
+    for name in [
+        "PATH",
+        "HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_COUNT",
+        "GIT_DIR",
+        "GIT_EXEC_PATH",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "TMPDIR",
+        "PAM_ARTIFACTS",
+        "NODE_OPTIONS",
+    ] {
+        let (path, message) = bad_step(&format!(
+            "  - id: build\n    run: [make]\n    env: {{ {name}: x }}\n"
+        ));
+        assert_eq!(path, format!("steps[0].env.{name}"));
+        assert!(
+            message.contains(&format!("`{name}` is reserved: ")),
+            "{message}"
+        );
+        assert!(
+            message.contains("GIT_*") && message.contains("LD_*"),
+            "{message}"
+        );
+        assert!(message.contains("drop it from `env`"), "{message}");
+    }
+}
+
+#[test]
+fn a_reserved_name_is_refused_even_with_a_substituted_value() {
+    let (path, _) = bad(
+        "schema: 1\nid: demo\nname: Demo\ninputs:\n  dir:\n    description: x\nsteps:\n  - id: a\n    run: [make]\n    env: { PATH: '${inputs.dir}' }\n",
+    );
+    assert_eq!(path, "steps[0].env.PATH");
+}
+
+#[test]
+fn ordinary_environment_names_are_accepted() {
+    let flow = good(&wrap(
+        "  - id: build\n    run: [make]\n    env: { RUSTFLAGS: '-D warnings', CI: '1', GIT_AUTHOR_NAME: pam, WHO: me }\n",
+    ));
+    assert_eq!(flow.steps[0].env.len(), 4);
+}
+
+#[test]
+fn a_later_stateful_step_must_say_what_it_depends_on() {
+    let (path, message) = bad_step(
+        "  - id: check\n    run: [git, status]\n  - id: push\n    run: [git, push]\n    effect: stateful\n",
+    );
+    assert_eq!(path, "steps[1]");
+    assert!(message.contains("step `push` is stateful"), "{message}");
+    assert!(
+        message.contains("add `needs: [...]`") && message.contains("`when: always`"),
+        "{message}"
+    );
+}
+
+#[test]
+fn an_explicit_default_when_does_not_say_what_it_depends_on() {
+    let (path, _) = bad_step(
+        "  - id: check\n    run: [git, status]\n  - id: push\n    run: [git, push]\n    effect: stateful\n    when: needs_succeeded\n",
+    );
+    assert_eq!(path, "steps[1]");
+}
+
+#[test]
+fn stateful_ordering_is_accepted_when_the_flow_says_it() {
+    for tail in [
+        "    needs: [check]\n",
+        "    when: always\n",
+        "    when: { succeeded: check }\n",
+        "    when: { failed: check }\n",
+    ] {
+        good(&wrap(&format!(
+            "  - id: check\n    run: [git, status]\n  - id: push\n    run: [git, push]\n    effect: stateful\n{tail}"
+        )));
+    }
+}
+
+#[test]
+fn the_first_step_may_be_stateful_without_needs_and_read_only_steps_stay_independent() {
+    good(&wrap(
+        "  - id: push\n    run: [git, push]\n    effect: stateful\n  - id: look\n    run: [git, status]\n  - id: other\n    run: [git, log]\n",
+    ));
 }

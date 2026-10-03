@@ -522,3 +522,41 @@ fn watches_require_explicit_revision_and_product_inputs() {
         }
     }
 }
+
+#[test]
+fn starter_inputs_that_are_clearly_a_sha_a_ref_or_a_number_are_typed() {
+    use crate::InputType::{Int, Ref, Sha};
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let typed = [
+        ("jenkins-build-investigation", "build", Int, "42"),
+        ("jenkins-node-evidence", "build", Int, "42"),
+        ("revision-ci-triage", "commit", Sha, sha),
+        ("revision-ci-triage", "run_id", Int, "9876543210"),
+        ("revision-ci-triage", "run_attempt", Int, "2"),
+        ("revision-ci-triage", "job_id", Int, "123456"),
+        ("revision-ci-triage", "page", Int, "1"),
+        ("revision-jenkins-check", "commit", Sha, sha),
+        ("revision-jenkins-check", "build", Int, "42"),
+        ("revision-sonar-check", "commit", Sha, sha),
+        ("revision-sonar-check", "branch", Ref, "feature/x"),
+        ("revision-sonar-check", "page", Int, "1"),
+        ("sonar-analysis-evidence", "page", Int, "1"),
+        ("watch-github-run", "commit", Sha, sha),
+        ("watch-github-run", "run_id", Int, "9876543210"),
+        ("watch-github-run", "run_attempt", Int, "1"),
+        ("watch-jenkins-build", "commit", Sha, sha),
+        ("watch-jenkins-build", "build", Int, "42"),
+        ("watch-sonar-analysis", "commit", Sha, sha),
+        ("guarded-land", "commit", Sha, sha),
+    ];
+    for (id, name, kind, sample) in typed {
+        let flow = builtin()
+            .iter()
+            .find_map(|entry| (entry.id == id).then(|| crate::parse(entry.yaml).unwrap()))
+            .unwrap();
+        let input = &flow.inputs[name];
+        assert_eq!(input.kind, kind, "{id}.{name}");
+        assert!(input.check(name, sample).is_ok(), "{id}.{name}");
+        assert!(input.check(name, "--output=x").is_err(), "{id}.{name}");
+    }
+}

@@ -9,6 +9,7 @@ inputs:
   job:
     description: Jenkins job path, including folders
   build:
+    type: int
     description: explicit positive build number; never latest
   node_id:
     description: explicit Pipeline node ID from the selected build's evidence

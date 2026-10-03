@@ -263,9 +263,18 @@ fn a_read_only_step_without_needs_is_independent_of_earlier_failures() {
     assert!(step.should_run(&[("first", Prior::Failed), ("second", Prior::Other)]));
 }
 
+/// A stateful step with no `needs` and no `when`: validation refuses that
+/// shape now, so the runtime's own guard is exercised on a step built by
+/// flipping a parsed read-only one.
+fn unordered_stateful_step() -> Step {
+    let mut step = third_step("");
+    step.effect = Effect::Stateful;
+    step
+}
+
 #[test]
 fn a_stateful_step_without_needs_never_follows_a_failure_by_default() {
-    let step = third_step("    effect: stateful\n");
+    let step = unordered_stateful_step();
     assert!(step.should_run(&[("first", Prior::Succeeded), ("second", Prior::Other)]));
     assert!(!step.should_run(&[("first", Prior::Failed), ("second", Prior::Succeeded)]));
     assert!(!step.should_run(&[("first", Prior::Succeeded), ("second", Prior::Failed)]));

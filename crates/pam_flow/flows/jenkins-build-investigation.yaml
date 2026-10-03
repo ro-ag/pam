@@ -10,6 +10,7 @@ inputs:
   job:
     description: Jenkins job path, including folders
   build:
+    type: int
     description: explicit positive build number; never latest
 steps:
   - id: investigate-build

@@ -5,7 +5,7 @@ description: Read the historical gate for an explicit main-branch compute task. 
 inputs:
   project: { description: Exact Sonar project key }
   ce_task: { description: Exact compute task ID }
-  page: { default: "1", description: Explicit analysis history page }
+  page: { type: int, default: "1", description: Explicit analysis history page }
 steps:
   - id: analysis
     connector: sonarqube

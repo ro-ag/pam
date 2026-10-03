@@ -67,7 +67,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// sometimes holds the file for seconds; the bound keeps that from holding a
 /// daemon's shutdown for the whole [`BUSY_TIMEOUT`].
 const CLOSE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
-const CLOSE_ATTEMPTS: u32 = 8;
+/// Wall clock the closing checkpoint may spend on attempts. Bounded by time,
+/// not by a count: one attempt can also fold part of the log and sync it,
+/// which on a slow disk takes far longer than its lock wait.
+const CLOSE_FOLD_BUDGET: Duration = Duration::from_millis(1_500);
 
 /// Largest string or blob the connection accepts. Evidence blobs and views
 /// run to 64 MiB; nothing the store writes comes near twice that.
@@ -475,10 +478,11 @@ pub(crate) fn shut(conn: Connection, fold_log: bool) -> Result<(), StoreError> {
     conn.close().map_err(|(_, error)| engine(error))
 }
 
-/// The closing checkpoint: up to [`CLOSE_ATTEMPTS`] tries of
-/// [`CLOSE_BUSY_TIMEOUT`] each, quietly until the last one.
+/// The closing checkpoint: tries of [`CLOSE_BUSY_TIMEOUT`] each while
+/// [`CLOSE_FOLD_BUDGET`] lasts, quietly until the last one.
 fn fold_at_close(conn: &Connection) -> bool {
-    for _ in 1..CLOSE_ATTEMPTS {
+    let deadline = std::time::Instant::now() + CLOSE_FOLD_BUDGET;
+    while std::time::Instant::now() + CLOSE_BUSY_TIMEOUT < deadline {
         if matches!(
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", (), |row| row
                 .get::<_, i64>(0)),

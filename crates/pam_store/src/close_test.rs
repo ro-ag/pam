@@ -271,8 +271,9 @@ async fn close_with_another_connection_mid_read_still_closes_and_loses_nothing()
 }
 
 /// The closing checkpoint is best effort, so a lock that does not clear costs
-/// a close a bounded wait (about two seconds), never the five-second statement
-/// timeout: a daemon's shutdown on Windows used to stall exactly that long.
+/// a close a bounded wait (a second and a half of attempts, plus whatever the
+/// last attempt's sync takes), never the five-second statement timeout: a
+/// daemon's shutdown on Windows used to stall exactly that long.
 #[tokio::test]
 async fn close_does_not_sit_out_the_statement_busy_timeout_behind_another_reader() {
     let dir = tempfile::tempdir().unwrap();

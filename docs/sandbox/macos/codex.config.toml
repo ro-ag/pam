@@ -1,0 +1,84 @@
+# codex.config.toml -- Codex permission profile "pam": the PAM boundary
+#
+# Harness:  Codex (CLI, macOS Seatbelt)
+# Status:   verified keys, partly verified semantics. The keys below are the
+#           documented ones (default_permissions, [permissions.<name>],
+#           extends, [...filesystem], [...network], [...network.unix_sockets]).
+#           The permissions page is marked Beta ("may change"). Two semantics
+#           are documented only in part and are left to `pam doctor`: whether a
+#           directory entry covers its subtree, and what an empty network
+#           domain table allows once network.enabled is true.
+# Sources:  https://learn.chatgpt.com/docs/config-file/config-reference
+#           https://learn.chatgpt.com/docs/permissions
+# Verified: 2026-10-02 (both pages read on that date; the file parses as TOML)
+# Base:     <base>   (PAM base directory, default ~/.pam; substituted by
+#           `pam doctor --profile codex [--base DIR]`; use the real path,
+#           `realpath ~/.pam`)
+# Allow:    network.unix_sockets allows exactly <base>/run/pam.sock;
+#           filesystem "read" re-opens exactly <base>/run/daemon.lock inside the
+#           denied base ("a more specific path can also reopen a narrower
+#           subtree inside a broader deny")
+# Deny:     filesystem "deny" for the base and every private path under it,
+#           including <base>/run/engine.sock and <base>/run/engine/ (the
+#           engine's socket and API key live inside the run directory the agent
+#           must traverse); unix_sockets "deny" for the admin and engine sockets
+# Prove:    with default_permissions = "pam" selected, from a command Codex
+#           runs, `pam doctor` must print "boundary: established" and exit 0
+#
+# Install:  merge this file's keys into ~/.codex/config.toml (or deliver them
+#           through your managed requirements; the documentation says an
+#           administrator can restrict profiles with requirements.toml
+#           `allowed_permission_profiles`: list "pam" there).
+#
+# What this does not say. The unix_sockets table applies only when
+# network.enabled is true ("Unix socket proxying is a local escape hatch"), so
+# this profile enables the network and relies on Codex's domain rules for
+# egress; it adds no domain allowance, and what Codex does with an empty domain
+# table is not documented in the pages above. Egress is not part of PAM's
+# boundary; if you need it closed, add domain rules after checking them. The
+# pages also say nothing about the keychain, signals, Mach lookups, LaunchServices
+# or AppleEvents inside the macOS profile: `pam doctor` reports each. If one
+# is `allowed`, wrap Codex in pam-agent.sb (sandbox-exec) or accept and record.
+#
+# If public.reach is not allowed, use the session relay (docs/session-socket-
+# relay.md): run `pam listen <dir>` outside Codex, export PAM_SOCKET_DIR=<dir>,
+# and allow the relay socket instead of the public one by replacing the
+# unix_sockets entry below with:
+#   "<dir>/pam.sock" = "allow"
+# keeping every deny.
+#
+# Writes. Codex's permission values are read, write and deny: there is no
+# write-only deny, so the executable and PAM.app are not named here (denying
+# them would also stop Codex executing a pam installed inside the bundle).
+# ":workspace" grants writes only inside the workspace roots and temporary
+# directories, so an installed pam is not writable; `pam doctor` probes
+# exe.write and bundle.write and says if one is.
+
+default_permissions = "pam"
+
+[permissions.pam]
+description = "Workspace write, PAM private state denied, PAM public socket allowed"
+extends = ":workspace"
+
+[permissions.pam.filesystem]
+"<base>" = "deny"
+"<base>/run/daemon.lock" = "read"
+"<base>/admin" = "deny"
+"<base>/state.sqlite3" = "deny"
+"<base>/state.sqlite3-wal" = "deny"
+"<base>/state.sqlite3-shm" = "deny"
+"<base>/backup" = "deny"
+"<base>/model-trust" = "deny"
+"<base>/engine" = "deny"
+"<base>/flows" = "deny"
+"<base>/log" = "deny"
+"<base>/run/engine" = "deny"
+"<base>/run/engine.sock" = "deny"
+
+[permissions.pam.network]
+enabled = true
+
+[permissions.pam.network.unix_sockets]
+"<base>/run/pam.sock" = "allow"
+"<base>/admin/control.sock" = "deny"
+"<base>/run/engine.sock" = "deny"

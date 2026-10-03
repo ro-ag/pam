@@ -801,9 +801,11 @@ fn an_outdated_daemon_is_waited_out_and_replaced() {
             .await;
         peer.until_closed().await;
     });
-    // Longer than the boot wait (two attempts of 100 ms), shorter than the handover.
+    // Longer than the boot wait (two attempts of 400 ms), shorter than the
+    // handover. The boot wait also bounds how long the replacement may take to
+    // answer once it is spawned; 100 ms was too short on a loaded Windows runner.
     let drain = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(1_500));
         old.stop();
     });
     let mut fakes = Vec::new();
@@ -818,7 +820,7 @@ fn an_outdated_daemon_is_waited_out_and_replaced() {
         spawn: &mut spawn,
         signal: &mut signal,
         client_version: env!("CARGO_PKG_VERSION"),
-        wait: Duration::from_millis(100),
+        wait: Duration::from_millis(400),
         poll: POLL,
         handover: Duration::from_secs(10),
         probe: Duration::from_millis(500),

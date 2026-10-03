@@ -209,23 +209,25 @@ proxy that inspects TLS can read the credentials PAM sends to connectors.
   Loopback targets never go through the proxy, whatever the list says.
 - **CA bundle.** Leave it empty when the root your organisation uses is
   already trusted by this computer (an MDM profile on macOS; Group Policy or
-  Intune on Windows). Otherwise give the path of a PEM file: PAM reads it
-  once, keeps only its certificate blocks (a file holding a private key is
-  refused whole), writes a private copy under `~/.pam/net`, records the
-  copy's SHA-256 and checks it again before every request; a copy that no
-  longer matches refuses the request rather than running without it. On
-  macOS the source file must be owned by you or by root and not writable by
-  other users, and so must its directory; on Windows those ownership checks
-  are not made and the private copy is what protects the setting. The bundle
-  is handed to curl as its `cacert`, so for PAM's requests it stands in for
+  Intune on Windows). On Windows a CA bundle file cannot be imported: install
+  the CA in the Windows certificate store (machine or user), which PAM's curl
+  trusts, and the page shows the field read-only. On macOS, give the path of a
+  PEM file: PAM reads it once, keeps only its certificate blocks (a file
+  holding a private key is refused whole), writes a private copy under
+  `~/.pam/net`, records the copy's SHA-256 and checks it again before every
+  request; a copy that no longer matches refuses the request rather than
+  running without it. The source file must be owned by you or by root and not
+  writable by other users, and so must its directory. The bundle is handed to
+  curl as its `cacert`, so for PAM's requests it is expected to stand in for
   the system trust: include every root the services and download hosts need.
-  What has been measured: on macOS, a private test issuer is untrusted until
-  its root is imported and trusted afterwards. What has not: whether the
-  system roots still apply beside the bundle on macOS, and any of this on
-  Windows, where curl uses Schannel and revocation checking stays on, so a
-  private CA with no reachable CRL fails as `tls_revocation_unavailable`. PAM
-  offers no "do not verify" option anywhere, and never writes to the
-  operating system's certificate store.
+  What has been measured on macOS: a private test issuer is untrusted until
+  its root is imported and trusted afterwards; whether the system roots still
+  apply beside the bundle is not measured, and the page warns about it when
+  you save. A Windows `cacert` replaces the store's trust and a private CA
+  with no http CRL fails revocation, which is why Windows uses the store; that
+  failure shows as `tls_revocation_unavailable`. PAM offers no "do not verify"
+  option anywhere, and never writes to the operating system's certificate
+  store.
 - **Mirrors.** The engine mirror is a directory address; PAM appends the
   archive name from the table above unchanged. The models mirror replaces the
   `https://huggingface.co/` prefix of a catalog address and keeps the rest;

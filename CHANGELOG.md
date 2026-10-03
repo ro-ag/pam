@@ -85,6 +85,10 @@ All notable changes to pam are documented in this file. The format follows
 
 ### Changed
 
+- On Windows `admin.network.set` refuses a CA bundle file (`network_ca_unsupported_on_windows`)
+  and Settings › Network shows the field read-only: install the CA in the Windows
+  certificate store, which PAM's curl trusts. On macOS saving a bundle warns that it is
+  expected to replace system trust for every request (not measured there).
 - The store runs on SQLite (bundled through `rusqlite`) instead of the Turso
   engine. Databases written by earlier versions are opened in place after a
   one-time backup. Building from source now needs a C compiler on every

@@ -30,7 +30,12 @@ async fn service_with(
 ) {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let (events, rx) = EventPublisher::for_tests();
-    let service = Arc::new(ApprovalService::new(Arc::clone(&store), events, timeout));
+    let service = Arc::new(ApprovalService::new(
+        Arc::clone(&store),
+        events,
+        timeout,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     (store, service, rx)
 }
 

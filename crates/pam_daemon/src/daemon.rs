@@ -46,8 +46,12 @@
 //!   (capability, repository, agent label, plane) for the administration plane's all-events
 //!   stream, and forgotten there when it ends.
 //! - **Boot order** ([`run_daemon_with`]): instance lock → store open → crash recovery
-//!   ([`crate::lifecycle::recover_stuck_rows`]) → lane rebuild → transport bind (safe to drop stale
-//!   sockets, lock already held) → serve.
+//!   ([`crate::lifecycle::recover_stuck_rows`]) → managed policy read
+//!   ([`PolicyHandle::load`], from [`DaemonConfig::policy_source`]) → policy gate and every other
+//!   service, each holding the one [`PolicyHandle`] → lane rebuild → transport bind (safe to drop
+//!   stale sockets, lock already held) → serve. The policy is read before the gate is built, so a
+//!   policy in force applies from the first request; its poll task runs with the other background
+//!   tasks and stops when the drain starts.
 //! - **Shutdown** is a graceful drain: phase leaves [`LifecyclePhase::Serving`] (new requests
 //!   refused, [`CAUSE_DAEMON_SHUTTING_DOWN`]), executor/reaper stop taking leases (`queued` rows
 //!   are the restart-safe checkpoint), in-flight leases get [`DaemonConfig::drain_timeout`] then
@@ -133,6 +137,10 @@ use crate::lifecycle::{
     InstanceLock, LifecycleError, LifecyclePhase, acquire_instance_lock, recover_stuck_rows,
 };
 use crate::log_service::LogService;
+use crate::managed_policy_service::{
+    ACTION_POLICY_CLEAR, ACTION_POLICY_LOAD, ACTION_POLICY_REJECT, FileSource, PolicyHandle,
+    PolicySource,
+};
 use crate::model_service::ModelService;
 use crate::network_service::NetworkService;
 use crate::policy::{
@@ -222,6 +230,11 @@ pub const TERMINAL_ACTIONS: &[&str] = &[
     crate::queue::ACTION_LEASE_REAPED,
     crate::queue::ACTION_RECOVERY_REFUSAL,
     crate::lifecycle::ACTION_DAEMON_RESTART,
+    // The daemon-owned `policy.load` request row is finished with whichever
+    // of these it carries last (see [`crate::managed_policy_service`]).
+    ACTION_POLICY_LOAD,
+    ACTION_POLICY_REJECT,
+    ACTION_POLICY_CLEAR,
 ];
 
 /// This daemon build's version, compared against the version every
@@ -376,6 +389,8 @@ pub struct DaemonHandle {
     /// The cached slow half of `status`, so a harness can produce a fresh
     /// snapshot on demand (see [`Self::refresh_status`]).
     status: Arc<StatusCache>,
+    /// The managed policy every service reads through.
+    policy: Arc<PolicyHandle>,
     #[cfg(test)]
     queue: Arc<QueueManager>,
     #[cfg(test)]
@@ -418,6 +433,14 @@ impl DaemonHandle {
     #[must_use]
     pub fn models(&self) -> Arc<ModelService> {
         Arc::clone(&self.models)
+    }
+
+    /// The managed policy handle every service of this daemon reads
+    /// through (see [`crate::managed_policy_service`]). For embedding hosts
+    /// and integration tests; nothing on public IPC reaches it.
+    #[must_use]
+    pub fn policy(&self) -> Arc<PolicyHandle> {
+        Arc::clone(&self.policy)
     }
 
     /// The daemon's lifecycle phase, as a watch: the process shell
@@ -491,7 +514,8 @@ impl DaemonHandle {
     /// The store is closed last, and the order is what makes that safe:
     ///
     /// 1. the daemon's own tasks are joined — the lease reaper, the
-    ///    retention scheduler, the status snapshot refresher, the
+    ///    retention scheduler, the status snapshot refresher, the managed
+    ///    policy poll (which stops when the drain starts), the
     ///    maintenance loop (which offers parked terminal verdicts to the
     ///    store one last time as it stops), the dispatcher (which joins or
     ///    aborts every request handler) and the executor loop;
@@ -563,6 +587,11 @@ pub struct DaemonConfig {
     /// is cut off (default [`DEFAULT_HANDLER_GRACE`]; tests inject a short
     /// one). The stranded-row reconciler waits this plus a margin.
     pub handler_grace: Duration,
+    /// Where the managed policy is read from; `None` reads the fixed
+    /// per-platform file through the production trust check
+    /// ([`FileSource::platform`]). Tests inject a scripted source, or one
+    /// that never finds a file.
+    pub policy_source: Option<Arc<dyn PolicySource>>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -579,6 +608,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("http_transport", &self.http_transport.is_some())
             .field("image_probe", &self.image_probe.is_some())
             .field("handler_grace", &self.handler_grace)
+            .field("policy_source", &self.policy_source.is_some())
             .finish()
     }
 }
@@ -593,6 +623,7 @@ impl Default for DaemonConfig {
             http_transport: None,
             image_probe: None,
             handler_grace: DEFAULT_HANDLER_GRACE,
+            policy_source: None,
         }
     }
 }
@@ -619,10 +650,11 @@ pub async fn run_daemon(
 /// `<base>/run` (erroring [`LifecycleError::AlreadyRunning`] when
 /// another daemon holds it), opens the store at `<base>/state.sqlite3`
 /// (constructing the policy gate from the profile persisted there),
-/// fails the rows a dead daemon left mid-flight, rebuilds the queue
+/// fails the rows a dead daemon left mid-flight, reads the managed policy
+/// (before the gate, so it applies from the first request), rebuilds the queue
 /// lanes, binds the transport (stale socket cleanup inside — safe under
 /// the held lock), builds the approval service, and spawns the
-/// dispatcher, executor loop, lease reaper, and lifecycle task.
+/// dispatcher, executor loop, lease reaper, policy poll, and lifecycle task.
 /// `config.base_dir` defaults to `~/.pam`. Flip `shutdown` to start the
 /// graceful drain, then await [`DaemonHandle::shutdown`].
 #[allow(
@@ -650,8 +682,18 @@ pub async fn run_daemon_with(
             "crash recovery reconciled in-flight rows from a previous daemon"
         );
     }
-    let gate = Arc::new(PolicyGate::new(Arc::clone(&store)).await?);
-    let models = ModelService::new(Arc::clone(&store)).await?;
+    // The managed policy first: the gate and every other service are built
+    // holding it, so a policy in force applies from the first request.
+    let policy_source = config
+        .policy_source
+        .unwrap_or_else(|| Arc::new(FileSource::platform()) as Arc<dyn PolicySource>);
+    let policy = PolicyHandle::load(Arc::clone(&store), policy_source, &base).await;
+    tracing::info!(
+        state = policy.status().state.as_str(),
+        "managed policy read"
+    );
+    let gate = Arc::new(PolicyGate::new(Arc::clone(&store), Arc::clone(&policy)).await?);
+    let models = ModelService::new(Arc::clone(&store), Arc::clone(&policy)).await?;
     models.set_engine_base(base.clone());
     // A SIGKILLed daemon leaves its engine running; stop it now rather than
     // on the first model op (idempotent, and a no-op with no engine).
@@ -672,16 +714,29 @@ pub async fn run_daemon_with(
     // One source of the network profile (proxy, no-proxy list, CA bundle)
     // for the connector transport, the downloads, the engine install and
     // the Network screen: the `net.settings` document plus the keychain.
-    let network = Arc::new(NetworkService::new(
-        Arc::clone(&store),
-        Some(Arc::clone(&secrets)),
-        base.clone(),
-    ));
+    // The managed policy is its overlay: a field the policy sets is pinned.
+    let network = Arc::new(
+        NetworkService::new(Arc::clone(&store), Some(Arc::clone(&secrets)), base.clone())
+            .with_managed(
+                Arc::clone(&policy) as Arc<dyn crate::network_service::ManagedNetworkLayer>
+            ),
+    );
+    {
+        // A changed policy drops the cached profile so the next spawn reads
+        // the new overlay. Weak: the service already holds the policy.
+        let network = Arc::downgrade(&network);
+        policy.on_change(move |_| {
+            if let Some(network) = network.upgrade() {
+                network.invalidate();
+            }
+        });
+    }
     models.set_network_service(Arc::clone(&network));
     let connectors = Arc::new(ConnectorService::from_parts(
         Arc::clone(&store),
         Some(Arc::clone(&secrets)),
         open_http_transport(config.http_transport, Arc::clone(&network)),
+        Arc::clone(&policy),
     ));
     let queue = Arc::new(
         QueueManager::new(Arc::clone(&store))
@@ -720,6 +775,7 @@ pub async fn run_daemon_with(
         Arc::clone(&store),
         transport.event_publisher(),
         config.approval_timeout,
+        Arc::clone(&policy),
     ));
     let flows = Arc::new(FlowService::new(
         &base,
@@ -728,6 +784,7 @@ pub async fn run_daemon_with(
         Arc::clone(&connectors),
         Arc::clone(&logs),
         Arc::clone(&gate),
+        Arc::clone(&policy),
     ));
     // Drain stops the lease-granting side (executor loop, reaper);
     // dispatch keeps answering (with refusals) until the drain is done.
@@ -742,6 +799,7 @@ pub async fn run_daemon_with(
             connectors,
             Arc::clone(&flows),
             incoming_tx.clone(),
+            Arc::clone(&policy),
         )
         .with_network(network),
     );
@@ -771,6 +829,7 @@ pub async fn run_daemon_with(
 
     let status = StatusCache::new(Arc::clone(&models), Arc::clone(&secrets));
     status.attach_boundary(Arc::clone(&boundary));
+    status.attach_policy(Arc::clone(&policy));
     let admission = Admission::new();
     let router = CompletionRouter::new();
     let pipeline = Arc::new(Pipeline {
@@ -799,8 +858,12 @@ pub async fn run_daemon_with(
     let tasks = vec![
         admin_observer,
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
-        RetentionService::new(Arc::clone(&store)).run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
+        RetentionService::new(Arc::clone(&store), Arc::clone(&policy))
+            .run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
         Arc::clone(&status).spawn(drain_rx.clone()),
+        // Stops when the drain starts; joined, like the rest, before the
+        // store closes.
+        policy.spawn_poller(drain_rx.clone()),
         // Runs through the drain: a verdict parked while draining is still
         // offered to the store before the daemon exits.
         tokio::spawn(maintenance_loop(
@@ -838,6 +901,7 @@ pub async fn run_daemon_with(
         image,
         admission,
         status,
+        policy,
         #[cfg(test)]
         queue,
         #[cfg(test)]

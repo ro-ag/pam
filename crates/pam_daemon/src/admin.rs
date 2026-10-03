@@ -71,6 +71,7 @@ use crate::executor::outcome_str;
 use crate::flow_service::FlowService;
 use crate::ingress::Origin;
 use crate::log_service::LogService;
+use crate::managed_policy_service::PolicyHandle;
 use crate::model_service::ModelService;
 use crate::network_service::NetworkService;
 use crate::policy::{CAP_CANCEL, Profile};
@@ -290,6 +291,9 @@ pub struct AdminService {
     /// paths. Created here and shared with the pipeline, whose maintenance
     /// loop retries whatever either of them parked.
     pub(crate) terminals: Arc<TerminalWriter>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]);
+    /// the `admin.*` ops read and refuse through it.
+    pub(crate) policy: Arc<PolicyHandle>,
     /// Seconds the retention ops' wall clock runs ahead of the real one.
     /// Tests stage a forward clock jump over real rows with it (see
     /// [`crate::admin_retention`]); production has no such field and reads
@@ -301,8 +305,13 @@ pub struct AdminService {
 impl AdminService {
     /// Builds the service over the daemon's store, approval service,
     /// model service, log service, connector host, flow engine, and the
-    /// pipeline ingress `admin.flows.run` submits through.
+    /// pipeline ingress `admin.flows.run` submits through, holding the
+    /// managed policy handle `policy`.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per daemon service the admin plane acts through"
+    )]
     pub fn new(
         store: Arc<Store>,
         approvals: Arc<ApprovalService>,
@@ -311,6 +320,7 @@ impl AdminService {
         connectors: Arc<ConnectorService>,
         flows: Arc<FlowService>,
         submit: mpsc::Sender<IncomingRequest>,
+        policy: Arc<PolicyHandle>,
     ) -> Self {
         // A network service of its own until the daemon hands over the one
         // its transport and downloads read; test fixtures keep this one.
@@ -329,6 +339,7 @@ impl AdminService {
             flows,
             network,
             submit,
+            policy,
             #[cfg(test)]
             retention_clock_ahead: std::sync::atomic::AtomicI64::new(0),
         }
@@ -340,6 +351,13 @@ impl AdminService {
     pub fn with_network(mut self, network: Arc<NetworkService>) -> Self {
         self.network = network;
         self
+    }
+
+    /// The managed policy handle the `admin.*` ops read through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// Handles one `admin.*` envelope end to end: records the request

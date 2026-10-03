@@ -473,8 +473,13 @@ mod seeded {
     }
 
     impl Fixture {
+        #[allow(
+            clippy::too_many_lines,
+            reason = "one fixture wires every service a flow run reaches, in boot order"
+        )]
         async fn new(checks: &'static str, pr_state: &'static str, http_calls: u64) -> Self {
             use std::os::unix::fs::PermissionsExt;
+            let policy = crate::managed_policy_service::PolicyHandle::none();
             let dirs = tempfile::tempdir().unwrap();
             let root = dirs.path().canonicalize().unwrap();
             let repo = root.join("repo");
@@ -492,8 +497,11 @@ mod seeded {
                 store.clone(),
                 events.clone(),
                 Duration::from_secs(10),
+                policy.clone(),
             ));
-            let models = ModelService::new(store.clone()).await.unwrap();
+            let models = ModelService::new(store.clone(), policy.clone())
+                .await
+                .unwrap();
             let logs = LogService::new(store.clone(), models.clone());
             let secrets = Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default())));
             let github = Arc::new(Github {
@@ -505,6 +513,7 @@ mod seeded {
                 store.clone(),
                 secrets.clone(),
                 github.clone(),
+                policy.clone(),
             ));
             connectors
                 .configure(

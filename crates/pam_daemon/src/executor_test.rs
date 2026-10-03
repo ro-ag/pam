@@ -37,15 +37,26 @@ struct Fixture {
 async fn fixture() -> Fixture {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let queue = Arc::new(QueueManager::new(Arc::clone(&store)));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let (events, events_rx) = EventPublisher::for_tests();
     let approvals = Arc::new(ApprovalService::new(
         Arc::clone(&store),
         events.clone(),
         DEADLINE,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
         &store,

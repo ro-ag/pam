@@ -51,16 +51,21 @@ async fn fixture_with(transport: FakeTransport) -> Fixture {
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store))
-        .await
-        .expect("model service");
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .expect("model service");
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
     let backend = Arc::new(FakeSecretBackend::default());
     let connectors = Arc::new(ConnectorService::new(
         Arc::clone(&store),
         Arc::new(SecretStore::new(Arc::clone(&backend) as Arc<_>)),
         Arc::new(transport),
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
@@ -78,6 +83,7 @@ async fn fixture_with(transport: FakeTransport) -> Fixture {
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     Fixture {
         store,

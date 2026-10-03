@@ -11,7 +11,12 @@ use crate::model_service::{ModelService, Tier};
 
 async fn service(dir: &std::path::Path) -> Arc<ModelService> {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let service = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let service = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     service.set_models_dir(dir).await.unwrap();
     service
 }

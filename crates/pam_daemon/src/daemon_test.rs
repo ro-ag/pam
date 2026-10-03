@@ -253,6 +253,60 @@ fn a_store_refusal_is_named_to_a_public_caller_and_other_store_errors_are_not() 
 }
 
 // ---------------------------------------------------------------------------
+// The managed policy a harness daemon reads: never the machine's own file.
+// ---------------------------------------------------------------------------
+
+/// A policy source the test scripts: `None` is no file, `Some` a file that
+/// passed the trust check with these bytes.
+pub(crate) struct ScriptedPolicy {
+    bytes: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl ScriptedPolicy {
+    pub(crate) fn new(bytes: Option<&str>) -> Self {
+        Self {
+            bytes: std::sync::Mutex::new(bytes.map(|text| text.as_bytes().to_vec())),
+        }
+    }
+}
+
+impl crate::managed_policy_service::PolicySource for ScriptedPolicy {
+    fn origin(&self) -> String {
+        "scripted".to_owned()
+    }
+
+    fn read(&self) -> crate::managed_policy_service::SourceRead {
+        match self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(bytes) => crate::managed_policy_service::SourceRead::Trusted(bytes),
+            None => crate::managed_policy_service::SourceRead::Absent,
+        }
+    }
+
+    fn fingerprint(&self) -> Option<crate::managed_policy_service::Fingerprint> {
+        None
+    }
+
+    fn read_referenced(
+        &self,
+        _path: &std::path::Path,
+        _max_bytes: u64,
+    ) -> crate::managed_policy_service::SourceRead {
+        crate::managed_policy_service::SourceRead::Absent
+    }
+}
+
+/// The source every harness daemon gets unless a test scripts one: no file,
+/// so a policy installed on the machine running the tests is never read.
+pub(crate) fn no_policy_file() -> std::sync::Arc<dyn crate::managed_policy_service::PolicySource> {
+    std::sync::Arc::new(ScriptedPolicy::new(None))
+}
+
+// ---------------------------------------------------------------------------
 // A real daemon, driven through its ingress channel, with its internals in
 // reach. `pam_testkit` links the non-test build of this crate, so its
 // `TestDaemon` cannot hand back this build's `QueueManager` or router; these
@@ -306,6 +360,7 @@ mod live {
             let mut config = DaemonConfig {
                 base_dir: Some(pam_testkit::base_of(&tmp)),
                 secret_backend: Some(Arc::new(FakeSecretBackend::default())),
+                policy_source: Some(super::no_policy_file()),
                 ..DaemonConfig::default()
             };
             mutate(&mut config);
@@ -1263,6 +1318,172 @@ mod live {
         );
         live.stop().await;
     }
+
+    /// A trusted policy: the profile locked, an organization and a contact
+    /// that must never reach the public `status`.
+    const MANAGED_POLICY: &str = r#"{
+  "version": 1,
+  "revision": "2026-10-02.1",
+  "organization": "Example Corp",
+  "contact": "it@example.com",
+  "security": { "profile": { "locked": "strict", "reason": "SEC-1" } }
+}"#;
+
+    async fn status_body(live: &Live, id: &str) -> serde_json::Value {
+        let response = live
+            .ask(request(id, "status", serde_json::json!({}), true))
+            .await;
+        let Response::Result { body, .. } = response else {
+            panic!("status answers a result: {response:?}");
+        };
+        body
+    }
+
+    /// No file: the block is there and says nothing is managed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_reports_an_unmanaged_policy_when_there_is_no_file() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let body = status_body(&live, "policy_none").await;
+        assert_eq!(
+            body["policy"],
+            serde_json::json!({
+                "state": "none",
+                "revision": null,
+                "digest": null,
+                "loaded_ts": null,
+                "managed": false,
+                "rejected_leaves": 0,
+            }),
+            "{body}"
+        );
+        assert_eq!(live.handle.policy().status().state.as_str(), "none");
+        live.stop().await;
+    }
+
+    /// A trusted policy read at boot: `status.policy` names its state,
+    /// revision and short digest, and nothing of what it says; the
+    /// daemon-owned `policy.load` row it wrote is a terminal row the audit
+    /// invariant accepts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_reports_a_trusted_policy_and_its_load_row_keeps_the_audit_invariant() {
+        use sha2::Digest as _;
+
+        let live = Live::start("relaxed", |config| {
+            config.policy_source = Some(Arc::new(super::ScriptedPolicy::new(Some(MANAGED_POLICY))));
+        })
+        .await;
+        let store = live.store();
+        let body = status_body(&live, "policy_active").await;
+        let digest = hex::encode(sha2::Sha256::digest(MANAGED_POLICY.as_bytes()));
+        let block = &body["policy"];
+        assert_eq!(block["state"], "active", "{body}");
+        assert_eq!(block["managed"], true);
+        assert_eq!(block["revision"], "2026-10-02.1");
+        assert_eq!(block["digest"], digest[..12]);
+        assert_eq!(block["rejected_leaves"], 0);
+        assert!(block["loaded_ts"].is_i64(), "{block}");
+        let mut keys: Vec<&str> = block
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "digest",
+                "loaded_ts",
+                "managed",
+                "rejected_leaves",
+                "revision",
+                "state"
+            ]
+        );
+        let text = body.to_string();
+        for secret in ["Example Corp", "it@example.com", "SEC-1", "strict"] {
+            assert!(!text.contains(secret), "status leaks {secret}: {text}");
+        }
+        assert_eq!(
+            live.handle.policy().status().digest.as_deref(),
+            Some(digest.as_str())
+        );
+
+        let loads = store
+            .list_requests_filtered(
+                None,
+                None,
+                None,
+                None,
+                Some(crate::managed_policy_service::CAPABILITY_POLICY_LOAD),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(loads.len(), 1, "{loads:?}");
+        assert_eq!(loads[0].state, RequestState::Done);
+        let audit = store.audit_for_request(&loads[0].id).await.unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|row| row.action == crate::managed_policy_service::ACTION_POLICY_LOAD),
+            "{audit:?}"
+        );
+        assert!(
+            store
+                .terminal_requests_missing_audit(crate::daemon::TERMINAL_ACTIONS)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a daemon-owned policy row breaks the audit invariant"
+        );
+        live.stop().await;
+    }
+
+    /// The policy is read before the gate is built: the gate and the status
+    /// hold the one handle the daemon read at boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_service_holds_the_policy_read_at_boot() {
+        let live = Live::start("relaxed", |config| {
+            config.policy_source = Some(Arc::new(super::ScriptedPolicy::new(Some(MANAGED_POLICY))));
+        })
+        .await;
+        let policy = live.handle.policy();
+        let admin = live.handle.admin();
+        assert!(Arc::ptr_eq(admin.policy(), &policy));
+        assert!(Arc::ptr_eq(admin.flows.policy(), &policy));
+        assert!(Arc::ptr_eq(admin.flows.gate().policy(), &policy));
+        assert!(Arc::ptr_eq(admin.connectors.policy(), &policy));
+        assert!(Arc::ptr_eq(admin.models.policy(), &policy));
+        assert!(Arc::ptr_eq(live.handle.approvals().policy(), &policy));
+        assert_eq!(policy.status().state.as_str(), "active");
+        live.stop().await;
+    }
+
+    /// The poll task holds the policy handle; after the shutdown (which
+    /// closes the store last) nothing does, so the poll ended with the
+    /// other background tasks rather than outliving the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_policy_poll_ends_with_the_shutdown() {
+        let live = Live::start("relaxed", |config| {
+            config.policy_source = Some(Arc::new(super::ScriptedPolicy::new(Some(MANAGED_POLICY))));
+        })
+        .await;
+        let policy = Arc::downgrade(&live.handle.policy());
+        let store = live.store();
+        live.stop().await;
+        assert!(
+            policy.upgrade().is_none(),
+            "something still holds the policy after the shutdown"
+        );
+        assert!(
+            matches!(
+                store.count_inflight().await,
+                Err(pam_store::StoreError::Closed)
+            ),
+            "the store closes at the end of the shutdown"
+        );
+    }
 }
 
 mod cancel_plane {
@@ -1344,6 +1565,7 @@ mod cancel_plane {
                 DaemonConfig {
                     base_dir: Some(pam_testkit::base_of(&tmp)),
                     secret_backend: Some(Arc::new(FakeSecretBackend::default())),
+                    policy_source: Some(super::no_policy_file()),
                     ..DaemonConfig::default()
                 },
                 shutdown_rx,

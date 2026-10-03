@@ -65,7 +65,10 @@ impl AdminService {
     /// The retention service for this call. Building one is an
     /// `Arc` clone, so the daemon carries no field for it.
     fn retention(&self) -> RetentionService {
-        let service = RetentionService::new(std::sync::Arc::clone(&self.store));
+        let service = RetentionService::new(
+            std::sync::Arc::clone(&self.store),
+            std::sync::Arc::clone(&self.policy),
+        );
         // Tests move the clock these ops read; production reads the system's.
         #[cfg(test)]
         let service = {

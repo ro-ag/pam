@@ -66,6 +66,7 @@ use crate::flow_exec::{
 };
 use crate::flow_recovery::Prepare;
 use crate::log_service::{CompressInput, LogService, new_evidence_id};
+use crate::managed_policy_service::PolicyHandle;
 use crate::model_readiness::Stage;
 use crate::model_service::Tier;
 use crate::policy::{CapabilityClass, GateDecision, PolicyGate};
@@ -488,6 +489,8 @@ pub struct FlowService {
     connectors: Arc<ConnectorService>,
     logs: Arc<LogService>,
     gate: Arc<PolicyGate>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
 }
 
 impl FlowService {
@@ -510,6 +513,7 @@ impl FlowService {
         connectors: Arc<ConnectorService>,
         logs: Arc<LogService>,
         gate: Arc<PolicyGate>,
+        policy: Arc<PolicyHandle>,
     ) -> Self {
         Self {
             protected_base: base_dir.to_path_buf(),
@@ -519,7 +523,15 @@ impl FlowService {
             connectors,
             logs,
             gate,
+            policy,
         }
+    }
+
+    /// The managed policy handle this engine reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// The flow library this engine reads and writes.

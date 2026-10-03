@@ -799,6 +799,7 @@ mod live {
                 base_dir: Some(pam_testkit::base_of(tmp)),
                 secret_backend: Some(Arc::new(FakeSecretBackend::default())),
                 handler_grace: Duration::from_millis(300),
+                policy_source: Some(crate::daemon_test::no_policy_file()),
                 ..DaemonConfig::default()
             },
             shutdown_rx,

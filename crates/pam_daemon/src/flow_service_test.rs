@@ -40,7 +40,14 @@ pub(crate) async fn flows_for_tests(
     // helper runs a step (which is the only thing that consults the
     // gate), so the store under test must not grow that setting.
     let gate_store = Arc::new(Store::open_in_memory().await.expect("store opens"));
-    let gate = Arc::new(PolicyGate::new(gate_store).await.expect("the gate builds"));
+    let gate = Arc::new(
+        PolicyGate::new(
+            gate_store,
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .expect("the gate builds"),
+    );
     Arc::new(FlowService::new(
         base,
         Arc::clone(store),
@@ -48,6 +55,7 @@ pub(crate) async fn flows_for_tests(
         Arc::clone(connectors),
         Arc::clone(logs),
         gate,
+        crate::managed_policy_service::PolicyHandle::none(),
     ))
 }
 
@@ -68,12 +76,21 @@ async fn service() -> (tempfile::TempDir, Arc<Store>, Arc<FlowService>) {
         Arc::clone(&store),
         events,
         std::time::Duration::from_mins(1),
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = crate::model_service::ModelService::new(Arc::clone(&store))
-        .await
-        .expect("the model service builds");
+    let models = crate::model_service::ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .expect("the model service builds");
     let logs = LogService::new(Arc::clone(&store), models);
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = flows_for_tests(tmp.path(), &store, &approvals, &connectors, &logs).await;
     (tmp, store, flows)
 }

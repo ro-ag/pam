@@ -25,6 +25,7 @@ use pam_daemon::daemon::{
 use pam_daemon::event_hub::{PUBLIC_PROGRESS_NOTE, Subscribed, Subscriber};
 use pam_daemon::flow_service::{SETTING_ALLOWED_PROGRAMS, SETTING_EXTRA_PATH};
 use pam_daemon::framed::{self, DialError};
+use pam_daemon::managed_policy_service::{Fingerprint, PolicySource, SourceRead};
 use pam_daemon::policy::PROFILE_SETTING_KEY;
 use pam_daemon::runtime_dir::{MAX_SOCKET_PATH_BYTES, RuntimeDir};
 use pam_daemon::secrets::SecretBackend;
@@ -39,6 +40,58 @@ pub use pam_connectors::testing::FakeTransport;
 /// The in-memory credential store connector tests run on. Re-exported so a
 /// test needs one dependency, not three, to drive the Connectors surface.
 pub use pam_daemon::secrets::FakeSecretBackend;
+
+/// A managed-policy source a test scripts, so no harness daemon ever reads
+/// the policy installed on the machine running the tests.
+/// [`ScriptedPolicy::absent`] is what every [`TestDaemon`] gets unless the
+/// config mutator injects another; [`ScriptedPolicy::trusted`] is a file
+/// that passed the trust check with exactly these bytes.
+#[derive(Debug, Default)]
+pub struct ScriptedPolicy {
+    bytes: Mutex<Option<Vec<u8>>>,
+}
+
+impl ScriptedPolicy {
+    /// No policy file.
+    #[must_use]
+    pub fn absent() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A trusted policy file holding `text`.
+    #[must_use]
+    pub fn trusted(text: &str) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: Mutex::new(Some(text.as_bytes().to_vec())),
+        })
+    }
+}
+
+impl PolicySource for ScriptedPolicy {
+    fn origin(&self) -> String {
+        "scripted".to_owned()
+    }
+
+    fn read(&self) -> SourceRead {
+        match self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(bytes) => SourceRead::Trusted(bytes),
+            None => SourceRead::Absent,
+        }
+    }
+
+    fn fingerprint(&self) -> Option<Fingerprint> {
+        None
+    }
+
+    fn read_referenced(&self, _path: &std::path::Path, _max_bytes: u64) -> SourceRead {
+        SourceRead::Absent
+    }
+}
 
 /// Wall deadline for any single harness await. Generous on purpose:
 /// loaded CI runners stretch wall time, and the budget only needs to
@@ -264,7 +317,8 @@ pub struct TestDaemon {
 
 impl TestDaemon {
     /// Spawns a daemon on a fresh short-path temp dir with the default
-    /// [`DaemonConfig`] and the relaxed profile ([`seed_relaxed`]).
+    /// [`DaemonConfig`], no managed policy file ([`ScriptedPolicy::absent`])
+    /// and the relaxed profile ([`seed_relaxed`]).
     pub async fn spawn() -> Self {
         let tmp = short_tempdir();
         seed_relaxed(&tmp).await;
@@ -313,6 +367,7 @@ impl TestDaemon {
         assert_socket_paths_fit(&base);
         let mut config = DaemonConfig {
             base_dir: Some(base),
+            policy_source: Some(ScriptedPolicy::absent()),
             ..DaemonConfig::default()
         };
         mutate(&mut config);

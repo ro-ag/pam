@@ -58,6 +58,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot, watch};
 
+use crate::managed_policy_service::PolicyHandle;
 use crate::transport::EventPublisher;
 
 /// How long a pending approval waits before it times out, unless the
@@ -192,20 +193,36 @@ pub struct ApprovalService {
     /// request id → the waiting `request_approval` call's resolution
     /// channel and step snapshot. Entries live exactly as long as the wait.
     pending: Mutex<HashMap<String, PendingWait>>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
 }
 
 impl ApprovalService {
     /// Builds the service over `store`, publishing on `events`, with
     /// `timeout` as the unanswered-approval bound (tests inject a short
-    /// one; the daemon default is [`DEFAULT_APPROVAL_TIMEOUT`]).
+    /// one; the daemon default is [`DEFAULT_APPROVAL_TIMEOUT`]), holding the
+    /// managed policy handle `policy`.
     #[must_use]
-    pub fn new(store: Arc<Store>, events: EventPublisher, timeout: Duration) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        events: EventPublisher,
+        timeout: Duration,
+        policy: Arc<PolicyHandle>,
+    ) -> Self {
         Self {
             store,
             events,
             timeout,
             pending: Mutex::new(HashMap::new()),
+            policy,
         }
+    }
+
+    /// The managed policy handle this service reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// Parks `request_id` until its approval is resolved: inserts the unresolved `approval` row

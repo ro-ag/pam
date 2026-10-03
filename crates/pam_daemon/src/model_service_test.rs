@@ -16,7 +16,12 @@ use crate::test_log::Captured;
 /// serve; production refuses `http://`.
 async fn service(dir: &std::path::Path) -> Arc<ModelService> {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let service = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let service = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     service.set_models_dir(dir).await.unwrap();
     service.allow_plain_http_downloads_for_tests();
     service
@@ -159,7 +164,12 @@ async fn a_default_naming_absent_weights_is_missing() {
 async fn defaults_round_trip_through_the_settings() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let service = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let service = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     service.set_models_dir(dir.path()).await.unwrap();
 
     assert_eq!(service.defaults().await.unwrap(), (None, None));
@@ -279,7 +289,12 @@ async fn boot_fails_the_jobs_a_dead_daemon_left_running() {
         .await
         .unwrap();
 
-    let service = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let service = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let jobs = service.status().await.unwrap();
     let job = &jobs["jobs"][0];
     assert_eq!(job["id"], "job_orphan");
@@ -980,7 +995,12 @@ async fn a_verify_job_makes_the_private_copy_and_a_cancelled_one_leaves_nothing(
 async fn shutdown_stops_running_transfers_and_their_followers_before_the_store_closes() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let service = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let service = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     service.set_models_dir(dir.path()).await.unwrap();
     service.allow_plain_http_downloads_for_tests();
     service.set_engine_base(dir.path().join("base"));
@@ -1394,7 +1414,12 @@ async fn a_summary_is_skipped_for_a_model_that_is_unverified_or_unqualified() {
     use pam_model::engine_server::EngineContract;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     models.set_models_dir(dir.path()).await.unwrap();
     models.set_engine_base(dir.path().join("base"));
     let path = touch_model(dir.path(), "qwen", "small.gguf");

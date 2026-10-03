@@ -346,6 +346,7 @@ async fn a_cancelled_pack_fetch_refuses_as_cancelled_before_any_network_send() {
         Arc::clone(&store),
         Arc::new(SecretStore::new(Arc::new(FakeSecretBackend::default()))),
         Arc::clone(&transport) as Arc<dyn HttpTransport>,
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     service
         .configure(

@@ -76,6 +76,7 @@ async fn fixture_with(transport: FakeTransport) -> Fixture {
         Arc::clone(&store),
         Arc::new(SecretStore::new(Arc::clone(&backend) as Arc<_>)),
         Arc::clone(&transport) as Arc<_>,
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     Fixture {
         repo,
@@ -598,7 +599,12 @@ async fn missing_scope_setting_does_not_inherit_connector_permission() {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let repo = tempfile::tempdir().unwrap();
     let transport = Arc::new(FakeTransport::new());
-    let service = ConnectorService::from_parts(Arc::clone(&store), None, Some(transport.clone()));
+    let service = ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        Some(transport.clone()),
+        crate::managed_policy_service::PolicyHandle::none(),
+    );
     assert!(
         store
             .get_setting("flows.scope_policy")
@@ -630,6 +636,7 @@ async fn a_daemon_without_curl_refuses_http_connectors() {
         Arc::clone(&store),
         Some(Arc::new(SecretStore::new(Arc::clone(&backend) as Arc<_>))),
         None,
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     service
         .configure(
@@ -672,7 +679,12 @@ async fn a_daemon_without_curl_refuses_http_connectors() {
 #[tokio::test]
 async fn a_daemon_without_a_credential_store_still_lists() {
     let store = Arc::new(Store::open_in_memory().await.expect("store opens"));
-    let service = ConnectorService::from_parts(Arc::clone(&store), None, None);
+    let service = ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    );
 
     let summaries = service.list().await.expect("list ok");
     assert_eq!(summaries.len(), ConnectorId::ALL.len());
@@ -818,6 +830,7 @@ async fn configuration_waits_for_the_old_test_then_retires_its_verdict() {
         store,
         Arc::new(SecretStore::new(backend)),
         transport.clone(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     service
         .configure(
@@ -901,7 +914,12 @@ async fn a_legacy_aws_row_is_ignored_by_the_connector_host() {
         )
         .await
         .unwrap();
-    let service = ConnectorService::from_parts(Arc::clone(&store), None, None);
+    let service = ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    );
 
     let summaries = service.list().await.expect("list survives a legacy row");
     assert_eq!(summaries.len(), ConnectorId::ALL.len());
@@ -1045,6 +1063,7 @@ async fn service_behind_a_refusing_proxy(
         Arc::clone(store),
         Arc::new(SecretStore::new(backend as Arc<_>)),
         Arc::new(transport),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     service
         .configure(

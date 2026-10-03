@@ -17,7 +17,10 @@ const DAY: i64 = 86_400;
 /// itself so a test can seed rows and read them back.
 async fn service() -> (Arc<Store>, RetentionService) {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
-    (Arc::clone(&store), RetentionService::new(store))
+    (
+        Arc::clone(&store),
+        RetentionService::new(store, crate::managed_policy_service::PolicyHandle::none()),
+    )
 }
 
 /// One request that has already finished, so a prune may touch it.

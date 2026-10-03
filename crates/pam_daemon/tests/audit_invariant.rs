@@ -496,3 +496,65 @@ async fn lease_reaping_writes_one_reaped_row_and_the_late_executor_no_ops() {
     })
     .await;
 }
+
+/// A managed policy read at boot writes its own daemon-owned `policy.load`
+/// request row. The sweep accepts it (its action is terminal), the public
+/// `status` carries the policy block over the real transport, and ordinary
+/// requests keep their one terminal row each.
+#[tokio::test]
+async fn a_managed_policy_load_row_keeps_the_invariant_clean() {
+    const POLICY: &str = r#"{
+  "version": 1,
+  "revision": "2026-10-02.1",
+  "organization": "Example Corp",
+  "security": { "profile": { "default": "relaxed" } }
+}"#;
+    with_deadline(async {
+        let daemon = TestDaemon::spawn_with(|config| {
+            config.policy_source = Some(pam_testkit::ScriptedPolicy::trusted(POLICY));
+        })
+        .await;
+        let mut client = daemon.client().await;
+
+        let response = client
+            .request(&envelope(
+                "req_managed",
+                "echo",
+                serde_json::json!({ "msg": "hi" }),
+                true,
+            ))
+            .await;
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let status = client
+            .request(&envelope(
+                "req_status",
+                "status",
+                serde_json::json!({}),
+                true,
+            ))
+            .await;
+        let Response::Result { body, .. } = status else {
+            panic!("status answers a result: {status:?}");
+        };
+        assert_eq!(body["policy"]["state"], "active", "{body}");
+        assert_eq!(body["policy"]["managed"], true);
+        assert_eq!(body["policy"]["revision"], "2026-10-02.1");
+        assert!(!body.to_string().contains("Example Corp"), "{body}");
+
+        let loads = daemon
+            .store()
+            .list_requests_filtered(None, None, None, None, Some("policy.load"), false)
+            .await
+            .unwrap();
+        assert_eq!(loads.len(), 1, "{loads:?}");
+        assert_eq!(loads[0].state, RequestState::Done);
+        assert_eq!(
+            daemon.terminal_audit_actions("req_managed").await,
+            [ACTION_EXECUTE]
+        );
+        daemon.assert_invariant_clean().await;
+
+        daemon.stop().await;
+    })
+    .await;
+}

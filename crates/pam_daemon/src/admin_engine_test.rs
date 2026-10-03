@@ -115,8 +115,14 @@ async fn fixture(
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     models.set_models_dir(models_dir.path()).await.unwrap();
     models.set_engine_base(base.path().to_path_buf());
     let network = if let Some(source) = source {
@@ -131,7 +137,12 @@ async fn fixture(
         Some(network)
     };
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         Path::new("pam-tests-have-no-flow-library"),
         &store,
@@ -148,6 +159,7 @@ async fn fixture(
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     if let Some(network) = &network {
         admin = admin.with_network(Arc::clone(network));

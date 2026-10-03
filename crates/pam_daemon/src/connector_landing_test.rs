@@ -72,6 +72,7 @@ async fn fixture(store: Arc<Store>, transport: Arc<dyn HttpTransport>) -> Fixtur
         Arc::clone(&store),
         Arc::new(SecretStore::new(secrets.clone())),
         transport,
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     service
         .configure(

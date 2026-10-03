@@ -314,6 +314,7 @@ fn service(
         Arc::clone(store),
         Arc::new(SecretStore::new(Arc::clone(backend) as Arc<_>)),
         transport,
+        crate::managed_policy_service::PolicyHandle::none(),
     )
 }
 

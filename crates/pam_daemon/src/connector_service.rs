@@ -39,6 +39,7 @@ use pam_store::{ConnectorPatch, ConnectorRow, Store, StoreError};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::managed_policy_service::PolicyHandle;
 use crate::scope_policy::{RECOVERY_SCOPE, ScopeError, ScopePolicy};
 use crate::secrets::{KeyringHealth, SecretBackend, SecretError, SecretStore};
 
@@ -348,6 +349,8 @@ pub struct ConnectorService {
     /// Whether `curl` is missing, which refuses every HTTP connector before
     /// the transport is touched.
     curl_missing: bool,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
 }
 
 impl std::fmt::Debug for ConnectorService {
@@ -367,6 +370,7 @@ impl ConnectorService {
         store: Arc<Store>,
         secrets: Arc<SecretStore>,
         transport: Arc<dyn HttpTransport>,
+        policy: Arc<PolicyHandle>,
     ) -> Self {
         Self {
             configuration_locks: ConnectorId::ALL
@@ -378,6 +382,7 @@ impl ConnectorService {
             transport,
             store_available: true,
             curl_missing: false,
+            policy,
         }
     }
 
@@ -392,6 +397,7 @@ impl ConnectorService {
         store: Arc<Store>,
         secrets: Option<Arc<SecretStore>>,
         transport: Option<Arc<dyn HttpTransport>>,
+        policy: Arc<PolicyHandle>,
     ) -> Self {
         let store_available = secrets.is_some();
         let curl_missing = transport.is_none();
@@ -406,7 +412,15 @@ impl ConnectorService {
             transport: transport.unwrap_or_else(|| Arc::new(MissingCurl)),
             store_available,
             curl_missing,
+            policy,
         }
+    }
+
+    /// The managed policy handle this host reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// The keychain this host reads credentials from, when it opened at

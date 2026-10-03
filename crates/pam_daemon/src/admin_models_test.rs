@@ -53,14 +53,25 @@ pub(crate) async fn fixture() -> Fixture {
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     models.set_models_dir(dir.path()).await.unwrap();
     // The origin these tests download from is a plain-http loopback
     // listener; production refuses `http://`.
     models.allow_plain_http_downloads_for_tests();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
         &store,
@@ -77,6 +88,7 @@ pub(crate) async fn fixture() -> Fixture {
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     Fixture {
         store,

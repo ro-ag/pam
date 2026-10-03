@@ -50,6 +50,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use crate::managed_policy_service::PolicyHandle;
+
 /// Setting key: how many days evidence blobs are kept, JSON `null` for
 /// forever.
 pub const SETTING_EVIDENCE_DAYS: &str = "retention.evidence_days";
@@ -332,18 +334,28 @@ pub struct RetentionService {
     clock: Clock,
     census: Arc<dyn CensusSource>,
     guard: GuardPolicy,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
 }
 
 impl RetentionService {
-    /// A service over `store`.
+    /// A service over `store`, holding the managed policy handle `policy`.
     #[must_use]
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new(store: Arc<Store>, policy: Arc<PolicyHandle>) -> Self {
         Self {
             census: Arc::new(StoreCensus(Arc::clone(&store))),
             store,
+            policy,
             clock: Clock(Arc::new(now_ts)),
             guard: GuardPolicy::default(),
         }
+    }
+
+    /// The managed policy handle this service reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// Replaces the wall clock the passes read.

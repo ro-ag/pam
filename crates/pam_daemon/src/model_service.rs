@@ -61,6 +61,8 @@ use pam_store::{ModelJobRow, Store, StoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
 
+use crate::managed_policy_service::PolicyHandle;
+
 /// Setting key: the directory PAM scans for weights (`~/llm` by default).
 pub const SETTING_MODELS_DIR: &str = "model.models_dir";
 
@@ -381,6 +383,8 @@ type Verifies = Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// The daemon's model layer (see the module docs).
 pub struct ModelService {
     store: Arc<Store>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
     /// The models directory. Behind a lock because
     /// `admin.models.settings.set` moves it while the daemon serves; a
     /// [`Registry`] is rebuilt from it on every read, so no caller can
@@ -467,8 +471,11 @@ impl ModelService {
     /// Reads the models directory setting, measures host RAM once, fails
     /// the jobs a previous daemon left `running`
     /// ([`CAUSE_DAEMON_RESTART`]), and spawns the idle-unload ticker.
-    /// Needs a tokio runtime.
-    pub async fn new(store: Arc<Store>) -> Result<Arc<Self>, StoreError> {
+    /// Needs a tokio runtime. Holds `policy`, the managed policy handle.
+    pub async fn new(
+        store: Arc<Store>,
+        policy: Arc<PolicyHandle>,
+    ) -> Result<Arc<Self>, StoreError> {
         let models_dir = read_models_dir(&store).await?;
         let recovered = store
             .fail_running_model_jobs(&job_failure_detail(
@@ -484,6 +491,7 @@ impl ModelService {
         }
         let service = Arc::new(Self {
             store,
+            policy,
             models_dir: RwLock::new(models_dir),
             qualifications: RwLock::new(QUALIFIED),
             engine_base: RwLock::new(None),
@@ -513,6 +521,13 @@ impl ModelService {
             service.stopping.subscribe(),
         ));
         Ok(service)
+    }
+
+    /// The managed policy handle this layer reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// Spawns one of the service's own tasks where [`Self::shutdown`] can

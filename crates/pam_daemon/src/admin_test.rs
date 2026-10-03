@@ -33,10 +33,21 @@ async fn service() -> (Arc<Store>, AdminService, mpsc::Receiver<(String, Event)>
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
         &store,
@@ -53,6 +64,7 @@ async fn service() -> (Arc<Store>, AdminService, mpsc::Receiver<(String, Event)>
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     (store, admin, rx)
 }
@@ -71,10 +83,21 @@ async fn service_with_approvals() -> (
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store)).await.unwrap();
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap();
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         std::path::Path::new("pam-tests-have-no-flow-library"),
         &store,
@@ -91,6 +114,7 @@ async fn service_with_approvals() -> (
         connectors,
         flows,
         crate::flow_service_test::closed_submit(),
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     (store, admin, approvals, rx)
 }

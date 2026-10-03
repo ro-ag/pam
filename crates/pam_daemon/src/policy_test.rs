@@ -29,7 +29,12 @@ async fn gate_with(store: &Arc<Store>, profile: Profile) -> PolicyGate {
         .insert_request("req_1", "echo", "ro-ag/pam", "claude", "{}", None)
         .await
         .unwrap();
-    PolicyGate::new(Arc::clone(store)).await.unwrap()
+    PolicyGate::new(
+        Arc::clone(store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .unwrap()
 }
 
 #[test]
@@ -136,7 +141,12 @@ async fn set_profile_governs_the_next_evaluation_and_persists() {
             GateDecision::RequireApproval { .. }
         ));
         // And a gate built after a restart reads the same profile.
-        let rebuilt = PolicyGate::new(Arc::clone(&store)).await.unwrap();
+        let rebuilt = PolicyGate::new(
+            Arc::clone(&store),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap();
         assert_eq!(rebuilt.profile(), Profile::Strict);
     })
     .await
@@ -171,7 +181,12 @@ async fn an_auto_grant_without_its_request_row_writes_neither_grant_nor_audit() 
 async fn first_construction_persists_platform_default() {
     timeout(DEADLINE, async {
         let store = fresh_store().await;
-        let gate = PolicyGate::new(Arc::clone(&store)).await.unwrap();
+        let gate = PolicyGate::new(
+            Arc::clone(&store),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap();
         assert_eq!(gate.profile(), Profile::platform_default());
 
         // Persisted so the GUI (and the next construction) sees it.
@@ -191,7 +206,12 @@ async fn first_construction_persists_platform_default() {
             .set_setting(PROFILE_SETTING_KEY, "\"strict\"")
             .await
             .unwrap();
-        let gate = PolicyGate::new(Arc::clone(&store)).await.unwrap();
+        let gate = PolicyGate::new(
+            Arc::clone(&store),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap();
         assert_eq!(gate.profile(), Profile::Strict);
     })
     .await
@@ -206,7 +226,12 @@ async fn corrupt_profile_setting_is_a_legible_error() {
             .set_setting(PROFILE_SETTING_KEY, "\"paranoid\"")
             .await
             .unwrap();
-        let err = PolicyGate::new(Arc::clone(&store)).await.unwrap_err();
+        let err = PolicyGate::new(
+            Arc::clone(&store),
+            crate::managed_policy_service::PolicyHandle::none(),
+        )
+        .await
+        .unwrap_err();
         let PolicyError::UnrecognizedProfile { value } = err else {
             panic!("expected UnrecognizedProfile, got {err:?}");
         };

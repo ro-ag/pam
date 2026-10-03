@@ -34,6 +34,8 @@ use pam_store::{Actor, AuditEntry, Decision, GrantChange, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::managed_policy_service::PolicyHandle;
+
 /// `setting` key holding the active [`Profile`] as a JSON string.
 pub const PROFILE_SETTING_KEY: &str = "policy.profile";
 
@@ -244,14 +246,17 @@ pub struct PolicyGate {
     /// sync lock: the critical section is one `Copy`, never held across an
     /// await.
     profile: RwLock<Profile>,
+    /// The managed policy in force (see [`crate::managed_policy_service`]).
+    policy: Arc<PolicyHandle>,
 }
 
 impl PolicyGate {
     /// Builds a gate from the profile persisted under
     /// [`PROFILE_SETTING_KEY`], falling back to
     /// [`Profile::platform_default`] — and persisting it — when the
-    /// setting is unset.
-    pub async fn new(store: Arc<Store>) -> Result<Self, PolicyError> {
+    /// setting is unset. Holds `policy`, the managed policy read at boot
+    /// before the gate is built.
+    pub async fn new(store: Arc<Store>, policy: Arc<PolicyHandle>) -> Result<Self, PolicyError> {
         let profile = if let Some(raw) = store.get_setting(PROFILE_SETTING_KEY).await? {
             serde_json::from_str(&raw)
                 .map_err(|_| PolicyError::UnrecognizedProfile { value: raw })?
@@ -265,7 +270,15 @@ impl PolicyGate {
         Ok(Self {
             store,
             profile: RwLock::new(profile),
+            policy,
         })
+    }
+
+    /// The managed policy handle this gate reads through (see
+    /// [`crate::managed_policy_service`]).
+    #[must_use]
+    pub fn policy(&self) -> &Arc<PolicyHandle> {
+        &self.policy
     }
 
     /// The profile this gate enforces — the daemon's one source of truth.

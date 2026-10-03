@@ -56,12 +56,21 @@ async fn service() -> (
         Arc::clone(&store),
         events,
         LONG_TIMEOUT,
+        crate::managed_policy_service::PolicyHandle::none(),
     ));
-    let models = ModelService::new(Arc::clone(&store))
-        .await
-        .expect("the model service builds");
+    let models = ModelService::new(
+        Arc::clone(&store),
+        crate::managed_policy_service::PolicyHandle::none(),
+    )
+    .await
+    .expect("the model service builds");
     let logs = LogService::new(Arc::clone(&store), Arc::clone(&models));
-    let connectors = Arc::new(ConnectorService::from_parts(Arc::clone(&store), None, None));
+    let connectors = Arc::new(ConnectorService::from_parts(
+        Arc::clone(&store),
+        None,
+        None,
+        crate::managed_policy_service::PolicyHandle::none(),
+    ));
     let flows = crate::flow_service_test::flows_for_tests(
         tmp.path(),
         &store,
@@ -79,6 +88,7 @@ async fn service() -> (
         connectors,
         flows,
         submit,
+        crate::managed_policy_service::PolicyHandle::none(),
     );
     (tmp, store, admin, ingress)
 }

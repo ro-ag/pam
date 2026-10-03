@@ -50,6 +50,7 @@ async fn boot(base: &Path) -> Result<(), DaemonError> {
     let (_keep, shutdown) = watch::channel(false);
     let config = DaemonConfig {
         base_dir: Some(base.to_owned()),
+        policy_source: Some(pam_testkit::ScriptedPolicy::absent()),
         ..DaemonConfig::default()
     };
     run_daemon_with(config, shutdown).await.map(|_| ())

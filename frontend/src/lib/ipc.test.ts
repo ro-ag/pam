@@ -45,6 +45,8 @@ import {
   networkGet,
   networkSet,
   networkTest,
+  policyGet,
+  policyReload,
   modelsCatalog,
   modelsDefaultsSet,
   modelsDelete,
@@ -617,6 +619,8 @@ describe("flow and connector wrappers speak the daemon's op names and arg shapes
       "admin.connectors.configure",
       { id: "jira", username: null },
     ],
+    ["policyGet", () => policyGet(), "admin.policy.get", {}],
+    ["policyReload", () => policyReload(), "admin.policy.reload", {}],
     ["networkGet", () => networkGet(), "admin.network.get", {}],
     [
       "networkSet (a patch: absent keeps, null clears)",

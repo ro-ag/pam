@@ -6,6 +6,7 @@ import {
   PastedConfirm,
   type ImportRequest,
 } from "./ModelFetch";
+import { ManagedNote } from "./ManagedField";
 import { ReadinessCard, type RepairTarget } from "./Readiness";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -676,10 +677,21 @@ function DownloadProgress({ job, onCancel }: { job: ModelJob; onCancel: () => vo
   );
 }
 
+/** Why a model source is closed under the managed policy, or undefined when it is open. */
+export function sourceBlocker(
+  allowed: string[] | null,
+  source: "catalog" | "custom_url" | "import",
+): string | undefined {
+  return allowed !== null && !allowed.includes(source)
+    ? "Your organization's policy does not allow this source"
+    : undefined;
+}
+
 function PresetCard({
   preset,
   job,
   busy,
+  blocked,
   savedTo,
   onDownload,
   onCancel,
@@ -688,6 +700,8 @@ function PresetCard({
   preset: CatalogPreset;
   job: ModelJob | undefined;
   busy: boolean;
+  /** Why a download cannot start under the managed policy; undefined when it can. */
+  blocked: string | undefined;
   savedTo: string | undefined;
   onDownload: () => void;
   onCancel: () => void;
@@ -718,7 +732,12 @@ function PresetCard({
           </span>
         ) : running || confirming ? null : (
           <div className="flex items-center gap-2">
-            <Button size="sm" disabled={busy} onClick={() => setConfirming(true)}>
+            <Button
+              size="sm"
+              disabled={busy || blocked !== undefined}
+              title={blocked}
+              onClick={() => setConfirming(true)}
+            >
               {resumable ? "Resume" : "Download"}
             </Button>
             {resumable && (
@@ -825,6 +844,13 @@ function CatalogPanel({
   // Presets this machine cannot hold are hidden, not disabled: an offer
   // that can never be taken is noise, not information.
   const presets = (catalog.data?.presets ?? []).filter((preset) => preset.fits_host);
+  const sourcesEntry = catalog.data?.effective?.allowed_sources;
+  const allowedSources = Array.isArray(sourcesEntry?.constraint?.allow)
+    ? (sourcesEntry.constraint.allow as string[])
+    : null;
+  const catalogBlocked = sourceBlocker(allowedSources, "catalog");
+  const urlBlocked = sourceBlocker(allowedSources, "custom_url");
+  const importBlocked = sourceBlocker(allowedSources, "import");
 
   const inputClasses = fieldClasses;
   const importJob = latestImport(jobs);
@@ -842,6 +868,7 @@ function CatalogPanel({
         )}
       </div>
 
+      <ManagedNote entry={sourcesEntry} />
       {listFailure && <FailureNote failure={listFailure} label="catalog" />}
 
       {catalog.data?.network_issue && (
@@ -870,6 +897,7 @@ function CatalogPanel({
             preset={preset}
             job={latestDownload(jobs, presetModelId(preset))}
             busy={download.isPending || discard.isPending}
+            blocked={catalogBlocked}
             savedTo={modelsDir}
             onDownload={() => download.mutate({ preset_id: preset.id })}
             onCancel={() => {
@@ -917,8 +945,13 @@ function CatalogPanel({
           <Button
             size="sm"
             type="submit"
-            disabled={download.isPending || !url.trim() || !vendor.trim()}
-            title={!url.trim() || !vendor.trim() ? "Enter a URL and a vendor first" : undefined}
+            disabled={
+              download.isPending || urlBlocked !== undefined || !url.trim() || !vendor.trim()
+            }
+            title={
+              urlBlocked ??
+              (!url.trim() || !vendor.trim() ? "Enter a URL and a vendor first" : undefined)
+            }
           >
             Fetch
           </Button>
@@ -943,6 +976,7 @@ function CatalogPanel({
       <ImportWeights
         savedTo={modelsDir}
         busy={importWeights.isPending || importRunning !== undefined}
+        blocked={importBlocked}
         result={importWeights.data}
         onImport={(request) => importWeights.mutate(request)}
       />

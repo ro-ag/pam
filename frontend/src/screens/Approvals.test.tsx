@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => ({
   daemonStatus: vi.fn(),
   approvalsPending: vi.fn(),
   approvalsResolve: vi.fn(),
+  grantsList: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -62,6 +63,7 @@ function hand(overrides: Partial<PendingApproval>): PendingApproval {
 
 beforeEach(() => {
   eventHandlers = [];
+  mocks.grantsList.mockResolvedValue({ grants: [] });
   mocks.approvalsPending.mockResolvedValue({
     pending: [
       hand({ request_id: "req_a", capability: "repo.push" }),
@@ -601,5 +603,79 @@ describe("lowered hands and broken water", () => {
     expect(screen.getByText(/pam -- gui/)).toBeInTheDocument();
     // A broken bridge never claims calm water.
     expect(screen.queryByText(/No requests are waiting/)).not.toBeInTheDocument();
+  });
+});
+
+describe("managed policy", () => {
+  async function renderBlocked(effective: Record<string, unknown>) {
+    mocks.grantsList.mockResolvedValue({ grants: [], effective });
+    renderApprovals();
+    await screen.findByText("2 requests awaiting review");
+    const pushCard = card("repo.push");
+    await waitFor(() =>
+      expect(
+        pushCard.getByRole("checkbox", { name: "Remember this capability" }),
+      ).toBeDisabled(),
+    );
+    return pushCard;
+  }
+
+  it("disables Remember with the reason when the policy forbids remembering", async () => {
+    const pushCard = await renderBlocked({
+      remember: { source: "policy", locked: true, mode: "forbid" },
+    });
+    expect(
+      pushCard.getByText(/does not allow remembering approvals; this one applies once/),
+    ).toBeInTheDocument();
+    expect(pushCard.queryByText(/grants it for every repository/)).toBeNull();
+  });
+
+  it("disables Remember too when manual grants are forbidden, since remembering adds a grant", async () => {
+    await renderBlocked({ manual: { source: "policy", locked: true, mode: "forbid" } });
+  });
+
+  it("approves once, with no remember and no typed confirmation, while Remember is closed", async () => {
+    const pushCard = await renderBlocked({
+      remember: { source: "policy", locked: true, mode: "forbid" },
+    });
+    fireEvent.click(pushCard.getByRole("button", { name: "Approve" }));
+    expect(pushCard.queryByRole("group", { name: /everywhere/ })).toBeNull();
+    await waitFor(() =>
+      expect(mocks.approvalsResolve).toHaveBeenCalledWith("req_a", "approved", {
+        remember: false,
+      }),
+    );
+  });
+
+  it("leaves Remember open when the policy does not touch it", async () => {
+    mocks.grantsList.mockResolvedValue({
+      grants: [],
+      effective: { remember: { source: "default", locked: false } },
+    });
+    renderApprovals();
+    await screen.findByText("2 requests awaiting review");
+    expect(
+      card("repo.push").getByRole("checkbox", { name: "Remember this capability" }),
+    ).toBeEnabled();
+  });
+
+  it.each([
+    ["policy_not_allowed", "remembering repo.push is not allowed by your organisation"],
+    ["setting_locked", "grants.remember is managed by your organisation's policy"],
+    ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
+  ])("renders a %s refusal's detail and recovery on the card", async (cause, detail) => {
+    mocks.approvalsResolve.mockRejectedValue({
+      cause,
+      detail,
+      recovery: "Managed by your organisation's policy; ask your administrator.",
+    });
+    renderApprovals();
+    await screen.findByText("2 requests awaiting review");
+    fireEvent.click(card("repo.push").getByRole("button", { name: "Approve" }));
+    expect(
+      await screen.findByText(new RegExp(`resolve failed · ${cause}`)),
+    ).toBeInTheDocument();
+    expect(screen.getByText(`${detail}.`)).toBeInTheDocument();
+    expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
   });
 });

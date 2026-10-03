@@ -181,11 +181,14 @@ export interface ImportRequest {
 export function ImportWeights({
   savedTo,
   busy,
+  blocked,
   result,
   onImport,
 }: {
   savedTo: string | undefined;
   busy: boolean;
+  /** Why importing is closed under the managed policy; undefined when it is open. */
+  blocked?: string;
   /** The reply to the last import request, whose `note` says what will be trusted. */
   result: ModelImportReply | undefined;
   onImport: (request: ImportRequest) => void;
@@ -198,7 +201,13 @@ export function ImportWeights({
   if (!open) {
     return (
       <div className="space-y-2 border-t border-line pt-4">
-        <Button size="sm" variant="secondary" onClick={() => setOpen(true)}>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={blocked !== undefined}
+          title={blocked}
+          onClick={() => setOpen(true)}
+        >
           Import weights from file…
         </Button>
         {result && <ImportNote result={result} />}

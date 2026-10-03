@@ -544,16 +544,49 @@ describe("managed policy", () => {
     expect(screen.getByLabelText("proxy password")).toBeDisabled();
     expect(screen.getByLabelText("engine mirror URL")).toBeDisabled();
     expect(screen.getByLabelText("models mirror URL")).toBeEnabled();
-    expect(screen.getAllByText("Set by your organisation").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Managed by your organization").length).toBeGreaterThan(0);
     expect(screen.getByLabelText("allowed mirror hosts")).toHaveTextContent(
       "artifacts.corp.example, .mirror.example",
     );
   });
 
+  it("shows a policy default as editable with the organization default hint", async () => {
+    mocks.networkGet.mockResolvedValue(
+      reply({
+        settings: settings({ no_proxy: ["api.github.test"] }),
+        effective: { no_proxy: { source: "policy", locked: false, mode: "default" } },
+      }),
+    );
+    await renderSection();
+    await waitFor(() => expect(screen.getByLabelText("no-proxy list")).toBeEnabled());
+    expect(screen.getByText("organization default")).toBeInTheDocument();
+    expect(screen.queryByText("Managed by your organization")).toBeNull();
+  });
+
+  it("says the policy closed the network and why, through the failure note", async () => {
+    mocks.networkGet.mockResolvedValue(
+      reply({
+        settings: settings({}),
+        closed_by_policy: {
+          key: "network.ca_bundle",
+          code: "network_policy_invalid",
+          detail: "the pinned CA bundle could not be imported.",
+          recovery: "The managed policy's network setting is invalid: ask your administrator.",
+        },
+      }),
+    );
+    await renderSection();
+    expect(
+      await screen.findByText(/network closed by policy · network_policy_invalid/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("the pinned CA bundle could not be imported.")).toBeInTheDocument();
+    expect(screen.getByText(/ask your administrator/)).toBeInTheDocument();
+  });
+
   it("hides the allowed-hosts line when no policy sets one", async () => {
     await renderSection();
     expect(screen.queryByLabelText("allowed mirror hosts")).toBeNull();
-    expect(screen.queryByText("Set by your organisation")).toBeNull();
+    expect(screen.queryByText("Managed by your organization")).toBeNull();
   });
 });
 

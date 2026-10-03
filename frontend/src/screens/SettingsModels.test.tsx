@@ -392,3 +392,107 @@ it("preserves dirty storage drafts across refresh and locks rapid saves", async 
   expect(dir).toHaveValue("/Volumes/draft");
   expect(minutes).toHaveValue(20);
 });
+
+describe("managed policy", () => {
+  it("disables the models directory the policy locks and keeps the idle window editable", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      status({
+        models_dir: "/managed/llm",
+        effective: {
+          models_dir: { source: "policy", locked: true, mode: "locked", reason: "DLP-7" },
+          idle_unload_min: { source: "policy", locked: false, mode: "default" },
+        },
+      }),
+    );
+    const section = await renderModelsSection();
+    const dir = await section.findByLabelText("models directory");
+    await waitFor(() => expect(dir).toHaveValue("/managed/llm"));
+    expect(dir).toBeDisabled();
+    const [applyDir, applyIdle] = section.getAllByRole("button", { name: "Apply" });
+    expect(applyDir).toBeDisabled();
+    expect(applyIdle).toBeEnabled();
+    expect(section.getByText("Managed by your organization")).toBeInTheDocument();
+    expect(section.getByText("DLP-7")).toBeInTheDocument();
+    // The idle window is a policy default: still editable, with the hint.
+    expect(section.getByLabelText("idle unload minutes")).toBeEnabled();
+    expect(section.getByText("organization default")).toBeInTheDocument();
+  });
+
+  it("disables the idle window the policy locks", async () => {
+    mocks.modelsStatus.mockResolvedValue(
+      status({
+        effective: { idle_unload_min: { source: "policy", locked: true, mode: "locked" } },
+      }),
+    );
+    const section = await renderModelsSection();
+    const minutes = await section.findByLabelText("idle unload minutes");
+    await waitFor(() => expect(minutes).toHaveValue(10));
+    expect(minutes).toBeDisabled();
+    expect(section.getByLabelText("models directory")).toBeEnabled();
+  });
+
+  it("offers only the curator agents the policy allows", async () => {
+    mocks.curatorList.mockResolvedValue({
+      detected: [cli({ id: "claude" }), cli({ id: "codex", path: "/opt/homebrew/bin/codex" })],
+      selected: null,
+      effective: {
+        curator: {
+          source: "policy",
+          locked: false,
+          mode: "forbid",
+          constraint: { allow: ["claude"] },
+          clamped: false,
+        },
+      },
+    });
+    const section = await renderModelsSection();
+    await section.findByRole("radiogroup", { name: "curator agent" });
+    expect(section.getByRole("radio", { name: /claude/ })).toBeEnabled();
+    const codex = section.getByRole("radio", { name: /codex/ });
+    expect(codex).toBeDisabled();
+    expect(codex.closest("label")).toHaveAttribute(
+      "title",
+      "Your organization's policy does not allow this agent",
+    );
+    expect(section.getByText("allowed: claude")).toBeInTheDocument();
+  });
+
+  it("an empty allowlist disables every curator agent but keeps clearing open", async () => {
+    mocks.curatorList.mockResolvedValue({
+      detected: [cli({ id: "claude" })],
+      selected: "claude",
+      effective: {
+        curator: {
+          source: "policy",
+          locked: false,
+          mode: "forbid",
+          constraint: { allow: [] },
+        },
+      },
+    });
+    const section = await renderModelsSection();
+    await section.findByRole("radiogroup", { name: "curator agent" });
+    expect(section.getByRole("radio", { name: /claude/ })).toBeDisabled();
+    expect(section.getByRole("radio", { name: "none" })).toBeEnabled();
+  });
+
+  it.each([
+    ["setting_locked", "models.dir is managed by your organisation's policy"],
+    ["policy_frozen", "the policy file cannot be trusted, so widening changes are paused"],
+    ["policy_not_allowed", "this idle window is longer than your organisation allows"],
+  ])("renders a %s refusal's detail and recovery", async (cause, detail) => {
+    mocks.modelsSettingsSet.mockRejectedValue({
+      cause,
+      detail,
+      recovery: "Managed by your organisation's policy; ask your administrator.",
+    });
+    const section = await renderModelsSection();
+    const minutes = await section.findByLabelText("idle unload minutes");
+    await waitFor(() => expect(minutes).toHaveValue(10));
+    fireEvent.change(minutes, { target: { value: "99" } });
+    fireEvent.submit(minutes.closest("form")!);
+    expect(await section.findByText(new RegExp(`models · ${cause}`))).toBeInTheDocument();
+    expect(section.getByText(`${detail}.`)).toBeInTheDocument();
+    expect(section.getByText(/ask your administrator/)).toBeInTheDocument();
+  });
+});

@@ -1041,3 +1041,73 @@ describe("try box", () => {
     expect(box.getByText(/Shorten the prompt/)).toBeInTheDocument();
   });
 });
+
+describe("catalog under a managed policy", () => {
+  function allow(sources: string[]) {
+    mocks.modelsCatalog.mockResolvedValue({
+      presets: [preset()],
+      host_ram_bytes: 64_000_000_000,
+      effective: {
+        allowed_sources: {
+          source: "policy",
+          locked: false,
+          mode: "forbid",
+          constraint: { allow: sources },
+          clamped: false,
+          state: "applied",
+        },
+      },
+    });
+  }
+
+  async function openDownloads() {
+    renderModels();
+    fireEvent.click(await screen.findByRole("tab", { name: "Downloads" }));
+    return within(await screen.findByRole("region", { name: "Downloads" }));
+  }
+
+  it("closes the sources the policy leaves out and prints what it allows", async () => {
+    allow(["catalog"]);
+    const catalog = await openDownloads();
+    expect(await catalog.findByText("allowed: catalog")).toBeInTheDocument();
+    expect(catalog.getByRole("button", { name: "Download" })).toBeEnabled();
+    expect(catalog.getByRole("button", { name: "Fetch" })).toBeDisabled();
+    expect(catalog.getByRole("button", { name: "Fetch" })).toHaveAttribute(
+      "title",
+      "Your organization's policy does not allow this source",
+    );
+    expect(catalog.getByRole("button", { name: "Import weights from file…" })).toBeDisabled();
+  });
+
+  it("closes catalog downloads when only a file import is allowed", async () => {
+    allow(["import"]);
+    const catalog = await openDownloads();
+    await waitFor(() =>
+      expect(catalog.getByRole("button", { name: "Download" })).toBeDisabled(),
+    );
+    expect(catalog.getByRole("button", { name: "Import weights from file…" })).toBeEnabled();
+  });
+
+  it("an empty allowlist closes every source", async () => {
+    allow([]);
+    const catalog = await openDownloads();
+    await waitFor(() =>
+      expect(catalog.getByRole("button", { name: "Download" })).toBeDisabled(),
+    );
+    expect(catalog.getByRole("button", { name: "Fetch" })).toBeDisabled();
+    expect(catalog.getByRole("button", { name: "Import weights from file…" })).toBeDisabled();
+  });
+
+  it("renders a refused download with the policy's cause, detail and recovery", async () => {
+    mocks.modelsDownload.mockRejectedValue({
+      cause: "policy_not_allowed",
+      detail: "downloading catalog models is not allowed on this machine",
+      recovery: "Managed by your organisation's policy; ask your administrator.",
+    });
+    const catalog = await openDownloads();
+    fireEvent.click(await catalog.findByRole("button", { name: "Download" }));
+    fireEvent.click(catalog.getByRole("button", { name: "Start download" }));
+    expect(await catalog.findByText(/catalog · policy_not_allowed/)).toBeInTheDocument();
+    expect(catalog.getByText(/ask your administrator/)).toBeInTheDocument();
+  });
+});

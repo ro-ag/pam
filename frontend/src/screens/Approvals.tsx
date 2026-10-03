@@ -16,6 +16,7 @@ import { cn } from "../lib/cn";
 import {
   CONFIRM_GRANT,
   approvalsPending,
+  grantsList,
   approvalsResolve,
   snapshotDigest,
   toBridgeFailure,
@@ -26,6 +27,7 @@ import {
 import { escapeInvisible } from "../lib/safeText";
 import { repoTail } from "../lib/repo";
 import { exactTime, relativeTime, useNow } from "../lib/time";
+import { isLocked } from "./ManagedField";
 
 /**
  * Approvals — the raised hand: each pending approval renders as a full card (never a table row).
@@ -195,17 +197,23 @@ function ArgvTokens({ argv, label }: { argv: string[]; label: string }) {
 /** What a card hands to the screen when the human answers. */
 type ResolveOptions = { remember?: boolean; note?: string; confirmation?: string };
 
+export const REMEMBER_BLOCKED_NOTE =
+  "your organization's policy does not allow remembering approvals; this one applies once";
+
 function ApprovalCard({
   approval,
   now,
   busy,
   failure,
+  rememberBlocked,
   onResolve,
 }: {
   approval: PendingApproval;
   now: number;
   busy: boolean;
   failure: BridgeFailure | undefined;
+  /** Whether the managed policy forbids turning an approval into a standing grant. */
+  rememberBlocked: boolean;
   onResolve: (resolution: "approved" | "denied", options: ResolveOptions) => void;
 }) {
   const [remember, setRemember] = useState(false);
@@ -217,7 +225,10 @@ function ApprovalCard({
   const clock = waitingClock(approval.requested_ts, now);
   const command = commandView(approval.args);
   const resolved = approval.resolved ?? null;
-  const options = () => ({ remember, ...(note.trim() ? { note: note.trim() } : {}) });
+  const options = () => ({
+    remember: remember && !rememberBlocked,
+    ...(note.trim() ? { note: note.trim() } : {}),
+  });
 
   // One answer per card: a second click (a double click, a held Enter) must never submit the
   // same decision twice, whatever the optimistic state has caught up with yet.
@@ -356,7 +367,7 @@ function ApprovalCard({
           disabled={busy}
           onClick={() => {
             // Remembering widens what agents may do for good: it asks for a typed confirmation.
-            if (remember) setConfirming(true);
+            if (remember && !rememberBlocked) setConfirming(true);
             else submit("approved", {});
           }}
         >
@@ -374,7 +385,8 @@ function ApprovalCard({
           <label className="flex cursor-pointer items-center gap-2 font-sans text-xs text-ink-muted">
             <input
               type="checkbox"
-              checked={remember}
+              checked={remember && !rememberBlocked}
+              disabled={rememberBlocked}
               aria-describedby={rememberHint}
               onChange={(event) => {
                 setRemember(event.target.checked);
@@ -384,8 +396,17 @@ function ApprovalCard({
             />
             Remember this capability
           </label>
-          <span id={rememberHint} className="font-sans text-xs text-ink-faint">
-            grants it for every repository, not just this one
+          <span
+            id={rememberHint}
+            className={
+              rememberBlocked
+                ? "font-sans text-xs text-warning"
+                : "font-sans text-xs text-ink-faint"
+            }
+          >
+            {rememberBlocked
+              ? REMEMBER_BLOCKED_NOTE
+              : "grants it for every repository, not just this one"}
           </span>
         </span>
         {!noteOpen && (
@@ -492,6 +513,11 @@ export function ApprovalsScreen() {
   const [changedNotice, setChangedNotice] = useState(false);
 
   const approvals = useQuery({ queryKey: APPROVALS_PENDING_KEY, queryFn: approvalsPending });
+  // Remembering adds a grant, so either `grants.remember` or `grants.manual` set to deny closes it.
+  // A failed read leaves it open: the daemon refuses a forbidden remember on its own.
+  const grants = useQuery({ queryKey: ["grants"], queryFn: grantsList, retry: false });
+  const rememberBlocked =
+    isLocked(grants.data?.effective?.remember) || isLocked(grants.data?.effective?.manual);
 
   // Stagger the entrance only for the first load; a hand raised later
   // slides in alone, undelayed.
@@ -640,6 +666,7 @@ export function ApprovalsScreen() {
                       now={now}
                       busy={resolving[hand.request_id] !== undefined}
                       failure={failures[hand.request_id]}
+                      rememberBlocked={rememberBlocked}
                       onResolve={(resolution, options) =>
                         resolve.mutate({
                           requestId: hand.request_id,

@@ -11,7 +11,7 @@ use std::time::Duration;
 use pam_daemon::runtime_dir::RuntimeDir;
 use pam_proto::wire::Via;
 
-use super::classify::{EACCES, ECONNREFUSED, ENOENT};
+use super::classify::{EACCES, ECONNREFUSED, ENOENT, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
 use super::helpers::{Helper, HelperOutcome, HelperRun};
 use super::os::{HelloAnswer, KeyringAnswer, LockState, Os, RealOs};
 
@@ -29,8 +29,21 @@ impl Answer {
     fn to_io(self) -> io::Result<()> {
         match self {
             Self::Ok => Ok(()),
-            Self::Denied => Err(io::Error::from_raw_os_error(EACCES)),
-            Self::Absent => Err(io::Error::from_raw_os_error(ENOENT)),
+            // The host's own codes: errno 13 and 2 mean other things as
+            // Win32 codes (and the other way round).
+            Self::Denied => Err(io::Error::from_raw_os_error(if cfg!(windows) {
+                ERROR_ACCESS_DENIED
+            } else {
+                EACCES
+            })),
+            Self::Absent => Err(io::Error::from_raw_os_error(if cfg!(windows) {
+                ERROR_FILE_NOT_FOUND
+            } else {
+                ENOENT
+            })),
+            Self::Refused if cfg!(windows) => {
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            }
             Self::Refused => Err(io::Error::from_raw_os_error(ECONNREFUSED)),
             Self::Code(kind, code) => Err(io::Error::new(kind, format!("fake os error {code}"))),
         }
@@ -211,6 +224,10 @@ impl FakeOs {
                 "",
                 "2026-10-02 18:18:23.907 osascript[26160:255111] Connection Invalid error for service com.apple.hiservices-xpcservice.\n0:2: execution error: Can’t get application \"Finder\". (-1728)\n",
             ),
+            // A sandbox that refuses process creation refuses the broker.
+            (HelperMood::Denied, "where.exe") => {
+                HelperOutcome::SpawnFailed(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED))
+            }
             (_, "where.exe") => run(Some(2), "", ""),
             (_, "powershell.exe") => {
                 let script = helper
@@ -220,6 +237,9 @@ impl FakeOs {
                     .unwrap_or_default();
                 if script.contains("Win32_Process") {
                     run(Some(0), "claude.exe\r\ncmd.exe\r\nexplorer.exe\r\n", "")
+                } else if self.helper_mood == HelperMood::Denied {
+                    // The query rights are refused: no path comes back.
+                    run(Some(0), "PATH=\r\n", "")
                 } else {
                     run(Some(0), "PATH=C:\\pam\\pam.exe\r\n", "")
                 }
@@ -439,6 +459,7 @@ fn the_windows_probes_never_dial_and_never_read_the_control_file() {
     assert!(source.contains("ProbeId::AdminControlRead => open_read("));
 }
 
+#[cfg(unix)]
 #[test]
 fn the_admin_connect_sends_nothing_and_stays_open_for_the_hold_on_unix() {
     use std::io::Read;
@@ -530,6 +551,8 @@ fn the_lock_probe_reports_a_holder_and_releases_what_it_took() {
         .open(&lock)
         .unwrap();
     next.try_lock().unwrap();
+    // Released before the read: a Windows lock is mandatory.
+    drop(next);
     assert_eq!(std::fs::read(&lock).unwrap(), b"1234");
     assert_eq!(
         RealOs

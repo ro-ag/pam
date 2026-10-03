@@ -54,7 +54,19 @@ fn the_facts_are_the_clients_view_fitted_to_the_bounds() {
         Some(MAX_PATH_BYTES)
     );
     assert_eq!(env.resolved_base, "/tmp/pamdoc-base");
-    assert_eq!(env.resolved_endpoint, "/tmp/pamdoc-session/pam.sock");
+    // The relay's door: the socket on unix, the loopback record on Windows.
+    let door = if cfg!(windows) {
+        "public.json"
+    } else {
+        "pam.sock"
+    };
+    assert_eq!(
+        env.resolved_endpoint,
+        std::path::Path::new("/tmp/pamdoc-session")
+            .join(door)
+            .display()
+            .to_string()
+    );
     assert_eq!(env.client_version, pam_daemon::daemon::DAEMON_VERSION);
     assert_eq!(env.exe.as_deref(), Some("/usr/local/bin/pam"));
     assert_eq!(env.cwd_repo, None, "no working directory, no repository");

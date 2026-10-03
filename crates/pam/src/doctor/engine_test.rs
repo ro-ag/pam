@@ -2,9 +2,10 @@
 //! acceptance by the daemon's validator, the safety invariants against a
 //! real temporary base, and the unsandboxed run against a real daemon.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+#[cfg(unix)]
+use std::{path::Path, time::Duration};
 
 use pam_proto::doctor::{
     DoctorReport, Platform, ProbeClass, ProbeId, ProbeState, ReportError, Verdict,
@@ -188,20 +189,26 @@ fn unrecognised_helper_output_is_unverified_and_fails_the_verdict() {
     os.helper_mood = HelperMood::Gibberish;
     let report = run_fake(os);
     assert_eq!(report.verdict, Verdict::NotEstablished);
-    assert!(report.failed.is_empty());
-    // The executable's row is a helper's answer on unix (`/bin/test -w`),
-    // an open's on Windows.
-    let expected: Vec<ProbeId> = [
-        ProbeId::KeychainSearch,
-        ProbeId::DaemonSignal,
-        ProbeId::BrokerLaunchServices,
-        ProbeId::BrokerAppleEvents,
-        ProbeId::ExeWrite,
-    ]
-    .into_iter()
-    .filter(|id| id.applies_to(report.platform))
-    .filter(|id| *id != ProbeId::ExeWrite || cfg!(unix))
-    .collect();
+    let expected: Vec<ProbeId> = if cfg!(windows) {
+        // Process creation is the broker, whatever `where.exe` printed; the
+        // credential store is not a helper, so only the process query
+        // meets output it cannot read.
+        assert_eq!(report.failed, [ProbeId::BrokerShellExecute]);
+        vec![ProbeId::DaemonProcessQuery]
+    } else {
+        assert!(report.failed.is_empty());
+        // The executable's row is a helper's answer here (`/bin/test -w`).
+        [
+            ProbeId::KeychainSearch,
+            ProbeId::DaemonSignal,
+            ProbeId::BrokerLaunchServices,
+            ProbeId::BrokerAppleEvents,
+            ProbeId::ExeWrite,
+        ]
+        .into_iter()
+        .filter(|id| id.applies_to(report.platform))
+        .collect()
+    };
     assert_eq!(report.unverified, expected);
     for id in expected {
         let probe = report.probes.iter().find(|probe| probe.id == id).unwrap();
@@ -222,10 +229,18 @@ fn a_missing_helper_is_unknown_with_the_spawn_error() {
     os.helper_mood = HelperMood::Missing;
     let report = run_fake(os);
     assert_eq!(report.verdict, Verdict::NotEstablished);
+    // The first probe that is a helper's answer on this platform: the
+    // keychain tool on macOS; on Windows the credential store is a library
+    // call, so the process query's `PowerShell` stands for it.
+    let helper_probe = if cfg!(windows) {
+        ProbeId::DaemonProcessQuery
+    } else {
+        ProbeId::KeychainSearch
+    };
     let keychain = report
         .probes
         .iter()
-        .find(|probe| probe.id == ProbeId::KeychainSearch)
+        .find(|probe| probe.id == helper_probe)
         .unwrap();
     assert_eq!(keychain.result, ProbeState::Unknown);
     assert_eq!(keychain.note.as_deref(), Some("spawn: NotFound"));

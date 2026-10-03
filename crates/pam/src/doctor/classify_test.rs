@@ -10,7 +10,7 @@ use pam_proto::doctor::{MAX_CHAIN_NAMES, MAX_TEXT_BYTES, Platform, ProbeResult, 
 use pam_proto::wire::Via;
 
 use super::classify::{
-    ACCESS_REFUSED_NOTE, EACCES, ENOENT, ENOTDIR, EPERM, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    ACCESS_REFUSED_NOTE, ENOENT, EPERM, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
     ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, bounded_chain, bounded_text, bundle_root,
     classify_access_write, classify_appleevents, classify_connect, classify_exists, classify_io,
     classify_io_result, classify_keyring, classify_kill, classify_kind_code,
@@ -28,6 +28,32 @@ fn raw(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
 }
 
+/// The platform the tests run on: the raw codes below mean what the host
+/// says they mean, so the host's own table is the one they can exercise.
+fn here() -> Platform {
+    Platform::current().expect("a supported platform")
+}
+
+/// An error this host's classifier must read as "permission denied": the
+/// unix errno, or the Win32 code on Windows (errno 1 is `ERROR_INVALID_FUNCTION`
+/// there, and unclassified).
+fn host_denied() -> io::Error {
+    raw(if cfg!(windows) {
+        ERROR_ACCESS_DENIED
+    } else {
+        EPERM
+    })
+}
+
+/// An error this host's classifier must read as "not found".
+fn host_absent() -> io::Error {
+    raw(if cfg!(windows) {
+        ERROR_FILE_NOT_FOUND
+    } else {
+        ENOENT
+    })
+}
+
 #[test]
 fn success_is_allowed_on_both_platforms() {
     for platform in [Platform::Macos, Platform::Windows] {
@@ -35,8 +61,11 @@ fn success_is_allowed_on_both_platforms() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn unix_errno_table() {
+    use super::classify::{EACCES, ENOTDIR};
+
     for code in [EPERM, EACCES] {
         let result = classify_io(Platform::Macos, &raw(code));
         assert_eq!(result.state, ProbeState::Denied, "errno {code}");
@@ -130,45 +159,42 @@ fn a_sharing_violation_code_means_nothing_on_macos() {
 #[test]
 fn a_refused_connect_reached_the_socket() {
     let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "nobody listens");
-    let result = classify_connect(Platform::Macos, Err(refused));
+    let result = classify_connect(here(), Err(refused));
     assert_eq!(result.state, ProbeState::Allowed);
     assert!(result.note.unwrap().contains("nothing listens"));
+    assert_eq!(classify_connect(here(), Ok(())).state, ProbeState::Allowed);
     assert_eq!(
-        classify_connect(Platform::Macos, Ok(())).state,
-        ProbeState::Allowed
-    );
-    assert_eq!(
-        classify_connect(Platform::Macos, Err(raw(EPERM))).state,
+        classify_connect(here(), Err(host_denied())).state,
         ProbeState::Denied
     );
     assert_eq!(
-        classify_connect(Platform::Macos, Err(raw(ENOENT))).state,
+        classify_connect(here(), Err(host_absent())).state,
         ProbeState::Absent
     );
 }
 
 #[test]
 fn the_lock_probe_is_information_with_a_note() {
-    let held = classify_lock(Platform::Macos, Ok(LockState::Held), false);
+    let held = classify_lock(here(), Ok(LockState::Held), false);
     assert_eq!(held.state, ProbeState::Allowed);
     assert_eq!(held.note.as_deref(), Some("held: a daemon is running"));
-    let free = classify_lock(Platform::Macos, Ok(LockState::Free), false);
+    let free = classify_lock(here(), Ok(LockState::Free), false);
     assert_eq!(free.note.as_deref(), Some("free: no daemon holds the lock"));
-    let denied = classify_lock(Platform::Macos, Err(raw(EACCES)), false);
+    let denied = classify_lock(here(), Err(host_denied()), false);
     assert_eq!(denied.state, ProbeState::Denied);
     assert_eq!(denied.note.as_deref(), Some("lazy start unavailable here"));
-    let relayed = classify_lock(Platform::Macos, Err(raw(EACCES)), true);
+    let relayed = classify_lock(here(), Err(host_denied()), true);
     assert_eq!(
         relayed.note.as_deref(),
         Some("unreadable under the relay; lazy start is not needed here")
     );
-    let absent = classify_lock(Platform::Macos, Err(raw(ENOENT)), false);
+    let absent = classify_lock(here(), Err(host_absent()), false);
     assert_eq!(absent.state, ProbeState::Absent);
     assert_eq!(
         absent.note.as_deref(),
         Some("no lock file: no daemon has run here")
     );
-    let other = classify_lock(Platform::Macos, Err(io::Error::other("x")), false);
+    let other = classify_lock(here(), Err(io::Error::other("x")), false);
     assert_eq!(other.state, ProbeState::Unknown);
 }
 
@@ -176,7 +202,7 @@ fn the_lock_probe_is_information_with_a_note() {
 fn the_reach_table() {
     let bound = Duration::from_secs(5);
     let (ready, facts) = classify_reach(
-        Platform::Macos,
+        here(),
         Via::Relay,
         bound,
         HelloAnswer::Ready {
@@ -195,19 +221,19 @@ fn the_reach_table() {
     assert_eq!(facts.via, Via::Relay);
 
     let (denied, facts) = classify_reach(
-        Platform::Macos,
+        here(),
         Via::Direct,
         bound,
-        HelloAnswer::Unreachable(raw(EPERM)),
+        HelloAnswer::Unreachable(host_denied()),
     );
     assert_eq!(denied.state, ProbeState::Denied);
     assert!(facts.is_none());
 
     let (absent, _) = classify_reach(
-        Platform::Macos,
+        here(),
         Via::Direct,
         bound,
-        HelloAnswer::Unreachable(raw(ENOENT)),
+        HelloAnswer::Unreachable(host_absent()),
     );
     assert_eq!(absent.state, ProbeState::Absent);
     assert_eq!(
@@ -217,7 +243,7 @@ fn the_reach_table() {
 
     let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "stale");
     let (unknown, _) = classify_reach(
-        Platform::Macos,
+        here(),
         Via::Direct,
         bound,
         HelloAnswer::Unreachable(refused),
@@ -225,12 +251,12 @@ fn the_reach_table() {
     assert_eq!(unknown.state, ProbeState::Unknown);
     assert!(unknown.note.unwrap().starts_with("connection refused"));
 
-    let (legacy, _) = classify_reach(Platform::Macos, Via::Direct, bound, HelloAnswer::Legacy);
+    let (legacy, _) = classify_reach(here(), Via::Direct, bound, HelloAnswer::Legacy);
     assert_eq!(legacy.state, ProbeState::Unknown);
     assert!(legacy.note.unwrap().contains("pre-migration"));
 
     let (refused, _) = classify_reach(
-        Platform::Macos,
+        here(),
         Via::Direct,
         bound,
         HelloAnswer::Refused {
@@ -243,7 +269,7 @@ fn the_reach_table() {
         Some("hello refused: client_version_mismatch: 0.1")
     );
 
-    let (silent, _) = classify_reach(Platform::Macos, Via::Direct, bound, HelloAnswer::Silent);
+    let (silent, _) = classify_reach(here(), Via::Direct, bound, HelloAnswer::Silent);
     assert_eq!(
         silent.note.as_deref(),
         Some("no hello acknowledgement within 5000 ms")

@@ -243,5 +243,13 @@ fn every_applicable_probe_has_a_plan_and_the_walk_emits_one_row_per_inventory_en
         (daemon.version.as_str(), daemon.proto, daemon.via),
         ("0.4.3", 2, Via::Direct)
     );
-    assert_eq!(walk.harness_chain, ["zsh", "claude", "launchd"]);
+    if cfg!(windows) {
+        // One `PowerShell` walk of `Win32_Process`, as the fake prints it.
+        assert_eq!(
+            walk.harness_chain,
+            ["claude.exe", "cmd.exe", "explorer.exe"]
+        );
+    } else {
+        assert_eq!(walk.harness_chain, ["zsh", "claude", "launchd"]);
+    }
 }

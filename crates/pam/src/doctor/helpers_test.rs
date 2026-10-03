@@ -118,3 +118,91 @@ fn helper_output_is_capped_without_blocking_the_helper() {
     assert_eq!(run.stdout.len(), MAX_HELPER_OUTPUT_BYTES);
     assert!(run.truncated);
 }
+
+/// A tool under `%SystemRoot%\System32`, as the Windows probes name theirs.
+#[cfg(windows)]
+fn system32(program: &str) -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    std::path::PathBuf::from(root)
+        .join("System32")
+        .join(program)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_helper_runs_with_captured_output_and_an_exit_code() {
+    let helper = Helper::new(
+        system32("cmd.exe"),
+        ["/c", "echo out& echo err 1>&2& exit 3"],
+        Duration::from_secs(5),
+    );
+    let HelperOutcome::Ran(run) = run_helper(&helper) else {
+        panic!("helper did not run");
+    };
+    assert_eq!(run.code, Some(3));
+    assert_eq!(run.stdout.trim_end(), "out");
+    assert_eq!(run.stderr.trim_end(), "err");
+    assert!(!run.truncated);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_helper_gets_a_cleared_environment() {
+    let helper = Helper::new(system32("cmd.exe"), ["/c", "set"], Duration::from_secs(5));
+    let HelperOutcome::Ran(run) = run_helper(&helper) else {
+        panic!("helper did not run");
+    };
+    assert_eq!(run.code, Some(0));
+    assert!(
+        run.stdout.lines().all(|line| {
+            let name = line.split('=').next().unwrap_or("");
+            // `cmd` names its own prompt, and the loader its architecture.
+            ["PROMPT", "PROCESSOR_ARCHITECTURE"].contains(&name)
+                || HELPER_ENV_ALLOWLIST
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        }),
+        "environment leaked: {}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout
+            .lines()
+            .any(|line| line.to_ascii_uppercase().starts_with("PATH="))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_helper_that_overruns_is_killed_and_reported() {
+    let bound = Duration::from_millis(200);
+    let helper = Helper::new(system32("ping.exe"), ["-n", "30", "127.0.0.1"], bound);
+    let started = Instant::now();
+    let outcome = run_helper(&helper);
+    assert!(matches!(outcome, HelperOutcome::TimedOut(waited) if waited == bound));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the helper was not killed"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_helper_output_is_capped_without_blocking_the_helper() {
+    let helper = Helper::new(
+        system32(r"WindowsPowerShell\v1.0\powershell.exe"),
+        [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Out.Write('a' * 300000)",
+        ],
+        Duration::from_secs(20),
+    );
+    let HelperOutcome::Ran(run) = run_helper(&helper) else {
+        panic!("helper did not run");
+    };
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.stdout.len(), MAX_HELPER_OUTPUT_BYTES);
+    assert!(run.truncated);
+}

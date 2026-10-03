@@ -6,7 +6,11 @@
 //! [`crate::framed_unix::UnixAcceptor`] with the kernel's view of each peer and
 //! are served by the shared administration policy, which admits only the
 //! daemon's own uid. The client half checks the same thing in the other
-//! direction before it writes a byte.
+//! direction before it writes a byte. Every accepted connection is also
+//! reported to the boundary observer ([`crate::boundary`]) when it ends:
+//! a connection that sent nothing, or spoke from an executable other than
+//! the daemon's own image, is an admin contact the human should be able to
+//! explain.
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -16,6 +20,7 @@ use tokio::net::UnixStream;
 
 use super::frame::{AdminLifecycle, AdminPolicy, Admission, denied, invalid};
 use crate::admin::AdminService;
+use crate::boundary::{self, Observed};
 use crate::event_hub::EventHub;
 use crate::framed::{self, Accept};
 use crate::framed_unix::{self, UnixAcceptor};
@@ -54,8 +59,14 @@ impl Listener {
         }
         let acceptor = UnixAcceptor::bind(&path)?;
         let policy = AdminPolicy::new(admin, lifecycle, hub, Admission::UnixOwner(uid));
+        // Every accepted connection reports itself to the daemon's boundary
+        // observer when it ends: the kernel peer and whether it ever sent
+        // a byte (the doctor's probe sends none). Registered by the daemon
+        // for this base before the bind; a listener bound without one is
+        // unobserved.
+        let observed = Observed::new(wrap(acceptor), boundary::admin_sink_for(base));
         Ok(Self {
-            inner: framed::Listener::spawn(wrap(acceptor), policy),
+            inner: framed::Listener::spawn(observed, policy),
         })
     }
 

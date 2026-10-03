@@ -16,6 +16,9 @@ mod admin_network_test;
 pub mod admin_retention;
 pub mod admin_transport;
 pub mod approval;
+pub mod boundary;
+#[cfg(test)]
+mod boundary_test;
 pub mod command_containment;
 #[cfg(test)]
 mod command_containment_test;

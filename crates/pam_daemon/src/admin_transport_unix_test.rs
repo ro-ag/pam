@@ -246,3 +246,219 @@ async fn an_admin_operation_is_sent_once_and_never_replayed() {
     .await
     .expect("test within deadline");
 }
+
+/// Waits until the observer has written `count` observation rows.
+async fn observations(
+    store: &pam_store::Store,
+    count: usize,
+) -> Vec<pam_store::BoundaryObservationRow> {
+    let waited = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = store.list_boundary_observations(16).await.unwrap();
+            if rows.len() >= count {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if let Ok(rows) = waited {
+        return rows;
+    }
+    panic!(
+        "the observer recorded {:?}, expected {count} rows; census {:?}",
+        store.list_boundary_observations(16).await.unwrap(),
+        store.boundary_census().await.unwrap()
+    )
+}
+
+/// A boundary observer for `base` whose trusted image is `image`.
+async fn observe(
+    base: &std::path::Path,
+    image: Option<std::path::PathBuf>,
+) -> (
+    Arc<pam_store::Store>,
+    Arc<crate::boundary::Boundary>,
+    tokio::task::JoinHandle<()>,
+) {
+    let store = Arc::new(pam_store::Store::open_in_memory().await.unwrap());
+    let boundary = crate::boundary::Boundary::new(
+        Arc::clone(&store),
+        image,
+        Arc::new(crate::boundary::SystemResolver),
+    );
+    boundary.load().await;
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    // The observer runs until the test aborts it; the sender is never dropped.
+    std::mem::forget(stop);
+    let (sink, task) = boundary.spawn_admin_observer(shutdown);
+    crate::boundary::register_admin_sink(base, sink);
+    (store, boundary, task)
+}
+
+fn same_file(a: &str, b: &std::path::Path) -> bool {
+    std::path::Path::new(a).canonicalize().ok() == b.canonicalize().ok()
+}
+
+/// The doctor's `admin.endpoint` probe — connect, send nothing, drop — is
+/// seen by the daemon as an admin contact with the kernel's pid and this
+/// process's executable; a hello from the daemon's own image (the GUI,
+/// here this very test binary) is an expected one.
+#[tokio::test]
+async fn an_accepted_connection_is_an_admin_contact_and_the_own_image_is_expected() {
+    tokio::time::timeout(DEADLINE, async {
+        let tmp = short_base();
+        let base = super::prepare_base(&tmp.path().join("pam")).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let (store, boundary, observer) = observe(&base, Some(exe.clone())).await;
+        let listener =
+            Listener::bind(&base, admin_service().await, lifecycle(), EventHub::new()).unwrap();
+
+        // The probe: the doctor holds its socket for a moment so the
+        // kernel can still say who connected when the daemon accepts.
+        let socket = base.join("admin").join("control.sock");
+        let probe = UnixStream::connect(&socket).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(probe);
+        let rows = observations(&store, 1).await;
+        let probe = &rows[0];
+        assert_eq!(probe.kind, pam_store::OBSERVATION_ADMIN_CONTACT);
+        assert!(!probe.expected);
+        assert_eq!(probe.peer.pid, Some(std::process::id()));
+        assert_eq!(
+            probe.detail.as_deref(),
+            Some("accepted; the peer sent nothing")
+        );
+        assert!(
+            probe
+                .peer
+                .exe
+                .as_deref()
+                .is_some_and(|got| same_file(got, &exe)),
+            "{probe:?}"
+        );
+        assert!(probe.peer.harness.is_some());
+        assert_eq!(probe.attributed, None);
+
+        // The GUI: a real hello and request from the trusted image.
+        let response = super::exchange(&base, &profile_get("req_gui"))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let rows = observations(&store, 2).await;
+        let gui = rows
+            .iter()
+            .find(|row| row.expected)
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert_eq!(
+            gui.detail.as_deref(),
+            Some("hello from the daemon's own image")
+        );
+        assert_eq!(gui.peer.pid, Some(std::process::id()));
+
+        let block = boundary.status_block();
+        assert_eq!(block["admin_contacts"]["unattributed"], 1);
+        assert_eq!(block["admin_contacts"]["expected_total"], 1);
+        assert_eq!(
+            block["admin_contacts"]["last"]["peer_pid"],
+            std::process::id()
+        );
+        listener.shutdown().await;
+        observer.abort();
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A peer that connects and closes before the daemon accepts cannot be
+/// identified (`getpeereid` fails on the closed socket and the acceptor
+/// reports the connection aborted); it is still recorded as a contact,
+/// with no pid and nothing to attribute it to.
+#[tokio::test]
+async fn a_connection_gone_before_its_credentials_are_read_is_a_vanished_contact() {
+    tokio::time::timeout(DEADLINE, async {
+        let tmp = short_base();
+        let base = super::prepare_base(&tmp.path().join("pam")).unwrap();
+        let (store, _boundary, observer) = observe(&base, None).await;
+        let listener =
+            Listener::bind(&base, admin_service().await, lifecycle(), EventHub::new()).unwrap();
+        let socket = base.join("admin").join("control.sock");
+        // Closed before the listener's task runs: not yet accepted.
+        drop(UnixStream::connect(&socket).await.unwrap());
+        let rows = observations(&store, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, pam_store::OBSERVATION_ADMIN_CONTACT);
+        assert_eq!(rows[0].peer.pid, None);
+        assert_eq!(
+            rows[0].detail.as_deref(),
+            Some("accepted; gone before its credentials could be read")
+        );
+        assert!(!rows[0].expected);
+        // The listener is still serving.
+        let response = super::exchange(&base, &profile_get("req_after_vanish"))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        listener.shutdown().await;
+        observer.abort();
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A hello from an executable that is not the daemon's image is an
+/// unexpected contact, whatever it asked for.
+#[tokio::test]
+async fn a_hello_from_another_executable_is_an_unexpected_admin_contact() {
+    tokio::time::timeout(DEADLINE, async {
+        let tmp = short_base();
+        let base = super::prepare_base(&tmp.path().join("pam")).unwrap();
+        let (store, boundary, observer) = observe(
+            &base,
+            Some(std::path::PathBuf::from(
+                "/Applications/PAM.app/Contents/MacOS/pam",
+            )),
+        )
+        .await;
+        let listener =
+            Listener::bind(&base, admin_service().await, lifecycle(), EventHub::new()).unwrap();
+        let response = super::exchange(&base, &profile_get("req_foreign"))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        let rows = observations(&store, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].expected);
+        assert_eq!(
+            rows[0].detail.as_deref(),
+            Some("hello from another executable")
+        );
+        assert_eq!(rows[0].peer.pid, Some(std::process::id()));
+        assert_eq!(boundary.status_block()["admin_contacts"]["unattributed"], 1);
+        listener.shutdown().await;
+        observer.abort();
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// A listener bound under a base nobody observes serves as before.
+#[tokio::test]
+async fn an_unobserved_listener_serves_without_a_sink() {
+    tokio::time::timeout(DEADLINE, async {
+        let tmp = short_base();
+        let base = super::prepare_base(&tmp.path().join("pam")).unwrap();
+        assert!(crate::boundary::admin_sink_for(&base).is_none());
+        let listener =
+            Listener::bind(&base, admin_service().await, lifecycle(), EventHub::new()).unwrap();
+        let socket = base.join("admin").join("control.sock");
+        drop(UnixStream::connect(&socket).await.unwrap());
+        let response = super::exchange(&base, &profile_get("req_unobserved"))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Result { .. }), "{response:?}");
+        listener.shutdown().await;
+    })
+    .await
+    .expect("test within deadline");
+}

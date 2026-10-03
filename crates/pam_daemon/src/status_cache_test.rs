@@ -184,3 +184,41 @@ async fn a_stale_snapshot_with_a_running_refresher_is_answered_without_waiting()
     );
     assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
 }
+
+/// The `boundary` block rides in every `status`: the never-checked shape
+/// with no observer attached, the observer's census once one is.
+#[tokio::test]
+async fn the_boundary_block_is_served_from_the_attached_observer_or_as_never_checked() {
+    let fx = fixture().await;
+    fx.cache.refresh().await;
+    let body = fx.cache.body(&fx.store, Instant::now()).await;
+    assert_eq!(body["boundary"]["last_report"], serde_json::Value::Null);
+    assert_eq!(body["boundary"]["reports"]["retained"], 0);
+    assert_eq!(body["boundary"]["admin_contacts"]["unattributed"], 0);
+    assert_eq!(
+        body["boundary"]["summary"],
+        "never checked — run pam doctor from the agent"
+    );
+    assert!(fx.cache.boundary().is_none());
+
+    let boundary = crate::boundary::Boundary::new(
+        Arc::clone(&fx.store),
+        None,
+        Arc::new(crate::boundary::SystemResolver),
+    );
+    assert!(fx.cache.attach_boundary(Arc::clone(&boundary)));
+    assert!(
+        !fx.cache.attach_boundary(Arc::clone(&boundary)),
+        "attached once"
+    );
+    boundary
+        .observe_admin_contact(crate::boundary::AdminContact::HandshakeFailed)
+        .await;
+    let body = fx.cache.body(&fx.store, Instant::now()).await;
+    assert_eq!(body["boundary"]["admin_contacts"]["unattributed"], 1);
+    assert_eq!(body["boundary"]["admin_contacts"]["total"], 1);
+    assert_eq!(
+        body["boundary"]["admin_contacts"]["last"]["kind"],
+        "admin_handshake_failed"
+    );
+}

@@ -77,7 +77,78 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 15,
         sql: SCHEMA_V15,
     },
+    Migration {
+        version: 16,
+        sql: SCHEMA_V16,
+    },
 ];
+
+/// Migration 16: the boundary self-check record.
+///
+/// - `request.peer_exe` and `request.peer_harness`: the daemon's own
+///   resolution of the kernel peer of a public request — the executable
+///   path behind `peer_pid` and the classification of its ancestry (a known
+///   agent name, `relay` through `pam listen`, otherwise the nearest parent's
+///   name verbatim). NULL on Windows (no kernel peer on the public plane) and
+///   when the resolution missed its budget. Attribution, like `peer_pid`.
+/// - `boundary_report`: one row per accepted `doctor.report`, the client's
+///   document (≤ 16 KiB, bounded by the CHECK) beside the peer facts the
+///   daemon recorded itself at receipt. The verdict is the client's claim;
+///   `cannot_probe` never lands here (such a report could not have arrived
+///   over the public socket). `request_id` is cleared, not the row removed,
+///   when retention prunes the request. The insert keeps the newest 64.
+/// - `boundary_observation`: what the daemon saw on its own: a connection the
+///   private admin listener accepted (`admin_contact`; `expected` when the
+///   peer is the daemon's own executable image, the GUI), a loopback
+///   connection that failed the admin nonce handshake on Windows
+///   (`admin_handshake_failed`), or a public request whose resolved ancestry
+///   is neither a known agent nor the relay (`public_unknown_harness`).
+///   `attributed` names the `doctor.report` request that explains an admin
+///   contact (same kernel pid within 60 s); NULL stays NULL forever otherwise.
+///   The insert keeps the newest 256 unexpected and 32 expected rows; the
+///   lifetime counters live in `setting` (`boundary.admin_contacts_total`,
+///   `boundary.admin_contacts_expected_total`, `boundary.public_unknown_total`).
+///
+/// Nothing is authorized by any of it: the gate, grants and approvals never
+/// read these tables.
+const SCHEMA_V16: &str = "
+ALTER TABLE request ADD COLUMN peer_exe TEXT;
+ALTER TABLE request ADD COLUMN peer_harness TEXT;
+CREATE TABLE boundary_report (
+    id              INTEGER PRIMARY KEY,
+    request_id      TEXT REFERENCES request (id) ON DELETE SET NULL,
+    ts              INTEGER NOT NULL,
+    report_ts       INTEGER NOT NULL,
+    verdict         TEXT NOT NULL CHECK (verdict IN ('established', 'not_established')),
+    failed_json     TEXT NOT NULL,
+    unverified_json TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    repo            TEXT NOT NULL,
+    peer_uid        INTEGER,
+    peer_pid        INTEGER,
+    peer_exe        TEXT,
+    peer_harness    TEXT,
+    relayed         INTEGER NOT NULL CHECK (relayed IN (0, 1)),
+    client_version  TEXT NOT NULL,
+    report_json     TEXT NOT NULL CHECK (length(CAST(report_json AS BLOB)) <= 16384)
+);
+CREATE INDEX boundary_report_ts_idx ON boundary_report (ts DESC, id DESC);
+CREATE INDEX boundary_report_request_idx ON boundary_report (request_id);
+CREATE TABLE boundary_observation (
+    id           INTEGER PRIMARY KEY,
+    ts           INTEGER NOT NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('admin_contact', 'admin_handshake_failed', 'public_unknown_harness')),
+    expected     INTEGER NOT NULL DEFAULT 0 CHECK (expected IN (0, 1)),
+    peer_uid     INTEGER,
+    peer_pid     INTEGER,
+    peer_exe     TEXT,
+    peer_harness TEXT,
+    detail       TEXT,
+    attributed   TEXT
+);
+CREATE INDEX boundary_observation_ts_idx ON boundary_observation (ts DESC, id DESC);
+CREATE INDEX boundary_observation_pid_idx ON boundary_observation (peer_pid, ts);
+";
 
 /// The schema version at which the store's engine changed. Every database
 /// written by the previous engine, and by every pam release up to 0.4.3, is

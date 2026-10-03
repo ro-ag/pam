@@ -301,6 +301,14 @@ impl Accept for LoopbackAcceptor {
                                 kind = ?error.kind(),
                                 "connection refused at the nonce handshake"
                             );
+                            // A loopback peer that reached the admin port and
+                            // could not prove the nonce is a boundary
+                            // observation (no process identity exists for it).
+                            if self.label == ADMIN_LABEL
+                                && let Some(sink) = admin_sink_for_control(&self.control)
+                            {
+                                sink.record(crate::boundary::AdminContact::HandshakeFailed);
+                            }
                         }
                         // A handshake task that was aborted or panicked.
                         Err(_) => {}
@@ -390,4 +398,13 @@ pub async fn connect(control: &Path, label: &str) -> io::Result<TcpStream> {
     stream.set_nodelay(true)?;
     admit_server(&mut stream, label, &nonce).await?;
     Ok(stream)
+}
+
+/// The boundary sink registered for the base a control file sits under
+/// (`<base>/admin/control.json`), if a daemon observes it.
+fn admin_sink_for_control(control: &Path) -> Option<crate::boundary::AdminContactSink> {
+    control
+        .parent()
+        .and_then(Path::parent)
+        .and_then(crate::boundary::admin_sink_for)
 }

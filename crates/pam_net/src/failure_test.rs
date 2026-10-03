@@ -265,31 +265,6 @@ fn schannel_text_is_matched_only_on_fixed_tokens() {
         case(60, "curl: (60) schannel: the revocation status is unknown"),
         "tls_revocation_unavailable"
     );
-    // The chain-trust flag spellings of the windows-2025 runner's build.
-    for (text, want) in [
-        (
-            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_REVOCATION_STATUS_UNKNOWN",
-            "tls_revocation_unavailable",
-        ),
-        (
-            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_OFFLINE_REVOCATION",
-            "tls_revocation_unavailable",
-        ),
-        (
-            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_PARTIAL_CHAIN",
-            "tls_untrusted_issuer",
-        ),
-        (
-            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_UNTRUSTED_ROOT",
-            "tls_untrusted_issuer",
-        ),
-        (
-            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_NOT_TIME_VALID",
-            "tls_expired",
-        ),
-    ] {
-        assert_eq!(case(60, text), want, "{text}");
-    }
     assert_eq!(
         case(
             60,
@@ -329,6 +304,43 @@ fn schannel_text_is_matched_only_on_fixed_tokens() {
         case(58, "curl: (58) schannel: Failed to import cert file"),
         "tls_error"
     );
+}
+
+#[test]
+fn schannel_chain_trust_flags_map_to_the_sentence_classes() {
+    let direct = Route::Direct;
+    let schannel = TlsBackend::Schannel;
+    let case = |exit: i32, text: &'static str| {
+        let mut transfer = transfer(Some(exit), text, "ssl_verify=0 num_connects=1", &direct);
+        transfer.backend = &schannel;
+        classify(&transfer).cause()
+    };
+    // The windows-2025 runner's curl names the chain-trust flag where a newer
+    // build prints a sentence.
+    for (text, want) in [
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_REVOCATION_STATUS_UNKNOWN",
+            "tls_revocation_unavailable",
+        ),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_OFFLINE_REVOCATION",
+            "tls_revocation_unavailable",
+        ),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_PARTIAL_CHAIN",
+            "tls_untrusted_issuer",
+        ),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_UNTRUSTED_ROOT",
+            "tls_untrusted_issuer",
+        ),
+        (
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_IS_NOT_TIME_VALID",
+            "tls_expired",
+        ),
+    ] {
+        assert_eq!(case(60, text), want, "{text}");
+    }
 }
 
 #[test]

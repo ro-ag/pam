@@ -642,6 +642,8 @@ fn classify_tls(transfer: &Transfer<'_>, host: String) -> NetFailure {
         "crypt_e_revocation_offline",
         "unable to check revocation",
         "revocation status is unknown",
+        // Older Schannel builds name the chain-trust flag instead of the sentence.
+        "cert_trust_revocation_status_unknown",
     ]) {
         return NetFailure::TlsRevocationUnavailable { host };
     }

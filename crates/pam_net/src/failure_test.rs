@@ -263,6 +263,10 @@ fn schannel_text_is_matched_only_on_fixed_tokens() {
     // Windows error code.
     assert_eq!(
         case(60, "curl: (60) schannel: the revocation status is unknown"),
+        case(
+            60,
+            "curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_REVOCATION_STATUS_UNKNOWN",
+        ),
         "tls_revocation_unavailable"
     );
     assert_eq!(

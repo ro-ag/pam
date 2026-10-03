@@ -3,11 +3,15 @@
 //! total deadline, collected into rows in inventory order.
 //!
 //! The probes both platforms share (the lock, the private directories, the
-//! store files, the executable, the public reach) are planned here from
-//! the base layout `crates/pam_daemon/src/runtime_dir.rs` and the spec's
-//! table document; the platform files add the mechanisms that differ.
-//! Every path is derived from the resolved base, never from the environment
-//! directly.
+//! store files, the public reach) are planned here from the base layout
+//! `crates/pam_daemon/src/runtime_dir.rs` and the spec's table document;
+//! the platform files add the mechanisms that differ. The executable's row
+//! is one of those: on macOS a Mach-O another process is mapped from must
+//! never be opened for write (the kernel drops its cached code signature
+//! and every later exec is killed), so `probe_unix.rs` asks through
+//! `access(2)`, while `probe_windows.rs` keeps the open the share check
+//! refuses. Every path is derived from the resolved base, never from the
+//! environment directly.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -293,11 +297,6 @@ fn plan_common(id: ProbeId, context: &Context) -> Option<Planned> {
         ProbeId::EngineRuntimeRead => list_dir(context, id, run.join(ENGINE_RUNTIME_DIR)),
         ProbeId::FlowsRead => list_dir(context, id, base.join(FLOWS_DIR)),
         ProbeId::LogRead => list_dir(context, id, base.join(LOG_DIR)),
-        ProbeId::ExeWrite => file_op(context, id, move |os| match os.current_exe() {
-            Ok(exe) => classify_io_result(platform, os.open_write(&exe)),
-            Err(error) => ProbeResult::unknown(format!("current_exe: {:?}", error.kind()))
-                .with_os_error(pam_proto::doctor::OsError::from_io(&error)),
-        }),
         _ => return None,
     })
 }
@@ -375,6 +374,18 @@ pub fn lock_pid(os: &dyn Os, lock: &Path) -> Result<u32, ProbeResult> {
     })?;
     super::classify::parse_lock_pid(&text)
         .ok_or_else(|| ProbeResult::unknown("lock file holds no pid: nothing to probe"))
+}
+
+/// This process's executable, or the `unknown` its absence classifies to.
+///
+/// # Errors
+///
+/// The result to report when the executable could not be resolved.
+pub fn current_exe(os: &dyn Os) -> Result<PathBuf, ProbeResult> {
+    os.current_exe().map_err(|error| {
+        ProbeResult::unknown(format!("current_exe: {:?}", error.kind()))
+            .with_os_error(pam_proto::doctor::OsError::from_io(&error))
+    })
 }
 
 /// Runs every planned probe on its own thread and collects what arrives

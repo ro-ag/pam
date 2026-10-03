@@ -42,14 +42,14 @@ async fn run_pam(base: &Path, args: &[&str]) -> CliRun {
 /// Every exec runs a fresh clone of the binary (an APFS clone: cheap, a
 /// new inode), never `target/debug/pam` itself.
 ///
-/// The engine's `exe.write` probe opens the running executable for write
-/// (it writes nothing), and macOS answers an open-for-write on a binary
+/// The engine's `exe.write` probe used to open the running executable for
+/// write (writing nothing), and macOS answers an open-for-write on a binary
 /// that another process is mapped from by invalidating the kernel's code
 /// signature for that inode: every later exec of it is `SIGKILL`ed until the
-/// file is replaced (`doctor_poisons_nothing_it_runs_from` pins it). A test
-/// run execs the binary many times, in parallel, so without a clone per
-/// exec one doctor run kills the rest of the suite — and the `cli.rs` tests
-/// that follow it.
+/// file is replaced. The probe now asks through `access(2)`
+/// (`doctor_poisons_nothing_it_runs_from` pins it), but a test run execs
+/// the binary many times, in parallel, and nothing here should ever depend
+/// on the shared inode's state: the clone per exec stays.
 fn run_pam_blocking(base: &Path, args: &[String]) -> CliRun {
     let scratch = tempfile::Builder::new()
         .prefix("pam-doctor-exe")
@@ -397,21 +397,19 @@ fn doctor_unknown_profile_is_a_usage_error_naming_the_choices() {
 
 /// A doctor run must leave the binary it ran from runnable.
 ///
-/// Pinned here because it is not: the `exe.write` probe opens the running
-/// executable for write (no byte written), and when another process is
-/// mapped from that inode — the daemon, in production — macOS invalidates
-/// the kernel's code signature for it and `SIGKILL`s every later exec until
-/// the file is replaced (`Killed: 9`; `codesign -vv` still says valid on
-/// disk). Measured on macOS 26 (Darwin 27) on 2026-10-02: a daemon running
-/// from a copy, one external `open(O_WRONLY)` + `close` on the copy, and
-/// `copy --version` exits 137 from then on. The probe must ask the
-/// permission question without opening the file (`/bin/test -w <exe>`,
-/// `access(2)`, which Seatbelt honours: exit 1 under `(deny file-write*)`,
-/// 0 outside); that is `crates/pam/src/doctor/probe_unix.rs`, the engine's
-/// file, not this task's — see `scratchpad/doctor/cross-T3T5.md`. Ignored
-/// until it lands; run it with `--ignored` to check.
+/// Regression: the `exe.write` probe once opened the running executable
+/// for write (no byte written), and when another process is mapped from
+/// that inode — the daemon, in production — macOS invalidates the kernel's
+/// code signature for it and `SIGKILL`s every later exec until the file is
+/// replaced (`Killed: 9`; `codesign -vv` still says valid on disk).
+/// Measured on macOS 26 (Darwin 27) on 2026-10-02: a daemon running from a
+/// copy, one external `open(O_WRONLY)` + `close` on the copy, and
+/// `copy --version` exits 137 from then on; this test failed the same way
+/// against that probe. The probe now asks the permission question without
+/// opening the file (`/bin/test -w <exe>`, `access(2)`, which Seatbelt
+/// honours: exit 1 under `(deny file-write*)`, 0 outside), in
+/// `crates/pam/src/doctor/probe_unix.rs`.
 #[cfg(target_os = "macos")]
-#[ignore = "the exe.write probe opens the running binary for write and macOS then SIGKILLs every later exec of it; fix in doctor/probe_unix.rs (cross-T3T5.md)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_poisons_nothing_it_runs_from() {
     timeout(DEADLINE, async {

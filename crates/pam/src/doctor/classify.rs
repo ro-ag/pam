@@ -11,7 +11,9 @@
 //! check precedes the share check in `CreateFile`); anything else is
 //! `unknown` with the error's kind and raw code. A helper's output is read
 //! for the lines pinned on the real OS; an unrecognised output is `unknown`,
-//! which fails the verdict — fail closed.
+//! which fails the verdict — fail closed. The executable and bundle rows on
+//! macOS are answered by `/bin/test` (`access(2)`), whose exit status is the
+//! whole answer: 0 writable, 1 refused.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,6 +68,10 @@ pub const KILL_DENIED_MARKER: &str = "Operation not permitted";
 /// `kill -0` on a pid that is gone (captured 2026-10-02:
 /// `kill: 999999: No such process`).
 pub const KILL_GONE_MARKER: &str = "No such process";
+
+/// `test -w <path>` answered no: `access(2)` with `W_OK` refused. There is
+/// no errno to carry — `test` folds it into its exit status.
+pub const ACCESS_REFUSED_NOTE: &str = "access(W_OK) refused";
 
 /// `lsappinfo find bundleid=com.apple.loginwindow`: the `LaunchServices`
 /// server answered with the session's login window (`ASN:0x0-0x1001-"loginwindow":`,
@@ -306,6 +312,43 @@ pub fn classify_kill(outcome: &HelperOutcome) -> ProbeResult {
         return ProbeResult::unknown("the lock pid names no process: nothing to signal");
     }
     unrecognised("kill", run)
+}
+
+/// `/bin/test -w <path>`: `access(2)` with `W_OK`, which asks the kernel the
+/// permission question without opening the file — an open-for-write of a
+/// Mach-O that another process is mapped from invalidates the kernel's
+/// cached code signature for it, and every later exec of the file is
+/// killed. Exit 0 is the right to write; exit 1 is the refusal — or a
+/// missing path, which `test` folds into the same status, so the caller
+/// tells them apart with [`classify_exists`]. Anything else is `unknown`
+/// (fail closed).
+#[must_use]
+pub fn classify_access_write(outcome: &HelperOutcome) -> ProbeResult {
+    let run = match ran(outcome) {
+        Ok(run) => run,
+        Err(result) => return result,
+    };
+    match run.code {
+        Some(0) => ProbeResult::allowed(),
+        Some(1) => {
+            ProbeResult::denied(OsError::of_kind("PermissionDenied")).with_note(ACCESS_REFUSED_NOTE)
+        }
+        _ => unrecognised("test", run),
+    }
+}
+
+/// `/bin/test -e <path>`: whether the path is there (exit 0) or not (exit 1).
+///
+/// # Errors
+///
+/// The `unknown` to report when the helper answered neither way.
+pub fn classify_exists(outcome: &HelperOutcome) -> Result<bool, ProbeResult> {
+    let run = ran(outcome)?;
+    match run.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(unrecognised("test", run)),
+    }
 }
 
 /// `lsappinfo find bundleid=com.apple.loginwindow`: an `ASN:` line is the

@@ -5,7 +5,12 @@
 //! place where the side-effect rules are enforced by construction:
 //! [`RealOs::open_read`] opens and closes without reading a byte,
 //! [`RealOs::open_write`] opens with `create(false)` and `truncate(false)`
-//! and never writes, [`RealOs::list_dir`] takes at most one entry,
+//! and never writes — and is never pointed at a Mach-O: on macOS an
+//! open-for-write of an executable that another process is mapped from
+//! invalidates the kernel's cached code signature for it and every later
+//! exec is killed, so the executable and bundle rows ask through
+//! `/bin/test -w` (`access(2)`) in `probe_unix.rs` — [`RealOs::list_dir`]
+//! takes at most one entry,
 //! [`RealOs::lock_probe`] is the client's own shared-lock readiness test and
 //! releases what it took, [`RealOs::connect_unix`] connects, holds the
 //! stream open for a moment and drops it without sending or reading (the

@@ -6,8 +6,19 @@
 //! for an account that cannot exist, the daemon's query rights through a
 //! `PowerShell` `Get-Process` (query only, never termination rights: that
 //! needs `OpenProcess` through FFI, which the workspace forbids), process
-//! creation as the `ShellExecute` broker, and the harness chain through
-//! `Win32_Process`.
+//! creation as the `ShellExecute` broker, the running executable opened
+//! for write through the seam (decision below), and the harness chain
+//! through `Win32_Process`.
+//!
+//! The executable keeps the open here, unlike macOS: Windows holds the
+//! image section of a running executable, so `CreateFile` with write
+//! access is refused at the share check — after the ACL's access check,
+//! which is why `ERROR_SHARING_VIOLATION` classifies as `allowed` — before
+//! any handle exists, and Windows keeps no code-signature cache that the
+//! attempt could invalidate. The non-opening alternatives answer a
+//! different question: the read-only attribute is not the ACL, and a
+//! directory opened for write is always `ERROR_ACCESS_DENIED` here, which
+//! would read `denied` for an unsandboxed process — a false pass.
 //!
 //! Every helper lives under `%SystemRoot%\System32`; `SystemRoot` is read
 //! through the seam with `C:\Windows` as the fallback.
@@ -19,9 +30,13 @@ use std::time::Duration;
 use pam_proto::caller::MAX_CHAIN_DEPTH;
 use pam_proto::doctor::ProbeId;
 
-use super::classify::{classify_keyring, classify_process_query, classify_shell_execute};
+use super::classify::{
+    classify_io_result, classify_keyring, classify_process_query, classify_shell_execute,
+};
 use super::helpers::{Helper, HelperOutcome};
-use super::inventory::{ADMIN_CONTROL, ADMIN_DIR, Context, Planned, lock_pid, open_read};
+use super::inventory::{
+    ADMIN_CONTROL, ADMIN_DIR, Context, Planned, current_exe, file_op, lock_pid, open_read,
+};
 use super::os::Os;
 
 /// The fallback for `%SystemRoot%`.
@@ -65,6 +80,16 @@ pub fn plan(id: ProbeId, context: &Context) -> Option<Planned> {
                 bound: helper.timeout + Duration::from_secs(1),
                 op: Box::new(move || classify_shell_execute(&os.run_helper(&helper)).into()),
             }
+        }
+        // Through the seam only: never created or truncated, no byte
+        // written; the share check refuses it after the ACL's access check
+        // (the module doc says why this is not `access(2)` as on macOS).
+        ProbeId::ExeWrite => {
+            let platform = context.platform;
+            file_op(context, id, move |os| match current_exe(os) {
+                Ok(exe) => classify_io_result(platform, os.open_write(&exe)),
+                Err(result) => result,
+            })
         }
         _ => return None,
     })

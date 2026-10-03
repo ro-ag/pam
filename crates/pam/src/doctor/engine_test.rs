@@ -189,14 +189,18 @@ fn unrecognised_helper_output_is_unverified_and_fails_the_verdict() {
     let report = run_fake(os);
     assert_eq!(report.verdict, Verdict::NotEstablished);
     assert!(report.failed.is_empty());
+    // The executable's row is a helper's answer on unix (`/bin/test -w`),
+    // an open's on Windows.
     let expected: Vec<ProbeId> = [
         ProbeId::KeychainSearch,
         ProbeId::DaemonSignal,
         ProbeId::BrokerLaunchServices,
         ProbeId::BrokerAppleEvents,
+        ProbeId::ExeWrite,
     ]
     .into_iter()
     .filter(|id| id.applies_to(report.platform))
+    .filter(|id| *id != ProbeId::ExeWrite || cfg!(unix))
     .collect();
     assert_eq!(report.unverified, expected);
     for id in expected {
@@ -263,9 +267,11 @@ fn an_unreadable_lock_leaves_the_signal_probe_unknown() {
 
 #[test]
 fn the_exe_and_bundle_probes_follow_the_executable() {
-    let mut os = FakeOs::unsandboxed();
-    os.exe = Some(PathBuf::from("/Applications/PAM.app/Contents/MacOS/pam"));
-    let report = run_fake(os);
+    let mut fake = FakeOs::unsandboxed();
+    fake.exe = Some(PathBuf::from("/Applications/PAM.app/Contents/MacOS/pam"));
+    let os = Arc::new(fake);
+    let dynamic: Arc<dyn super::os::Os> = os.clone();
+    let report = run_with(&Options::new(PathBuf::from(BASE)), dynamic).unwrap();
     let bundle = report
         .probes
         .iter()
@@ -274,6 +280,23 @@ fn the_exe_and_bundle_probes_follow_the_executable() {
     if bundle.id.applies_to(report.platform) {
         assert_eq!(bundle.result, ProbeState::Allowed);
         assert!(report.failed.contains(&ProbeId::BundleWrite));
+        // Asked through `access(2)`, never opened: nothing in the bundle
+        // (nor the executable) is a write-open away from a dropped
+        // signature cache.
+        let calls = os.calls();
+        assert!(calls.iter().any(|call| call
+            == "helper /bin/test -w /Applications/PAM.app/Contents/Info.plist"));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "helper /bin/test -w /Applications/PAM.app/Contents/MacOS/pam")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("OpenWrite /Applications")),
+            "{calls:#?}"
+        );
     }
     let mut os = FakeOs::unsandboxed();
     os.exe = None;
@@ -319,7 +342,7 @@ fn the_probes_target_exactly_the_spec_paths_and_absent_names() {
         "ListDir /tmp/pamdoc-base/flows",
         "ListDir /tmp/pamdoc-base/log",
         "ReadPid /tmp/pamdoc-base/run/daemon.lock",
-        "OpenWrite /usr/local/bin/pam",
+        "helper /bin/test -w /usr/local/bin/pam",
         "helper /bin/kill -0 4242",
     ] {
         assert!(has(expected), "missing call {expected:?} in {calls:#?}");
@@ -329,6 +352,15 @@ fn the_probes_target_exactly_the_spec_paths_and_absent_names() {
         !calls
             .iter()
             .any(|call| call.starts_with("Connect ") && call.ends_with("pam.sock"))
+    );
+    // The executable is asked through `access(2)`, never opened: an
+    // open-for-write of a mapped Mach-O drops its signature cache and every
+    // later exec is killed.
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("OpenWrite ") && call.ends_with("/pam")),
+        "{calls:#?}"
     );
     // The keychain item and the bundle id cannot exist.
     let pid = std::process::id();

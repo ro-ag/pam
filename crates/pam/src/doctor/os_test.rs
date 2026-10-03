@@ -195,6 +195,16 @@ impl FakeOs {
             (HelperMood::Allowed, "lsappinfo") => {
                 run(Some(0), "ASN:0x0-0x1001-\"loginwindow\":\n", "")
             }
+            // `test -w` / `test -e` (`access(2)`): writable outside the
+            // sandbox; inside, the write is refused but the path is there.
+            (HelperMood::Allowed, "test") => run(Some(0), "", ""),
+            (HelperMood::Denied, "test") => {
+                let exists = helper
+                    .args
+                    .first()
+                    .is_some_and(|flag| flag.to_str() == Some("-e"));
+                run(Some(i32::from(!exists)), "", "")
+            }
             // Captured 2026-10-02 outside and under both macOS profiles.
             (HelperMood::Allowed, "osascript") => run(Some(0), "com.apple.finder\n", ""),
             (HelperMood::Denied, "osascript") => run(
@@ -340,6 +350,64 @@ fn no_probe_source_writes_creates_truncates_unlinks_or_renames() {
             );
         }
     }
+}
+
+/// Every source of the module but the tests: the one open-for-write is
+/// the seam's, and nothing points it at a Mach-O.
+const DOCTOR_SOURCES: &[(&str, &str)] = &[
+    ("mod.rs", include_str!("mod.rs")),
+    ("classify.rs", include_str!("classify.rs")),
+    ("env.rs", include_str!("env.rs")),
+    ("helpers.rs", include_str!("helpers.rs")),
+    ("inventory.rs", include_str!("inventory.rs")),
+    ("os.rs", include_str!("os.rs")),
+    ("probe_unix.rs", include_str!("probe_unix.rs")),
+    ("probe_windows.rs", include_str!("probe_windows.rs")),
+    ("profiles.rs", include_str!("profiles.rs")),
+    ("render.rs", include_str!("render.rs")),
+];
+
+#[test]
+fn the_executable_and_the_bundle_are_never_opened_for_write_on_unix() {
+    // One open-for-write in the whole module — the seam's — and no file
+    // opened outside the seam.
+    let opens: usize = DOCTOR_SOURCES
+        .iter()
+        .map(|(_, source)| source.matches(".write(true)").count())
+        .sum();
+    assert_eq!(opens, 1, "the seam holds the only open-for-write");
+    for (file, source) in DOCTOR_SOURCES {
+        if *file != "os.rs" {
+            for forbidden in ["OpenOptions", "File::", "write(true)"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{file} must not contain `{forbidden}`: files are opened through the seam"
+                );
+            }
+        }
+    }
+    // The unix rows ask through `access(2)`: the probe file opens nothing,
+    // and the executable is not the shared plan's business.
+    let unix = include_str!("probe_unix.rs");
+    assert!(
+        !unix.contains("open_write"),
+        "probe_unix.rs must not open anything for write: a mapped Mach-O opened for write loses its signature cache"
+    );
+    assert!(unix.contains("pub const TEST: &str = \"/bin/test\";"));
+    assert!(unix.contains("ProbeId::ExeWrite => exe_write("));
+    assert!(unix.contains("ProbeId::BundleWrite => bundle_write("));
+    let shared = include_str!("inventory.rs");
+    for forbidden in ["ExeWrite", "BundleWrite", "Info.plist", "bundle_root"] {
+        assert!(
+            !shared.contains(forbidden),
+            "inventory.rs must not plan `{forbidden}`: the platform files do"
+        );
+    }
+    // Windows keeps the open (the share check refuses it before any handle
+    // exists; no signature cache there), through the seam only.
+    let windows = include_str!("probe_windows.rs");
+    assert!(windows.contains("ProbeId::ExeWrite =>"));
+    assert!(windows.contains("os.open_write(&exe)"));
 }
 
 #[test]

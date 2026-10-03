@@ -51,6 +51,8 @@ mod helpers_test;
 mod inventory_test;
 #[cfg(test)]
 pub(crate) mod os_test;
+#[cfg(all(test, unix))]
+mod probe_unix_test;
 #[cfg(test)]
 mod probe_windows_test;
 // `profiles_test` is declared from `profiles.rs` (its `super` is `profiles`).

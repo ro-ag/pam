@@ -10,12 +10,13 @@ use pam_proto::doctor::{MAX_CHAIN_NAMES, MAX_TEXT_BYTES, Platform, ProbeResult, 
 use pam_proto::wire::Via;
 
 use super::classify::{
-    EACCES, ENOENT, ENOTDIR, EPERM, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    ACCESS_REFUSED_NOTE, EACCES, ENOENT, ENOTDIR, EPERM, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
     ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, bounded_chain, bounded_text, bundle_root,
-    classify_appleevents, classify_connect, classify_io, classify_io_result, classify_keyring,
-    classify_kill, classify_kind_code, classify_launchservices, classify_lock,
-    classify_process_query, classify_reach, classify_security, classify_shell_execute, first_line,
-    fit_result, parse_lock_pid, parse_ps_line,
+    classify_access_write, classify_appleevents, classify_connect, classify_exists, classify_io,
+    classify_io_result, classify_keyring, classify_kill, classify_kind_code,
+    classify_launchservices, classify_lock, classify_process_query, classify_reach,
+    classify_security, classify_shell_execute, first_line, fit_result, parse_lock_pid,
+    parse_ps_line,
 };
 use super::helpers::{HelperOutcome, HelperRun};
 use super::os::{HelloAnswer, KeyringAnswer, LockState};
@@ -269,6 +270,7 @@ fn helpers_that_could_not_run_are_unknown_with_the_reason() {
         classify_launchservices,
         classify_appleevents,
         classify_process_query,
+        classify_access_write,
     ] {
         let result = classify(&spawn);
         assert_eq!(result.state, ProbeState::Unknown);
@@ -344,6 +346,41 @@ fn kill_table() {
         killed.note.as_deref(),
         Some("unrecognised kill output (killed by a signal): no output")
     );
+}
+
+#[test]
+fn access_table() {
+    // `/bin/test -w`: the exit status is the whole answer (captured
+    // 2026-10-02 under `(deny file-write* (literal …))`: 1; outside: 0).
+    assert_eq!(
+        classify_access_write(&ran(Some(0), "", "")),
+        ProbeResult::allowed()
+    );
+    let denied = classify_access_write(&ran(Some(1), "", ""));
+    assert_eq!(denied.state, ProbeState::Denied);
+    let os_error = denied.os_error.unwrap();
+    assert_eq!(
+        (os_error.kind.as_str(), os_error.code),
+        ("PermissionDenied", None)
+    );
+    assert_eq!(denied.note.as_deref(), Some(ACCESS_REFUSED_NOTE));
+    let usage = classify_access_write(&ran(Some(2), "", "test: -w: unary operator expected\n"));
+    assert_eq!(usage.state, ProbeState::Unknown);
+    assert_eq!(
+        usage.note.as_deref(),
+        Some("unrecognised test output (exit 2): test: -w: unary operator expected")
+    );
+    // `/bin/test -e` tells a refused path from a missing one.
+    assert_eq!(classify_exists(&ran(Some(0), "", "")), Ok(true));
+    assert_eq!(classify_exists(&ran(Some(1), "", "")), Ok(false));
+    let killed = classify_exists(&ran(None, "", "")).unwrap_err();
+    assert_eq!(
+        killed.note.as_deref(),
+        Some("unrecognised test output (killed by a signal): no output")
+    );
+    let spawn = classify_exists(&HelperOutcome::SpawnFailed(raw(ENOENT))).unwrap_err();
+    assert_eq!(spawn.state, ProbeState::Unknown);
+    assert_eq!(spawn.note.as_deref(), Some("spawn: NotFound"));
 }
 
 #[test]

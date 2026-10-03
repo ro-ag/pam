@@ -5,8 +5,13 @@
 //! query of the session's login window, the application-services broker
 //! behind `AppleEvents` through `/usr/bin/osascript -e 'id of application
 //! "Finder"'` (a property read of the running Finder: no event is sent to
-//! it, nothing is launched, nothing prompts), the bundle's `Info.plist`
-//! opened for write, and the harness chain through `/bin/ps`.
+//! it, nothing is launched, nothing prompts), the running executable and
+//! the bundle's `Info.plist` asked through `/bin/test -w` — `access(2)`,
+//! never an open: an open-for-write of a Mach-O that another process is
+//! mapped from (the daemon, always, in production) invalidates the kernel's
+//! cached code signature for that inode, and every later exec of the file
+//! is `SIGKILL`ed until the file is replaced — and the harness chain
+//! through `/bin/ps`.
 //!
 //! The spec's broker methods — `open -b <absent id>` and `osascript`
 //! against an absent id — resolve the id in process and fail before any
@@ -21,21 +26,23 @@
 //! them under `sandbox-exec`.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use pam_daemon::secrets::SECRET_SERVICE;
 use pam_proto::caller::MAX_CHAIN_DEPTH;
-use pam_proto::doctor::{MAX_CHAIN_NAMES, ProbeId, ProbeResult};
+use pam_proto::doctor::{MAX_CHAIN_NAMES, ProbeId, ProbeResult, ProbeState};
 
 use super::classify::{
-    bundle_root, classify_appleevents, classify_connect, classify_io_result, classify_kill,
-    classify_launchservices, classify_security, parse_ps_line,
+    bundle_root, classify_access_write, classify_appleevents, classify_connect, classify_exists,
+    classify_kill, classify_launchservices, classify_security, parse_ps_line,
 };
 use super::helpers::{Helper, HelperOutcome};
 use super::inventory::{
-    ADMIN_DIR, ADMIN_SOCKET, Context, ENGINE_SOCKET, Planned, RUN_DIR, file_op, lock_pid,
+    ADMIN_DIR, ADMIN_SOCKET, Context, ENGINE_SOCKET, Planned, RUN_DIR, current_exe, file_op,
+    lock_pid,
 };
 use super::os::Os;
 
@@ -61,6 +68,9 @@ pub const OSASCRIPT: &str = "/usr/bin/osascript";
 pub const APPLEEVENTS_SCRIPT: &str = "id of application \"Finder\"";
 /// The process-table helper for the harness chain.
 pub const PS: &str = "/bin/ps";
+/// The `access(2)` helper: `test -w` and `test -e` ask the kernel the
+/// permission and existence questions without opening the path.
+pub const TEST: &str = "/bin/test";
 
 /// The plan for a macOS-specific probe; `None` for the shared ones and
 /// for the Windows-only ones.
@@ -116,6 +126,7 @@ pub fn plan(id: ProbeId, context: &Context) -> Option<Planned> {
             ),
             classify_appleevents,
         ),
+        ProbeId::ExeWrite => exe_write(context),
         ProbeId::BundleWrite => bundle_write(context),
         _ => return None,
     })
@@ -163,26 +174,75 @@ fn signal(context: &Context) -> Planned {
     }
 }
 
-/// `<bundle>/Contents/Info.plist` opened for write when the executable sits
-/// in an application bundle; `absent` otherwise.
-fn bundle_write(context: &Context) -> Planned {
-    let platform = context.platform;
-    file_op(context, ProbeId::BundleWrite, move |os| {
-        let exe = match os.current_exe() {
-            Ok(exe) => exe,
-            Err(error) => {
-                return ProbeResult::unknown(format!("current_exe: {:?}", error.kind()))
-                    .with_os_error(pam_proto::doctor::OsError::from_io(&error));
-            }
-        };
-        match bundle_root(&exe) {
-            Some(bundle) => classify_io_result(
-                platform,
-                os.open_write(&bundle.join("Contents").join("Info.plist")),
-            ),
-            None => ProbeResult::absent().with_note("not inside an application bundle"),
-        }
+/// `test -w` on the running executable: never an open. An open-for-write
+/// of a Mach-O that another process is mapped from — the daemon, in
+/// production, runs from this same binary — makes the kernel drop its
+/// cached code signature for that inode, and every later exec of the file
+/// is `SIGKILL`ed until the file is replaced; `access(2)` asks the same
+/// permission question without touching the file, and Seatbelt honours it.
+fn exe_write(context: &Context) -> Planned {
+    access_op(context, ProbeId::ExeWrite, |os, bound| {
+        Ok(access_write(os, &current_exe(os)?, bound))
     })
+}
+
+/// `test -w` on `<bundle>/Contents/Info.plist` when the executable sits in
+/// an application bundle — the same shape as `exe.write`: nothing in the
+/// bundle is ever opened for write; `absent` otherwise.
+fn bundle_write(context: &Context) -> Planned {
+    access_op(context, ProbeId::BundleWrite, |os, bound| {
+        let exe = current_exe(os)?;
+        Ok(match bundle_root(&exe) {
+            Some(bundle) => access_write(os, &bundle.join("Contents").join("Info.plist"), bound),
+            None => ProbeResult::absent().with_note("not inside an application bundle"),
+        })
+    })
+}
+
+/// A probe answered by the `access(2)` helper, bounded by two helper runs:
+/// a refusal is told apart from a missing path by a second one.
+fn access_op(
+    context: &Context,
+    id: ProbeId,
+    op: impl FnOnce(&dyn Os, Duration) -> Result<ProbeResult, ProbeResult> + Send + 'static,
+) -> Planned {
+    let os = Arc::clone(&context.os);
+    let bound = context.options.helper_bound;
+    Planned {
+        id,
+        bound: bound * 2 + Duration::from_secs(1),
+        op: Box::new(move || {
+            match op(os.as_ref(), bound) {
+                Ok(result) | Err(result) => result,
+            }
+            .into()
+        }),
+    }
+}
+
+/// Whether `path` may be written, by `test -w` — `access(2)` with `W_OK`:
+/// exit 0 is `allowed`; exit 1 is `denied`, unless `test -e` says the path
+/// is not there, which is `absent`. The path is never opened.
+#[must_use]
+pub fn access_write(os: &dyn Os, path: &Path, bound: Duration) -> ProbeResult {
+    let result = classify_access_write(&os.run_helper(&test(path, "-w", bound)));
+    if result.state != ProbeState::Denied {
+        return result;
+    }
+    match classify_exists(&os.run_helper(&test(path, "-e", bound))) {
+        Ok(true) => result,
+        Ok(false) => ProbeResult::absent(),
+        Err(unknown) => unknown,
+    }
+}
+
+/// `/bin/test <flag> <path>`.
+fn test(path: &Path, flag: &str, bound: Duration) -> Helper {
+    Helper::new(
+        TEST,
+        [OsString::from(flag), path.as_os_str().to_owned()],
+        bound,
+    )
 }
 
 /// The parent-process names of `pid`, nearest first, through

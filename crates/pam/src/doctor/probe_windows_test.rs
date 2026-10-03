@@ -34,7 +34,7 @@ fn run(context: &Context, id: ProbeId) -> Outcome {
 
 #[test]
 fn only_the_windows_specific_probes_are_planned_here() {
-    let (context, _) = context(FakeOs::unsandboxed());
+    let (context, _) = self::context(FakeOs::unsandboxed());
     for id in ProbeId::all() {
         let windows_specific = matches!(
             id,
@@ -42,6 +42,7 @@ fn only_the_windows_specific_probes_are_planned_here() {
                 | ProbeId::KeychainSearch
                 | ProbeId::DaemonProcessQuery
                 | ProbeId::BrokerShellExecute
+                | ProbeId::ExeWrite
         );
         assert_eq!(plan(id, &context).is_some(), windows_specific, "{id}");
     }
@@ -49,7 +50,7 @@ fn only_the_windows_specific_probes_are_planned_here() {
 
 #[test]
 fn the_control_file_is_opened_for_read_through_the_seam_only() {
-    let (context, os) = context(FakeOs::unsandboxed());
+    let (context, os) = self::context(FakeOs::unsandboxed());
     let outcome = run(&context, ProbeId::AdminControlRead);
     assert_eq!(outcome.result.state, ProbeState::Allowed);
     let expected = format!(
@@ -61,7 +62,7 @@ fn the_control_file_is_opened_for_read_through_the_seam_only() {
 
 #[test]
 fn the_credential_store_is_asked_for_the_absent_account() {
-    let (context, os) = context(FakeOs::sandboxed());
+    let (context, os) = self::context(FakeOs::sandboxed());
     let outcome = run(&context, ProbeId::KeychainSearch);
     assert_eq!(outcome.result.state, ProbeState::Denied);
     assert_eq!(
@@ -77,7 +78,7 @@ fn the_credential_store_is_asked_for_the_absent_account() {
 
 #[test]
 fn the_process_query_asks_powershell_for_the_lock_pids_path() {
-    let (context, os) = context(FakeOs::unsandboxed().with_env("SystemRoot", r"C:\Windows"));
+    let (context, os) = self::context(FakeOs::unsandboxed().with_env("SystemRoot", r"C:\Windows"));
     let outcome = run(&context, ProbeId::DaemonProcessQuery);
     assert_eq!(outcome.result.state, ProbeState::Allowed);
     assert_eq!(outcome.result.note.as_deref(), Some("query only"));
@@ -101,7 +102,7 @@ fn the_process_query_asks_powershell_for_the_lock_pids_path() {
 fn an_unreadable_lock_leaves_the_process_query_unknown() {
     let mut os = FakeOs::unsandboxed();
     os.pid_file = Err(super::os_test::Answer::Denied);
-    let (context, os) = context(os);
+    let (context, os) = self::context(os);
     let outcome = run(&context, ProbeId::DaemonProcessQuery);
     assert_eq!(outcome.result.state, ProbeState::Unknown);
     assert_eq!(
@@ -113,7 +114,7 @@ fn an_unreadable_lock_leaves_the_process_query_unknown() {
 
 #[test]
 fn process_creation_is_the_shell_execute_broker() {
-    let (context, os) = context(FakeOs::unsandboxed());
+    let (context, os) = self::context(FakeOs::unsandboxed());
     let outcome = run(&context, ProbeId::BrokerShellExecute);
     assert_eq!(outcome.result.state, ProbeState::Allowed);
     let where_exe = Path::new(DEFAULT_SYSTEM_ROOT)
@@ -123,8 +124,33 @@ fn process_creation_is_the_shell_execute_broker() {
 }
 
 #[test]
+fn the_executable_is_opened_for_write_through_the_seam_only() {
+    // Windows keeps the open: the share check refuses a mapped image after
+    // the ACL's access check and before any handle exists, and there is no
+    // signature cache to invalidate (macOS asks through `access(2)`).
+    let (context, os) = self::context(FakeOs::unsandboxed());
+    let outcome = run(&context, ProbeId::ExeWrite);
+    assert_eq!(outcome.result.state, ProbeState::Allowed);
+    assert_eq!(os.calls(), ["OpenWrite /usr/local/bin/pam"]);
+    let (context, os) = self::context(FakeOs::sandboxed());
+    let outcome = run(&context, ProbeId::ExeWrite);
+    assert_eq!(outcome.result.state, ProbeState::Denied);
+    assert_eq!(os.calls(), ["OpenWrite /usr/local/bin/pam"]);
+    let mut fake = FakeOs::unsandboxed();
+    fake.exe = None;
+    let (context, os) = self::context(fake);
+    let outcome = run(&context, ProbeId::ExeWrite);
+    assert_eq!(outcome.result.state, ProbeState::Unknown);
+    assert!(outcome.result.note.unwrap().starts_with("current_exe:"));
+    assert!(
+        os.calls().is_empty(),
+        "nothing is opened without an executable"
+    );
+}
+
+#[test]
 fn the_harness_chain_is_one_powershell_walk() {
-    let (_, os) = context(FakeOs::unsandboxed());
+    let (_, os) = self::context(FakeOs::unsandboxed());
     let chain = harness_chain(os.as_ref(), 4242, std::time::Duration::from_secs(5));
     assert_eq!(chain, ["claude.exe", "cmd.exe", "explorer.exe"]);
     let calls = os.calls();

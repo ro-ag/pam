@@ -728,8 +728,9 @@ fn network_recovery(cause: &str) -> &'static str {
              download again."
         }
         "tls_revocation_unavailable" => {
-            "Windows could not check the certificate's revocation list; ask IT to make it \
-             reachable, then download again."
+            "Windows could not check the certificate's revocation list; publish the CA's CRL \
+             over http or install the CA in the operating system's certificate store, then \
+             download again."
         }
         "tls_error" => {
             "The TLS handshake failed; check the system clock and any inspecting proxy, then \

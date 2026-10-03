@@ -10,9 +10,11 @@ use pam_store::{ConnectorPatch, RequestState, Store};
 use serde_json::{Value, json};
 
 use crate::admin::{ACTION_ADMIN, ADMIN_CALLER_AGENT, AdminService, CAUSE_INVALID_ADMIN_ARGS};
+#[cfg(not(windows))]
+use crate::admin_network::CAUSE_CA_IMPORT_REFUSED;
 use crate::admin_network::{
-    ACTION_NETWORK_CONFIGURE, CAUSE_CA_IMPORT_REFUSED, CAUSE_NETWORK_INVALID, CAUSE_SETTING_LOCKED,
-    NETWORK_ADMIN_OPS, OP_NETWORK_GET, OP_NETWORK_SET, OP_NETWORK_TEST,
+    ACTION_NETWORK_CONFIGURE, CAUSE_NETWORK_INVALID, CAUSE_SETTING_LOCKED, NETWORK_ADMIN_OPS,
+    OP_NETWORK_GET, OP_NETWORK_SET, OP_NETWORK_TEST,
 };
 use crate::approval::ApprovalService;
 use crate::connector_service::ConnectorService;
@@ -271,12 +273,20 @@ async fn get_answers_the_defaults_in_the_shape_the_screen_reads() {
     let fixture = fixture().await;
     let (id, response) = fixture.run(OP_NETWORK_GET, json!({})).await;
     let body = body_of(response, Outcome::Verified);
+    // Windows offers no bundle file: the field is read-only there.
+    let ca_bundle = if cfg!(windows) {
+        let reason = body["settings"]["ca_bundle"]["reason"].clone();
+        assert!(reason.as_str().unwrap().contains("replaces"), "{reason}");
+        json!({ "supported": false, "reason": reason })
+    } else {
+        Value::Null
+    };
     assert_eq!(
         body["settings"],
         json!({
             "proxy": null,
             "no_proxy": [],
-            "ca_bundle": null,
+            "ca_bundle": ca_bundle,
             "engine_mirror": null,
             "models_mirror": null,
             "credential": { "present": false, "store_available": true },
@@ -683,6 +693,7 @@ async fn a_field_the_policy_owns_refuses_the_whole_patch_and_is_reported_locked(
     assert_eq!(settings.proxy().unwrap().host(), "managed.corp.example");
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_ca_bundle_is_imported_as_a_private_copy_and_removed_with_it() {
     let fixture = fixture().await;
@@ -691,6 +702,13 @@ async fn a_ca_bundle_is_imported_as_a_private_copy_and_removed_with_it() {
     let (id, body) = fixture
         .set(json!({ "ca_bundle": { "path": source.to_str().unwrap() } }))
         .await;
+    // Not measured on macOS, and the warning says so instead of claiming.
+    let warning = body["warning"].as_str().expect("a warning with the save");
+    assert!(
+        warning.contains("replace the system's certificate trust"),
+        "{warning}"
+    );
+    assert!(warning.contains("not been measured on macOS"), "{warning}");
     let bundle = &body["settings"]["ca_bundle"];
     let sha256 = bundle["sha256"].as_str().unwrap().to_owned();
     assert_eq!(sha256.len(), 64);
@@ -755,6 +773,7 @@ async fn a_ca_bundle_is_imported_as_a_private_copy_and_removed_with_it() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_ca_bundle_that_cannot_be_trusted_is_refused_and_the_old_one_stays() {
     let fixture = fixture().await;
@@ -1154,28 +1173,31 @@ async fn test_probes_the_configured_targets_through_the_saved_settings() {
                 .contains("Settings › Network"),
             "{results}"
         );
-        let source = fixture.ca_source();
-        fixture
-            .set(json!({ "ca_bundle": { "path": source.to_str().unwrap() } }))
-            .await;
-        // `openssl s_server -www` never answers a HEAD, so the probe ends on
-        // curl's own clock — after the handshake verified, which is what the
-        // bundle is for.
-        let (_, response) = fixture
-            .run(OP_NETWORK_TEST, json!({ "target": "jira" }))
-            .await;
-        let results = body_of(response, Outcome::Verified)["results"].clone();
         if cfg!(windows) {
-            // `Schannel` trusts the chain through the bundle and then
-            // checks revocation, which the committed leaf cannot satisfy
-            // (no CRL or OCSP address): the verdict moved from the issuer
-            // to the revocation check.
-            assert_eq!(results[0]["stage"], "tls", "{results}");
-            assert_eq!(
-                results[0]["cause"], "tls_revocation_unavailable",
-                "{results}"
-            );
+            // The bundle cannot be saved there; the issuer stays untrusted
+            // until the CA is in the Windows store, which a test must not
+            // touch. The revocation verdict a trusted private chain gets is
+            // asserted in `pam_net`'s TLS tests.
+            let source = fixture.ca_source();
+            let (cause, _, _) = fixture
+                .refuse(
+                    OP_NETWORK_SET,
+                    json!({ "ca_bundle": { "path": source.to_str().unwrap() } }),
+                )
+                .await;
+            assert_eq!(cause, "network_ca_unsupported_on_windows");
         } else {
+            let source = fixture.ca_source();
+            fixture
+                .set(json!({ "ca_bundle": { "path": source.to_str().unwrap() } }))
+                .await;
+            // `openssl s_server -www` never answers a HEAD, so the probe ends
+            // on curl's own clock — after the handshake verified, which is
+            // what the bundle is for.
+            let (_, response) = fixture
+                .run(OP_NETWORK_TEST, json!({ "target": "jira" }))
+                .await;
+            let results = body_of(response, Outcome::Verified)["results"].clone();
             assert_ne!(results[0]["stage"], "tls", "{results}");
             assert_ne!(results[0]["cause"], "tls_untrusted_issuer", "{results}");
         }
@@ -1205,4 +1227,49 @@ async fn the_request_row_never_carries_the_arguments() {
     assert_eq!(row.args_json, "{}");
     assert_eq!(row.state, RequestState::Done);
     assert_eq!(row.capability, OP_NETWORK_SET);
+}
+
+/// Windows trusts a private CA through its certificate store: a bundle
+/// import is refused before anything is read or written, and `get` shows
+/// the field read-only with the reason.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_ca_bundle_import_is_refused_on_windows_and_get_says_why() {
+    let fixture = fixture().await;
+    let source = fixture.ca_source();
+    let (cause, detail, recovery) = fixture
+        .refuse(
+            OP_NETWORK_SET,
+            json!({ "ca_bundle": { "path": source.to_str().unwrap() }, "no_proxy": ["x.example"] }),
+        )
+        .await;
+    assert_eq!(cause, "network_ca_unsupported_on_windows");
+    assert!(
+        detail.contains("replaces the Windows certificate store"),
+        "{detail}"
+    );
+    assert!(detail.contains("http CRL"), "{detail}");
+    assert!(recovery.contains("Windows certificate store"), "{recovery}");
+    assert!(
+        !fixture.base.path().join("net").exists()
+            || std::fs::read_dir(fixture.base.path().join("net"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+
+    let (_, response) = fixture.run(OP_NETWORK_GET, json!({})).await;
+    let body = body_of(response, Outcome::Verified);
+    assert_eq!(body["settings"]["ca_bundle"]["supported"], false);
+    assert!(
+        body["settings"]["ca_bundle"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("replaces")
+    );
+    // Nothing else in the refused patch was applied.
+    assert_eq!(body["settings"]["no_proxy"], json!([]));
+
+    // Clearing is not an import: it is accepted.
+    fixture.set(json!({ "ca_bundle": null })).await;
 }

@@ -416,8 +416,8 @@ impl NetFailure {
                 "Check this computer's clock; otherwise the service's certificate needs renewing."
             }
             Self::TlsRevocationUnavailable { .. } => {
-                "Ask IT to make the certificate's revocation list (CRL distribution point) \
-                 reachable from this computer."
+                "Publish the CA's CRL over http so this computer can reach it, or install the CA \
+                 in the operating system's certificate store."
             }
             Self::TlsFailed { .. } => {
                 "Check this computer's clock and certificate trust, and any proxy that inspects \

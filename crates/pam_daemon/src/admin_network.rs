@@ -63,6 +63,20 @@ pub const NETWORK_ADMIN_OPS: &[&str] = &[OP_NETWORK_GET, OP_NETWORK_SET, OP_NETW
 /// addition to the op's terminal [`crate::admin::ACTION_ADMIN`] row.
 pub const ACTION_NETWORK_CONFIGURE: &str = "network.configure";
 
+/// Refusal cause for a CA bundle import on Windows, where the operating
+/// system's certificate store is how a private CA is trusted.
+pub const CAUSE_CA_UNSUPPORTED_ON_WINDOWS: &str = "network_ca_unsupported_on_windows";
+
+/// Why a CA bundle file is not offered on Windows: what curl's Schannel
+/// build was measured to do with `cacert` (Windows 11, curl 8.21.0).
+const WINDOWS_CA_REASON: &str = "On Windows a CA bundle file replaces the Windows certificate store for the request instead of adding to it, so public hosts stop verifying, and a private CA whose certificates name no reachable http CRL fails Windows revocation checking (the revocation status is unknown).";
+
+/// The recovery for a CA bundle import on Windows.
+const RECOVERY_CA_WINDOWS: &str = "Install the CA in the Windows certificate store (machine or user); PAM's curl trusts the store.";
+
+/// The warning on a saved CA bundle where it is supported (macOS).
+const CA_BUNDLE_WARNING: &str = "A CA bundle is expected to replace the system's certificate trust for every connector call and download PAM makes, so a public host its certificates do not cover may stop verifying. This has not been measured on macOS. Prefer installing the CA in the system keychain.";
+
 /// Refusal cause for a patch that touches a field the policy owns.
 pub const CAUSE_SETTING_LOCKED: &str = "setting_locked";
 
@@ -161,7 +175,7 @@ impl AdminService {
         };
         let document = &loaded.resolved.document;
         let (present, store_available) = self.network.credential_present().await;
-        let ca_bundle = match &document.ca_bundle {
+        let mut ca_bundle = match &document.ca_bundle {
             None => Value::Null,
             Some(bundle) => {
                 let mut value = bundle_json(bundle);
@@ -171,6 +185,15 @@ impl AdminService {
                 value
             }
         };
+        if cfg!(windows) {
+            // Read-only there: the screen says why, and any bundle an older
+            // document still names stays visible.
+            if ca_bundle.is_null() {
+                ca_bundle = json!({});
+            }
+            ca_bundle["supported"] = json!(false);
+            ca_bundle["reason"] = json!(WINDOWS_CA_REASON);
+        }
         let allowed = &loaded.resolved.mirror_allowed_hosts;
         let mut effective = serde_json::Map::new();
         for field in Field::ALL {
@@ -236,6 +259,7 @@ impl AdminService {
                 (invalid.raw, NetworkDocument::default(), defaults.resolved)
             }
         };
+        patch.refuse_ca_import_on_windows()?;
         let locked: Vec<&str> = patch
             .fields()
             .into_iter()
@@ -310,9 +334,13 @@ impl AdminService {
         self.network
             .prune_ca_copies(next.ca_bundle.as_ref().map(|bundle| bundle.sha256.as_str()));
 
+        let mut body = self.network_body().await?;
+        if matches!(patch.ca_bundle, Change::Set(_)) {
+            body["warning"] = json!(CA_BUNDLE_WARNING);
+        }
         Ok(AdminOk {
             outcome: Outcome::Changed,
-            body: self.network_body().await?,
+            body,
             audit: json!({ "op": OP_NETWORK_SET, "changed": changed }),
         })
     }
@@ -847,6 +875,19 @@ struct Patch {
 }
 
 impl Patch {
+    /// A bundle import is refused where the OS store is how a private CA is
+    /// trusted, before anything is read or written.
+    fn refuse_ca_import_on_windows(&self) -> Result<(), AdminRefusal> {
+        if cfg!(windows) && matches!(self.ca_bundle, Change::Set(_)) {
+            return Err(AdminRefusal {
+                cause: CAUSE_CA_UNSUPPORTED_ON_WINDOWS,
+                detail: WINDOWS_CA_REASON.to_owned(),
+                recovery: RECOVERY_CA_WINDOWS,
+            });
+        }
+        Ok(())
+    }
+
     const KEYS: [&'static str; 6] = [
         "proxy",
         "credential",

@@ -440,10 +440,10 @@ async fn a_registry_switch_rejects_an_entry_resolved_from_the_old_directory() {
 
 /// The fake llama-server `cargo test` builds for `pam_model`, found next to
 /// this test binary's directory; `None` when it was not built.
-#[cfg(unix)]
 pub(crate) fn fake_engine_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.parent()?.join("pam-fake-llama-server");
+    let name = format!("pam-fake-llama-server{}", std::env::consts::EXE_SUFFIX);
+    let path = exe.parent()?.parent()?.join(name);
     path.is_file().then_some(path)
 }
 

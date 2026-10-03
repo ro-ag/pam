@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use pam_model::engine::{self, ENGINE_BUILD, ENGINE_TAG, EngineRelease, EngineSource, Target};
+#[cfg(unix)]
+use pam_model::engine::EngineSource;
+use pam_model::engine::{self, ENGINE_BUILD, ENGINE_TAG, EngineRelease, Target};
 use pam_net::{NetFailure, NetSettings, NetworkSource};
 use pam_proto::{Caller, Envelope, Outcome, PROTOCOL_VERSION, Response};
 use pam_store::Store;
@@ -99,10 +101,13 @@ async fn fixture(
     managed: Option<ManagedNetwork>,
     source: Option<Arc<dyn NetworkSource>>,
 ) -> Fixture {
-    let base = tempfile::Builder::new()
-        .prefix("pam-eng-")
-        .tempdir_in("/tmp")
-        .expect("tempdir");
+    let mut base = tempfile::Builder::new();
+    base.prefix("pam-eng-");
+    // Windows has no such socket path to fit, and no `/tmp`.
+    #[cfg(unix)]
+    let base = base.tempdir_in("/tmp").expect("tempdir");
+    #[cfg(not(unix))]
+    let base = base.tempdir().expect("tempdir");
     let models_dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let (events, _rx) = EventPublisher::for_tests();
@@ -213,6 +218,13 @@ impl Fixture {
 fn pinned() -> &'static engine::EngineAsset {
     Target::current().expect("a supported host").asset()
 }
+
+/// What the release archive holds the server as on this host.
+const SERVER_FILE: &str = if cfg!(windows) {
+    "llama-server.exe"
+} else {
+    "llama-server"
+};
 
 // ------------------------------------------------------------------ tests
 
@@ -387,7 +399,6 @@ async fn a_mirror_outside_the_policy_allowlist_refuses_the_install_by_name() {
 /// another name is refused naming the asset this build needs; a file with
 /// the right name and the wrong size is refused with both sizes; a symlink
 /// and a missing path are refused by name. Nothing is copied or installed.
-#[cfg(unix)]
 #[tokio::test]
 async fn import_refuses_what_is_not_the_pinned_archive_with_the_pinned_numbers() {
     timeout(DEADLINE, async {
@@ -411,7 +422,7 @@ async fn import_refuses_what_is_not_the_pinned_archive_with_the_pinned_numbers()
 
         let unpacked = share.path().join(format!("llama-{ENGINE_TAG}"));
         std::fs::create_dir(&unpacked).unwrap();
-        std::fs::write(unpacked.join("llama-server"), b"x").unwrap();
+        std::fs::write(unpacked.join(SERVER_FILE), b"x").unwrap();
         let detail = expect_refusal(
             fx.run(
                 OP_ENGINE_IMPORT,
@@ -435,16 +446,19 @@ async fn import_refuses_what_is_not_the_pinned_archive_with_the_pinned_numbers()
         assert!(detail.contains(&asset.bytes.to_string()), "{detail}");
         assert!(detail.contains("15 bytes"), "{detail}");
 
-        let link = share.path().join("link");
-        std::os::unix::fs::symlink(&wrong_size, &link).unwrap();
-        expect_refusal(
-            fx.run(
-                OP_ENGINE_IMPORT,
-                json!({ "confirm": true, "path": link.display().to_string() }),
-            )
-            .await,
-            "engine_import_symlink",
-        );
+        #[cfg(unix)]
+        {
+            let link = share.path().join("link");
+            std::os::unix::fs::symlink(&wrong_size, &link).unwrap();
+            expect_refusal(
+                fx.run(
+                    OP_ENGINE_IMPORT,
+                    json!({ "confirm": true, "path": link.display().to_string() }),
+                )
+                .await,
+                "engine_import_symlink",
+            );
+        }
         expect_refusal(
             fx.run(
                 OP_ENGINE_IMPORT,
@@ -464,28 +478,27 @@ async fn import_refuses_what_is_not_the_pinned_archive_with_the_pinned_numbers()
     .expect("test within deadline");
 }
 
-/// The fake server packed as the pinned release would be: a `.tar.gz`
-/// holding `llama-<tag>/llama-server`, built with the OS tar the installer
-/// uses, and the release pinned to its bytes (tag and build stay the real
-/// pin, which is what `engine::status` reads).
-#[cfg(unix)]
+/// The fake server packed as the pinned release would be: a `.tar.gz` (a
+/// `.zip` on Windows) holding `llama-<tag>/llama-server`, built with the OS
+/// tar the installer uses, and the release pinned to its bytes (tag and
+/// build stay the real pin, which is what `engine::status` reads).
 fn fake_release_archive(fake: &Path) -> (tempfile::TempDir, PathBuf, EngineRelease) {
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
     let tree = dir.path().join(format!("llama-{ENGINE_TAG}"));
     std::fs::create_dir_all(&tree).unwrap();
-    std::fs::copy(fake, tree.join("llama-server")).unwrap();
-    let asset_name = format!("llama-{ENGINE_TAG}-bin-test.tar.gz");
+    std::fs::copy(fake, tree.join(SERVER_FILE)).unwrap();
+    let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let asset_name = format!("llama-{ENGINE_TAG}-bin-test.{extension}");
     let archive = dir.path().join(&asset_name);
-    let status = std::process::Command::new(engine::trusted_tar_path().unwrap())
-        .arg("-czf")
+    let mut tar = std::process::Command::new(engine::trusted_tar_path().unwrap());
+    // `-a` picks the format from the suffix (the Windows tar writes zip).
+    tar.arg(if cfg!(windows) { "-acf" } else { "-czf" })
         .arg(&archive)
         .arg("-C")
         .arg(dir.path())
-        .arg(format!("llama-{ENGINE_TAG}"))
-        .status()
-        .unwrap();
-    assert!(status.success());
+        .arg(format!("llama-{ENGINE_TAG}"));
+    assert!(tar.status().unwrap().success());
     let bytes = std::fs::read(&archive).unwrap();
     let release = EngineRelease {
         tag: ENGINE_TAG.to_owned(),
@@ -505,7 +518,6 @@ fn fake_release_archive(fake: &Path) -> (tempfile::TempDir, PathBuf, EngineRelea
 /// → one generation; then Remove is refused while the model is loaded,
 /// and clears the engine directory once it is unloaded. The network
 /// source is never asked, so curl never ran.
-#[cfg(unix)]
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,

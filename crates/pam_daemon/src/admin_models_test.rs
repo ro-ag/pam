@@ -1268,7 +1268,6 @@ async fn an_import_is_unverified_without_a_digest_and_verified_with_the_right_on
 /// stray key, a relative path, a bad digest shape, a vendor that is not one
 /// plain segment, a missing file, a symbolic link, a non-gguf, a file
 /// already inside the models directory, and a destination a transfer holds.
-#[cfg(unix)]
 #[tokio::test]
 async fn an_import_refuses_bad_arguments_and_sources_by_name() {
     timeout(DEADLINE, async {
@@ -1290,13 +1289,16 @@ async fn an_import_refuses_bad_arguments_and_sources_by_name() {
             assert!(detail.contains(needle), "{args}: {detail}");
         }
 
-        let link = share.path().join("link.gguf");
-        std::os::unix::fs::symlink(&source, &link).unwrap();
-        let detail = expect_refusal(
-            fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": link.display().to_string() })).await,
-            CAUSE_IMPORT_SOURCE_REFUSED,
-        );
-        assert!(detail.contains("symbolic link"), "{detail}");
+        #[cfg(unix)]
+        {
+            let link = share.path().join("link.gguf");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let detail = expect_refusal(
+                fx.run(OP_MODELS_IMPORT, json!({ "confirm": true, "path": link.display().to_string() })).await,
+                CAUSE_IMPORT_SOURCE_REFUSED,
+            );
+            assert!(detail.contains("symbolic link"), "{detail}");
+        }
 
         let text = share.path().join("notes.txt");
         std::fs::write(&text, b"x").unwrap();
@@ -1398,9 +1400,11 @@ async fn the_import_and_engine_ops_are_dispatched_and_listed() {
 fn an_import_of_a_catalog_sized_file_is_held_to_the_catalog_not_the_caller() {
     let registry = pam_model::Registry::new("/models");
     let preset = &CATALOG[0];
+    // Absolute on every platform: a bare `/share/…` has no drive on Windows.
+    let share = std::env::temp_dir().join("anything.gguf");
     let args = json!({
         "confirm": true,
-        "path": "/share/anything.gguf",
+        "path": share.to_str().unwrap(),
         "vendor": "mine",
         "expected_sha256": "f".repeat(64),
     });

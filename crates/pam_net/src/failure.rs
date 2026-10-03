@@ -644,12 +644,15 @@ fn classify_tls(transfer: &Transfer<'_>, host: String) -> NetFailure {
         "revocation status is unknown",
         // Older Schannel builds name the chain-trust flag instead of the sentence.
         "cert_trust_revocation_status_unknown",
+        "cert_trust_is_offline_revocation",
     ]) {
         return NetFailure::TlsRevocationUnavailable { host };
     }
     if has(&[
         "certificate has expired",
         "not yet valid",
+        // Older Schannel builds name the chain-trust flag.
+        "cert_trust_is_not_time_valid",
         "not time valid",
         "sec_e_cert_expired",
         "cert_e_expired",
@@ -661,6 +664,8 @@ fn classify_tls(transfer: &Transfer<'_>, host: String) -> NetFailure {
         "self signed certificate",
         "self-signed certificate",
         "sec_e_untrusted_root",
+        "cert_trust_is_untrusted_root",
+        "cert_trust_is_partial_chain",
         "cert_e_untrustedroot",
         "certificate chain is incomplete",
         "based on an untrusted root",

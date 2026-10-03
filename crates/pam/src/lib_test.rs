@@ -26,6 +26,9 @@ fn a_plain_binary_stays_a_cli() {
 #[test]
 fn the_playbook_carries_the_whole_agent_loop() {
     for marker in [
+        "pam doctor --json",
+        "`established`",
+        "`not_established`",
         "pam status --json",
         "pam flow list --json",
         "pam flow inspect <id> key=value --json",

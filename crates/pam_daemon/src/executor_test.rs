@@ -738,3 +738,441 @@ async fn cancel_of_a_parked_ticket_is_cancelled_queued() {
     .await
     .expect("test within deadline");
 }
+
+// ---------------------------------------------------------------------------
+// `doctor.report`: the boundary self-check record.
+// ---------------------------------------------------------------------------
+
+mod doctor_report {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use pam_proto::doctor::{
+        DaemonFacts, DoctorReport, EnvFacts, Frontend, OsError, Platform, Probe, ProbeId,
+        ProbeResult,
+    };
+    use pam_proto::wire::Via;
+    use pam_store::{
+        BoundaryObservationInsert, BoundaryPeer, OBSERVATION_ADMIN_CONTACT, RequestIngress,
+        RequestOrigin,
+    };
+    use serde_json::{Value, json};
+
+    use super::{Fixture, fixture};
+    use crate::boundary::{
+        ACTION_DOCTOR_REPORT, AdminContact, Boundary, CAP_DOCTOR_REPORT,
+        CAUSE_BOUNDARY_UNAVAILABLE, CAUSE_INVALID_REPORT, SystemResolver,
+    };
+    use crate::executor::{BuiltinCapability, CapabilityFailure, ExecContext};
+    use crate::ingress::PeerIdentity;
+    use crate::policy::{CapabilityClass, classify};
+
+    const IMAGE: &str = "/Applications/PAM.app/Contents/MacOS/pam";
+    const PID: u32 = 4242;
+    /// The must-deny probe that stands for reaching the admin plane: the
+    /// socket on macOS, the control file on Windows.
+    const ADMIN_PROBE: ProbeId = if cfg!(windows) {
+        ProbeId::AdminControlRead
+    } else {
+        ProbeId::AdminEndpoint
+    };
+
+    /// A full document for this platform: every probe denied except
+    /// the admin probe when `reachable`, which makes it `not_established`.
+    pub(crate) fn document(admin_reachable: bool) -> Value {
+        let platform = Platform::current().expect("a supported platform");
+        let probes = ProbeId::all()
+            .map(|id| {
+                if !id.applies_to(platform) {
+                    return Probe::not_applicable(id, platform);
+                }
+                match id {
+                    ProbeId::PublicUnlink => Probe::not_probed(id, "side effect"),
+                    ProbeId::PublicReach | ProbeId::RunLockProbe => {
+                        Probe::new(id, ProbeResult::allowed())
+                    }
+                    id if id == ADMIN_PROBE && admin_reachable => {
+                        Probe::new(id, ProbeResult::allowed())
+                    }
+                    _ => Probe::new(
+                        id,
+                        ProbeResult::denied(OsError::of_kind("PermissionDenied")),
+                    ),
+                }
+            })
+            .collect();
+        let env = EnvFacts {
+            socket_dir: None,
+            base_dir_override: None,
+            resolved_base: "/Users/me/.pam".to_owned(),
+            resolved_endpoint: "/Users/me/.pam/run/pam.sock".to_owned(),
+            client_version: "0.5.0".to_owned(),
+            exe: Some("/usr/local/bin/pam".to_owned()),
+            cwd_repo: Some("/repo/test".to_owned()),
+            frontend: Frontend::Embedded,
+            harness_chain: vec!["zsh".to_owned(), "claude".to_owned()],
+        };
+        let daemon = Some(DaemonFacts {
+            version: "0.5.0".to_owned(),
+            proto: 2,
+            epoch: "01JB".to_owned(),
+            via: Via::Direct,
+        });
+        let report = DoctorReport::new(platform, 1_759_400_000, daemon, probes, env);
+        serde_json::to_value(report.as_args()).unwrap()
+    }
+
+    fn origin() -> RequestOrigin {
+        RequestOrigin {
+            ingress: RequestIngress::Public,
+            peer_uid: Some(501),
+            peer_pid: Some(PID),
+            relayed: false,
+        }
+    }
+
+    async fn boundary(fx: &Fixture) -> Arc<Boundary> {
+        let boundary = Boundary::new(
+            Arc::clone(&fx.store),
+            Some(PathBuf::from(IMAGE)),
+            Arc::new(SystemResolver),
+        );
+        boundary.load().await;
+        boundary
+    }
+
+    /// A context whose request row exists (admitted on the public plane
+    /// from pid 4242) and whose row carries the pipeline's resolution.
+    async fn ctx(
+        fx: &Fixture,
+        id: &str,
+        args: Value,
+        boundary: Option<&Arc<Boundary>>,
+    ) -> ExecContext {
+        fx.store
+            .insert_admitted_request_from(
+                id,
+                CAP_DOCTOR_REPORT,
+                "/repo/test",
+                "claude",
+                "{}",
+                None,
+                9_000_000_000_000,
+                &origin(),
+            )
+            .await
+            .unwrap();
+        fx.store
+            .set_request_peer_facts(id, Some("/usr/local/bin/pam"), Some("claude"))
+            .await
+            .unwrap();
+        let mut ctx = fx.ctx_uncancelled(id, args);
+        ctx.peer = origin();
+        ctx.capability = CAP_DOCTOR_REPORT.to_owned();
+        if let Some(boundary) = boundary {
+            assert!(ctx.status.attach_boundary(Arc::clone(boundary)));
+        }
+        ctx
+    }
+
+    #[test]
+    fn doctor_report_is_a_control_capability_dispatched_by_name() {
+        assert_eq!(
+            BuiltinCapability::from_name(CAP_DOCTOR_REPORT),
+            Some(BuiltinCapability::DoctorReport)
+        );
+        assert_eq!(BuiltinCapability::DoctorReport.name(), "doctor.report");
+        assert_eq!(classify(CAP_DOCTOR_REPORT), Some(CapabilityClass::Control));
+    }
+
+    #[tokio::test]
+    async fn a_valid_report_is_stored_under_the_daemon_peer_facts_with_its_audit_row() {
+        let fx = fixture().await;
+        let boundary = boundary(&fx).await;
+        let ctx = ctx(&fx, "req_doc", document(true), Some(&boundary)).await;
+        let output = BuiltinCapability::DoctorReport.execute(ctx).await.unwrap();
+        assert_eq!(output.outcome, pam_proto::Outcome::Verified);
+        let body = output.body;
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["request_id"], "req_doc");
+        assert_eq!(body["verdict"], "not_established");
+        assert_eq!(body["peer"]["uid"], 501);
+        assert_eq!(body["peer"]["pid"], PID);
+        assert_eq!(body["peer"]["exe"], "/usr/local/bin/pam");
+        assert_eq!(body["peer"]["harness"], "claude");
+        assert_eq!(body["peer"]["relayed"], false);
+        assert_eq!(body["claimed_harness"], "claude");
+        assert_eq!(body["harness_agrees"], true);
+        assert_eq!(body["attributed_admin_contacts"], 0);
+        let report_id = body["report_id"].as_i64().unwrap();
+
+        let rows = fx.store.list_boundary_reports(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, report_id);
+        assert_eq!(row.request_id.as_deref(), Some("req_doc"));
+        assert_eq!(row.verdict, "not_established");
+        assert_eq!(row.failed, [ADMIN_PROBE.as_str()]);
+        assert!(row.unverified.is_empty());
+        assert_eq!(row.agent, "claude");
+        assert_eq!(row.repo, "/repo/test");
+        assert_eq!(row.report_ts, 1_759_400_000);
+        assert_eq!(row.client_version, "0.5.0");
+        assert_eq!(
+            row.peer,
+            BoundaryPeer {
+                uid: Some(501),
+                pid: Some(PID),
+                exe: Some("/usr/local/bin/pam".to_owned()),
+                harness: Some("claude".to_owned()),
+            }
+        );
+        let stored: Value = serde_json::from_str(&row.report_json).unwrap();
+        assert_eq!(stored, document(true));
+
+        let audit = fx.store.audit_for_request("req_doc").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, ACTION_DOCTOR_REPORT);
+        assert_eq!(audit[0].decision, pam_store::Decision::Allow);
+        assert_eq!(audit[0].actor, pam_store::Actor::System);
+        let detail: Value = serde_json::from_str(audit[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["verdict"], "not_established");
+        assert_eq!(detail["failed"], json!([ADMIN_PROBE.as_str()]));
+        assert_eq!(detail["unverified"], json!([]));
+        assert_eq!(detail["peer_harness"], "claude");
+
+        // The status block sees it at once.
+        let block = boundary.status_block();
+        assert_eq!(block["last_report"]["verdict"], "not_established");
+        assert_eq!(block["last_report"]["request_id"], "req_doc");
+        assert_eq!(block["last_report"]["peer_pid"], PID);
+        assert_eq!(block["last_report"]["peer_harness"], "claude");
+        assert_eq!(
+            block["last_report"]["failed"],
+            json!([ADMIN_PROBE.as_str()])
+        );
+        assert_eq!(block["last_report"]["ts"], 1_759_400_000);
+        assert_eq!(block["reports"]["not_established"], 1);
+        assert!(
+            block["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("not_established ")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_from_a_relayed_peer_records_the_relay_harness_and_agreement_is_undetermined()
+    {
+        let fx = fixture().await;
+        let boundary = boundary(&fx).await;
+        let mut ctx = ctx(&fx, "req_relay", document(false), Some(&boundary)).await;
+        // No resolution on the row (the relay's pid is `pam listen`, here
+        // a pid nobody holds) and the hello said relay.
+        fx.store
+            .set_request_peer_facts("req_relay", None, None)
+            .await
+            .unwrap();
+        ctx.peer = RequestOrigin {
+            relayed: true,
+            peer_pid: Some(u32::MAX - 7),
+            ..origin()
+        };
+        let body = BuiltinCapability::DoctorReport
+            .execute(ctx)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(body["verdict"], "established");
+        assert_eq!(body["peer"]["harness"], "relay");
+        assert_eq!(body["peer"]["exe"], Value::Null);
+        assert_eq!(body["peer"]["relayed"], true);
+        // The daemon sees the relay, not the client's harness: it cannot
+        // say the two disagree.
+        assert_eq!(body["harness_agrees"], Value::Null);
+        let block = boundary.status_block();
+        assert_eq!(block["last_report"]["relayed"], true);
+        assert!(block["summary"].as_str().unwrap().contains(", relay)"));
+    }
+
+    /// Under a profile that denies `/bin/ps` the client's chain is empty
+    /// and it claims `unknown`; the daemon, which resolved the harness
+    /// itself, answers undetermined rather than `false`.
+    #[tokio::test]
+    async fn a_client_that_could_not_walk_its_chain_leaves_the_agreement_undetermined() {
+        let fx = fixture().await;
+        let boundary = boundary(&fx).await;
+        let mut args = document(false);
+        args["env"]["harness_chain"] = json!([]);
+        let ctx = ctx(&fx, "req_sandboxed", args, Some(&boundary)).await;
+        let body = BuiltinCapability::DoctorReport
+            .execute(ctx)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["peer"]["harness"], "claude");
+        assert_eq!(body["claimed_harness"], "unknown");
+        assert_eq!(body["harness_agrees"], Value::Null);
+    }
+
+    async fn refused(
+        fx: &Fixture,
+        id: &str,
+        args: Value,
+        boundary: &Arc<Boundary>,
+    ) -> (String, String) {
+        let ctx = ctx(fx, id, args, Some(boundary)).await;
+        match BuiltinCapability::DoctorReport.execute(ctx).await {
+            Err(CapabilityFailure::Refused {
+                cause,
+                detail,
+                recovery,
+            }) => {
+                assert!(!recovery.is_empty());
+                (cause, detail)
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forged_oversized_or_unrecordable_document_is_refused_and_nothing_is_stored() {
+        let fx = fixture().await;
+        let boundary = boundary(&fx).await;
+
+        // The verdict says established while a must-deny probe was allowed.
+        let mut forged = document(true);
+        forged["verdict"] = json!("established");
+        forged["failed"] = json!([]);
+        let (cause, detail) = refused(&fx, "req_forged", forged, &boundary).await;
+        assert_eq!(cause, CAUSE_INVALID_REPORT);
+        assert!(
+            detail.starts_with("doctor.report was refused: "),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("verdict") || detail.contains("inconsisten"),
+            "{detail}"
+        );
+
+        // Over the 16 KiB bound, refused before parsing.
+        let mut oversized = document(false);
+        oversized["env"]["cwd_repo"] = json!("x".repeat(20 * 1024));
+        let (cause, detail) = refused(&fx, "req_big", oversized, &boundary).await;
+        assert_eq!(cause, CAUSE_INVALID_REPORT);
+        assert!(detail.contains("16") || detail.contains("byte"), "{detail}");
+
+        // `cannot_probe` could not have arrived over the public socket.
+        let mut unreachable = document(false);
+        let probes = unreachable["probes"].as_array_mut().unwrap();
+        probes[0]["result"] = json!("denied");
+        unreachable["verdict"] = json!("cannot_probe");
+        let (cause, _) = refused(&fx, "req_cannot", unreachable, &boundary).await;
+        assert_eq!(cause, CAUSE_INVALID_REPORT);
+
+        // Not even a document.
+        let (cause, _) = refused(&fx, "req_junk", json!({ "hello": 1 }), &boundary).await;
+        assert_eq!(cause, CAUSE_INVALID_REPORT);
+
+        assert!(fx.store.list_boundary_reports(10).await.unwrap().is_empty());
+        for id in ["req_forged", "req_big", "req_cannot", "req_junk"] {
+            assert!(
+                fx.store.audit_for_request(id).await.unwrap().is_empty(),
+                "{id}"
+            );
+        }
+        assert_eq!(boundary.status_block()["last_report"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn without_an_observer_the_capability_refuses_rather_than_dropping_the_report() {
+        let fx = fixture().await;
+        let ctx = ctx(&fx, "req_none", document(false), None).await;
+        match BuiltinCapability::DoctorReport.execute(ctx).await {
+            Err(CapabilityFailure::Refused { cause, .. }) => {
+                assert_eq!(cause, CAUSE_BOUNDARY_UNAVAILABLE);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_contacts_from_the_same_pid_are_attributed_before_and_after_the_report() {
+        let fx = fixture().await;
+        let boundary = boundary(&fx).await;
+        let insert = |pid: u32| BoundaryPeer {
+            uid: Some(501),
+            pid: Some(pid),
+            exe: Some("/usr/local/bin/pam".to_owned()),
+            harness: Some("zsh".to_owned()),
+        };
+        let mine = insert(PID);
+        let other = insert(9);
+        for peer in [&mine, &other] {
+            fx.store
+                .insert_boundary_observation(BoundaryObservationInsert {
+                    kind: OBSERVATION_ADMIN_CONTACT,
+                    expected: false,
+                    peer,
+                    detail: Some("accepted; the peer sent nothing"),
+                    attributed: None,
+                })
+                .await
+                .unwrap();
+        }
+        let ctx = ctx(&fx, "req_doc", document(true), Some(&boundary)).await;
+        let body = BuiltinCapability::DoctorReport
+            .execute(ctx)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(body["attributed_admin_contacts"], 1);
+
+        // A contact right after the report, from the same pid: born
+        // attributed. From another pid: not.
+        boundary
+            .observe_admin_contact(AdminContact::Accepted {
+                peer: PeerIdentity::Unix {
+                    uid: 501,
+                    gid: 20,
+                    pid: Some(PID),
+                },
+                spoke: false,
+            })
+            .await;
+        boundary
+            .observe_admin_contact(AdminContact::Accepted {
+                peer: PeerIdentity::Unix {
+                    uid: 501,
+                    gid: 20,
+                    pid: Some(77),
+                },
+                spoke: false,
+            })
+            .await;
+        let rows = fx.store.list_boundary_observations(10).await.unwrap();
+        assert_eq!(rows.len(), 4);
+        let attributed = |pid: u32| -> Vec<Option<String>> {
+            rows.iter()
+                .filter(|row| row.peer.pid == Some(pid))
+                .map(|row| row.attributed.clone())
+                .collect()
+        };
+        assert_eq!(
+            attributed(PID),
+            [Some("req_doc".to_owned()), Some("req_doc".to_owned())]
+        );
+        assert_eq!(attributed(9), [None]);
+        assert_eq!(attributed(77), [None]);
+        let block = boundary.status_block();
+        assert_eq!(block["admin_contacts"]["unattributed"], 2);
+        assert_eq!(block["admin_contacts"]["total"], 4);
+        assert!(
+            block["summary"]
+                .as_str()
+                .unwrap()
+                .ends_with("admin contacts unattributed: 2")
+        );
+    }
+}

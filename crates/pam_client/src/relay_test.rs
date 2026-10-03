@@ -498,6 +498,7 @@ fn fake_daemon(path: &Path, script: Vec<Greets>) -> Arc<AtomicUsize> {
                             proto: WIRE_PROTOCOL,
                             version: "9.9.9".to_owned(),
                             epoch: "01JB2M5T8Q0V7K3W9X4Y6Z1ABC".to_owned(),
+                            pid: std::process::id(),
                         });
                         let _ = pam_daemon::framed::send(&mut stream, &ack, 4096).await;
                     }

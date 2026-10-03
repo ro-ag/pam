@@ -66,7 +66,8 @@ Every subcommand the binary has; there is no raw-protocol escape hatch and no
 security command. `--json` prints the daemon's response unchanged, and every
 subcommand maps its outcome to the same exit codes: `0` success (or a ticket
 handed off), `1` transport/client failure or observation timeout, `2` usage
-error, `3` refused, `4` unresolved, `5` blocked. A daemon started from another
+error, `3` refused, `4` unresolved, `5` blocked, `6` sandbox boundary not
+established (`pam doctor` only). A daemon started from another
 build refuses the command (`client_version_mismatch`, exit `3`) and keeps
 running; a daemon of version 0.4 or older that this process may not stop is a
 client failure (exit `1`) with the instruction to run `pam daemon stop` and
@@ -86,11 +87,32 @@ then `pam status` outside the sandbox.
 | `pam flow inspect <id> [key=value…] [--json]` | Inputs and readiness (including whether a model summary will be available) without running. The first line carries the flow's digest. |
 | `pam flow run <id> [key=value…] [--no-wait] [--deadline-ms N] [--digest <sha256>] [--json]` | Runs one flow and prints its verdict (default deadline 30 minutes); `--no-wait` prints a ticket to `subscribe` to. `--digest` runs it only if the flow still has the digest `pam flow inspect` printed; otherwise it refuses as `flow_changed`. If the reply is lost, the request id and the `pam wait` recovery are printed. |
 | `pam flow result <ticket> [--json]` | The durable result of a finished flow ticket, including the state-changing steps that ran (`effects`). Local-model summaries are labelled `[untrusted local-model summary]`. |
+| `pam doctor [--json] [--no-report] [--timeout-ms N]` | Checks the caller's own sandbox boundary: from where it runs, it probes PAM's private paths, endpoints and brokers (writing, creating and sending nothing), prints the verdict and sends the document to the daemon as `doctor.report` (`--no-report` skips that; the exit code never depends on it). Exit `0` `established`, `6` `not_established` (the failed probes are listed), `1` `cannot_probe` (the daemon did not answer the hello; nothing is started). With `--json` the document is the only thing on stdout; when the daemon answered, its reply is the top-level `daemon_reply` member. See [Verifying your agent's sandbox](#verifying-your-agents-sandbox). |
+| `pam doctor --profile <claude-code\|codex\|gemini-cli\|copilot-cli\|sandbox-exec> [--base DIR] [--managed]` | Prints the reference sandbox profile for that harness with the base directory filled in (default: the resolved base; `--base` is made absolute and resolved) and exits `0` without probing or dialing; `--managed` prints the locked variant where one exists (Claude Code). The sources, with the per-harness guides, live under [docs/sandbox/](docs/sandbox/README.md). |
 | `pam service install [--base-dir DIR]\|uninstall\|status [--json]` | The login-start unit (see [Start at login](#start-at-login)). |
 | `pam listen <dir>` (unix) | Serves a session socket relay: binds one socket, `pam.sock`, in `<dir>` and forwards to the daemon, for clients under an agent sandbox that blocks the daemon's own socket — point them at it with `PAM_SOCKET_DIR=<dir>` (see [Session socket relay](docs/session-socket-relay.md)). It refuses a `<dir>` that is a link or is shared, and replaces a daemon of version 0.4 or older when it starts. |
 | `pam daemon` | Runs the daemon in the foreground. |
 | `pam daemon stop` | Signals the running daemon to drain and exit. |
 | `pam gui` | Opens the desktop control center. |
+
+### Verifying your agent's sandbox
+
+PAM's administration boundary rests on the agent's OS sandbox keeping it away
+from everything PAM owns except one public socket; PAM does not install that
+sandbox, it checks it. Apply the harness's profile (`pam doctor --profile
+<harness>` prints it; [docs/sandbox/](docs/sandbox/README.md) explains where it
+goes), then run `pam doctor` from where the agent runs — by the agent, or by you
+in the same terminal with the sandbox applied. `established` means the sandbox
+holds that process to the public socket; `not_established` names what it could
+reach, which is yours to fix, never the agent's to work around. The daemon keeps
+the last report and its own observations of its private plane: `pam status`
+prints them on the `boundary:` line, and the desktop app shows them under
+Settings › Daemon and on Home. A report changes no authority: authority is per
+operating-system user, so every process that can reach the public socket as that
+user holds the whole approved set. Caller labels, pids and executable paths are
+attribution; agents that need different authority run as different users, and
+`pam doctor` proves each one's sandbox (see
+[Administration boundary](docs/admin-boundary.md#verifying-the-boundary)).
 
 ## Desktop workspace
 

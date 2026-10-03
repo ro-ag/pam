@@ -159,6 +159,213 @@ export function keyringHealth(status: StatusBody | null | undefined): KeyringHea
   };
 }
 
+// --- boundary (pam doctor) --------------------------------------------------
+
+/**
+ * The harness names `pam doctor --profile` takes, in the order the CLI
+ * documents them (`pam::doctor::profiles::Harness::ALL`; a test in the
+ * `pam` crate pins this line to it, because the window cannot ask the
+ * binary).
+ */
+export const HARNESS_PROFILES = [
+  "claude-code",
+  "codex",
+  "gemini-cli",
+  "copilot-cli",
+  "sandbox-exec",
+] as const;
+
+export type HarnessProfile = (typeof HARNESS_PROFILES)[number];
+
+/**
+ * The profile a report's agent runs under (`claude` → `claude-code`, as
+ * `pam::doctor::profiles::Harness::parse` maps it); `sandbox-exec`, the
+ * harness-less fallback, for anything else — including no report at all.
+ */
+export function harnessProfileFor(agent: string | null | undefined): HarnessProfile {
+  switch ((agent ?? "").toLowerCase()) {
+    case "claude":
+    case "claude-code":
+      return "claude-code";
+    case "codex":
+      return "codex";
+    case "gemini":
+    case "gemini-cli":
+      return "gemini-cli";
+    case "copilot":
+    case "github-copilot":
+    case "copilot-cli":
+      return "copilot-cli";
+    default:
+      return "sandbox-exec";
+  }
+}
+
+/**
+ * A `pam doctor` verdict. The daemon records only the first two (a
+ * `cannot_probe` document never arrives over the public socket), but the
+ * type keeps the third so a block that carries it is still read.
+ */
+export type BoundaryVerdict = "established" | "not_established" | "cannot_probe";
+
+/** The last `pam doctor` report the daemon accepted (`status.boundary.last_report`). */
+export interface BoundaryLastReport {
+  verdict: BoundaryVerdict;
+  /** The client's clock when it probed. */
+  ts: number;
+  /** The daemon's clock when it recorded the report. */
+  received_ts: number;
+  /** Seconds since `received_ts`, as of the poll. */
+  age_s: number;
+  /** The caller's self-reported agent (`claude`, `codex`, …). */
+  agent: string;
+  repo: string | null;
+  relayed: boolean;
+  /** The daemon's own kernel-peer facts; null on Windows and through the relay. */
+  peer_pid: number | null;
+  peer_exe: string | null;
+  peer_harness: string | null;
+  /** Must-deny probes that were allowed. */
+  failed: string[];
+  /** Must-deny probes whose answer was unknown. */
+  unverified: string[];
+  request_id: string | null;
+}
+
+/** One observed contact on the admin plane, or one public request from an unknown harness. */
+export interface BoundaryContact {
+  ts: number;
+  kind: string | null;
+  peer_pid: number | null;
+  peer_exe: string | null;
+  peer_harness: string | null;
+  /** The `doctor.report` request that explains the contact, when one did. */
+  attributed: string | null;
+}
+
+/**
+ * The `boundary` block of a daemon status body: the last report and the
+ * daemon's own observations of its admin plane. See
+ * `docs/specs/2026-10-02-boundary-self-check.md`.
+ */
+export interface BoundaryStatus {
+  /** `kernel_pid` where the public plane has a kernel peer (macOS), `none` elsewhere. */
+  peer_identity: "kernel_pid" | "none";
+  last_report: BoundaryLastReport | null;
+  reports: { retained: number; established: number; not_established: number };
+  admin_contacts: {
+    /** Unexpected contacts no report explains: the headline. */
+    unattributed: number;
+    unattributed_24h: number;
+    total: number;
+    expected_total: number;
+    last: BoundaryContact | null;
+    last_expected: BoundaryContact | null;
+  };
+  public_unknown_harness: { total: number; last: BoundaryContact | null };
+  /** The daemon's one-line form. */
+  summary: string;
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+function boundaryContact(value: unknown): BoundaryContact | null {
+  const row = record(value);
+  if (row === null) return null;
+  return {
+    ts: numberOr(row.ts, 0),
+    kind: stringOrNull(row.kind),
+    peer_pid: numberOrNull(row.peer_pid),
+    peer_exe: stringOrNull(row.peer_exe),
+    peer_harness: stringOrNull(row.peer_harness),
+    attributed: stringOrNull(row.attributed),
+  };
+}
+
+function boundaryLastReport(value: unknown): BoundaryLastReport | null {
+  const row = record(value);
+  if (row === null) return null;
+  const verdict = row.verdict;
+  if (verdict !== "established" && verdict !== "not_established" && verdict !== "cannot_probe") {
+    return null;
+  }
+  return {
+    verdict,
+    ts: numberOr(row.ts, 0),
+    received_ts: numberOr(row.received_ts, numberOr(row.ts, 0)),
+    age_s: numberOr(row.age_s, 0),
+    agent: typeof row.agent === "string" ? row.agent : "unknown",
+    repo: stringOrNull(row.repo),
+    relayed: row.relayed === true,
+    peer_pid: numberOrNull(row.peer_pid),
+    peer_exe: stringOrNull(row.peer_exe),
+    peer_harness: stringOrNull(row.peer_harness),
+    failed: stringList(row.failed),
+    unverified: stringList(row.unverified),
+    request_id: stringOrNull(row.request_id),
+  };
+}
+
+/**
+ * The `boundary` block of a daemon status body, when the daemon publishes
+ * one. An older daemon has none, and the caller shows nothing rather than
+ * inventing a verdict. Counts the block omits read as zero; a `last_report`
+ * without a known verdict reads as none.
+ */
+export function boundaryStatus(status: StatusBody | null | undefined): BoundaryStatus | null {
+  const block = record(status?.boundary);
+  if (block === null) return null;
+  const reports = record(block.reports) ?? {};
+  const admin = record(block.admin_contacts) ?? {};
+  const unknown = record(block.public_unknown_harness) ?? {};
+  const lastReport = boundaryLastReport(block.last_report);
+  return {
+    peer_identity: block.peer_identity === "kernel_pid" ? "kernel_pid" : "none",
+    last_report: lastReport,
+    reports: {
+      retained: numberOr(reports.retained, 0),
+      established: numberOr(reports.established, 0),
+      not_established: numberOr(reports.not_established, 0),
+    },
+    admin_contacts: {
+      unattributed: numberOr(admin.unattributed, 0),
+      unattributed_24h: numberOr(admin.unattributed_24h, 0),
+      total: numberOr(admin.total, 0),
+      expected_total: numberOr(admin.expected_total, 0),
+      last: boundaryContact(admin.last),
+      last_expected: boundaryContact(admin.last_expected),
+    },
+    public_unknown_harness: {
+      total: numberOr(unknown.total, 0),
+      last: boundaryContact(unknown.last),
+    },
+    summary:
+      typeof block.summary === "string"
+        ? block.summary
+        : lastReport === null
+          ? "never checked — run pam doctor from the agent"
+          : lastReport.verdict,
+  };
+}
+
 export interface DaemonStatusReply {
   connected: boolean;
   status: StatusBody | null;

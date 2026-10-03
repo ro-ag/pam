@@ -1,0 +1,102 @@
+;; pam-agent.sb -- harness-independent default-deny sandbox-exec profile
+;;
+;; Harness:  any (wrap the harness, or only its tool commands, with sandbox-exec)
+;; Status:   fallback format -- sandbox-exec is not a harness configuration;
+;;           this is the strongest profile and the one to use where a harness's
+;;           own sandbox is weak or absent (Copilot CLI) or cannot express a rule
+;; Sources:  crates/pam/tests/support/broker-macos.sb in this repository (the
+;;           fixture this generalises) and docs/macos-sandbox-acceptance.md;
+;;           sandbox-exec(1) on macOS. Apple documents neither SBPL nor
+;;           sandbox-exec's profile language (deprecated, still shipped), so the
+;;           rules here are the ones the fixture and this file's test exercise.
+;; Verified: 2026-10-02 -- loads under /usr/bin/sandbox-exec (Darwin 27.0.0)
+;;           with the -D names below; a script issuing the doctor probes' syscalls
+;;           and helper commands saw every private path and the keychain denied
+;; Base:     <base>   (PAM base directory, default ~/.pam; substituted by
+;;           `pam doctor --profile sandbox-exec [--base DIR]`; use the real
+;;           path, `realpath ~/.pam` -- Seatbelt matches resolved paths)
+;; Allow:    connect to <base>/run/pam.sock, nothing else on the network;
+;;           read of <base>/run/daemon.lock
+;; Deny:     everything else under <base> (the engine's socket and API key
+;;           live under <base>/engine/run, covered by the engine deny) --
+;;           plus the keychain, signals to other processes, the
+;;           LaunchServices and AppleEvents brokers, writes to the pam
+;;           executable and PAM.app
+;; Prove:    pam doctor --profile sandbox-exec > pam-agent.sb
+;;           sandbox-exec -D HOME="$HOME" -D WORKSPACE="$PWD" \
+;;             -D PAM_EXE="$(command -v pam)" -f pam-agent.sb pam doctor
+;;           must print "boundary: established" and exit 0
+;;
+;; Run a harness (or one command) under it:
+;;   pam doctor --profile sandbox-exec > ~/pam-agent.sb
+;;   sandbox-exec -D HOME="$HOME" -D WORKSPACE="$PWD" -D PAM_EXE="$(command -v pam)" \
+;;     -f ~/pam-agent.sb <harness> [args]
+;;
+;; This profile is deliberately strict: it grants no Mach lookup and no network
+;; beyond pam.sock, so a harness that must reach its model API, resolve DNS or
+;; talk to system services will fail until you add specific allowances in the
+;; marked section below. Loosen there, with narrow rules (a named Mach service,
+;; a host); never remove or reorder the PAM block, which must stay last: in
+;; SBPL the last matching rule wins.
+
+(version 1)
+(deny default)
+
+;; Reads (broad, as in the fixture; the PAM block removes the private paths),
+;; process creation and the caller metadata the client reports.
+(allow file-read*)
+(allow process-exec process-fork)
+(allow sysctl-read)
+(allow process-info*)
+(allow signal (target self))
+
+;; Writes: the workspace, temporary directories and the terminal.
+(allow file-write*
+  (subpath (param "WORKSPACE"))
+  (subpath "/private/tmp")
+  (subpath "/private/var/folders")
+  (literal "/dev/null")
+  (literal "/dev/tty")
+  (regex #"^/dev/ttys[0-9]*$"))
+(allow file-ioctl (regex #"^/dev/tty.*"))
+
+;; ---- YOUR ALLOWANCES (narrow rules only; examples, all off by default) ----
+;; (allow network-outbound (remote ip "*:443"))
+;; (allow mach-lookup (global-name "com.apple.mDNSResponder"))
+;; ---------------------------------------------------------------------------
+
+;; Session relay (`pam listen <dir>`, PAM_SOCKET_DIR=<dir>): to use it instead of
+;; the public socket, replace the two PAM-block lines that allow pam.sock and
+;; daemon.lock with this one, and keep every deny:
+;;   (allow network-outbound (remote unix-socket (literal "<dir>/pam.sock")))
+
+;; ---- PAM block: keep last ----
+;; The public socket and the lock readiness probe.
+(deny file-read-data file-write* (subpath "<base>"))
+(allow file-read-data (literal "<base>/run/daemon.lock"))
+(allow network-outbound (remote unix-socket (literal "<base>/run/pam.sock")))
+
+;; Private state, named one by one so that narrowing the broad rule above never
+;; reopens one of them.
+(deny file-read-data file-write* (subpath "<base>/admin"))
+(deny file-read-data file-write* (literal "<base>/state.sqlite3"))
+(deny file-read-data file-write* (literal "<base>/state.sqlite3-wal"))
+(deny file-read-data file-write* (literal "<base>/state.sqlite3-shm"))
+(deny file-read-data file-write* (subpath "<base>/backup"))
+(deny file-read-data file-write* (subpath "<base>/model-trust"))
+(deny file-read-data file-write* (subpath "<base>/engine"))
+(deny file-read-data file-write* (subpath "<base>/flows"))
+(deny file-read-data file-write* (subpath "<base>/log"))
+(deny network-outbound (remote unix-socket (literal "<base>/admin/control.sock")))
+(deny network-outbound (remote unix-socket (literal "<base>/engine/run/engine.sock")))
+
+;; The trusted executable and bundle, the keychain, process control and brokers.
+(deny file-write* (literal (param "PAM_EXE")))
+(deny file-write* (subpath "/Applications/PAM.app"))
+(deny file-read-data file-write* (subpath (string-append (param "HOME") "/Library/Keychains")))
+(deny signal (target others))
+(deny mach-lookup (global-name "com.apple.SecurityServer"))
+(deny mach-lookup (global-name "com.apple.secd"))
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))
+(deny mach-lookup (global-name "com.apple.coreservices.appleevents"))
+(deny mach-lookup (global-name-prefix "com.apple.lsd."))

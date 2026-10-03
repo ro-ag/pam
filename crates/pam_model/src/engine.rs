@@ -21,7 +21,13 @@
 //! <base>/engine/llama-<tag>/llama-server unpacked release, plus its libraries
 //! <base>/engine/.pam-engine.json         manifest: tag, target, digest, version line, source
 //! <base>/engine/weights/<sha256>.gguf    the registry's private copies of verified weights
+//! <base>/engine/run/                     the supervisor's runtime: socket, API key, pid
 //! ```
+//!
+//! The runtime directory is the supervisor's ([`crate::engine_server`]); it
+//! sits under the engine directory, not under the public `<base>/run`, so a
+//! sandbox that lets an agent reach the public socket never traverses past
+//! the engine's key or socket.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -257,6 +263,9 @@ pub enum EngineSource {
     },
 }
 
+/// Name of the supervisor's runtime directory under the engine directory.
+pub const RUNTIME_DIR: &str = "run";
+
 /// Where the engine lives under a private base directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineLayout {
@@ -276,6 +285,14 @@ impl EngineLayout {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The supervisor's private runtime directory, `<base>/engine/run`:
+    /// the engine's socket, its per-load API key file and its pid file
+    /// ([`crate::engine_server::EngineServer::new`] takes it).
+    #[must_use]
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.root.join(RUNTIME_DIR)
     }
 
     /// Where the archive is downloaded to.
@@ -908,7 +925,7 @@ pub struct RemoveReport {
 
 /// Deletes everything under `<base>/engine`: the archive if one is there,
 /// the unpacked release, the manifest, the registry's private weight copies,
-/// the server's key file and any scratch directory. The directory itself
+/// the supervisor's runtime directory and any scratch directory. The directory itself
 /// stays (private, empty). The models directory is never touched. Whether
 /// a model is loaded is the caller's knowledge, and the caller refuses then.
 pub fn remove(base: &Path) -> Result<RemoveReport, EngineError> {

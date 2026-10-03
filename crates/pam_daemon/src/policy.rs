@@ -162,7 +162,9 @@ pub const CAP_CANCEL: &str = "cancel";
 ///
 /// Known capabilities: `status` (read-only), `query` (read-only ticket-state lookup backing `pam
 /// wait`/`pam subscribe`), `echo` (first executor capability, non-destructive), `cancel` (built-in
-/// behind `pam cancel <ticket>`), and the three flow capabilities. The table is static by design —
+/// behind `pam cancel <ticket>`), `doctor.report` (the boundary self-check record, Control class:
+/// a bookkeeping request that changes no authority — see [`crate::boundary`]), and the three flow
+/// capabilities. The table is static by design —
 /// not something a request can extend. An unknown capability classifies as `None` and the gate
 /// refuses with [`CAUSE_UNKNOWN_CAPABILITY`].
 ///
@@ -178,7 +180,9 @@ pub const CAP_CANCEL: &str = "cancel";
 #[must_use]
 pub fn classify(capability: &str) -> Option<CapabilityClass> {
     match capability {
-        CAP_STATUS | CAP_CANCEL | CAP_QUERY => Some(CapabilityClass::Control),
+        CAP_STATUS | CAP_CANCEL | CAP_QUERY | crate::boundary::CAP_DOCTOR_REPORT => {
+            Some(CapabilityClass::Control)
+        }
         crate::flow_service::CAP_FLOW_LIST
         | crate::flow_service::CAP_FLOW_SHOW
         | crate::flow_service::CAP_FLOW_INSPECT

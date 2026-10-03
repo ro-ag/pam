@@ -120,6 +120,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::admin::{ACTION_ADMIN, ACTION_ADMIN_DENIED, ADMIN_PREFIX, AdminService};
 use crate::approval::{ApprovalOutcome, ApprovalService, DEFAULT_APPROVAL_TIMEOUT};
+use crate::boundary::{Boundary, PeerFacts, SystemResolver};
 use crate::connector_service::ConnectorService;
 use crate::event_hub::{EventHub, TicketMeta};
 use crate::executor::{
@@ -372,6 +373,9 @@ pub struct DaemonHandle {
     image: Arc<ImageWatch>,
     /// The dispatcher's pools, for inspection.
     admission: Arc<Admission>,
+    /// The cached slow half of `status`, so a harness can produce a fresh
+    /// snapshot on demand (see [`Self::refresh_status`]).
+    status: Arc<StatusCache>,
     #[cfg(test)]
     queue: Arc<QueueManager>,
     #[cfg(test)]
@@ -453,6 +457,15 @@ impl DaemonHandle {
     #[must_use]
     pub fn public_connections_available(&self) -> usize {
         self.transport.public_connections_available()
+    }
+
+    /// Produces the `status` snapshot now and returns once it is stored:
+    /// what a first `status` poll otherwise waits a bounded moment for
+    /// ([`crate::status_cache::FIRST_SNAPSHOT_WAIT`]). For embedding hosts
+    /// and integration tests that assert on a fresh snapshot rather than
+    /// on how quickly this host produced one; the poll path is unchanged.
+    pub async fn refresh_status(&self) {
+        self.status.refresh().await;
     }
 
     /// The queue manager, for in-crate tests that need to stall or inject.
@@ -732,6 +745,16 @@ pub async fn run_daemon_with(
         )
         .with_network(network),
     );
+    // The boundary observer is registered before the admin listener is
+    // bound, so the adapter finds the sink for this base when it binds.
+    let boundary = Boundary::new(
+        Arc::clone(&store),
+        image.boot_path().map(Path::to_path_buf),
+        Arc::new(SystemResolver),
+    );
+    boundary.load().await;
+    let (admin_sink, admin_observer) = boundary.spawn_admin_observer(drain_rx.clone());
+    crate::boundary::register_admin_sink(&base, admin_sink);
     let admin_transport = match crate::admin_transport::AdminTransport::bind(
         &base,
         Arc::clone(&admin),
@@ -747,6 +770,7 @@ pub async fn run_daemon_with(
     };
 
     let status = StatusCache::new(Arc::clone(&models), Arc::clone(&secrets));
+    status.attach_boundary(Arc::clone(&boundary));
     let admission = Admission::new();
     let router = CompletionRouter::new();
     let pipeline = Arc::new(Pipeline {
@@ -765,6 +789,7 @@ pub async fn run_daemon_with(
         phase: phase.clone(),
         image: Arc::clone(&image),
         status: Arc::clone(&status),
+        boundary,
         // One writer for the whole daemon: the admin surface parks into
         // the same queue the maintenance loop retries.
         terminals: Arc::clone(&admin.terminals),
@@ -772,9 +797,10 @@ pub async fn run_daemon_with(
     });
 
     let tasks = vec![
+        admin_observer,
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
         RetentionService::new(Arc::clone(&store)).run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
-        status.spawn(drain_rx.clone()),
+        Arc::clone(&status).spawn(drain_rx.clone()),
         // Runs through the drain: a verdict parked while draining is still
         // offered to the store before the daemon exits.
         tokio::spawn(maintenance_loop(
@@ -811,6 +837,7 @@ pub async fn run_daemon_with(
         phase,
         image,
         admission,
+        status,
         #[cfg(test)]
         queue,
         #[cfg(test)]
@@ -950,6 +977,9 @@ struct Pipeline {
     image: Arc<ImageWatch>,
     /// What `status` answers from.
     status: Arc<StatusCache>,
+    /// The boundary observer: resolves the peer of every public request
+    /// and records what it resolved on the row (see [`crate::boundary`]).
+    boundary: Arc<Boundary>,
     /// The retrying, parking writer of terminal rows.
     terminals: Arc<TerminalWriter>,
     /// See [`DaemonConfig::handler_grace`].
@@ -1596,6 +1626,17 @@ impl Pipeline {
         // Unknown capability: no class, no dedupe — record the request,
         // let the gate produce the refusal.
         let recorded = crate::ingress::recorded(origin, peer);
+        // The daemon's own view of who is asking: the executable and the
+        // ancestry behind the kernel pid, resolved within a small budget
+        // (a miss is null). Attribution, written on the row after
+        // admission; nothing below reads it to decide anything.
+        let facts = if origin == Origin::Public {
+            self.boundary
+                .resolve(recorded.peer_pid, recorded.relayed)
+                .await
+        } else {
+            PeerFacts::default()
+        };
         let Some(class) = class else {
             let response = self.refuse_unadmitted(&envelope, origin, &recorded).await;
             guard.send(response);
@@ -1609,6 +1650,11 @@ impl Pipeline {
                 return;
             }
         };
+        if !matches!(admitted, AdmitOutcome::Attached { .. }) {
+            self.boundary
+                .note_public_request(&envelope.id, &recorded, &facts)
+                .await;
+        }
         // Advisory caller registry: every admitted request records its
         // observed agent+repo pair (attribution and GUI filters, never
         // authorization). Failures are non-fatal bookkeeping.

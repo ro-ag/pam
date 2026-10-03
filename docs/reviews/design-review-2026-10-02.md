@@ -175,6 +175,20 @@ not settle. The first five are ptrack issues 38 to 42.
    narrowed what a label can do (cancel, restart) but not who may use a grant.
    Per-agent or per-project authority, and whether PAM should install or verify a
    sandbox profile, remain open.
+   **Resolved 2026-10-02 (ptrack plan 53).** Verification: `pam doctor` probes
+   the boundary from the caller's position, the daemon records the report and
+   its own observations of the private plane (a `boundary` block in `status`),
+   and reference sandbox profiles per harness ship with it; PAM still does not
+   install or lock the harness's sandbox. Per-agent authority: not built, by
+   decision. Authority is per operating-system user; caller labels, pids and
+   executable paths are attribution, never a boundary; agents that need
+   different authority run as different users; `pam doctor` proves each one's
+   sandbox. Windows has no supported configuration that establishes the
+   boundary, and the documents say so. Design, decisions and the as-built
+   record: [the boundary self-check spec](../specs/2026-10-02-boundary-self-check.md);
+   the statement itself: [the administration boundary](../admin-boundary.md#global-target-authority).
+   Plan 53 also found that the engine's socket and API key live in the run
+   directory (issue 44); the profiles deny them and the relocation is filed.
 5. **Proportion of the model layer (issue 42).** The curator, the structured
    diagnosis stack (no production caller), the readiness ladder and the catalog
    are large against what runs in production, which is prose summaries. The fixes

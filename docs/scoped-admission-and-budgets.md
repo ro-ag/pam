@@ -83,7 +83,7 @@ does not cancel the underlying work.
 
 Every request handler runs under one hard deadline around admission, the gate,
 execution and the terminal write: the request deadline (clamped to the one-hour
-ceiling) plus a 30-second grace, and for `status`, `query` and `cancel` the
+ceiling) plus a 30-second grace, and for `status`, `query`, `cancel` and `doctor.report` the
 smaller of the deadline and 10 seconds plus 2 seconds. When it elapses the caller
 is answered `deadline_exceeded` at once, the slot is released and the terminal
 row is written in a detached task. A handler that is only parked on the
@@ -108,9 +108,9 @@ admission capacity.
 | Caller repository spelling | 4,096 bytes |
 | Active admitted requests | 128; a row past its deadline stops counting |
 | Persisted fields of active admitted requests | 8 MiB cumulative |
-| Public dispatcher slots | 128 work; 16 `status`; 16 `query`; 8 `cancel` (falls back to a control slot); 32 for requests the private admin plane submits. The transport holds none |
-| Aggregate admission rate | 256 work/second; 64 `status`/second; 64 `query`/second; 16 `cancel`/second |
-| Request handler | Request deadline plus 30 seconds; control class: the smaller of deadline and 10 seconds, plus 2 seconds |
+| Public dispatcher slots | 128 work; 16 `status`; 16 `query` and `doctor.report`; 8 `cancel` (falls back to a control slot); 32 for requests the private admin plane submits. The transport holds none |
+| Aggregate admission rate | 256 work/second; 64 `status`/second; 64 `query` and `doctor.report`/second; 16 `cancel`/second |
+| Request handler | Request deadline plus 30 seconds; control class (`status`, `query`, `cancel`, `doctor.report`): the smaller of deadline and 10 seconds, plus 2 seconds |
 | Public followers (`pam wait`, `pam subscribe`) | 96 in total; 16 per ticket; refusal `follower_capacity_exhausted` (retried by the client) |
 | Follower queue | 64 events; the oldest `progress` event is dropped first, the ending never |
 | Replay kept per live ticket | The last 32 events, for a late or resumed follower |

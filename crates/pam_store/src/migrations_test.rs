@@ -9,7 +9,7 @@ async fn fresh_open_lands_on_latest_version() {
         store.schema_version().await.unwrap(),
         migrations::latest_version()
     );
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
 }
 
 #[tokio::test]
@@ -67,7 +67,7 @@ async fn newer_database_version_is_refused() {
         err,
         StoreError::VersionTooNew {
             found: 999,
-            supported: 15
+            supported: 16
         }
     ));
     let message = err.to_string();
@@ -91,7 +91,7 @@ async fn v1_database_upgrades_to_v2() {
     // exists, the model job table exists, the connector table exists,
     // and the version advances.
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
     store
         .insert_model_job("job_1", "verify", "qwen/tiny", None, None)
         .await
@@ -119,7 +119,7 @@ async fn v3_database_gains_meta_json() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
     assert!(
         evidence_columns(&store)
             .await
@@ -155,7 +155,7 @@ async fn v4_database_upgrades_to_v5() {
     drop(conn);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
 
     let count: i64 = store
         .raw_scalar(
@@ -292,7 +292,7 @@ async fn v11_database_gains_indexes_revocation_order_and_immutability() {
     build_v11_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
 
     // Revocations are numbered in order; the two that share a second share
     // the higher number, so a request admitted between them is voided
@@ -422,7 +422,7 @@ async fn v12_database_gains_the_request_origin_columns() {
     build_v12_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
 
     for id in ["old_queued", "old_done", "old_admin"] {
         let row = store.get_request(id).await.unwrap().unwrap();
@@ -494,7 +494,7 @@ async fn v12_database_gains_the_request_origin_columns() {
 /// row. The boundary migration's version (14) is above every version a
 /// binary on the previous engine knows (11 in release 0.4.3, 13 in the last
 /// development build), so such a binary is the "older binary" of this test;
-/// the database it is handed is at the latest version (15).
+/// the database it is handed is at the latest version (16).
 #[tokio::test]
 async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
     let dir = tempfile::tempdir().unwrap();
@@ -511,20 +511,20 @@ async fn a_binary_that_knows_fewer_migrations_refuses_this_database_legibly() {
         assert!(
             matches!(
                 error,
-                StoreError::VersionTooNew { found: 15, supported } if supported == i64::try_from(known).unwrap()
+                StoreError::VersionTooNew { found: 16, supported } if supported == i64::try_from(known).unwrap()
             ),
             "{error:?}"
         );
         assert_eq!(
             error.to_string(),
             format!(
-                "database schema version 15 is newer than this binary supports (max {known}); \
+                "database schema version 16 is newer than this binary supports (max {known}); \
                  upgrade pam instead of downgrading the database"
             )
         );
     }
     // Refusing changed nothing.
-    assert_eq!(migrations::current_version(&conn).unwrap(), 15);
+    assert_eq!(migrations::current_version(&conn).unwrap(), 16);
     let kept: String = conn
         .query_row("SELECT value FROM setting WHERE key = 'kept'", (), |row| {
             row.get(0)
@@ -592,7 +592,7 @@ async fn v14_database_admits_import_jobs_and_keeps_its_rows() {
     build_v14_database(&path);
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 15);
+    assert_eq!(store.schema_version().await.unwrap(), 16);
 
     let jobs = store.list_model_jobs(10).await.unwrap();
     let by_id = |id: &str| jobs.iter().find(|job| job.id == id).expect(id).clone();
@@ -663,4 +663,102 @@ async fn v14_database_admits_import_jobs_and_keeps_its_rows() {
             .await
             .is_err()
     );
+}
+
+fn build_v15_database(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    for migration in migrations::MIGRATIONS.iter().filter(|m| m.version <= 15) {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.execute_batch("PRAGMA user_version = 15").unwrap();
+    conn.execute(
+        "INSERT INTO request (id, capability, repo, caller_agent, args_json, state, created_ts, \
+         updated_ts, ingress, peer_uid, peer_pid, relayed)
+         VALUES ('old_public', 'echo', '/r', 'claude', '{}', 'done', 1, 2, 'public', 501, 77, 0)",
+        (),
+    )
+    .unwrap();
+    drop(conn);
+}
+
+/// The upgrade from the previous version: the request row gains the two
+/// peer-resolution columns (NULL for every existing row), the two boundary
+/// tables exist with their bounds, and the old row reads back unchanged.
+#[tokio::test]
+async fn v15_database_gains_the_boundary_tables_and_the_peer_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    build_v15_database(&path);
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), 16);
+
+    let row = store.get_request("old_public").await.unwrap().unwrap();
+    assert_eq!(row.origin.peer_pid, Some(77));
+    assert_eq!(
+        store.request_peer_facts("old_public").await.unwrap(),
+        Some((None, None))
+    );
+    for table in ["boundary_report", "boundary_observation"] {
+        let count: i64 = store
+            .raw_scalar(
+                &format!(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "{table}");
+    }
+    // The new columns and tables are usable at once.
+    assert!(
+        store
+            .set_request_peer_facts("old_public", Some("/usr/local/bin/pam"), Some("zsh"))
+            .await
+            .unwrap()
+    );
+    let peer = crate::BoundaryPeer {
+        uid: Some(501),
+        pid: Some(77),
+        exe: Some("/usr/local/bin/pam".to_owned()),
+        harness: Some("zsh".to_owned()),
+    };
+    let id = store
+        .insert_boundary_report(
+            crate::BoundaryReportInsert {
+                request_id: "old_public",
+                report_ts: 5,
+                verdict: "established",
+                failed_json: "[]",
+                unverified_json: "[]",
+                agent: "claude",
+                repo: "/r",
+                peer: &peer,
+                relayed: false,
+                client_version: "0.5.0",
+                report_json: "{}",
+            },
+            crate::AuditEntry {
+                action: "doctor.report",
+                decision: crate::Decision::Allow,
+                actor: crate::Actor::System,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, 1);
+    // The CHECK on the verdict came with the table.
+    let bad: Result<i64, _> = store
+        .raw_scalar(
+            "INSERT INTO boundary_report (request_id, ts, report_ts, verdict, failed_json, \
+             unverified_json, agent, repo, relayed, client_version, report_json)
+             VALUES ('old_public', 1, 1, 'cannot_probe', '[]', '[]', 'a', '/r', 0, 'v', '{}') \
+             RETURNING id",
+            (),
+        )
+        .await;
+    assert!(bad.is_err());
+    assert!(store.boundary_census().await.unwrap().last_report.is_some());
 }

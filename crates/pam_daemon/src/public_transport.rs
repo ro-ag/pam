@@ -667,6 +667,7 @@ where
             proto: WIRE_PROTOCOL,
             version: DAEMON_VERSION.to_owned(),
             epoch: self.hub.epoch().to_owned(),
+            pid: std::process::id(),
         };
         let body =
             match framed::accept_hello(stream, ack, self.limits.request_bytes, deadline).await {

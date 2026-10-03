@@ -221,6 +221,98 @@ describe("Home shell", () => {
     expect(within(overview).queryByText(/Keychain/)).not.toBeInTheDocument();
   });
 
+  it("says the sandbox boundary is not verified when the daemon has no report", async () => {
+    mocks.daemonStatus.mockResolvedValue({
+      connected: true,
+      status: {
+        daemon_version: "0.1.0",
+        protocol: 1,
+        uptime_s: 10,
+        active_requests: 0,
+        boundary: {
+          last_report: null,
+          admin_contacts: { unattributed: 0, unattributed_24h: 0 },
+          summary: "never checked — run pam doctor from the agent",
+        },
+      },
+    });
+    renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    const line = await within(overview).findByText("Sandbox boundary: not verified");
+    expect(line).toHaveAttribute("href", "/settings#daemon");
+  });
+
+  it("shows an established boundary with its age, and points a failed one at Settings", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const status = (verdict: string) => ({
+      connected: true,
+      status: {
+        daemon_version: "0.1.0",
+        protocol: 1,
+        uptime_s: 10,
+        active_requests: 0,
+        boundary: {
+          last_report: {
+            verdict,
+            ts: nowSec - 7_201,
+            received_ts: nowSec - 7_200,
+            age_s: 7_200,
+            agent: "claude",
+            repo: null,
+            relayed: false,
+            peer_pid: 1,
+            peer_exe: "/usr/local/bin/pam",
+            peer_harness: "claude",
+            failed: [],
+            unverified: [],
+            request_id: "req_x",
+          },
+          summary: `${verdict} 2 h ago by claude (pid 1, direct); admin contacts unattributed: 0`,
+        },
+      },
+    });
+
+    mocks.daemonStatus.mockResolvedValue(status("established"));
+    const { unmount } = render(
+      <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
+    );
+    let overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    expect(
+      await within(overview).findByText("Sandbox boundary: established 2h ago"),
+    ).toBeInTheDocument();
+    unmount();
+
+    mocks.daemonStatus.mockResolvedValue(status("not_established"));
+    const second = render(
+      <App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />,
+    );
+    overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    expect(
+      await within(overview).findByText(
+        "Sandbox boundary: not established — see Settings › Daemon",
+      ),
+    ).toBeInTheDocument();
+    second.unmount();
+
+    mocks.daemonStatus.mockResolvedValue(status("cannot_probe"));
+    render(<App router={createAppRouter(createMemoryHistory({ initialEntries: ["/"] }))} />);
+    overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    expect(
+      await within(overview).findByText(
+        "Sandbox boundary: could not be probed — see Settings › Daemon",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says nothing about the boundary for a daemon that publishes no block", async () => {
+    renderHome();
+    const overview = await screen.findByRole("complementary", { name: "Workspace overview" });
+    await waitFor(() =>
+      expect(within(overview).getByText(/Active requests/)).toBeInTheDocument(),
+    );
+    expect(within(overview).queryByText(/Sandbox boundary/)).not.toBeInTheDocument();
+  });
+
   it("shows unavailable state instead of inventing zero counts and keeps workspace links usable", async () => {
     mocks.daemonStatus.mockResolvedValue({ connected: false, status: null });
     mocks.approvalsPending.mockRejectedValue(new Error("unavailable"));

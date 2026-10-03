@@ -75,9 +75,8 @@ async fn the_pinned_engine_serves_the_smallest_model_on_this_platform() {
         other => panic!("model transfer did not finish: {other:?}"),
     }
 
-    let run = base.path().join("run");
-    std::fs::create_dir_all(&run).unwrap();
-    let server = EngineServer::new(server_binary, &run, base.path()).unwrap();
+    let runtime = pam_model::engine::EngineLayout::new(base.path()).runtime_dir();
+    let server = EngineServer::new(server_binary, &runtime, base.path()).unwrap();
     let options = ServerOptions {
         context_tokens: 512,
         threads: Some(2),

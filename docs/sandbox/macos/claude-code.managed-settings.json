@@ -1,0 +1,31 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowManagedReadPathsOnly": true,
+      "denyRead": [
+        "<base>",
+        "<base>/admin",
+        "<base>/state.sqlite3",
+        "<base>/state.sqlite3-wal",
+        "<base>/state.sqlite3-shm",
+        "<base>/backup",
+        "<base>/model-trust",
+        "<base>/engine",
+        "<base>/flows",
+        "<base>/log"
+      ],
+      "allowRead": ["<base>/run/daemon.lock"],
+      "denyWrite": ["<base>", "/Applications/PAM.app"]
+    },
+    "network": {
+      "allowAllUnixSockets": false,
+      "allowUnixSockets": ["<base>/run/pam.sock"]
+    }
+  },
+  "permissions": {
+    "deny": ["Read(/<base>/**)", "Edit(/<base>/**)", "Edit(//Applications/PAM.app/**)"]
+  }
+}

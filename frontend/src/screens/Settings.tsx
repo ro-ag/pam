@@ -11,6 +11,7 @@ import { TypedConfirm } from "../components/ui/TypedConfirm";
 import { FailureNote } from "../components/ui/FailureNote";
 import { fieldClasses, fieldLabelClasses } from "../components/ui/field";
 import { Panel } from "../components/ui/Panel";
+import { SafeText } from "../components/ui/SafeText";
 import { Section } from "../components/ui/Section";
 import { DAEMON_STATUS_KEY, statusRefetchInterval } from "../components/shell/useDaemonStatus";
 import { formatBytes } from "../lib/bytes";
@@ -19,8 +20,11 @@ import { backoffRefetchInterval } from "../lib/polling";
 import {
   CONFIRM_GRANT,
   CONFIRM_RELAXED,
+  HARNESS_PROFILES,
+  boundaryStatus,
   daemonStatus,
   daemonStop,
+  harnessProfileFor,
   grantsAdd,
   grantsList,
   grantsRevoke,
@@ -35,8 +39,10 @@ import {
   serviceUninstall,
   toBridgeFailure,
   versionMismatchNote,
+  type BoundaryStatus,
   type BridgeFailure,
   type DaemonStopReply,
+  type HarnessProfile,
   type GrantRow,
   type Profile,
   type PruneReport,
@@ -381,9 +387,181 @@ function statusField(status: Record<string, unknown> | null | undefined, key: st
 }
 
 /**
- * The daemon card: live status facts, stop/restart, and the login-start
- * row — whether the platform's user-scope unit (LaunchAgent, scheduled
- * task) is installed, with Install / Remove.
+ * The last `pam doctor` verdict as one phrase: the verdict, how long ago
+ * the daemon received it, who sent it and how. No report reads as not
+ * verified — the honest state of a machine nobody checked.
+ */
+export function boundaryVerdictLine(boundary: BoundaryStatus, nowMs?: number): string {
+  const report = boundary.last_report;
+  if (report === null) return "not verified — run pam doctor from the agent";
+  const age = relativeTime(report.received_ts, nowMs);
+  const via = report.relayed ? "relay" : "direct";
+  const verdict =
+    report.verdict === "established"
+      ? "established"
+      : report.verdict === "not_established"
+        ? "not established"
+        : "could not be probed";
+  return `${verdict} · ${age} · by ${report.agent} (${via})`;
+}
+
+/** The badge tone of a boundary state: only an established boundary reads as success. */
+function boundaryTone(boundary: BoundaryStatus): "success" | "warning" | "neutral" {
+  switch (boundary.last_report?.verdict) {
+    case "established":
+      return "success";
+    case "not_established":
+      return "warning";
+    default:
+      return "neutral";
+  }
+}
+
+/** The badge word of a boundary state. */
+function boundaryLabel(boundary: BoundaryStatus): string {
+  switch (boundary.last_report?.verdict) {
+    case "established":
+      return "established";
+    case "not_established":
+      return "not established";
+    case "cannot_probe":
+      return "not probed";
+    default:
+      return "not verified";
+  }
+}
+
+/** A button that copies `text` and says so for two seconds; without a clipboard it just stays. */
+function CopyCommandButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2_000);
+    } catch {
+      // No clipboard (webview permission, jsdom): the button just stays.
+    }
+  };
+  return (
+    <Button size="sm" variant="ghost" aria-label={label} onClick={() => void copy()}>
+      {copied ? (
+        <Check size={14} aria-hidden="true" className="text-success" />
+      ) : (
+        <Copy size={14} aria-hidden="true" />
+      )}
+      {copied ? "Copied" : "Copy"}
+    </Button>
+  );
+}
+
+/**
+ * The "Boundary" rows of the daemon card: the last `pam doctor` report
+ * (verdict, age, sender, what it reached), the admin contacts nothing
+ * explains, and the command to run from the agent's position with the
+ * harness pre-selected from the last report. The daemon's own observations
+ * are the only part it can vouch for; the report is a point in time from
+ * one position. The beacon never carries this: liveness and the boundary
+ * are different questions.
+ */
+function BoundaryRows({ boundary }: { boundary: BoundaryStatus }) {
+  const report = boundary.last_report;
+  const [harness, setHarness] = useState<HarnessProfile>(() =>
+    harnessProfileFor(report?.agent),
+  );
+  const command = `pam doctor --profile ${harness}`;
+  const contacts = boundary.admin_contacts;
+  const lastContact = contacts.last;
+  return (
+    <div className="space-y-3 border-t border-line pt-4" role="group" aria-label="Boundary">
+      <div className="flex items-center justify-between gap-3">
+        <p className="font-data text-xs text-ink-faint">Boundary</p>
+        <Badge tone={boundaryTone(boundary)}>{boundaryLabel(boundary)}</Badge>
+      </div>
+      <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2">
+        <div className="min-w-0 space-y-0.5">
+          <dt className="font-data text-xs text-ink-faint">last report</dt>
+          <dd className="font-data text-sm text-ink">{boundaryVerdictLine(boundary)}</dd>
+        </div>
+        {report && (
+          <div className="min-w-0 space-y-0.5">
+            <dt className="font-data text-xs text-ink-faint">harness</dt>
+            <dd className="font-data text-sm text-ink">
+              <SafeText value={report.peer_harness ?? report.agent} />
+              {report.peer_pid !== null && (
+                <span className="text-ink-muted"> · pid {report.peer_pid}</span>
+              )}
+            </dd>
+          </div>
+        )}
+        {report && report.failed.length > 0 && (
+          <div className="min-w-0 space-y-0.5 sm:col-span-2">
+            <dt className="font-data text-xs text-ink-faint">reached (must be denied)</dt>
+            <dd className="break-words font-data text-sm text-warning">
+              <SafeText value={report.failed.join(" ")} />
+            </dd>
+          </div>
+        )}
+        {report && report.unverified.length > 0 && (
+          <div className="min-w-0 space-y-0.5 sm:col-span-2">
+            <dt className="font-data text-xs text-ink-faint">unverified</dt>
+            <dd className="break-words font-data text-sm text-warning">
+              <SafeText value={report.unverified.join(" ")} />
+            </dd>
+          </div>
+        )}
+        <div className="min-w-0 space-y-0.5 sm:col-span-2">
+          <dt className="font-data text-xs text-ink-faint">unexpected admin contacts (24 h)</dt>
+          <dd className="font-data text-sm text-ink tabular-nums">
+            {contacts.unattributed_24h}
+            {lastContact && lastContact.peer_exe !== null && (
+              <span className="text-ink-muted">
+                {" "}
+                · last from <SafeText value={lastContact.peer_exe} />
+                {" "}
+                {relativeTime(lastContact.ts)}
+              </span>
+            )}
+            {lastContact && lastContact.peer_exe === null && (
+              <span className="text-ink-muted">
+                {" "}
+                · last {relativeTime(lastContact.ts)}, peer unknown
+              </span>
+            )}
+          </dd>
+        </div>
+      </dl>
+      <div className="flex flex-wrap items-center gap-3">
+        <p className="font-data text-xs text-ink-faint">verify from the agent</p>
+        <SelectField
+          aria-label="harness"
+          value={harness}
+          onChange={(event) => setHarness(event.target.value as HarnessProfile)}
+          className={cn(fieldClasses, "w-auto px-2")}
+        >
+          {HARNESS_PROFILES.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </SelectField>
+        <code className="select-text rounded-control bg-inset px-2 py-1 font-data text-xs text-ink">
+          {command}
+        </code>
+        <CopyCommandButton text={command} label="copy doctor command" />
+      </div>
+      <p className="font-sans text-xs text-ink-muted">
+        Run it where the agent runs, with the sandbox applied; the profile it prints is the
+        sandbox fragment for that harness. A report changes no authority.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The daemon card: live status facts, the boundary rows, stop/restart,
+ * and the login-start row — whether the platform's user-scope unit
+ * (LaunchAgent, scheduled task) is installed, with Install / Remove.
  */
 function DaemonPanel({ active }: { active: boolean }) {
   const queryClient = useQueryClient();
@@ -490,6 +668,9 @@ function DaemonPanel({ active }: { active: boolean }) {
     ["uptime", typeof uptime === "number" ? formatDuration(uptime) : "—"],
     ["active requests", statusField(body, "active_requests")],
   ];
+  // Only a daemon that publishes the block gets the rows: an older one
+  // shows nothing rather than an invented verdict.
+  const boundary = connected ? boundaryStatus(body) : null;
 
   return (
     <Panel ground="raised" className="space-y-4 p-4">
@@ -517,6 +698,8 @@ function DaemonPanel({ active }: { active: boolean }) {
           ))}
         </dl>
       )}
+
+      {!bridgeDown && boundary && <BoundaryRows boundary={boundary} />}
 
       {/* Login-start: the unit is a property of this machine's session,
           not of the running daemon, so the row stands whether or not the

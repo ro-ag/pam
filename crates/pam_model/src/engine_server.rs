@@ -21,6 +21,15 @@
 //! [`EngineServerError::Exited`]) and the next load starts a new one. A pid
 //! file in the private runtime directory lets the next daemon find an engine
 //! its predecessor left behind.
+//!
+//! The runtime directory (`<base>/engine/run`, see
+//! [`crate::engine::EngineLayout::runtime_dir`]) holds the socket, the key
+//! file and the pid file, owner-only. It sits under the engine directory
+//! rather than under the public `<base>/run`: a sandbox that lets an agent
+//! reach `<base>/run/pam.sock` must not, by traversing the same directory,
+//! reach the engine's key or its OpenAI-compatible endpoint. Daemons before
+//! this layout kept them inside `<base>/run`; [`LegacyRuntime`] names what
+//! they left so the daemon can adopt the pid record and remove the rest.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,6 +45,15 @@ use crate::runtime::{CONTEXT_TOKENS, GenerateRequest};
 
 /// The longest a Unix socket path may be on macOS (`sun_path`).
 pub const MAX_SOCKET_PATH_BYTES: usize = 104;
+
+/// File name of the engine's private socket inside the runtime directory (Unix).
+pub const SOCKET_FILE: &str = "engine.sock";
+
+/// File name of the per-load API key file inside the runtime directory.
+pub const KEY_FILE: &str = "api.key";
+
+/// File name of the pid record inside the runtime directory.
+pub const PID_FILE: &str = "engine.pid";
 
 /// How long a freshly spawned server must have stayed alive before a healthy
 /// answer on its endpoint is believed. A server that cannot bind (another
@@ -307,7 +325,8 @@ struct Live {
 pub struct EngineServer {
     binary: PathBuf,
     socket: PathBuf,
-    /// Private directory for the key file and the pid file (`<run dir>/engine`).
+    /// Private directory for the socket, the key file and the pid file
+    /// (`<base>/engine/run`).
     runtime: PathBuf,
     log: PathBuf,
     live: Arc<Mutex<Option<Live>>>,
@@ -335,20 +354,33 @@ impl std::fmt::Debug for EngineServer {
 }
 
 impl EngineServer {
-    /// A supervisor for `binary`, listening on `run_dir/engine.sock` and
-    /// logging to `log_dir/llama-server.log`.
-    pub fn new(binary: PathBuf, run_dir: &Path, log_dir: &Path) -> Result<Self, EngineServerError> {
-        let socket = run_dir.join("engine.sock");
-        if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+    /// A supervisor for `binary` whose socket (`engine.sock`), API key file
+    /// and pid file live in `runtime_dir` — the engine's private runtime
+    /// directory, `<base>/engine/run` in the daemon — and that logs to
+    /// `log_dir/llama-server.log`. The directory is created owner-only at
+    /// the first load. A socket path that cannot fit `sun_path` is refused
+    /// here, before anything binds, naming the limit and the path.
+    pub fn new(
+        binary: PathBuf,
+        runtime_dir: &Path,
+        log_dir: &Path,
+    ) -> Result<Self, EngineServerError> {
+        let socket = runtime_dir.join(SOCKET_FILE);
+        // `sun_path` holds the path and its terminator, so the limit itself
+        // is already too long: the same bound the public socket applies.
+        if socket.as_os_str().len() >= MAX_SOCKET_PATH_BYTES {
             return Err(EngineServerError::SocketPath(format!(
-                "{} exceeds {MAX_SOCKET_PATH_BYTES} bytes",
-                socket.display()
+                "{} is {} bytes; a unix socket path must be shorter than \
+                 {MAX_SOCKET_PATH_BYTES} bytes (`sun_path` on macOS); use a shorter pam base \
+                 directory",
+                socket.display(),
+                socket.as_os_str().len()
             )));
         }
         Ok(Self {
             binary,
             socket,
-            runtime: run_dir.join("engine"),
+            runtime: runtime_dir.to_path_buf(),
             log: log_dir.join("llama-server.log"),
             live: Arc::new(Mutex::new(None)),
             endpoint: Mutex::new(None),
@@ -373,17 +405,24 @@ impl EngineServer {
         self
     }
 
+    /// The private runtime directory: the socket, the key file and the pid
+    /// file live directly in it.
+    #[must_use]
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime
+    }
+
     /// Where the per-load API key file is written (removed once the server is
     /// healthy, and on every exit path).
     #[must_use]
     pub fn key_file(&self) -> PathBuf {
-        self.runtime.join("api.key")
+        self.runtime.join(KEY_FILE)
     }
 
     /// Where the pid record of the running server is kept.
     #[must_use]
     pub fn pid_file(&self) -> PathBuf {
-        self.runtime.join("engine.pid")
+        self.runtime.join(PID_FILE)
     }
 
     /// The pid record a previous supervisor left, if one is there and parses.
@@ -396,6 +435,29 @@ impl EngineServer {
     /// Removes the pid record (the process it named is gone or was never ours).
     pub fn forget_pid_record(&self) {
         let _ = std::fs::remove_file(self.pid_file());
+    }
+
+    /// Adopts the pid record a daemon with the old layout left under the
+    /// public run directory ([`LegacyRuntime`]) when this supervisor has
+    /// none, so the orphan reap reads it from the runtime directory like any
+    /// other. The old file is removed once copied; a record already in the
+    /// runtime directory wins and the old one is left for the removal step.
+    /// Returns whether a record was adopted.
+    pub fn adopt_pid_record(&self, legacy: &LegacyRuntime) -> bool {
+        if self.pid_file().exists() {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(legacy.pid_file()) else {
+            return false;
+        };
+        if serde_json::from_slice::<EnginePidRecord>(&bytes).is_err() {
+            return false;
+        }
+        if crate::private::write_private_file(&self.pid_file(), &bytes).is_err() {
+            return false;
+        }
+        let _ = std::fs::remove_file(legacy.pid_file());
+        true
     }
 
     /// Why the last server that had loaded is gone, when it died on its own.
@@ -560,11 +622,7 @@ impl EngineServer {
             return Err(EngineServerError::BinaryMissing(self.binary.clone()));
         }
         self.unload().await;
-        if let Some(dir) = self.socket.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| EngineServerError::SocketPath(format!("{}: {e}", dir.display())))?;
-        }
-        crate::private::create_private_dir(&self.runtime).map_err(|e| {
+        create_runtime_dir(&self.runtime).map_err(|e| {
             EngineServerError::SocketPath(format!("{}: {e}", self.runtime.display()))
         })?;
         let mut last = None;
@@ -1030,6 +1088,111 @@ impl From<EngineServerError> for LoadAttempt {
             error,
             retry: false,
         }
+    }
+}
+
+/// Creates the runtime directory owner-only. A pre-existing directory keeps
+/// its old mode under `DirBuilder`, so the mode is forced: the directory is
+/// the wall around the key file and the socket.
+fn create_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    crate::private::create_private_dir(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// The engine runtime as daemons before the `<base>/engine/run` layout kept
+/// it: the socket at `<run dir>/engine.sock` and the key and pid files in
+/// `<run dir>/engine/`, inside the public run directory an agent's sandbox
+/// must let it traverse. The daemon adopts the pid record from here
+/// ([`EngineServer::adopt_pid_record`]) before its orphan reap and then
+/// removes the rest ([`Self::remove`]); nothing is left behind silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRuntime {
+    socket: PathBuf,
+    dir: PathBuf,
+}
+
+/// Why a leftover of the old layout could not be removed.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot remove {} left by an older daemon: {source}; remove it by hand", path.display())]
+pub struct LegacyRuntimeError {
+    /// The leftover that stayed.
+    pub path: PathBuf,
+    /// The underlying I/O error.
+    #[source]
+    pub source: std::io::Error,
+}
+
+impl LegacyRuntime {
+    /// The old layout inside `run_dir` (`<base>/run`).
+    #[must_use]
+    pub fn in_run_dir(run_dir: &Path) -> Self {
+        Self {
+            socket: run_dir.join(SOCKET_FILE),
+            dir: run_dir.join("engine"),
+        }
+    }
+
+    /// The old socket path, `<run dir>/engine.sock`.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// The old key-and-pid directory, `<run dir>/engine`.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The old pid record, `<run dir>/engine/engine.pid`.
+    #[must_use]
+    pub fn pid_file(&self) -> PathBuf {
+        self.dir.join(PID_FILE)
+    }
+
+    /// Whether anything of the old layout is there: the old socket, or a
+    /// directory of the old name (what [`Self::remove`] would remove).
+    #[must_use]
+    pub fn present(&self) -> bool {
+        self.socket.symlink_metadata().is_ok()
+            || self.dir.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+    }
+
+    /// Removes the old socket and the old directory with whatever it holds
+    /// (key file, pid file, their temp files). Returns the paths that were
+    /// there and are now gone; nothing there is `Ok(empty)`. The first
+    /// failure stops the removal and names the path, so the daemon can say
+    /// what stayed.
+    ///
+    /// # Errors
+    ///
+    /// A leftover that could not be removed, with the path and the I/O error.
+    pub fn remove(&self) -> Result<Vec<PathBuf>, LegacyRuntimeError> {
+        let mut removed = Vec::new();
+        if self.socket.symlink_metadata().is_ok() {
+            std::fs::remove_file(&self.socket).map_err(|source| LegacyRuntimeError {
+                path: self.socket.clone(),
+                source,
+            })?;
+            removed.push(self.socket.clone());
+        }
+        // Only a directory of that name is the old layout; a file or a link
+        // called `engine` is somebody else's and stays.
+        if let Ok(meta) = self.dir.symlink_metadata()
+            && meta.is_dir()
+        {
+            std::fs::remove_dir_all(&self.dir).map_err(|source| LegacyRuntimeError {
+                path: self.dir.clone(),
+                source,
+            })?;
+            removed.push(self.dir.clone());
+        }
+        Ok(removed)
     }
 }
 

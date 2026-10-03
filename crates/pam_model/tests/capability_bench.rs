@@ -897,9 +897,9 @@ struct Timed {
 /// `PAM_BENCH_ENGINE_SERVER`.
 async fn load_generator(entry: &pam_model::registry::ModelEntry, path: &Path) -> Generator {
     let server = PathBuf::from(required("PAM_BENCH_ENGINE_SERVER"));
-    let run = std::env::temp_dir().join(format!("pam-bench-{}", std::process::id()));
-    std::fs::create_dir_all(&run).expect("bench run dir");
-    let engine = EngineServer::new(server, &run, &run).expect("engine supervisor");
+    let runtime = std::env::temp_dir().join(format!("pam-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).expect("bench runtime dir");
+    let engine = EngineServer::new(server, &runtime, &runtime).expect("engine supervisor");
     let options = ServerOptions {
         context_tokens: pam_model::runtime::CONTEXT_TOKENS,
         gpu_layers: std::env::var("PAM_BENCH_ENGINE_GPU_LAYERS")

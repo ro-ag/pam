@@ -56,6 +56,14 @@ pub use store::{
     RequestOrigin, RequestPrune, RequestRow, RequestState, RequestStatusMeta, RetentionCensus,
     Store,
 };
+pub use store::{
+    BoundaryCensus, BoundaryObservationInsert, BoundaryObservationRow, BoundaryPeer,
+    BoundaryReportInsert, BoundaryReportRow, MAX_BOUNDARY_OBSERVATIONS, MAX_BOUNDARY_REPORT_BYTES,
+    MAX_BOUNDARY_REPORTS, MAX_EXPECTED_OBSERVATIONS, OBSERVATION_ADMIN_CONTACT,
+    OBSERVATION_ADMIN_HANDSHAKE_FAILED, OBSERVATION_PUBLIC_UNKNOWN_HARNESS,
+    SETTING_ADMIN_CONTACTS_EXPECTED_TOTAL, SETTING_ADMIN_CONTACTS_TOTAL,
+    SETTING_PUBLIC_UNKNOWN_TOTAL,
+};
 
 #[cfg(test)]
 mod backup_test;
@@ -107,3 +115,6 @@ mod correlation_membership_test;
 
 #[cfg(test)]
 mod landing_session_test;
+
+#[cfg(test)]
+mod boundary_test;

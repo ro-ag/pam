@@ -98,6 +98,7 @@ fn every_frame_type_round_trips_under_its_documented_name() {
             proto: 2,
             version: "0.5.0".to_owned(),
             epoch: "01JB2M5T8Q0V7K3W9X4Y6Z1ABC".to_owned(),
+            pid: 4242,
         }),
         Frame::Request {
             envelope: envelope("req_1"),

@@ -1,5 +1,6 @@
 use super::{
-    Cli, Cmd, EvidenceCmd, EvidenceReadArgs, ServiceCmd, evidence_read_args, render_evidence,
+    Cli, Cmd, DOCTOR_TIMEOUT_MS, EvidenceCmd, EvidenceReadArgs, ServiceCmd, evidence_read_args,
+    render_evidence, resolved_profile_base,
 };
 use clap::Parser;
 use serde_json::json;
@@ -226,4 +227,146 @@ fn only_service_install_takes_an_explicit_base_dir() {
             "service {action} has no base override"
         );
     }
+}
+
+// --- pam doctor -------------------------------------------------------------
+
+#[test]
+fn doctor_parses_its_probe_flags_with_the_engines_default_bound() {
+    let Cmd::Doctor {
+        json,
+        no_report,
+        timeout_ms,
+        profile,
+        base,
+        managed,
+    } = Cli::try_parse_from(["pam", "doctor"]).unwrap().command
+    else {
+        panic!("expected the doctor command");
+    };
+    assert!(!json && !no_report && !managed);
+    assert_eq!(timeout_ms, DOCTOR_TIMEOUT_MS);
+    assert_eq!(
+        u128::from(DOCTOR_TIMEOUT_MS),
+        pam::doctor::DEFAULT_TIMEOUT.as_millis()
+    );
+    assert_eq!(profile, None);
+    assert_eq!(base, None);
+
+    let Cmd::Doctor {
+        json,
+        no_report,
+        timeout_ms,
+        ..
+    } = Cli::try_parse_from([
+        "pam",
+        "doctor",
+        "--json",
+        "--no-report",
+        "--timeout-ms",
+        "500",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("expected the doctor command");
+    };
+    assert!(json && no_report);
+    assert_eq!(timeout_ms, 500);
+}
+
+#[test]
+fn doctor_profile_takes_a_base_and_managed_only_beside_it() {
+    let Cmd::Doctor {
+        profile,
+        base,
+        managed,
+        ..
+    } = Cli::try_parse_from([
+        "pam",
+        "doctor",
+        "--profile",
+        "claude-code",
+        "--base",
+        "/tmp/x",
+        "--managed",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("expected the doctor command");
+    };
+    assert_eq!(profile.as_deref(), Some("claude-code"));
+    assert_eq!(base.as_deref(), Some(std::path::Path::new("/tmp/x")));
+    assert!(managed);
+
+    // `--base` and `--managed` describe a profile; without one they are usage errors,
+    // and a profile run neither probes nor reports, so those flags are refused too.
+    for args in [
+        vec!["pam", "doctor", "--base", "/tmp/x"],
+        vec!["pam", "doctor", "--managed"],
+        vec!["pam", "doctor", "--profile", "codex", "--json"],
+        vec!["pam", "doctor", "--profile", "codex", "--no-report"],
+        vec!["pam", "doctor", "--profile", "codex", "--timeout-ms", "5"],
+    ] {
+        assert!(
+            Cli::try_parse_from(&args).is_err(),
+            "{args:?} must not parse"
+        );
+    }
+}
+
+#[test]
+fn a_profile_base_is_made_absolute_and_left_as_given_when_it_does_not_exist() {
+    let missing = std::env::temp_dir().join("pam-doctor-profile-base-that-does-not-exist");
+    assert_eq!(resolved_profile_base(&missing), missing);
+    let relative = resolved_profile_base(std::path::Path::new("relative/base"));
+    assert!(relative.is_absolute(), "{}", relative.display());
+    assert!(
+        relative.ends_with("relative/base"),
+        "{}",
+        relative.display()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_profile_base_that_exists_is_resolved_through_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        resolved_profile_base(&link),
+        real.canonicalize().unwrap(),
+        "Seatbelt matches the resolved path"
+    );
+}
+
+/// The GUI offers the same harness names as `pam doctor --profile`; the
+/// list is pinned here because the frontend cannot ask the binary.
+#[test]
+fn the_gui_offers_every_profile_name_the_cli_takes() {
+    let ipc = include_str!("../../../frontend/src/lib/ipc.ts");
+    let (_, rest) = ipc
+        .split_once("HARNESS_PROFILES = [")
+        .expect("ipc.ts pins HARNESS_PROFILES");
+    let (list, _) = rest
+        .split_once(']')
+        .expect("the HARNESS_PROFILES array closes");
+    let offered: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.trim_matches('"'))
+        .collect();
+    let expected: Vec<&str> = pam::doctor::profiles::Harness::ALL
+        .iter()
+        .map(|harness| harness.name())
+        .collect();
+    assert_eq!(
+        offered, expected,
+        "ipc.ts offers the CLI's profile names in order"
+    );
 }

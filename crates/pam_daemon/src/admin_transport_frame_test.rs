@@ -330,6 +330,7 @@ async fn an_owner_request_is_answered_with_one_reply() {
             proto,
             version,
             epoch,
+            pid,
         }) = read(&mut client).await
         else {
             panic!("expected hello_ack");
@@ -337,6 +338,7 @@ async fn an_owner_request_is_answered_with_one_reply() {
         assert_eq!(proto, WIRE_PROTOCOL);
         assert_eq!(version, crate::daemon::DAEMON_VERSION);
         assert_eq!(epoch, plane.hub.epoch());
+        assert_eq!(pid, std::process::id(), "the ack names the daemon process");
         write(
             &mut client,
             &Frame::Request {
@@ -725,6 +727,7 @@ async fn oversized_frames_are_refused_before_allocation_in_both_directions() {
             proto: WIRE_PROTOCOL,
             version: version.to_owned(),
             epoch: "01JB2M5T8Q0V7K3W9X4Y6Z1ABC".to_owned(),
+            pid: std::process::id(),
         });
         framed::send(&mut daemon, &acked, MAX_REQUEST_BYTES)
             .await
@@ -792,6 +795,7 @@ async fn the_client_reports_a_refused_hello_as_a_refusal_and_anything_later_as_a
             proto: WIRE_PROTOCOL,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             epoch: "01JB2M5T8Q0V7K3W9X4Y6Z1ABC".to_owned(),
+            pid: std::process::id(),
         });
         let busy = Frame::error(cause::CONNECTION_CAPACITY_EXHAUSTED, "full", "Retry.");
         let other_id = Frame::Reply {

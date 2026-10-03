@@ -1,6 +1,6 @@
 //! Human and machine rendering of daemon responses and events. Exit codes: `0`
 //! solved/changed/verified (or a ticket), `1` transport/client failure, `2` usage error, `3`
-//! refused, `4` unresolved, `5` blocked.
+//! refused, `4` unresolved, `5` blocked, `6` boundary not established (`pam doctor` only).
 //!
 //! A refusal always renders all three fields the daemon sends — machine cause, human detail, and
 //! the recovery sentence (points at the GUI, never a security command):
@@ -20,9 +20,16 @@
 //! same way either way. `pam flow` gets three renderers — [`render_flow_list`],
 //! [`render_flow_show`], [`render_flow_result`] — plus [`parse_flow_inputs`], which turns
 //! positional `key=value` args into the `flow.run` args object.
+//!
+//! `pam doctor` renders its own document (`crate::doctor::render`); this module adds what the
+//! CLI learns from *sending* it: [`doctor_delivery`] turns the daemon's answer into the
+//! document's `report` member, [`render_doctor_reply`] prints how the daemon saw the caller,
+//! [`render_doctor_json`] adds that reply to the `--json` document, and [`doctor_exit_code`]
+//! maps the local verdict to the exit code.
 
 use std::fmt::Write as _;
 
+use pam_proto::doctor::{DoctorReport, ReportRecord, Verdict};
 use pam_proto::{Event, Outcome, Response};
 use serde_json::Value;
 
@@ -34,6 +41,183 @@ pub const EXIT_UNRESOLVED: u8 = 4;
 
 /// Exit code for a `blocked` result.
 pub const EXIT_BLOCKED: u8 = 5;
+
+/// Exit code of `pam doctor` when the boundary is `not_established`: new
+/// and distinct, so a script never mistakes a sandbox finding for a daemon
+/// decision (`3` refused, `5` blocked).
+pub const EXIT_BOUNDARY: u8 = 6;
+
+/// Maps a `pam doctor` verdict to the exit code: `established` `0`,
+/// `not_established` [`EXIT_BOUNDARY`], `cannot_probe` `1` (the daemon was
+/// unreachable or the base could not be resolved — the client failure every
+/// other subcommand maps to `1`). The verdict is the client's own; whether
+/// the daemon recorded the report never changes it.
+#[must_use]
+pub fn doctor_exit_code(verdict: Verdict) -> u8 {
+    match verdict {
+        Verdict::Established => 0,
+        Verdict::NotEstablished => EXIT_BOUNDARY,
+        Verdict::CannotProbe => 1,
+    }
+}
+
+/// Deadline the `doctor.report` request carries, in milliseconds: the
+/// daemon's control-class cap, so the client never waits longer than the
+/// daemon would serve.
+pub const DOCTOR_REPORT_DEADLINE_MS: u64 = 10_000;
+
+/// What `pam doctor` learned from sending its report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorDelivery {
+    /// The document's `report` member: recorded, under which request id,
+    /// or why not.
+    pub record: ReportRecord,
+    /// The daemon's reply body when it answered with a result: how it saw
+    /// the caller (`peer`, `claimed_harness`, `harness_agrees`,
+    /// `attributed_admin_contacts`).
+    pub reply: Option<Value>,
+    /// The stderr text when the report was not recorded; `None` when it was.
+    pub stderr: Option<String>,
+}
+
+impl DoctorDelivery {
+    /// A report that was deliberately not sent (`--no-report`, or a
+    /// `cannot_probe` verdict, which the daemon would refuse).
+    #[must_use]
+    pub fn not_sent(reason: &str) -> Self {
+        Self {
+            record: ReportRecord {
+                recorded: false,
+                request_id: None,
+                reason: Some(reason.to_owned()),
+            },
+            reply: None,
+            stderr: None,
+        }
+    }
+}
+
+/// How the daemon answered the `doctor.report` request. A result records
+/// the report under the daemon's request id and carries the reply; a
+/// refusal or a client-side failure leaves it unrecorded with the cause,
+/// and says so on stderr. None of it changes the verdict.
+#[must_use]
+pub fn doctor_delivery(sent: &Result<Response, crate::client::RequestError>) -> DoctorDelivery {
+    match sent {
+        Ok(Response::Result { body, .. }) => {
+            let accepted = body.get("accepted").and_then(Value::as_bool) == Some(true);
+            let request_id = body
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            DoctorDelivery {
+                record: ReportRecord {
+                    recorded: accepted,
+                    request_id,
+                    reason: (!accepted)
+                        .then(|| "the daemon answered without accepting the report".to_owned()),
+                },
+                reply: Some(body.clone()),
+                stderr: (!accepted).then(|| {
+                    "pam doctor: the daemon answered without accepting the report".to_owned()
+                }),
+            }
+        }
+        Ok(Response::Refusal {
+            cause,
+            detail,
+            recovery,
+            ..
+        }) => DoctorDelivery {
+            record: ReportRecord {
+                recorded: false,
+                request_id: None,
+                reason: Some(format!("refused ({cause}): {detail}")),
+            },
+            reply: None,
+            stderr: Some(format!(
+                "pam doctor: the report was not recorded\n{}",
+                render_refusal(cause, detail, recovery)
+            )),
+        },
+        Ok(Response::Ticket { ticket, .. }) => DoctorDelivery {
+            record: ReportRecord {
+                recorded: false,
+                request_id: None,
+                reason: Some(format!("the daemon queued the report as ticket {ticket}")),
+            },
+            reply: None,
+            stderr: Some(format!(
+                "pam doctor: the daemon queued the report as ticket {ticket} instead of recording it"
+            )),
+        },
+        Err(err) => DoctorDelivery {
+            record: ReportRecord {
+                recorded: false,
+                request_id: None,
+                reason: Some(err.to_string()),
+            },
+            reply: None,
+            stderr: Some(format!("pam doctor: the report was not sent: {err}")),
+        },
+    }
+}
+
+/// The human lines for the daemon's `doctor.report` reply, printed after
+/// the document: who the daemon saw at the socket (its own kernel-peer
+/// resolution, never the client's claim), what the client claimed, whether
+/// the two agree, and how many admin contacts the run explained.
+#[must_use]
+pub fn render_doctor_reply(reply: &Value) -> String {
+    let peer = reply.get("peer").unwrap_or(&Value::Null);
+    let text = |value: Option<&Value>, missing: &str| -> String {
+        match value {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Number(number)) => number.to_string(),
+            _ => missing.to_owned(),
+        }
+    };
+    let via = match peer.get("relayed").and_then(Value::as_bool) {
+        Some(true) => "relay",
+        Some(false) => "direct",
+        None => "via unknown",
+    };
+    let pid = peer
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "no pid".to_owned(), |pid| format!("pid {pid}"));
+    let exe = peer
+        .get("exe")
+        .and_then(Value::as_str)
+        .map(|exe| format!(" from {exe}"))
+        .unwrap_or_default();
+    let agrees = match reply.get("harness_agrees").and_then(Value::as_bool) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "undetermined",
+    };
+    format!(
+        "the daemon saw you as: {} ({pid}, {via}){exe}\n  claimed: {}; harness agrees: {agrees}; admin contacts attributed to this run: {}\n",
+        text(peer.get("harness"), "unknown"),
+        text(reply.get("claimed_harness"), "unknown"),
+        text(reply.get("attributed_admin_contacts"), "0"),
+    )
+}
+
+/// The `--json` document: the report as serde writes it, plus the daemon's
+/// reply under `daemon_reply` when it answered. (`daemon` is the hello's
+/// facts — version, protocol, epoch, via — so the reply sits beside it, not
+/// inside it.) One document, nothing else.
+#[must_use]
+pub fn render_doctor_json(report: &DoctorReport, reply: Option<&Value>) -> String {
+    let mut document = serde_json::to_value(report).unwrap_or_else(
+        |error| serde_json::json!({ "error": format!("cannot serialize the report: {error}") }),
+    );
+    if let (Some(reply), Some(object)) = (reply, document.as_object_mut()) {
+        object.insert("daemon_reply".to_owned(), reply.clone());
+    }
+    serde_json::to_string_pretty(&document).unwrap_or_else(|_| document.to_string())
+}
 
 /// Maps a terminal [`Response`] to the CLI exit code (see the module
 /// docs). A ticket is a successful hand-off, hence `0`.
@@ -263,7 +447,7 @@ pub fn render_ticket(ticket: &str, position: u64) -> String {
 pub fn render_status(body: &serde_json::Value) -> String {
     let field = |name: &str| body.get(name).map_or_else(|| "?".to_owned(), render_scalar);
     format!(
-        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  playbook:        pam playbook (the agent guide)",
+        "pam daemon\n  version:         {}\n  protocol:        {}\n  uptime:          {}\n  active requests: {}\n  model:           {}\n  keyring:         {}\n  boundary:        {}\n  playbook:        pam playbook (the agent guide)",
         field("daemon_version"),
         field("protocol"),
         body.get("uptime_s")
@@ -272,7 +456,61 @@ pub fn render_status(body: &serde_json::Value) -> String {
         field("active_requests"),
         render_model(body.get("model")),
         render_keyring(body.get("keyring")),
+        render_boundary(body.get("boundary")),
     )
+}
+
+/// The `boundary:` line: the block's own `summary` (`never checked — run
+/// pam doctor from the agent`, or the last verdict, its age, who sent it
+/// and the unexplained admin contacts), then, when a report exists, the
+/// request it was recorded under and its age on a second line. A daemon
+/// that publishes no block is an older build and renders `?`; a block
+/// without a `summary` is rebuilt from its fields.
+fn render_boundary(boundary: Option<&Value>) -> String {
+    let Some(boundary) = boundary else {
+        return "?".to_owned();
+    };
+    let report = boundary
+        .get("last_report")
+        .filter(|report| report.is_object());
+    let age = report
+        .and_then(|report| report.get("age_s"))
+        .and_then(Value::as_u64)
+        .map(render_age);
+    let summary = match boundary.get("summary").and_then(Value::as_str) {
+        Some(summary) => summary.to_owned(),
+        None => match (report, &age) {
+            (Some(report), Some(age)) => format!("{} {age} ago", field(report, "verdict")),
+            (Some(report), None) => field(report, "verdict").to_owned(),
+            (None, _) => "never checked — run pam doctor from the agent".to_owned(),
+        },
+    };
+    match report {
+        Some(report) => {
+            let request = field(report, "request_id");
+            let request = if request.is_empty() {
+                "(no request id)"
+            } else {
+                request
+            };
+            match age {
+                Some(age) => format!("{summary}\n    last report:   {request} ({age} ago)"),
+                None => format!("{summary}\n    last report:   {request}"),
+            }
+        }
+        None => summary,
+    }
+}
+
+/// An age the way the daemon's summary spells it: `12 s`, `7 min`, `3 h`,
+/// `2 d`.
+fn render_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3_599 => format!("{} min", secs / 60),
+        3_600..=86_399 => format!("{} h", secs / 3_600),
+        _ => format!("{} d", secs / 86_400),
+    }
 }
 
 /// The `keyring:` line: `reachable`, or the refusal and its way out.

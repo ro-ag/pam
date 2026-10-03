@@ -30,9 +30,14 @@
 //! a part is older than [`STALE_AFTER`] (its refresh keeps timing out), was
 //! never taken, or the live request count could not be read in time. A stale
 //! answer still proves the daemon is serving, which is the question a poll asks.
+//!
+//! The `boundary` block (the last `pam doctor` report and the daemon's own
+//! admin-contact observations) comes from the attached
+//! [`crate::boundary::Boundary`], which keeps its census in memory and reloads
+//! it after each of its own writes: no row is read on the poll either.
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use pam_model::runtime::RuntimeState;
@@ -43,6 +48,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::boundary::Boundary;
 use crate::model_service::{ModelService, Tier};
 use crate::secrets::SecretStore;
 
@@ -91,6 +97,11 @@ pub struct StatusCache {
     activity: RwLock<Activity>,
     /// The last in-flight count read from the store; `-1` before any.
     active_requests: AtomicI64,
+    /// The boundary observer, attached once at boot: the `boundary` block
+    /// is read from its in-memory census, and `doctor.report` records
+    /// through it. Absent in a harness that attached none; `status` then
+    /// serves the never-checked block.
+    boundary: OnceLock<Arc<Boundary>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -121,7 +132,20 @@ impl StatusCache {
             demand: Notify::new(),
             activity: RwLock::new(Activity::default()),
             active_requests: AtomicI64::new(-1),
+            boundary: OnceLock::new(),
         })
+    }
+
+    /// Attaches the boundary observer. Once: a second attachment is
+    /// ignored and answers `false`.
+    pub fn attach_boundary(&self, boundary: Arc<Boundary>) -> bool {
+        self.boundary.set(boundary).is_ok()
+    }
+
+    /// The attached boundary observer, if any.
+    #[must_use]
+    pub fn boundary(&self) -> Option<&Arc<Boundary>> {
+        self.boundary.get()
     }
 
     /// Spawns the one task that keeps the snapshot fresh while `status` is
@@ -257,6 +281,10 @@ impl StatusCache {
             "blocking_jobs": crate::blocking_jobs::snapshot(),
             "model": self.model_block(snapshot.model.as_ref().map(|(_, block)| block)),
             "keyring": snapshot.keyring.as_ref().map_or(Value::Null, |(_, block)| block.clone()),
+            "boundary": self.boundary.get().map_or_else(
+                crate::boundary::never_checked_block,
+                |boundary| boundary.status_block(),
+            ),
             "snapshot": {
                 "stale": stale,
                 "model_age_ms": age_ms(&snapshot.model),

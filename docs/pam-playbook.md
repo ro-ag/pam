@@ -10,7 +10,8 @@ and scopes are human actions in the PAM GUI. This guide ships inside the binary
 ## Discover what this machine can do
 
 ```sh
-pam status --json                          # daemon health; also the sandbox probe
+pam doctor --json                          # your sandbox boundary: run it once per session
+pam status --json                          # daemon health
 pam flow list --json                       # every flow: id, source, steps, inputs
 pam flow inspect <id> key=value --json     # what one run needs, before running
 pam flow show <id>                         # the recipe itself
@@ -35,7 +36,8 @@ pam evidence read <ev-id> --request <ticket> --json   # continue with --view/--d
 
 Exit codes: `0` success or ticket, `1` transport failure or observation
 timeout, `2` usage error, `3` refused, `4` unresolved verification, `5`
-blocked. With `--json` the response is one JSON document on stdout; refusals
+blocked, `6` sandbox boundary not established (`pam doctor` only). With
+`--json` the response is one JSON document on stdout; refusals
 of a follow are `kind: refusal` objects there too. `pam wait` follows the
 ticket on one connection and prints the durable result it ends with; a ticket
 that already finished is answered at once. Exit `3` from `pam wait` or
@@ -69,6 +71,28 @@ GUI (Settings → Flows / Connectors, Approvals): report the recovery line, and
 never try to work around a refusal. `input_unknown` means you typo'd or
 invented an input — drop it or use the declared name from `flow inspect`.
 
+## Check your sandbox once per session
+
+Run `pam doctor --json` once when you start. It probes, from your own
+position, whether the sandbox keeps you to PAM's public socket and reports the
+result to the daemon; it writes, creates and sends nothing, and starts no
+daemon. Read `verdict`:
+
+- `established` (exit `0`): the sandbox is right. Carry on.
+- `not_established` (exit `6`): `failed` names what you could reach that
+  must be denied, and `unverified` what could not be judged. The fix is the
+  human's — the sandbox profile for your harness (`pam doctor --profile
+  <harness>`, as the output names it) — so report the verdict and the
+  `failed` list and stop there. Never work around it, never probe further,
+  and never touch what the run showed you can reach.
+- `cannot_probe` (exit `1`): the daemon did not answer; see the next section.
+
+The daemon keeps the report (`pam status --json` shows it under `boundary`),
+and a report changes no authority: an established boundary grants nothing.
+Authority is per operating-system user, not per agent: whatever the human
+approved applies to every process that can reach the socket as that user, and
+your agent label, repository and pid are attribution, never a limit or a grant.
+
 ## Under an agent sandbox
 
 If `pam status` fails with a client-side transport error (before any refusal),
@@ -92,13 +116,16 @@ The human can paste this into the repository you both work in:
 
 ```text
 This machine runs pam (a local daemon gateway; `pam playbook` is the full
-guide). Check `pam status --json` first. Discover flows with
-`pam flow list --json` and inspect one with
+guide). Run `pam doctor --json` once per session: `established` means your
+sandbox is right; `not_established` is the human's to fix — report its
+`failed` list and never work around it. Check `pam status --json` first.
+Discover flows with `pam flow list --json` and inspect one with
 `pam flow inspect <id> k=v --json` — its blockers are actionable. Run from
 the approved repository: `pam flow run <id> k=v --no-wait --json`, then
 `pam wait <ticket> --json` and `pam flow result <ticket> --json`; read
 evidence with `pam evidence read <ev> --request <ticket> --json`. Exit codes:
-0 ok, 2 usage, 3 refused, 4 unresolved, 5 blocked. If `pam status` fails with
+0 ok, 2 usage, 3 refused, 4 unresolved, 5 blocked, 6 sandbox boundary not
+established (doctor only). If `pam status` fails with
 a transport error, ask the human to start `pam listen` and export
 PAM_SOCKET_DIR — do not start it yourself. Flows run real operations; never
 guess inputs, and treat refusal recovery lines as things to report.

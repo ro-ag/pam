@@ -44,7 +44,9 @@ use pam_model::download::{
     DownloadError, DownloadHandle, DownloadRequest, DownloadState, ImportRequest, TransferLimits,
 };
 use pam_model::engine;
-use pam_model::engine_server::{EngineContract, EngineServer, EngineServerError, ServerOptions};
+use pam_model::engine_server::{
+    EngineContract, EngineServer, EngineServerError, LegacyRuntime, ServerOptions,
+};
 use pam_model::qualification::{PromptContract, QUALIFIED, Qualification};
 use pam_model::registry::{
     ModelClass, ModelEntry, Registry, RegistryError, VerifyOutcome, default_models_dir,
@@ -607,7 +609,11 @@ impl ModelService {
         {
             return Some(Arc::clone(existing));
         }
-        let built = EngineServer::new(server, &base.join("run"), &base.join("engine")).ok()?;
+        // The engine's socket, key file and pid file live under
+        // `<base>/engine/run`, never in the public `<base>/run` an agent's
+        // sandbox must let it traverse.
+        let layout = engine::EngineLayout::new(&base);
+        let built = EngineServer::new(server, &layout.runtime_dir(), layout.root()).ok()?;
         let built = Arc::new(built);
         *slot = Some(Arc::clone(&built));
         Some(built)
@@ -1005,23 +1011,65 @@ impl ModelService {
     /// recorded model and key-file arguments, and started when the record says. Anything
     /// else with that pid is somebody else's: the stale record is removed and nothing is
     /// killed. Returns what happened, for logs and tests.
+    ///
+    /// The same pass migrates the engine runtime a daemon before the
+    /// `<base>/engine/run` layout kept inside the public run directory
+    /// (`<base>/run/engine.sock`, `<base>/run/engine/`): its pid record is
+    /// adopted first, so an engine that daemon left is still found and
+    /// stopped, and the leftovers are then removed — logged, never left
+    /// behind silently. With no engine installed there is nothing to reap,
+    /// but the leftovers still go.
     pub async fn reap_orphan_engine(&self) -> OrphanReap {
         if self.orphans_checked.swap(true, Ordering::AcqRel) {
             return OrphanReap::NothingToDo;
         }
+        let legacy = self.legacy_engine_runtime();
         let Some(engine) = self.engine_server() else {
             // No engine installed yet: look again once there is one.
             self.orphans_checked.store(false, Ordering::Release);
+            if legacy.present() {
+                let cleanup = crate::blocking_jobs::run(
+                    crate::blocking_jobs::Kind::ModelFilesystem,
+                    move || legacy.remove(),
+                )
+                .await;
+                if let Ok(cleanup) = cleanup {
+                    log_legacy_engine_cleanup(&cleanup);
+                }
+            }
             return OrphanReap::NothingToDo;
         };
         if engine.model().is_some() {
             return OrphanReap::NothingToDo;
         }
-        crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
-            reap_recorded_engine(&engine)
-        })
-        .await
-        .unwrap_or(OrphanReap::NothingToDo)
+        let outcome =
+            crate::blocking_jobs::run(crate::blocking_jobs::Kind::ModelFilesystem, move || {
+                // The old record is read for the reap before the old files go.
+                let adopted = engine
+                    .adopt_pid_record(&legacy)
+                    .then(|| (legacy.pid_file(), engine.pid_file()));
+                let reaped = reap_recorded_engine(&engine);
+                (reaped, adopted, legacy.remove())
+            })
+            .await;
+        let Ok((reaped, adopted, cleanup)) = outcome else {
+            return OrphanReap::NothingToDo;
+        };
+        if let Some((from, to)) = adopted {
+            tracing::info!(
+                from = %from.display(),
+                to = %to.display(),
+                "adopted the engine pid record an older daemon kept inside the run directory"
+            );
+        }
+        log_legacy_engine_cleanup(&cleanup);
+        reaped
+    }
+
+    /// The engine runtime as daemons before the `<base>/engine/run` layout
+    /// kept it, inside this base's public run directory.
+    fn legacy_engine_runtime(&self) -> LegacyRuntime {
+        LegacyRuntime::in_run_dir(&self.engine_base().join("run"))
     }
 
     /// The daemon's base directory as set by [`Self::set_engine_base`], or
@@ -2084,6 +2132,34 @@ pub enum OrphanReap {
         /// The pid that was stopped.
         pid: u32,
     },
+}
+
+/// One line for what the migration of an older daemon's engine runtime did:
+/// what went, or what stayed and why. Silent when there was nothing.
+fn log_legacy_engine_cleanup(
+    cleanup: &Result<Vec<PathBuf>, pam_model::engine_server::LegacyRuntimeError>,
+) {
+    match cleanup {
+        Ok(removed) if removed.is_empty() => {}
+        Ok(removed) => {
+            let removed: Vec<String> = removed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            tracing::info!(
+                removed = ?removed,
+                "removed the engine runtime an older daemon kept inside the run directory; \
+                 it now lives under <base>/engine/run"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %error.path.display(),
+                error = %error.source,
+                "an older daemon's engine runtime stayed inside the run directory; remove it by hand"
+            );
+        }
+    }
 }
 
 /// Reads the supervisor's pid file and stops the process it names — only when that

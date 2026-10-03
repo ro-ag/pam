@@ -9,8 +9,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use pam_model::engine::EngineLayout;
 use pam_model::engine_http::{self, Endpoint, HttpError};
-use pam_model::engine_server::{EngineServer, EngineServerError, ServerOptions};
+use pam_model::engine_server::{
+    EnginePidRecord, EngineServer, EngineServerError, KEY_FILE, LegacyRuntime, PID_FILE,
+    SOCKET_FILE, ServerOptions,
+};
 use pam_model::runtime::GenerateRequest;
 
 fn fake_binary() -> PathBuf {
@@ -735,6 +739,20 @@ async fn load_over_loopback_probes_a_port_polls_health_and_trusts_only_its_model
     };
     assert!(port > 0);
     assert!(!server.socket().exists(), "no socket file in loopback mode");
+    // The pid record is the one runtime file a loopback engine keeps, and
+    // it sits in the runtime directory itself: the old layout's `engine`
+    // subdirectory is never created.
+    assert_eq!(server.pid_file(), dir.path().join(PID_FILE));
+    assert!(server.pid_file().is_file(), "the pid record is written");
+    assert_eq!(server.key_file(), dir.path().join(KEY_FILE));
+    assert!(
+        !server.key_file().exists(),
+        "the key file is removed once the server has read it"
+    );
+    assert!(
+        !dir.path().join("engine").exists(),
+        "no key-and-pid subdirectory of the old layout"
+    );
     // Without the bearer key the server that `load` trusts refuses.
     let refused = engine_http::request(
         &Endpoint::Loopback(port),
@@ -780,4 +798,169 @@ async fn load_over_loopback_probes_a_port_polls_health_and_trusts_only_its_model
     );
     assert!(server.model().is_none());
     assert!(server.endpoint().is_none());
+}
+
+/// The runtime directory is `<base>/engine/run`, created owner-only at the
+/// first load, and it alone holds the socket, the pid record and (while the
+/// server starts) the key file. The public run directory beside it stays as
+/// the daemon left it: nothing of the engine lands there.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_runtime_directory_under_the_engine_holds_the_socket_key_and_pid() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = short_dir();
+    let base = dir.path();
+    let public_run = base.join("run");
+    std::fs::create_dir_all(&public_run).unwrap();
+    std::fs::write(public_run.join("pam.sock"), b"").unwrap();
+    std::fs::write(public_run.join("daemon.lock"), b"1").unwrap();
+    let runtime = EngineLayout::new(base).runtime_dir();
+    assert_eq!(runtime, base.join("engine").join("run"));
+    let server = EngineServer::new(fake_binary(), &runtime, &base.join("log")).unwrap();
+    assert_eq!(server.runtime_dir(), runtime);
+    assert_eq!(server.socket(), runtime.join(SOCKET_FILE));
+    assert_eq!(server.key_file(), runtime.join(KEY_FILE));
+    assert_eq!(server.pid_file(), runtime.join(PID_FILE));
+    assert!(
+        !runtime.exists(),
+        "nothing is created before the first load"
+    );
+
+    let options = ServerOptions {
+        load_timeout: Duration::from_secs(20),
+        ..ServerOptions::default()
+    };
+    server
+        .load("fake/model", Path::new("/models/fake.gguf"), &options)
+        .await
+        .unwrap();
+    let mode = std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the runtime directory is owner-only");
+    assert_eq!(names(&runtime), [PID_FILE, SOCKET_FILE]);
+    assert_eq!(
+        names(&public_run),
+        ["daemon.lock", "pam.sock"],
+        "the public run directory holds the public plane only"
+    );
+
+    server.unload().await;
+    assert!(
+        names(&runtime).is_empty(),
+        "unload leaves the runtime directory empty"
+    );
+    assert_eq!(names(&public_run), ["daemon.lock", "pam.sock"]);
+}
+
+/// A base directory whose runtime socket path cannot fit `sun_path` is refused
+/// at construction with the limit and the path, like the public socket.
+#[test]
+fn a_runtime_directory_too_deep_for_a_socket_is_refused_legibly() {
+    let deep = PathBuf::from("/tmp")
+        .join("x".repeat(90))
+        .join("engine")
+        .join("run");
+    let error = EngineServer::new(fake_binary(), &deep, Path::new("/tmp")).unwrap_err();
+    let EngineServerError::SocketPath(detail) = error else {
+        panic!("{error:?}");
+    };
+    assert!(detail.contains("engine.sock"), "{detail}");
+    assert!(detail.contains("104 bytes"), "{detail}");
+    assert!(detail.contains("shorter pam base directory"), "{detail}");
+}
+
+/// Daemons before this layout kept the engine runtime inside the public run
+/// directory. The next daemon adopts the pid record from there (so its
+/// orphan reap still finds the engine) and removes the rest; nothing is left
+/// behind, and a record already in the new place is never overwritten.
+#[tokio::test]
+async fn the_old_runtime_inside_the_run_directory_is_adopted_and_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    let public_run = base.join("run");
+    let old_dir = public_run.join("engine");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(public_run.join("pam.sock"), b"").unwrap();
+    std::fs::write(public_run.join("daemon.lock"), b"1").unwrap();
+    std::fs::write(public_run.join(SOCKET_FILE), b"").unwrap();
+    std::fs::write(old_dir.join(KEY_FILE), b"old-key\n").unwrap();
+    std::fs::write(old_dir.join("api.key.tmp"), b"").unwrap();
+    let record = EnginePidRecord {
+        pid: 4242,
+        exe: base.join("llama-server"),
+        model_path: base.join("model.gguf"),
+        spawned_ms: 1_700_000_000_000,
+    };
+    std::fs::write(old_dir.join(PID_FILE), serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let legacy = LegacyRuntime::in_run_dir(&public_run);
+    assert_eq!(legacy.socket(), public_run.join(SOCKET_FILE));
+    assert_eq!(legacy.dir(), old_dir);
+    assert_eq!(legacy.pid_file(), old_dir.join(PID_FILE));
+    assert!(legacy.present());
+
+    let runtime = EngineLayout::new(base).runtime_dir();
+    let server = EngineServer::new(fake_binary(), &runtime, base).unwrap();
+    assert!(server.pid_record().is_none());
+    assert!(
+        server.adopt_pid_record(&legacy),
+        "the old record is adopted"
+    );
+    assert_eq!(server.pid_record(), Some(record.clone()));
+    assert!(
+        !legacy.pid_file().exists(),
+        "the old record is gone once copied"
+    );
+    assert!(!server.adopt_pid_record(&legacy), "nothing left to adopt");
+
+    let removed = legacy.remove().unwrap();
+    assert_eq!(removed, [public_run.join(SOCKET_FILE), old_dir.clone()]);
+    assert!(!legacy.present());
+    assert_eq!(
+        names(&public_run),
+        ["daemon.lock", "pam.sock"],
+        "the public plane stays"
+    );
+    assert_eq!(legacy.remove().unwrap(), Vec::<PathBuf>::new());
+    assert_eq!(server.pid_record(), Some(record.clone()));
+
+    // A record already in the runtime directory wins over an old one.
+    std::fs::create_dir_all(&old_dir).unwrap();
+    let other = EnginePidRecord {
+        pid: 17,
+        ..record.clone()
+    };
+    std::fs::write(old_dir.join(PID_FILE), serde_json::to_vec(&other).unwrap()).unwrap();
+    assert!(!server.adopt_pid_record(&legacy));
+    assert_eq!(server.pid_record(), Some(record));
+    assert!(legacy.pid_file().exists(), "left for the removal step");
+    assert_eq!(legacy.remove().unwrap(), std::slice::from_ref(&old_dir));
+
+    // An old record that does not parse is not adopted; a plain file called
+    // `engine` is not the old layout and is left alone.
+    server.forget_pid_record();
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(old_dir.join(PID_FILE), b"not json").unwrap();
+    assert!(!server.adopt_pid_record(&legacy));
+    assert!(server.pid_record().is_none());
+    assert_eq!(legacy.remove().unwrap(), std::slice::from_ref(&old_dir));
+    std::fs::write(&old_dir, b"a file of that name").unwrap();
+    assert!(
+        !legacy.present(),
+        "a file of that name is not the old layout"
+    );
+    assert_eq!(legacy.remove().unwrap(), Vec::<PathBuf>::new());
+    assert!(old_dir.is_file());
+}
+
+/// Sorted entry names of a directory; empty when it does not exist.
+fn names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }

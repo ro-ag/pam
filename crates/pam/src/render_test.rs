@@ -1,11 +1,15 @@
+use pam_proto::doctor::{
+    DoctorReport, EnvFacts, Frontend, Platform, Probe, ProbeId, ProbeResult, ReportRecord, Verdict,
+};
 use pam_proto::{Event, Outcome, Response};
 
 use crate::client::RequestError;
 use crate::render::{
-    CAUSE_FOLLOW_TIMEOUT, EXIT_BLOCKED, EXIT_REFUSED, EXIT_UNRESOLVED, exit_code, flow_run_args,
-    parse_flow_inputs, render_event, render_flow_inspect, render_flow_list, render_flow_result,
-    render_flow_show, render_follow_failure, render_json, render_refusal, render_status,
-    render_ticket,
+    CAUSE_FOLLOW_TIMEOUT, DoctorDelivery, EXIT_BLOCKED, EXIT_BOUNDARY, EXIT_REFUSED,
+    EXIT_UNRESOLVED, doctor_delivery, doctor_exit_code, exit_code, flow_run_args,
+    parse_flow_inputs, render_doctor_json, render_doctor_reply, render_event, render_flow_inspect,
+    render_flow_list, render_flow_result, render_flow_show, render_follow_failure, render_json,
+    render_refusal, render_status, render_ticket,
 };
 
 fn result(outcome: Outcome) -> Response {
@@ -893,4 +897,245 @@ fn a_version_mismatch_refusal_is_one_plain_sentence_with_the_daemons_recovery() 
         render_follow_error("wait", &other),
         format!("pam wait: {other}")
     );
+}
+
+// --- pam doctor -------------------------------------------------------------
+
+/// A minimal `not_established` report: the reach allowed, one must-deny
+/// probe allowed, every other row not probed on this platform.
+fn doctor_report() -> DoctorReport {
+    let platform = Platform::Macos;
+    let probes = ProbeId::all()
+        .map(|id| match id {
+            ProbeId::PublicReach | ProbeId::AdminDir => Probe::new(id, ProbeResult::allowed()),
+            _ if id.applies_to(platform) => Probe::not_probed(id, "test"),
+            _ => Probe::not_applicable(id, platform),
+        })
+        .collect();
+    DoctorReport::new(
+        platform,
+        1_759_400_000,
+        None,
+        probes,
+        EnvFacts {
+            socket_dir: None,
+            base_dir_override: None,
+            resolved_base: "/Users/me/.pam".to_owned(),
+            resolved_endpoint: "/Users/me/.pam/run/pam.sock".to_owned(),
+            client_version: "0.0.0".to_owned(),
+            exe: None,
+            cwd_repo: None,
+            frontend: Frontend::Embedded,
+            harness_chain: vec!["zsh".to_owned(), "claude".to_owned()],
+        },
+    )
+}
+
+fn reply_body() -> serde_json::Value {
+    serde_json::json!({
+        "accepted": true,
+        "report_id": 7,
+        "request_id": "req_abc",
+        "verdict": "not_established",
+        "peer": { "uid": 501, "pid": 48122, "exe": "/Applications/PAM.app/Contents/MacOS/pam",
+                  "harness": "claude", "relayed": false },
+        "claimed_harness": "claude",
+        "harness_agrees": true,
+        "attributed_admin_contacts": 1
+    })
+}
+
+#[test]
+fn the_doctor_exit_code_is_the_local_verdict_and_six_is_new() {
+    assert_eq!(doctor_exit_code(Verdict::Established), 0);
+    assert_eq!(doctor_exit_code(Verdict::NotEstablished), EXIT_BOUNDARY);
+    assert_eq!(doctor_exit_code(Verdict::CannotProbe), 1);
+    assert_eq!(EXIT_BOUNDARY, 6);
+    for taken in [EXIT_REFUSED, EXIT_UNRESOLVED, EXIT_BLOCKED, 1, 2] {
+        assert_ne!(EXIT_BOUNDARY, taken);
+    }
+}
+
+#[test]
+fn an_accepted_reply_records_the_report_under_the_daemons_request_id() {
+    let sent = Ok(Response::Result {
+        id: "req_abc".to_owned(),
+        outcome: Outcome::Verified,
+        body: reply_body(),
+        evidence: Vec::new(),
+    });
+    let delivery = doctor_delivery(&sent);
+    assert_eq!(
+        delivery.record,
+        ReportRecord {
+            recorded: true,
+            request_id: Some("req_abc".to_owned()),
+            reason: None,
+        }
+    );
+    assert_eq!(delivery.reply, Some(reply_body()));
+    assert_eq!(delivery.stderr, None);
+}
+
+#[test]
+fn a_refused_reply_leaves_the_report_unrecorded_with_the_cause_on_stderr() {
+    let sent = Ok(Response::Refusal {
+        retryable: false,
+        id: "req_abc".to_owned(),
+        cause: "invalid_args".to_owned(),
+        detail: "doctor.report was refused: verdict is inconsistent".to_owned(),
+        recovery: "Run pam doctor again.".to_owned(),
+    });
+    let delivery = doctor_delivery(&sent);
+    assert!(!delivery.record.recorded);
+    assert_eq!(delivery.record.request_id, None);
+    assert_eq!(
+        delivery.record.reason.as_deref(),
+        Some("refused (invalid_args): doctor.report was refused: verdict is inconsistent")
+    );
+    assert_eq!(delivery.reply, None);
+    let stderr = delivery.stderr.expect("a refusal is said on stderr");
+    assert!(
+        stderr.starts_with("pam doctor: the report was not recorded"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("pam: refused (invalid_args)"), "{stderr}");
+    assert!(stderr.contains("Run pam doctor again."), "{stderr}");
+}
+
+#[test]
+fn a_transport_failure_and_a_ticket_both_leave_the_report_unrecorded() {
+    let failed: Result<Response, RequestError> = Err(RequestError::ReplyTimeout {
+        waited: std::time::Duration::from_secs(10),
+    });
+    let delivery = doctor_delivery(&failed);
+    assert!(!delivery.record.recorded);
+    assert!(delivery.record.reason.is_some());
+    assert!(
+        delivery
+            .stderr
+            .as_deref()
+            .is_some_and(|text| text.starts_with("pam doctor: the report was not sent: ")),
+        "{:?}",
+        delivery.stderr
+    );
+
+    let ticket = Ok(Response::Ticket {
+        id: "req_abc".to_owned(),
+        ticket: "req_abc".to_owned(),
+        position: 1,
+    });
+    let delivery = doctor_delivery(&ticket);
+    assert!(!delivery.record.recorded);
+    assert!(delivery.stderr.is_some());
+
+    let skipped = DoctorDelivery::not_sent("--no-report");
+    assert_eq!(skipped.record.reason.as_deref(), Some("--no-report"));
+    assert_eq!(skipped.stderr, None);
+}
+
+#[test]
+fn the_daemons_view_of_the_caller_renders_as_two_lines() {
+    let text = render_doctor_reply(&reply_body());
+    assert_eq!(
+        text,
+        "the daemon saw you as: claude (pid 48122, direct) from /Applications/PAM.app/Contents/MacOS/pam\n  claimed: claude; harness agrees: yes; admin contacts attributed to this run: 1\n"
+    );
+
+    // Windows, or a relay: the daemon has no peer of its own.
+    let text = render_doctor_reply(&serde_json::json!({
+        "accepted": true, "request_id": "req_w",
+        "peer": { "uid": null, "pid": null, "exe": null, "harness": null, "relayed": true },
+        "claimed_harness": "codex", "harness_agrees": null, "attributed_admin_contacts": 0
+    }));
+    assert_eq!(
+        text,
+        "the daemon saw you as: unknown (no pid, relay)\n  claimed: codex; harness agrees: undetermined; admin contacts attributed to this run: 0\n"
+    );
+}
+
+#[test]
+fn the_doctor_json_document_carries_the_record_and_the_reply_beside_the_hello_facts() {
+    let mut report = doctor_report();
+    report.report = Some(ReportRecord {
+        recorded: true,
+        request_id: Some("req_abc".to_owned()),
+        reason: None,
+    });
+    let text = render_doctor_json(&report, Some(&reply_body()));
+    let document: serde_json::Value = serde_json::from_str(&text).expect("one JSON document");
+    assert_eq!(document["verdict"], "not_established");
+    assert_eq!(document["report"]["recorded"], true);
+    assert_eq!(document["report"]["request_id"], "req_abc");
+    assert_eq!(document["daemon_reply"]["harness_agrees"], true);
+    assert_eq!(document["daemon_reply"]["peer"]["pid"], 48122);
+    // The hello's facts keep their key; the reply never shadows them.
+    assert!(document["daemon"].is_null());
+
+    let text = render_doctor_json(&report, None);
+    let document: serde_json::Value = serde_json::from_str(&text).expect("one JSON document");
+    assert!(document.get("daemon_reply").is_none());
+}
+
+#[test]
+fn status_prints_the_boundary_summary_and_the_last_report() {
+    let line = |boundary: serde_json::Value| {
+        render_status(&serde_json::json!({
+            "daemon_version": "0.1.0",
+            "protocol": 1,
+            "uptime_s": 1,
+            "active_requests": 0,
+            "boundary": boundary,
+        }))
+    };
+
+    let never = line(serde_json::json!({
+        "peer_identity": "kernel_pid",
+        "last_report": null,
+        "reports": { "retained": 0, "established": 0, "not_established": 0 },
+        "admin_contacts": { "unattributed": 0, "unattributed_24h": 0, "total": 0,
+                            "expected_total": 0, "last": null, "last_expected": null },
+        "public_unknown_harness": { "total": 0, "last": null },
+        "summary": "never checked — run pam doctor from the agent",
+    }));
+    assert!(
+        never.contains("boundary:        never checked — run pam doctor from the agent"),
+        "{never}"
+    );
+    assert!(!never.contains("last report"), "{never}");
+
+    let checked = line(serde_json::json!({
+        "peer_identity": "kernel_pid",
+        "last_report": {
+            "verdict": "not_established", "ts": 1, "received_ts": 2, "age_s": 7_200,
+            "agent": "codex", "repo": "/work/app", "relayed": true, "peer_pid": 11,
+            "peer_exe": "/usr/local/bin/pam", "peer_harness": "codex",
+            "failed": ["admin.dir"], "unverified": [], "request_id": "req_abc",
+        },
+        "reports": { "retained": 1, "established": 0, "not_established": 1 },
+        "admin_contacts": { "unattributed": 2, "unattributed_24h": 2, "total": 2,
+                            "expected_total": 0, "last": null, "last_expected": null },
+        "public_unknown_harness": { "total": 0, "last": null },
+        "summary": "not_established 2 h ago by codex (pid 11, relay); admin contacts unattributed: 2",
+    }));
+    assert!(
+        checked.contains(
+            "boundary:        not_established 2 h ago by codex (pid 11, relay); admin contacts unattributed: 2\n    last report:   req_abc (2 h ago)"
+        ),
+        "{checked}"
+    );
+
+    // A block without a summary (a trimmed status) is rebuilt from its fields.
+    let rebuilt = line(serde_json::json!({
+        "last_report": { "verdict": "established", "age_s": 42, "request_id": "req_x" },
+    }));
+    assert!(
+        rebuilt
+            .contains("boundary:        established 42 s ago\n    last report:   req_x (42 s ago)"),
+        "{rebuilt}"
+    );
+
+    // An older daemon publishes no block at all.
+    let missing = render_status(&serde_json::json!({ "daemon_version": "0.1.0" }));
+    assert!(missing.contains("boundary:        ?"), "{missing}");
 }

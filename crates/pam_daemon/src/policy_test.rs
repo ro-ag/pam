@@ -419,3 +419,15 @@ async fn strict_requires_approval_even_when_granted() {
     .await
     .expect("test within deadline");
 }
+
+#[test]
+fn doctor_report_is_control_class_in_the_control_pool() {
+    assert_eq!(
+        classify(crate::boundary::CAP_DOCTOR_REPORT),
+        Some(CapabilityClass::Control)
+    );
+    assert_eq!(
+        admission_pool(crate::boundary::CAP_DOCTOR_REPORT),
+        AdmissionPool::Control
+    );
+}

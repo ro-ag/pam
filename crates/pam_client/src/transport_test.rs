@@ -107,6 +107,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
             proto: WIRE_PROTOCOL,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             epoch: epoch.to_owned(),
+            pid: std::process::id(),
         }))
         .await;
     }

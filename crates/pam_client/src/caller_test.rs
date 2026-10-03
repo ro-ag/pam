@@ -6,43 +6,24 @@ fn chain(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
 
+// The classification rule and its table are tested where they live,
+// `pam_proto::caller`; this pins the re-export every call site relies on.
 #[test]
-fn classify_matches_exact_agent_name() {
+fn classify_chain_is_the_shared_rule() {
     assert_eq!(
-        classify_chain(&chain(&["claude", "zsh", "login"])),
+        classify_chain(&chain(&["claude-code", "zsh", "login"])),
         "claude"
     );
-}
-
-#[test]
-fn classify_nearest_ancestor_wins() {
-    assert_eq!(classify_chain(&chain(&["cursor", "claude"])), "cursor");
-}
-
-#[test]
-fn classify_is_case_insensitive() {
-    assert_eq!(classify_chain(&chain(&["Claude"])), "claude");
-}
-
-#[test]
-fn classify_matches_prefixed_variants() {
-    assert_eq!(classify_chain(&chain(&["claude-code"])), "claude");
-    assert_eq!(classify_chain(&chain(&["github-copilot"])), "copilot");
-}
-
-#[test]
-fn classify_falls_back_to_immediate_parent() {
-    assert_eq!(classify_chain(&chain(&["zsh", "login"])), "zsh");
-}
-
-#[test]
-fn classify_skips_empty_names_in_fallback() {
-    assert_eq!(classify_chain(&chain(&["", "bash"])), "bash");
-}
-
-#[test]
-fn classify_empty_chain_is_unknown() {
-    assert_eq!(classify_chain(&[]), "unknown");
+    assert_eq!(classify_chain(&[]), pam_proto::caller::UNKNOWN_AGENT);
+    assert!(
+        crate::caller::KNOWN_AGENTS
+            .iter()
+            .any(|(_, canonical)| *canonical == "claude")
+    );
+    assert_eq!(
+        crate::caller::MAX_CHAIN_DEPTH,
+        pam_proto::caller::MAX_CHAIN_DEPTH
+    );
 }
 
 #[test]

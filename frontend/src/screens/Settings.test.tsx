@@ -23,6 +23,7 @@ import {
   KNOWN_CAPABILITIES,
   LOG_LINE_CHOICES,
   PROFILE_SENTENCES,
+  boundaryVerdictLine,
   logTone,
 } from "./Settings";
 
@@ -904,6 +905,189 @@ describe("daemon", () => {
     expect(card.getByText(/PAM_BASE_DIR cannot be honoured/)).toBeInTheDocument();
     expect(card.queryByRole("button", { name: "Install" })).toBeNull();
     expect(card.queryByRole("button", { name: "Remove" })).toBeNull();
+  });
+});
+
+/** A `status.boundary` block as the daemon serves it, with overrides. */
+function boundaryBlock(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    peer_identity: "kernel_pid",
+    last_report: null,
+    reports: { retained: 0, established: 0, not_established: 0 },
+    admin_contacts: {
+      unattributed: 0,
+      unattributed_24h: 0,
+      total: 0,
+      expected_total: 0,
+      last: null,
+      last_expected: null,
+    },
+    public_unknown_harness: { total: 0, last: null },
+    summary: "never checked — run pam doctor from the agent",
+    ...overrides,
+  };
+}
+
+/** A recorded report, received `ageS` seconds ago. */
+function lastReport(verdict: string, ageS: number, overrides: Record<string, unknown> = {}) {
+  return {
+    verdict,
+    ts: nowSec - ageS - 1,
+    received_ts: nowSec - ageS,
+    age_s: ageS,
+    agent: "claude",
+    repo: "/work/app",
+    relayed: false,
+    peer_pid: 48122,
+    peer_exe: "/Applications/PAM.app/Contents/MacOS/pam",
+    peer_harness: "claude",
+    failed: [],
+    unverified: [],
+    request_id: "req_abc",
+    ...overrides,
+  };
+}
+
+function statusWithBoundary(boundary: Record<string, unknown> | undefined) {
+  mocks.daemonStatus.mockResolvedValue({
+    connected: true,
+    status: {
+      daemon_version: "0.10.1",
+      protocol: 1,
+      uptime_s: 3_723,
+      active_requests: 2,
+      ...(boundary === undefined ? {} : { boundary }),
+    },
+    base_dir: "/Users/me/.pam",
+  });
+}
+
+describe("boundary", () => {
+  it("shows nothing for a daemon that publishes no block", async () => {
+    statusWithBoundary(undefined);
+    renderSettings("daemon");
+    const card = within(await screen.findByRole("region", { name: "Daemon" }));
+    expect(await card.findByText("0.10.1")).toBeInTheDocument();
+    expect(card.queryByRole("group", { name: "Boundary" })).not.toBeInTheDocument();
+  });
+
+  it("reads not verified before any report, with the command preselected on the fallback", async () => {
+    statusWithBoundary(boundaryBlock());
+    renderSettings("daemon");
+    const rows = within(await screen.findByRole("group", { name: "Boundary" }));
+    expect(rows.getByText("not verified")).toBeInTheDocument();
+    expect(rows.getByText("not verified — run pam doctor from the agent")).toBeInTheDocument();
+    expect(rows.getByText("0")).toBeInTheDocument();
+    expect(rows.getByRole("combobox", { name: "harness" })).toHaveValue("sandbox-exec");
+    expect(rows.getByText("pam doctor --profile sandbox-exec")).toBeInTheDocument();
+    expect(rows.getByRole("button", { name: "copy doctor command" })).toBeEnabled();
+  });
+
+  it("shows an established boundary with its age, sender and the harness it came from", async () => {
+    statusWithBoundary(
+      boundaryBlock({
+        last_report: lastReport("established", 7_200),
+        reports: { retained: 1, established: 1, not_established: 0 },
+        summary: "established 2 h ago by claude (pid 48122, direct); admin contacts unattributed: 0",
+      }),
+    );
+    renderSettings("daemon");
+    const rows = within(await screen.findByRole("group", { name: "Boundary" }));
+    expect(rows.getByText("established")).toBeInTheDocument();
+    expect(rows.getByText("established · 2h ago · by claude (direct)")).toBeInTheDocument();
+    expect(rows.getByText("claude")).toBeInTheDocument();
+    expect(rows.getByText(/pid 48122/)).toBeInTheDocument();
+    expect(rows.queryByText("reached (must be denied)")).not.toBeInTheDocument();
+    // The harness of the last report picks the profile to copy.
+    expect(rows.getByRole("combobox", { name: "harness" })).toHaveValue("claude-code");
+    expect(rows.getByText("pam doctor --profile claude-code")).toBeInTheDocument();
+  });
+
+  it("names what a not-established run reached and the unexplained admin contacts", async () => {
+    statusWithBoundary(
+      boundaryBlock({
+        last_report: lastReport("not_established", 120, {
+          agent: "codex",
+          relayed: true,
+          peer_pid: null,
+          peer_harness: null,
+          failed: ["admin.dir", "store.read"],
+          unverified: ["daemon.signal"],
+        }),
+        reports: { retained: 1, established: 0, not_established: 1 },
+        admin_contacts: {
+          unattributed: 2,
+          unattributed_24h: 2,
+          total: 3,
+          expected_total: 10,
+          last: {
+            ts: nowSec - 60,
+            kind: "admin_contact",
+            peer_pid: 4711,
+            peer_exe: "/usr/local/bin/pam\u202e",
+            peer_harness: "zsh",
+            attributed: null,
+          },
+          last_expected: null,
+        },
+        summary: "not_established 2 min ago by codex (no pid, relay); admin contacts unattributed: 2",
+      }),
+    );
+    renderSettings("daemon");
+    const rows = within(await screen.findByRole("group", { name: "Boundary" }));
+    expect(rows.getByText("not established")).toBeInTheDocument();
+    expect(rows.getByText("not established · 2m ago · by codex (relay)")).toBeInTheDocument();
+    expect(rows.getByText("reached (must be denied)")).toBeInTheDocument();
+    expect(rows.getByText("admin.dir store.read")).toBeInTheDocument();
+    expect(rows.getByText("unverified")).toBeInTheDocument();
+    expect(rows.getByText("daemon.signal")).toBeInTheDocument();
+    expect(rows.getByText("2")).toBeInTheDocument();
+    // The peer executable is agent-influenced text: its hidden character is shown as an escape.
+    expect(rows.getByText(/last from/)).toBeInTheDocument();
+    expect(rows.getByText("\\u{202E}")).toBeInTheDocument();
+    expect(rows.getByRole("combobox", { name: "harness" })).toHaveValue("codex");
+  });
+
+  it("keeps a cannot-probe report honest and lets the human pick another harness", async () => {
+    statusWithBoundary(
+      boundaryBlock({
+        last_report: lastReport("cannot_probe", 600, { agent: "gemini" }),
+      }),
+    );
+    renderSettings("daemon");
+    const rows = within(await screen.findByRole("group", { name: "Boundary" }));
+    expect(rows.getByText("not probed")).toBeInTheDocument();
+    expect(rows.getByText("could not be probed · 10m ago · by gemini (direct)")).toBeInTheDocument();
+    const select = rows.getByRole("combobox", { name: "harness" });
+    expect(select).toHaveValue("gemini-cli");
+    fireEvent.change(select, { target: { value: "copilot-cli" } });
+    expect(rows.getByText("pam doctor --profile copilot-cli")).toBeInTheDocument();
+  });
+
+  it("copies the command and says so", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    statusWithBoundary(boundaryBlock());
+    renderSettings("daemon");
+    const rows = within(await screen.findByRole("group", { name: "Boundary" }));
+    fireEvent.click(rows.getByRole("button", { name: "copy doctor command" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("pam doctor --profile sandbox-exec"));
+    expect(await rows.findByText("Copied")).toBeInTheDocument();
+  });
+
+  it("phrases every verdict as one line", () => {
+    const now = nowSec * 1000;
+    const block = (last_report: unknown) =>
+      ({ ...boundaryBlock(), last_report }) as unknown as Parameters<typeof boundaryVerdictLine>[0];
+    expect(boundaryVerdictLine(block(null), now)).toBe(
+      "not verified — run pam doctor from the agent",
+    );
+    expect(
+      boundaryVerdictLine(block(lastReport("established", 3_600 * 5)), now),
+    ).toBe("established · 5h ago · by claude (direct)");
+    expect(
+      boundaryVerdictLine(block(lastReport("not_established", 0, { relayed: true })), now),
+    ).toBe("not established · now · by claude (relay)");
   });
 });
 

@@ -123,7 +123,9 @@ their sequence numbers needs no action.
 
 The CLI uses the same outcome mapping for synchronous execution and a completed
 wait: success 0, usage error 2, refusal 3, unresolved verification 4 and blocked
-work 5. Client/internal errors and observation timeout use 1. Transient daemon
+work 5. Client/internal errors and observation timeout use 1. Exit 6 belongs to
+`pam doctor` alone (the caller's sandbox boundary is not established); no run,
+wait, subscribe or result command returns it. Transient daemon
 conditions (capacity, rate, a full follower table, shutdown, restart, deadline,
 internal error, a follow that reached its one-hour lifetime) and a dropped
 connection are retried with backoff until the observation timeout: the client

@@ -28,6 +28,10 @@
 //!   instead. A public cancel acts only on a ticket admitted under the caller's own repository and
 //!   is audited as `system`; the private admin plane's cancel ([`Origin::Admin`]) may cancel any
 //!   ticket and is audited as `human`.
+//! - `doctor.report` (control class): stores a `pam doctor` document under the kernel peer facts
+//!   the daemon recorded itself, with its own audit row, and attributes the admin contacts the
+//!   same pid made around it ([`crate::boundary`]). A document that does not validate is refused
+//!   `invalid_args`; nothing about it changes any gate, grant or approval. Outcome `verified`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,6 +201,9 @@ pub enum BuiltinCapability {
     FlowResult,
     /// Read one scoped, bounded redacted evidence range.
     EvidenceRead,
+    /// Record a `pam doctor` document under the daemon's own peer facts
+    /// (see [`crate::boundary`]).
+    DoctorReport,
 }
 
 impl BuiltinCapability {
@@ -216,6 +223,7 @@ impl BuiltinCapability {
             crate::flow_service::CAP_FLOW_INSPECT => Some(Self::FlowInspect),
             crate::flow_result_service::CAP_FLOW_RESULT => Some(Self::FlowResult),
             crate::evidence_service::CAP_EVIDENCE_READ => Some(Self::EvidenceRead),
+            crate::boundary::CAP_DOCTOR_REPORT => Some(Self::DoctorReport),
             _ => None,
         }
     }
@@ -234,6 +242,7 @@ impl BuiltinCapability {
             Self::FlowInspect => crate::flow_service::CAP_FLOW_INSPECT,
             Self::FlowResult => crate::flow_result_service::CAP_FLOW_RESULT,
             Self::EvidenceRead => crate::evidence_service::CAP_EVIDENCE_READ,
+            Self::DoctorReport => crate::boundary::CAP_DOCTOR_REPORT,
         }
     }
 
@@ -250,6 +259,7 @@ impl BuiltinCapability {
             Self::FlowInspect => Ok(ctx.flows.inspect(&ctx, &ctx.args).await?),
             Self::FlowResult => crate::flow_result_service::result(&ctx).await,
             Self::EvidenceRead => crate::evidence_service::read(&ctx).await,
+            Self::DoctorReport => crate::boundary::report(&ctx).await,
         }
     }
 }

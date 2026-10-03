@@ -82,6 +82,44 @@ All notable changes to pam are documented in this file. The format follows
   and from where, the pinned archive table (held equal to the build's
   constants by a test), what runs on the machine, the mirror and
   install-from-file paths, the network settings, and how to remove it.
+- `pam doctor` checks the caller's own sandbox boundary. Run from where the
+  agent runs, it probes whether that position can reach what only the GUI may:
+  the private administration endpoint, the store files, the lock file for
+  writing, the model-trust, engine, flow and log directories, the engine's
+  socket and key directory, the keychain service, a signal to the daemon, the
+  LaunchServices and AppleEvents brokers, and writes to the `pam` executable and
+  its bundle. It prints one verdict and exits `0` for `established`, **`6` for
+  `not_established`** (a new code, distinct from refused and blocked; the
+  `failed` probes are listed) and `1` for `cannot_probe` (no daemon answered
+  the hello; nothing is started). `unknown` on a must-deny probe fails the
+  verdict. `--json` prints one document and nothing else, with the daemon's
+  reply as a top-level `daemon_reply`; `--no-report` skips recording and never
+  changes the code. An unsandboxed developer machine is `not_established`, and
+  so is every supported Windows configuration: no harness sandbox on Windows
+  establishes the boundary today, and the documents say what to do instead.
+- The daemon records each report (a control-class public request,
+  `doctor.report`, with an audit row) and its own observations of the private
+  plane: admin connections that sent nothing or came from another executable,
+  and public requests from an unrecognised harness. `pam status` gains a
+  `boundary` block (last report, retained counts, unattributed admin contacts,
+  a `summary` line), printed as a `boundary:` line; Settings › Daemon shows it
+  with a copyable `pam doctor` command, and Home shows one line. A report
+  changes no authority; nothing reads it but the human and fleet scripts.
+- `pam doctor --profile <claude-code|codex|gemini-cli|copilot-cli|sandbox-exec>
+  [--base DIR] [--managed]` prints a reference sandbox profile for that harness
+  with the base filled in and exits `0` without probing. The profiles live in
+  `docs/sandbox/` (macOS profiles per harness, a harness-independent
+  `sandbox-exec` profile, a Windows statement) and are embedded in the binary.
+  Each allows the literal public socket and the lock-file read, denies the rest
+  of the base, and says what its harness leaves outside.
+- Request rows record the peer's executable and the harness the daemon found in
+  its ancestry (`peer_exe`, `peer_harness`; `relay` through `pam listen`) beside
+  `peer_uid` and `peer_pid`, on macOS. Attribution, never authorization.
+- The administration boundary document gains "Verifying the boundary" and
+  states that authority is per operating-system user: caller labels, pids and
+  executable paths are attribution, and agents that need different authority
+  run as different users. The playbook teaches `pam doctor --json` once per
+  session, exit `6`, and stopping rather than working around a finding.
 
 ### Changed
 
@@ -246,6 +284,35 @@ All notable changes to pam are documented in this file. The format follows
   pinned release themselves (`install_release` is test-only), the engine and
   import ops refuse unknown arguments, and a mirror or a file that serves
   other bytes is refused before anything is unpacked.
+- The `pam doctor` write probes never open the binary. On macOS, opening for
+  write a binary that the daemon is mapped from invalidates the kernel's cached
+  code signature, and every later exec of `pam` and `PAM.app` is killed until
+  reinstalled, so `exe.write` and `bundle.write` ask `access(2)` through
+  `/bin/test -w` and open nothing (a regression test pins it). No probe writes,
+  creates, truncates, unlinks, renames, sends a frame or reads a private byte,
+  and `pam doctor` starts no daemon.
+- The admin-endpoint probe connects and sends nothing: it holds the socket for
+  150 ms so the daemon can read the peer's pid, then drops it; the daemon counts
+  the connection as an admin contact and attributes it to the report from the
+  same pid. The Windows probe opens `control.json` for read and closes it
+  without reading a byte, and never dials the admin port; the keychain probe
+  searches for an account that does not exist.
+- The engine's private socket and transient API key no longer live inside the
+  run directory that a sandboxed agent must traverse to reach `pam.sock`
+  (ptrack issue 44): the engine runtime moved to `<base>/engine/run` (`0700`,
+  inside the `engine` tree every profile denies), `run/` holds the public plane
+  only, and a daemon removes an older daemon's leftovers inside `run` at
+  start. The reference profiles name no engine path under `run` any more, and
+  `pam doctor` probes the runtime where it is.
+- `pam doctor` reads no byte from under the base. The daemon's pid, which the
+  `daemon.signal` and `daemon.process_query` probes need, comes from the hello
+  acknowledgement (`hello_ack` now carries `pid`) instead of the lock file, so
+  the probe is judged through the session relay too: a run through
+  `pam listen` under a profile that allows nothing under the base is
+  `established`. `harness_agrees` in the `doctor.report` reply is three-valued:
+  `false` only when both the daemon's resolution and the client's own chain are
+  known and differ; `null` (undetermined) when either is unknown, as under a
+  profile that denies `/bin/ps`.
 
 ### Removed
 

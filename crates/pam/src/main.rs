@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use pam::client::{self, DEFAULT_FOLLOW_TIMEOUT_MS, StopOutcome};
+use pam::doctor;
+use pam::doctor::profiles::{Harness, Variant, WINDOWS_STATEMENT, render_variant};
 use pam::render;
 use pam::request::{DEFAULT_DEADLINE_MS, parse_args_object};
 use pam_daemon::daemon::{DaemonError, run_daemon};
@@ -33,6 +35,10 @@ const RESULT_PATIENCE: Duration = Duration::from_secs(60);
 /// Default deadline for `pam flow run`, in milliseconds (30 minutes): a
 /// flow that runs `cargo test` is not a 60 s request.
 const FLOW_DEADLINE_MS: u64 = 1_800_000;
+
+/// Default bound of one `pam doctor` run, in milliseconds
+/// ([`doctor::DEFAULT_TIMEOUT`]).
+const DOCTOR_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Parser)]
 #[command(
@@ -136,6 +142,42 @@ enum Cmd {
     Flow {
         #[command(subcommand)]
         action: FlowCmd,
+    },
+    /// Check this process's sandbox boundary: probe PAM's private paths,
+    /// endpoints and brokers from here, print the verdict, and record it
+    /// with the daemon.
+    ///
+    /// Run it from where the agent runs. `established` (exit 0) means the
+    /// sandbox holds this process to the public socket; `not_established`
+    /// (exit 6) names what it could reach; `cannot_probe` (exit 1) means
+    /// the daemon did not answer the hello, so nothing could be judged. The
+    /// verdict is this process's own: a daemon that refuses or drops the
+    /// report changes the `report:` line, never the exit code.
+    /// `--profile` prints a reference sandbox profile for a harness and
+    /// exits without probing or dialing.
+    Doctor {
+        /// Print the report as one JSON document.
+        #[arg(long)]
+        json: bool,
+        /// Probe and print, but do not send the report to the daemon.
+        #[arg(long)]
+        no_report: bool,
+        /// Bound of the whole run, in milliseconds; a probe still pending
+        /// at the deadline is `unknown`, which fails the verdict.
+        #[arg(long, default_value_t = DOCTOR_TIMEOUT_MS)]
+        timeout_ms: u64,
+        /// Print the reference sandbox profile for this harness
+        /// (claude-code, codex, gemini-cli, copilot-cli, sandbox-exec)
+        /// instead of probing. The sources live under docs/sandbox/.
+        #[arg(long, value_name = "HARNESS", conflicts_with_all = ["json", "no_report", "timeout_ms"])]
+        profile: Option<String>,
+        /// The base directory the profile names (default: the resolved
+        /// base, `$PAM_BASE_DIR` or `~/.pam`); made absolute and resolved.
+        #[arg(long, value_name = "DIR", requires = "profile")]
+        base: Option<PathBuf>,
+        /// Print the managed (locked) variant, where the harness has one.
+        #[arg(long, requires = "profile")]
+        managed: bool,
     },
     /// Start the daemon at login: a user-scope launch agent or
     /// scheduled task. Never sudo or admin.
@@ -376,6 +418,14 @@ fn main() -> ExitCode {
         } => daemon_stop(),
         Cmd::Gui => gui_mode(),
         Cmd::Service { action } => service_command(&action),
+        // A profile is static text: printed without a runtime, a base
+        // directory that exists, or a daemon.
+        Cmd::Doctor {
+            profile: Some(name),
+            base,
+            managed,
+            ..
+        } => doctor_profile(&name, base, managed),
         command => client_mode(command),
     }
 }
@@ -481,9 +531,147 @@ async fn run_client_command(base: &Path, command: Cmd) -> ExitCode {
             }
         },
         Cmd::Flow { action } => run_flow_command(base, action).await,
-        Cmd::Daemon { .. } | Cmd::Gui | Cmd::Service { .. } | Cmd::Playbook => {
+        Cmd::Doctor {
+            json,
+            no_report,
+            timeout_ms,
+            profile: None,
+            ..
+        } => doctor_mode(base, json, no_report, timeout_ms).await,
+        Cmd::Daemon { .. }
+        | Cmd::Gui
+        | Cmd::Service { .. }
+        | Cmd::Playbook
+        | Cmd::Doctor {
+            profile: Some(_), ..
+        } => {
             unreachable!("handled in main")
         }
+    }
+}
+
+/// `pam doctor`: runs the probe engine from this process's position
+/// against `base` (the same resolution every client command uses,
+/// `PAM_SOCKET_DIR` included), sends the document as `doctor.report`
+/// unless `--no-report` — or unless the verdict is `cannot_probe`, which
+/// the daemon would refuse and which usually means it is unreachable —
+/// then prints the document once, with the daemon's answer folded into its
+/// `report` member. The exit code is the local verdict's
+/// ([`render::doctor_exit_code`]).
+///
+/// The engine runs its probes on threads of its own under its deadline,
+/// so it runs on the blocking pool rather than on top of the runtime.
+async fn doctor_mode(base: &Path, json: bool, no_report: bool, timeout_ms: u64) -> ExitCode {
+    let options =
+        doctor::Options::new(base.to_path_buf()).with_timeout(Duration::from_millis(timeout_ms));
+    let mut report = match tokio::task::spawn_blocking(move || doctor::run(&options)).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(err)) => {
+            eprintln!("pam doctor: {err}");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("pam doctor: the probe run did not finish: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let delivery = if no_report {
+        render::DoctorDelivery::not_sent("--no-report")
+    } else if report.verdict == pam_proto::doctor::Verdict::CannotProbe {
+        render::DoctorDelivery::not_sent("a cannot_probe report is not recordable")
+    } else {
+        let args = serde_json::to_value(report.as_args()).unwrap_or(serde_json::Value::Null);
+        let sent = client::send_request_with_id(
+            base,
+            pam::request::new_request_id(),
+            "doctor.report",
+            args,
+            true,
+            render::DOCTOR_REPORT_DEADLINE_MS,
+            None,
+        )
+        .await;
+        render::doctor_delivery(&sent)
+    };
+    report.report = Some(delivery.record);
+    if json {
+        println!(
+            "{}",
+            render::render_doctor_json(&report, delivery.reply.as_ref())
+        );
+    } else {
+        print!("{}", doctor::render_human(&report));
+        if let Some(reply) = &delivery.reply {
+            print!("{}", render::render_doctor_reply(reply));
+        }
+    }
+    if let Some(stderr) = delivery.stderr {
+        eprintln!("{stderr}");
+    }
+    ExitCode::from(render::doctor_exit_code(report.verdict))
+}
+
+/// `pam doctor --profile <harness>`: prints the reference sandbox profile
+/// for `base` and exits `0` (on Windows, the Windows statement instead:
+/// there is no profile there, and `--base` and `--managed` are ignored); nothing is probed and nothing is dialed. An
+/// unknown harness, a base the profile cannot carry safely, or `--managed`
+/// for a harness without a managed variant is a usage error (exit `2`)
+/// with the recovery on stderr. Where the fragment cannot carry its own
+/// instructions (JSON), stderr names the guide beside it.
+fn doctor_profile(name: &str, base: Option<PathBuf>, managed: bool) -> ExitCode {
+    let Some(harness) = Harness::parse(name) else {
+        eprintln!(
+            "pam doctor: unknown profile {name:?}; choose one of {}",
+            Harness::names()
+        );
+        return ExitCode::from(EXIT_USAGE);
+    };
+    // The profiles name POSIX paths and Windows has none to give: answer
+    // with what applies there, before any base is resolved or validated
+    // (`--base` and `--managed` have nothing to act on).
+    if cfg!(windows) {
+        let _ = (&base, managed);
+        print!("{WINDOWS_STATEMENT}");
+        return ExitCode::SUCCESS;
+    }
+    let Some(base) = base.or_else(pam::default_base_dir) else {
+        eprintln!(
+            "pam doctor: cannot resolve the home directory to place ~/.pam; set $HOME or pass --base"
+        );
+        return ExitCode::FAILURE;
+    };
+    let base = resolved_profile_base(&base);
+    let variant = if managed {
+        Variant::Managed
+    } else {
+        Variant::Standard
+    };
+    match render_variant(harness, variant, &base) {
+        Ok(text) => {
+            print!("{text}");
+            if let Some(guide) = harness.profile().guide_file {
+                eprintln!("pam doctor: how to apply this fragment: docs/sandbox/{guide}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("pam doctor: {err}");
+            ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+/// The base a profile names: absolute (a relative `--base` is taken from
+/// the working directory) and, on unix, resolved through symlinks when it
+/// exists — Seatbelt and the harnesses match the path the OS resolves, so
+/// `/tmp/x` must read `/private/tmp/x` on macOS. A base that does not
+/// exist yet is named as given.
+fn resolved_profile_base(base: &Path) -> PathBuf {
+    let absolute = std::path::absolute(base).unwrap_or_else(|_| base.to_path_buf());
+    if cfg!(unix) {
+        absolute.canonicalize().unwrap_or(absolute)
+    } else {
+        absolute
     }
 }
 

@@ -26,8 +26,11 @@ mod correlation_membership;
 #[path = "flow_results.rs"]
 mod flow_results;
 pub use flow_results::*;
+#[path = "boundary.rs"]
+mod boundary;
 #[path = "watch_progress.rs"]
 mod watch_progress;
+pub use boundary::*;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

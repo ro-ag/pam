@@ -111,6 +111,11 @@ async fn status_bypasses_the_lanes_and_verifies() {
         let mut events = daemon.subscribe(&["req_status", "req_query"]).await;
         let mut client = daemon.client().await;
 
+        // The snapshot's slow half is produced here, awaited, rather than
+        // left to the poll's bounded first-snapshot wait: the assertion
+        // below is that the body comes from a snapshot the task produced,
+        // not that this host produced one within the bound.
+        daemon.handle().refresh_status().await;
         client
             .send(&envelope(
                 "req_status",

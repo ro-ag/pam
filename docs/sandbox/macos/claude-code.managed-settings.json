@@ -15,9 +15,7 @@
         "<base>/model-trust",
         "<base>/engine",
         "<base>/flows",
-        "<base>/log",
-        "<base>/run/engine",
-        "<base>/run/engine.sock"
+        "<base>/log"
       ],
       "allowRead": ["<base>/run/daemon.lock"],
       "denyWrite": ["<base>", "/Applications/PAM.app"]

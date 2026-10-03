@@ -373,6 +373,9 @@ pub struct DaemonHandle {
     image: Arc<ImageWatch>,
     /// The dispatcher's pools, for inspection.
     admission: Arc<Admission>,
+    /// The cached slow half of `status`, so a harness can produce a fresh
+    /// snapshot on demand (see [`Self::refresh_status`]).
+    status: Arc<StatusCache>,
     #[cfg(test)]
     queue: Arc<QueueManager>,
     #[cfg(test)]
@@ -454,6 +457,15 @@ impl DaemonHandle {
     #[must_use]
     pub fn public_connections_available(&self) -> usize {
         self.transport.public_connections_available()
+    }
+
+    /// Produces the `status` snapshot now and returns once it is stored:
+    /// what a first `status` poll otherwise waits a bounded moment for
+    /// ([`crate::status_cache::FIRST_SNAPSHOT_WAIT`]). For embedding hosts
+    /// and integration tests that assert on a fresh snapshot rather than
+    /// on how quickly this host produced one; the poll path is unchanged.
+    pub async fn refresh_status(&self) {
+        self.status.refresh().await;
     }
 
     /// The queue manager, for in-crate tests that need to stall or inject.
@@ -788,7 +800,7 @@ pub async fn run_daemon_with(
         admin_observer,
         Arc::clone(&queue).run_reaper(REAP_INTERVAL, drain_rx.clone()),
         RetentionService::new(Arc::clone(&store)).run_scheduler(PRUNE_INTERVAL, drain_rx.clone()),
-        status.spawn(drain_rx.clone()),
+        Arc::clone(&status).spawn(drain_rx.clone()),
         // Runs through the drain: a verdict parked while draining is still
         // offered to the store before the daemon exits.
         tokio::spawn(maintenance_loop(
@@ -825,6 +837,7 @@ pub async fn run_daemon_with(
         phase,
         image,
         admission,
+        status,
         #[cfg(test)]
         queue,
         #[cfg(test)]

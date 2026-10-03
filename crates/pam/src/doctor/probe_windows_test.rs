@@ -77,39 +77,38 @@ fn the_credential_store_is_asked_for_the_absent_account() {
 }
 
 #[test]
-fn the_process_query_asks_powershell_for_the_lock_pids_path() {
+fn the_process_query_asks_powershell_for_the_path_of_the_pid_the_hello_named() {
     let (context, os) = self::context(FakeOs::unsandboxed().with_env("SystemRoot", r"C:\Windows"));
+    // What the reach probe records from the acknowledged hello.
+    context.daemon_pid.set(Some(4242));
     let outcome = run(&context, ProbeId::DaemonProcessQuery);
     assert_eq!(outcome.result.state, ProbeState::Allowed);
     assert_eq!(outcome.result.note.as_deref(), Some("query only"));
     let calls = os.calls();
-    assert_eq!(
-        calls[0],
-        format!("ReadPid {}", context.lock_path().display())
-    );
+    assert_eq!(calls.len(), 1, "one helper, nothing read: {calls:#?}");
     let powershell = Path::new(r"C:\Windows")
         .join("System32")
         .join(r"WindowsPowerShell\v1.0\powershell.exe");
-    assert!(calls[1].starts_with(&format!(
+    assert!(calls[0].starts_with(&format!(
         "helper {} -NoProfile -NonInteractive -NoLogo -Command ",
         powershell.display()
     )));
-    assert!(calls[1].contains("Get-Process -Id 4242 -ErrorAction Stop"));
-    assert!(calls[1].contains("'PATH=' + [string]$p.Path"));
+    assert!(calls[0].contains("Get-Process -Id 4242 -ErrorAction Stop"));
+    assert!(calls[0].contains("'PATH=' + [string]$p.Path"));
 }
 
 #[test]
-fn an_unreadable_lock_leaves_the_process_query_unknown() {
-    let mut os = FakeOs::unsandboxed();
-    os.pid_file = Err(super::os_test::Answer::Denied);
-    let (context, os) = self::context(os);
+fn without_a_reached_daemon_the_process_query_is_not_probed() {
+    let (context, os) = self::context(FakeOs::unsandboxed());
+    // The reach probe answered: nothing acknowledged the hello.
+    context.daemon_pid.set(None);
     let outcome = run(&context, ProbeId::DaemonProcessQuery);
-    assert_eq!(outcome.result.state, ProbeState::Unknown);
+    assert_eq!(outcome.result.state, ProbeState::NotProbed);
     assert_eq!(
         outcome.result.note.as_deref(),
-        Some("lock file unreadable: no pid to probe")
+        Some("no daemon reached: no pid to probe")
     );
-    assert_eq!(os.calls().len(), 1, "no helper runs without a pid");
+    assert!(os.calls().is_empty(), "no helper runs without a pid");
 }
 
 #[test]

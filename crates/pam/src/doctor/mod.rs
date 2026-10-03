@@ -7,8 +7,9 @@
 //! through [`DoctorReport::new`]. Each probe obeys the side-effect rules of
 //! `docs/specs/2026-10-02-boundary-self-check.md`: nothing is written,
 //! created, truncated, unlinked, renamed or sent; no private byte is read
-//! (the lock file's pid is the one exception, and the ordinary client reads
-//! it too); the admin connect sends nothing; every spawned helper is named by
+//! (the daemon's pid, which the signal probe needs, comes from the hello's
+//! acknowledgement, not from the lock file); the admin connect sends
+//! nothing; every spawned helper is named by
 //! absolute path, runs with a cleared environment and null stdin, and is
 //! bounded. Every OS interaction goes through the [`os::Os`] seam so that the
 //! classifiers in [`classify`] are pure functions over injected errors and

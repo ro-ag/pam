@@ -952,7 +952,8 @@ mod doctor_report {
     }
 
     #[tokio::test]
-    async fn a_report_from_a_relayed_peer_records_the_relay_harness_and_cannot_agree() {
+    async fn a_report_from_a_relayed_peer_records_the_relay_harness_and_agreement_is_undetermined()
+    {
         let fx = fixture().await;
         let boundary = boundary(&fx).await;
         let mut ctx = ctx(&fx, "req_relay", document(false), Some(&boundary)).await;
@@ -976,10 +977,33 @@ mod doctor_report {
         assert_eq!(body["peer"]["harness"], "relay");
         assert_eq!(body["peer"]["exe"], Value::Null);
         assert_eq!(body["peer"]["relayed"], true);
-        assert_eq!(body["harness_agrees"], false);
+        // The daemon sees the relay, not the client's harness: it cannot
+        // say the two disagree.
+        assert_eq!(body["harness_agrees"], Value::Null);
         let block = boundary.status_block();
         assert_eq!(block["last_report"]["relayed"], true);
         assert!(block["summary"].as_str().unwrap().contains(", relay)"));
+    }
+
+    /// Under a profile that denies `/bin/ps` the client's chain is empty
+    /// and it claims `unknown`; the daemon, which resolved the harness
+    /// itself, answers undetermined rather than `false`.
+    #[tokio::test]
+    async fn a_client_that_could_not_walk_its_chain_leaves_the_agreement_undetermined() {
+        let fx = fixture().await;
+        let boundary = boundary(&fx).await;
+        let mut args = document(false);
+        args["env"]["harness_chain"] = json!([]);
+        let ctx = ctx(&fx, "req_sandboxed", args, Some(&boundary)).await;
+        let body = BuiltinCapability::DoctorReport
+            .execute(ctx)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["peer"]["harness"], "claude");
+        assert_eq!(body["claimed_harness"], "unknown");
+        assert_eq!(body["harness_agrees"], Value::Null);
     }
 
     async fn refused(

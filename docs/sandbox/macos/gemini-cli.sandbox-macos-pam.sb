@@ -18,8 +18,8 @@
 ;; Allow:    connect to <base>/run/pam.sock; read of <base>/run/daemon.lock;
 ;;           outbound TCP/UDP (Gemini's own API traffic), local binds, and
 ;;           the mDNSResponder socket for name resolution
-;; Deny:     every other unix-socket connect; everything else under <base> --
-;;           including <base>/run/engine.sock and <base>/run/engine/;
+;; Deny:     every other unix-socket connect; everything else under <base>
+;;           (the engine's socket and API key live under <base>/engine/run);
 ;;           the keychain (files and the SecurityServer Mach service); signals
 ;;           to other processes; the LaunchServices and AppleEvents brokers;
 ;;           writes to PAM.app
@@ -121,11 +121,8 @@
 (deny file-read-data file-write* (subpath "<base>/engine"))
 (deny file-read-data file-write* (subpath "<base>/flows"))
 (deny file-read-data file-write* (subpath "<base>/log"))
-;; The engine runtime sits inside <base>/run: its socket and its transient API key.
-(deny file-read-data file-write* (subpath "<base>/run/engine"))
-(deny file-read-data file-write* (literal "<base>/run/engine.sock"))
 (deny network-outbound (remote unix-socket (literal "<base>/admin/control.sock")))
-(deny network-outbound (remote unix-socket (literal "<base>/run/engine.sock")))
+(deny network-outbound (remote unix-socket (literal "<base>/engine/run/engine.sock")))
 
 ;; The trusted bundle, the keychain, process control and brokers.
 (deny file-write* (subpath "/Applications/PAM.app"))

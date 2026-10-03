@@ -35,7 +35,8 @@ use super::classify::{
 };
 use super::helpers::{Helper, HelperOutcome};
 use super::inventory::{
-    ADMIN_CONTROL, ADMIN_DIR, Context, Planned, current_exe, file_op, lock_pid, open_read,
+    ADMIN_CONTROL, ADMIN_DIR, Context, Planned, current_exe, daemon_pid, file_op, open_read,
+    reach_bound,
 };
 use super::os::Os;
 
@@ -95,15 +96,19 @@ pub fn plan(id: ProbeId, context: &Context) -> Option<Planned> {
     })
 }
 
-/// `Get-Process -Id <lock pid>` printing `PATH=<exe>`: query rights only.
+/// `Get-Process -Id <pid>` of the pid the daemon's hello acknowledgement
+/// named, printing `PATH=<exe>`: query rights only. Waits for the reach
+/// probe like `daemon.signal` on macOS; `not_probed` when no daemon was
+/// reached.
 fn process_query(context: &Context) -> Planned {
     let os = Arc::clone(&context.os);
-    let lock = context.lock_path();
+    let cell = Arc::clone(&context.daemon_pid);
+    let hello_bound = context.options.hello_bound;
     let bound = context.options.helper_bound;
     Planned {
         id: ProbeId::DaemonProcessQuery,
-        bound: bound + Duration::from_secs(1),
-        op: Box::new(move || match lock_pid(os.as_ref(), &lock) {
+        bound: reach_bound(hello_bound) + bound + Duration::from_secs(1),
+        op: Box::new(move || match daemon_pid(&cell, hello_bound) {
             Ok(pid) => {
                 let script = format!(
                     "$p = Get-Process -Id {pid} -ErrorAction Stop; Write-Output ('PATH=' + [string]$p.Path)"

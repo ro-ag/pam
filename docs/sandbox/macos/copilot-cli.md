@@ -21,8 +21,9 @@
   `<base>/run/daemon.lock`. No dialog item for a Unix socket is documented;
   see "The public socket" below.
 - **Deny:** in the dialog's Filesystem tab, a Denied path rule for each of the
-  paths listed below, including the engine runtime `<base>/run/engine.sock` and
-  `<base>/run/engine/`; in the Auth tab, "Allow keychain access" off.
+  paths listed below (the engine's socket and API key live under
+  `<base>/engine/run`, covered by the `<base>/engine` rule); in the Auth tab,
+  "Allow keychain access" off.
 - **Prove:** from a command Copilot runs in the sandbox, `pam doctor` must print
   `boundary: established` and exit `0`.
 
@@ -44,8 +45,6 @@ Filesystem tab, path rules, permission Denied (one rule each):
 - `<base>/engine`
 - `<base>/flows`
 - `<base>/log`
-- `<base>/run/engine`
-- `<base>/run/engine.sock`
 
 The rule on `<base>` also covers `<base>/run/daemon.lock`, which the client
 reads to decide whether to start the daemon. Add `<base>/run/daemon.lock` as a

@@ -84,8 +84,10 @@ the sandbox refuses the admin connect before it reaches the socket, so there
 is no contact to attribute. The public socket and lock inodes and the lock
 bytes are unchanged. The harness chain is empty under the profile because
 `/bin/ps` cannot exec there (`sandbox-exec: execvp() of '/bin/ps' failed:
-Operation not permitted`), so the daemon reports `claimed_harness: unknown`,
-`harness_agrees: false` while its own view of the peer names the real harness.
+Operation not permitted`), so the daemon reports `claimed_harness: unknown` and
+`harness_agrees: null` (undetermined: one side does not know) while its own
+view of the peer names the real harness. The profiles do not allow `/bin/ps`; a
+process listing is information the sandbox should deny.
 
 **Not established, unsandboxed**
 (`unsandboxed_is_not_established_and_its_admin_contact_is_attributed`). The
@@ -125,23 +127,23 @@ a daemon creates stays listable. Everything else it denies the way
 the profile that establishes the boundary.
 
 **Through the relay**
-(`through_the_relay_the_verdict_is_computed_and_the_lock_decides_daemon_signal`).
+(`through_the_relay_the_boundary_is_established_without_reading_the_lock`).
 With `pam listen <dir>` running outside the sandbox and `PAM_SOCKET_DIR=<dir>`
 in the sandboxed run, the hello goes through the relay (`daemon.via: relay`,
 `env.socket_dir` and `env.resolved_endpoint` name `<dir>`), the admin, store
 and log probes stay `denied`, and the daemon records the report with the
 relay as its peer (`peer.relayed = true`, `peer.harness = "relay"`,
-`peer.pid` = the relay's). With the relay variant the profile's own comment
-describes — the `pam.sock` and `daemon.lock` allow lines replaced by one
-allow of `<dir>/pam.sock`, nothing under `<base>` readable — the verdict is
-`not_established` with `failed = []` and `unverified = [daemon.signal]`:
-the daemon's pid lives in `<base>/run/daemon.lock`, which is now unreadable
-(`run.lock_probe`: `unreadable under the relay; lazy start is not needed
-here`), so the signal probe is `unknown` (`lock file unreadable: no pid to
-probe`) and an unknown fails the verdict. The same profile with the
-`daemon.lock` read line kept is `established` through the relay. Until the
-relay guidance or the probe changes, a relay deployment that wants
-`established` keeps the lock readable.
+`peer.pid` = the relay's; `claimed_harness: unknown`, `harness_agrees: null`).
+With the relay variant the profile's own comment describes — the `pam.sock`
+and `daemon.lock` allow lines replaced by one allow of `<dir>/pam.sock`,
+nothing under `<base>` readable — the verdict is **`established`**, exit 0,
+`failed = []`, `unverified = []`: `daemon.signal` takes the daemon's pid from
+the hello acknowledgement and is refused (`kill: <pid>: Operation not
+permitted`) without reading the lock, which reads `denied` only as the
+informational `run.lock_probe` (`unreadable under the relay; lazy start is not
+needed here`). The same profile with the `daemon.lock` read line kept is
+`established` too, with the lock probe `allowed` (`held: a daemon is
+running`); `pam status` then shows two retained reports, both `relayed`.
 
 **Helper strings re-pinned under `sandbox-exec`**
 (`keychain_signal_access_and_ps_helpers_under_pam_agent_sb_match_the_pinned_strings`,

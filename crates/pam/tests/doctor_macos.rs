@@ -497,6 +497,22 @@ async fn under_pam_agent_sb_the_boundary_is_established_and_recorded() {
             report["daemon_reply"]["attributed_admin_contacts"], 0,
             "{report}"
         );
+        // `/bin/ps` cannot exec under the profile, so the client's chain is
+        // empty and it claims `unknown`; the daemon, which resolved the
+        // harness itself, answers undetermined rather than a disagreement.
+        assert_eq!(
+            report["env"]["harness_chain"],
+            serde_json::json!([]),
+            "{report}"
+        );
+        assert_eq!(
+            report["daemon_reply"]["claimed_harness"], "unknown",
+            "{report}"
+        );
+        assert!(
+            report["daemon_reply"]["harness_agrees"].is_null(),
+            "undetermined, not false: {report}"
+        );
 
         let block = fixture.boundary_block().await;
         assert_eq!(block["last_report"]["verdict"], "established", "{block}");
@@ -524,6 +540,21 @@ async fn under_pam_agent_sb_the_boundary_is_established_and_recorded() {
     })
     .await
     .expect("test within deadline");
+}
+
+/// Unsandboxed, both walks see the same ancestry: when the daemon resolved a
+/// harness within its budget the two agree; when it missed, the answer is
+/// undetermined — never a disagreement.
+fn assert_unsandboxed_harness_agreement(report: &serde_json::Value) {
+    let reply = &report["daemon_reply"];
+    assert_ne!(reply["claimed_harness"], "unknown", "{report}");
+    match reply["peer"]["harness"].as_str() {
+        Some(seen) => {
+            assert_eq!(reply["claimed_harness"], seen, "{report}");
+            assert_eq!(reply["harness_agrees"], true, "{report}");
+        }
+        None => assert!(reply["harness_agrees"].is_null(), "{report}"),
+    }
 }
 
 /// Item 2: the same clone without `sandbox-exec` exits `6`,
@@ -596,6 +627,7 @@ async fn unsandboxed_is_not_established_and_its_admin_contact_is_attributed() {
                 .is_some_and(|count| count >= 1),
             "the admin connect was attributed to this report: {report}"
         );
+        assert_unsandboxed_harness_agreement(&report);
 
         let block = fixture.boundary_block().await;
         assert_eq!(
@@ -857,7 +889,7 @@ impl Drop for Relay {
 /// says: the two PAM-block lines that allow `<base>/run/pam.sock` and the
 /// read of `<base>/run/daemon.lock` are replaced by one allow of
 /// `<dir>/pam.sock`, every deny kept. With `keep_lock_read` the lock line
-/// stays (the variant the finding below suggests).
+/// stays (a deployment that wants lazy start to keep working).
 fn relay_variant(profile: &str, session: &Path, keep_lock_read: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(profile.len() + 128);
@@ -880,17 +912,19 @@ fn relay_variant(profile: &str, session: &Path, keep_lock_read: bool) -> String 
     out
 }
 
-/// The report of a sandboxed run through the relay under the documented
-/// relay variant: reached via the relay, every private path denied, the
-/// lock unreadable and therefore `daemon.signal` unverifiable, recorded by
-/// the daemon with the relay (`relay_pid`) as its peer.
-fn assert_relayed_without_lock_read(
+/// The report of a sandboxed run through the relay: reached via the relay,
+/// every private path denied, the daemon's pid taken from the hello
+/// acknowledgement so `daemon.signal` is judged (and refused) whether or not
+/// the lock is readable, recorded by the daemon with the relay (`relay_pid`)
+/// as its peer, and the harness agreement undetermined (the daemon sees the
+/// relay, and the client's chain is empty under the profile).
+fn assert_relayed_established(
     report: &serde_json::Value,
     session: &Path,
     base: &Path,
     relay_pid: u32,
 ) {
-    assert_eq!(report["verdict"], "not_established", "{report}");
+    assert_eq!(report["verdict"], "established", "{report}");
     assert_eq!(report["daemon"]["via"], "relay", "{report}");
     assert_eq!(
         report["env"]["socket_dir"],
@@ -908,18 +942,15 @@ fn assert_relayed_without_lock_read(
         "{report}"
     );
     assert_eq!(report["failed"], serde_json::json!([]), "{report}");
-    assert_eq!(
-        id_list(&report["unverified"]),
-        ["daemon.signal"],
-        "{report}"
-    );
+    assert_eq!(report["unverified"], serde_json::json!([]), "{report}");
+    assert_established_rows(report, base);
+    assert_denied_helper_evidence(report);
     let rows: BTreeMap<String, &serde_json::Value> = report["probes"]
         .as_array()
         .expect("rows")
         .iter()
         .map(|row| (row["id"].as_str().expect("id").to_owned(), row))
         .collect();
-    assert_eq!(rows["public.reach"]["result"], "allowed", "{report}");
     for id in [
         "admin.endpoint",
         "admin.endpoint_alias",
@@ -927,21 +958,18 @@ fn assert_relayed_without_lock_read(
         "store.read",
         "store.write",
         "log.read",
+        "daemon.signal",
     ] {
         assert_eq!(rows[id]["result"], "denied", "{id}: {report}");
     }
-    assert_eq!(rows["run.lock_probe"]["result"], "denied", "{report}");
     assert_eq!(
-        rows["run.lock_probe"]["note"], "unreadable under the relay; lazy start is not needed here",
-        "{report}"
-    );
-    assert_eq!(rows["daemon.signal"]["result"], "unknown", "{report}");
-    assert_eq!(
-        rows["daemon.signal"]["note"], "lock file unreadable: no pid to probe",
+        report["env"]["harness_chain"],
+        serde_json::json!([]),
         "{report}"
     );
     assert_eq!(report["report"]["recorded"], true, "{report}");
     assert_eq!(report["daemon_reply"]["accepted"], true, "{report}");
+    assert_eq!(report["daemon_reply"]["verdict"], "established", "{report}");
     assert_eq!(report["daemon_reply"]["peer"]["relayed"], true, "{report}");
     assert_eq!(
         report["daemon_reply"]["peer"]["harness"], "relay",
@@ -952,19 +980,27 @@ fn assert_relayed_without_lock_read(
         u64::from(relay_pid),
         "the daemon's peer is the relay: {report}"
     );
+    assert_eq!(
+        report["daemon_reply"]["claimed_harness"], "unknown",
+        "{report}"
+    );
+    assert!(
+        report["daemon_reply"]["harness_agrees"].is_null(),
+        "undetermined through the relay: {report}"
+    );
 }
 
 /// Item 4: through `pam listen` (outside the sandbox) with `PAM_SOCKET_DIR`
 /// set, the sandboxed clone reaches the daemon (`via: relay`), the admin
 /// probes stay denied and the daemon records the report with the relay as
-/// its peer. With the profile's documented relay variant — nothing under
-/// `<base>` readable at all — the daemon's pid in `run/daemon.lock` cannot
-/// be read, so `daemon.signal` is `unknown`, and an unknown fails the
-/// verdict: `not_established` with `failed` empty and `unverified` exactly
-/// `[daemon.signal]` (observed 2026-10-02; recorded in `cross-T7.md`). The
-/// same profile with the lock-read line kept is `established`.
+/// its peer. Under the profile's documented relay variant — nothing under
+/// `<base>` readable at all — the verdict is `established`, exit `0`: the
+/// daemon's pid comes from the hello acknowledgement, so `daemon.signal` is
+/// probed (`kill -0`, refused) without the lock file, which reads `denied`
+/// as the informational `run.lock_probe`. The same profile with the
+/// lock-read line kept is `established` too, with the lock probe `allowed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn through_the_relay_the_verdict_is_computed_and_the_lock_decides_daemon_signal() {
+async fn through_the_relay_the_boundary_is_established_without_reading_the_lock() {
     timeout(DEADLINE, async {
         let fixture = Fixture::start().await;
         let base = fixture.base.clone();
@@ -1001,18 +1037,31 @@ async fn through_the_relay_the_verdict_is_computed_and_the_lock_decides_daemon_s
         );
         let env: [(&str, &Path); 1] = [("PAM_SOCKET_DIR", session.as_path())];
 
+        // The documented variant: nothing under the base is readable.
         let run = fixture
             .run(Some(&documented), &env, &["doctor", "--json"])
             .await;
         assert_eq!(
-            run.code, 6,
+            run.code, 0,
             "stdout: {}\nstderr: {}",
             run.stdout, run.stderr
         );
-        assert_relayed_without_lock_read(&run.document(), &session, &base, relay.pid());
+        let report = run.document();
+        assert_relayed_established(&report, &session, &base, relay.pid());
+        let lock_row = report["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "run.lock_probe")
+            .unwrap()
+            .clone();
+        assert_eq!(lock_row["result"], "denied", "{lock_row}");
+        assert_eq!(
+            lock_row["note"], "unreadable under the relay; lazy start is not needed here",
+            "{lock_row}"
+        );
 
-        // The lock-read line kept: the pid is readable, the signal is
-        // refused, and the boundary is established through the relay.
+        // The lock-read line kept: the same verdict, the lock probe allowed.
         let run = fixture
             .run(Some(&with_lock), &env, &["doctor", "--json"])
             .await;
@@ -1022,16 +1071,23 @@ async fn through_the_relay_the_verdict_is_computed_and_the_lock_decides_daemon_s
             run.stdout, run.stderr
         );
         let report = run.document();
-        assert_eq!(report["verdict"], "established", "{report}");
-        assert_eq!(report["daemon"]["via"], "relay", "{report}");
-        assert_established_rows(&report, &base);
-        assert_denied_helper_evidence(&report);
-        assert_eq!(report["daemon_reply"]["accepted"], true, "{report}");
+        assert_relayed_established(&report, &session, &base, relay.pid());
+        let lock_row = report["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "run.lock_probe")
+            .unwrap()
+            .clone();
+        assert_eq!(lock_row["result"], "allowed", "{lock_row}");
+        assert_eq!(lock_row["note"], "held: a daemon is running", "{lock_row}");
 
         let block = fixture.boundary_block().await;
         assert_eq!(block["last_report"]["verdict"], "established", "{block}");
         assert_eq!(block["last_report"]["relayed"], true, "{block}");
+        assert_eq!(block["last_report"]["peer_harness"], "relay", "{block}");
         assert_eq!(block["reports"]["retained"], 2, "{block}");
+        assert_eq!(block["reports"]["established"], 2, "{block}");
         assert_eq!(block["admin_contacts"]["total"], 0, "{block}");
         assert_eq!(block["admin_contacts"]["unattributed_24h"], 0, "{block}");
 

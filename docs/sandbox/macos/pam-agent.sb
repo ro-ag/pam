@@ -17,11 +17,11 @@
 ;;           path, `realpath ~/.pam` -- Seatbelt matches resolved paths)
 ;; Allow:    connect to <base>/run/pam.sock, nothing else on the network;
 ;;           read of <base>/run/daemon.lock
-;; Deny:     everything else under <base> -- including <base>/run/engine.sock
-;;           and <base>/run/engine/ (the engine's socket and API key live
-;;           inside the run directory the agent must traverse) -- plus the
-;;           keychain, signals to other processes, the LaunchServices and
-;;           AppleEvents brokers, writes to the pam executable and PAM.app
+;; Deny:     everything else under <base> (the engine's socket and API key
+;;           live under <base>/engine/run, covered by the engine deny) --
+;;           plus the keychain, signals to other processes, the
+;;           LaunchServices and AppleEvents brokers, writes to the pam
+;;           executable and PAM.app
 ;; Prove:    pam doctor --profile sandbox-exec > pam-agent.sb
 ;;           sandbox-exec -D HOME="$HOME" -D WORKSPACE="$PWD" \
 ;;             -D PAM_EXE="$(command -v pam)" -f pam-agent.sb pam doctor
@@ -87,11 +87,8 @@
 (deny file-read-data file-write* (subpath "<base>/engine"))
 (deny file-read-data file-write* (subpath "<base>/flows"))
 (deny file-read-data file-write* (subpath "<base>/log"))
-;; The engine runtime sits inside <base>/run: its socket and its transient API key.
-(deny file-read-data file-write* (subpath "<base>/run/engine"))
-(deny file-read-data file-write* (literal "<base>/run/engine.sock"))
 (deny network-outbound (remote unix-socket (literal "<base>/admin/control.sock")))
-(deny network-outbound (remote unix-socket (literal "<base>/run/engine.sock")))
+(deny network-outbound (remote unix-socket (literal "<base>/engine/run/engine.sock")))
 
 ;; The trusted executable and bundle, the keychain, process control and brokers.
 (deny file-write* (literal (param "PAM_EXE")))

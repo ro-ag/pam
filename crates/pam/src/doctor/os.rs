@@ -16,13 +16,13 @@
 //! stream open for a moment and drops it without sending or reading (the
 //! hold lets the daemon's accept loop read the kernel peer credentials, so
 //! the admin contact is attributable to this run's report instead of a
-//! "vanished" peer), and [`RealOs::read_pid_file`] is the
-//! only place that reads bytes from under the base — the lock file's pid,
-//! bounded, which the ordinary client reads as well.
+//! "vanished" peer). No method reads a byte from under the base: the
+//! daemon's pid, which the signal probe needs, arrives in the hello's
+//! acknowledgement rather than from the lock file.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -32,9 +32,6 @@ use pam_daemon::runtime_dir::RuntimeDir;
 use pam_proto::wire::Via;
 
 use super::helpers::{Helper, HelperOutcome, run_helper};
-
-/// The most bytes [`Os::read_pid_file`] reads: a pid and a line ending.
-pub const MAX_PID_FILE_BYTES: usize = 32;
 
 /// What the shared-lock probe found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +53,8 @@ pub enum HelloAnswer {
         proto: u32,
         /// Its boot epoch.
         epoch: String,
+        /// The daemon's process id, as the acknowledgement names it.
+        pid: u32,
     },
     /// Nothing accepted the connection, or it ended without an answer.
     Unreachable(io::Error),
@@ -79,6 +78,7 @@ impl From<Probe> for HelloAnswer {
                 version: ack.version,
                 proto: ack.proto,
                 epoch: ack.epoch,
+                pid: ack.pid,
             },
             Probe::Unreachable(error) => Self::Unreachable(error),
             Probe::Legacy => Self::Legacy,
@@ -123,9 +123,6 @@ pub trait Os: Send + Sync {
     /// The client's readiness test: open for read, try a shared lock,
     /// release it.
     fn lock_probe(&self, path: &Path) -> io::Result<LockState>;
-
-    /// Reads at most [`MAX_PID_FILE_BYTES`] of `path`: the lock file's pid.
-    fn read_pid_file(&self, path: &Path) -> io::Result<String>;
 
     /// Connects the unix stream socket at `path`, holds the stream open for
     /// `hold`, and drops it: nothing is sent, nothing is read.
@@ -189,14 +186,6 @@ impl Os for RealOs {
             Err(TryLockError::WouldBlock) => Ok(LockState::Held),
             Err(TryLockError::Error(error)) => Err(error),
         }
-    }
-
-    fn read_pid_file(&self, path: &Path) -> io::Result<String> {
-        let mut text = String::new();
-        File::open(path)?
-            .take(MAX_PID_FILE_BYTES as u64)
-            .read_to_string(&mut text)?;
-        Ok(text)
     }
 
     #[cfg(unix)]

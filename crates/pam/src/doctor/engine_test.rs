@@ -231,38 +231,49 @@ fn a_missing_helper_is_unknown_with_the_spawn_error() {
     assert_eq!(keychain.note.as_deref(), Some("spawn: NotFound"));
 }
 
+/// The signal probe takes the daemon's pid from the hello acknowledgement:
+/// with no daemon reached there is no process to ask about, so the row is
+/// `not_probed` (counted neither way) rather than `unknown`, and the lock
+/// file is never read for it — nothing under the base is read at all.
 #[test]
-fn an_unreadable_lock_leaves_the_signal_probe_unknown() {
-    let mut os = FakeOs::sandboxed();
-    os.pid_file = Err(Answer::Denied);
-    let report = run_fake(os);
+fn without_a_reached_daemon_the_signal_probe_is_not_probed_and_the_lock_is_never_read() {
+    let os = Arc::new(FakeOs::sandboxed().with_hello(HelloAnswer::Unreachable(
+        std::io::Error::from_raw_os_error(super::classify::ECONNREFUSED),
+    )));
+    let dynamic: Arc<dyn super::os::Os> = os.clone();
+    let report = run_with(&Options::new(PathBuf::from(BASE)), dynamic).unwrap();
+    assert_eq!(report.verdict, Verdict::CannotProbe);
     let signal = report
         .probes
         .iter()
         .find(|probe| probe.id == ProbeId::DaemonSignal)
         .unwrap();
     if signal.id.applies_to(report.platform) {
-        assert_eq!(signal.result, ProbeState::Unknown);
+        assert_eq!(signal.result, ProbeState::NotProbed);
         assert_eq!(
             signal.note.as_deref(),
-            Some("lock file unreadable: no pid to probe")
+            Some("no daemon reached: no pid to probe")
         );
-        assert_eq!(report.unverified, [ProbeId::DaemonSignal]);
-    }
-    let mut os = FakeOs::sandboxed();
-    os.pid_file = Ok("not a pid".to_owned());
-    let report = run_fake(os);
-    let signal = report
-        .probes
-        .iter()
-        .find(|probe| probe.id == ProbeId::DaemonSignal)
-        .unwrap();
-    if signal.id.applies_to(report.platform) {
-        assert_eq!(
-            signal.note.as_deref(),
-            Some("lock file holds no pid: nothing to probe")
+        assert!(!report.unverified.contains(&ProbeId::DaemonSignal));
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|row| row.id == ProbeId::DaemonSignal
+                    && row.why == "not_probed: no daemon reached: no pid to probe"),
+            "{:?}",
+            report.skipped
         );
     }
+    let calls = os.calls();
+    assert!(
+        !calls.iter().any(|call| call.contains("/bin/kill")),
+        "no signal helper runs without a pid: {calls:#?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("ReadPid ")),
+        "the lock file is never read: {calls:#?}"
+    );
 }
 
 #[test]
@@ -341,8 +352,8 @@ fn the_probes_target_exactly_the_spec_paths_and_absent_names() {
         "ListDir /tmp/pamdoc-base/engine/run",
         "ListDir /tmp/pamdoc-base/flows",
         "ListDir /tmp/pamdoc-base/log",
-        "ReadPid /tmp/pamdoc-base/run/daemon.lock",
         "helper /bin/test -w /usr/local/bin/pam",
+        // The pid the hello acknowledged, never one read from the lock.
         "helper /bin/kill -0 4242",
     ] {
         assert!(has(expected), "missing call {expected:?} in {calls:#?}");
@@ -387,13 +398,11 @@ fn the_probes_target_exactly_the_spec_paths_and_absent_names() {
     for call in calls.iter().filter(|call| call.starts_with("helper ")) {
         assert!(call.starts_with("helper /"), "{call}");
     }
-    // Nothing is read from under the base but the lock file's pid.
-    assert_eq!(
-        calls
-            .iter()
-            .filter(|call| call.starts_with("ReadPid "))
-            .count(),
-        1
+    // Nothing is read from under the base: the lock is opened for the
+    // lock probe and the write probe, never for its bytes.
+    assert!(
+        !calls.iter().any(|call| call.starts_with("ReadPid ")),
+        "{calls:#?}"
     );
 }
 
@@ -553,13 +562,23 @@ fn two_runs_against_a_real_base_change_nothing_on_disk() {
             ProbeId::AdminEndpoint,
             ProbeId::AdminEndpointAlias,
             ProbeId::EngineSocket,
-            ProbeId::DaemonSignal,
             ProbeId::KeychainSearch,
             ProbeId::BrokerLaunchServices,
             ProbeId::BrokerAppleEvents,
         ] {
             let probe = report.probes.iter().find(|probe| probe.id == id).unwrap();
             assert_eq!(probe.result, ProbeState::Allowed, "{id}: {probe:?}");
+        }
+        // No daemon answered: there is no pid to signal, and the lock's
+        // bytes (this process's pid) are never read for one.
+        #[cfg(target_os = "macos")]
+        {
+            let signal = report
+                .probes
+                .iter()
+                .find(|probe| probe.id == ProbeId::DaemonSignal)
+                .unwrap();
+            assert_eq!(signal.result, ProbeState::NotProbed, "{signal:?}");
         }
         let lock = report
             .probes
@@ -651,15 +670,17 @@ fn private_state_the_user_cannot_open_classifies_denied() {
     assert_eq!(lock.note.as_deref(), Some("lazy start unavailable here"));
     #[cfg(target_os = "macos")]
     {
+        // Nothing answered the hello: no pid to signal, whatever the lock
+        // file's mode.
         let signal = report
             .probes
             .iter()
             .find(|probe| probe.id == ProbeId::DaemonSignal)
             .unwrap();
-        assert_eq!(signal.result, ProbeState::Unknown);
+        assert_eq!(signal.result, ProbeState::NotProbed);
         assert_eq!(
             signal.note.as_deref(),
-            Some("lock file unreadable: no pid to probe")
+            Some("no daemon reached: no pid to probe")
         );
         // The admin directory is closed: the socket inside it cannot be reached.
         let admin = report

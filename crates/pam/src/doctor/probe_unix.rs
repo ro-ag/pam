@@ -41,8 +41,8 @@ use super::classify::{
 };
 use super::helpers::{Helper, HelperOutcome};
 use super::inventory::{
-    ADMIN_DIR, ADMIN_SOCKET, Context, ENGINE_SOCKET, Planned, RUN_DIR, current_exe,
-    engine_runtime_dir, file_op, lock_pid,
+    ADMIN_DIR, ADMIN_SOCKET, Context, ENGINE_SOCKET, Planned, RUN_DIR, current_exe, daemon_pid,
+    engine_runtime_dir, file_op, reach_bound,
 };
 use super::os::Os;
 
@@ -156,15 +156,19 @@ fn helper(
     }
 }
 
-/// `kill -0 <pid>` against the lock file's pid: signal 0 delivers nothing.
+/// `kill -0 <pid>` against the pid the daemon's hello acknowledgement
+/// named: signal 0 delivers nothing. The probe waits for the reach probe
+/// to answer (its bound is the reach bound plus the helper's); with no
+/// daemon reached there is nothing to signal and the row is `not_probed`.
 fn signal(context: &Context) -> Planned {
     let os = Arc::clone(&context.os);
-    let lock = context.lock_path();
+    let cell = Arc::clone(&context.daemon_pid);
+    let hello_bound = context.options.hello_bound;
     let bound = context.options.helper_bound;
     Planned {
         id: ProbeId::DaemonSignal,
-        bound: bound + Duration::from_secs(1),
-        op: Box::new(move || match lock_pid(os.as_ref(), &lock) {
+        bound: reach_bound(hello_bound) + bound + Duration::from_secs(1),
+        op: Box::new(move || match daemon_pid(&cell, hello_bound) {
             Ok(pid) => {
                 let helper = Helper::new(KILL, ["-0", &pid.to_string()], bound);
                 classify_kill(&os.run_helper(&helper)).into()

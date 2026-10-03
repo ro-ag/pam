@@ -199,13 +199,10 @@ fn every_profile_opens_with_the_preamble() {
         // The proving command is `pam doctor`, with the verdict to expect.
         assert!(head.contains("pam doctor"), "{}", profile.harness);
         assert!(head.contains("established"), "{}", profile.harness);
-        // The engine runtime inside `run` is named in the preamble's Deny line.
-        assert!(
-            head.contains("<base>/run/engine.sock"),
-            "{}",
-            profile.harness
-        );
-        assert!(head.contains("<base>/run/engine/"), "{}", profile.harness);
+        // The preamble's Deny line says where the engine runtime lives
+        // (under the denied engine tree, not inside `run`).
+        assert!(head.contains("<base>/engine/run"), "{}", profile.harness);
+        assert!(!head.contains("<base>/run/engine"), "{}", profile.harness);
     }
 }
 
@@ -315,9 +312,9 @@ fn every_profile_names_each_private_path_a_probe_attempts() {
             if let Need::Path(path) = need(id) {
                 let full = format!("{BASE_PLACEHOLDER}/{path}");
                 // A sub-path is covered by naming its first component (the
-                // admin directory covers the admin socket), except under
-                // `run`, which is never denied as a whole: its engine paths
-                // and the lock are named exactly.
+                // admin directory covers the admin socket and the engine
+                // directory its runtime), except under `run`, which is
+                // never denied as a whole: the lock is named exactly.
                 let first = path.split('/').next().unwrap();
                 let named = path_occurrences(&text, &full) > 0
                     || (first != "run"
@@ -329,13 +326,14 @@ fn every_profile_names_each_private_path_a_probe_attempts() {
                 );
             }
         }
-        // The engine runtime inside `run` is named exactly (decision 9).
-        for path in ["run/engine", "run/engine.sock"] {
-            assert!(
-                path_occurrences(&text, &format!("{BASE_PLACEHOLDER}/{path}")) > 0,
-                "{harness} ({variant:?}) does not deny {path}"
-            );
-        }
+        // Nothing names the engine runtime at its old place inside `run`
+        // (relocated under `engine/run`, ptrack issue 44): a stale deny
+        // would read as if something still lived there.
+        assert_eq!(
+            path_occurrences(&text, &format!("{BASE_PLACEHOLDER}/run/engine")),
+            0,
+            "{harness} ({variant:?}) still names the old engine runtime inside run"
+        );
     }
 }
 
@@ -441,7 +439,7 @@ fn claude_fragment_allows_one_socket_and_one_file() {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(deny_read[0], BASE);
-        for path in ["admin", "run/engine", "run/engine.sock", "state.sqlite3"] {
+        for path in ["admin", "engine", "state.sqlite3"] {
             assert!(
                 deny_read.contains(&format!("{BASE}/{path}").as_str()),
                 "{path}"
@@ -591,12 +589,7 @@ fn codex_profile_allows_one_socket_and_one_file() {
         Some("read")
     );
     assert_eq!(get("permissions.pam.filesystem", BASE), Some("deny"));
-    for path in [
-        "admin",
-        "run/engine",
-        "run/engine.sock",
-        "state.sqlite3-shm",
-    ] {
+    for path in ["admin", "engine", "state.sqlite3-shm"] {
         assert_eq!(
             get("permissions.pam.filesystem", &format!("{BASE}/{path}")),
             Some("deny"),
@@ -613,7 +606,7 @@ fn codex_profile_allows_one_socket_and_one_file() {
     assert_eq!(
         get(
             "permissions.pam.network.unix_sockets",
-            &format!("{BASE}/run/engine.sock")
+            &format!("{BASE}/engine/run/engine.sock")
         ),
         Some("deny")
     );
@@ -643,8 +636,6 @@ fn copilot_page_lists_every_denied_path_and_keychain_off() {
         "/engine",
         "/flows",
         "/log",
-        "/run/engine",
-        "/run/engine.sock",
     ] {
         assert!(
             text.contains(&format!("- `{BASE}{path}`\n")),
@@ -740,7 +731,7 @@ fn seatbelt_paths_round_trip_an_awkward_base() {
             .collect();
         assert!(base_denies.contains(&AWKWARD_BASE.to_owned()), "{harness}");
         assert!(
-            base_denies.contains(&format!("{AWKWARD_BASE}/run/engine")),
+            base_denies.contains(&format!("{AWKWARD_BASE}/engine")),
             "{harness}"
         );
         // Every quote in a profile line is balanced: an escaped base cannot

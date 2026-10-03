@@ -123,20 +123,19 @@ with `pam doctor` (see [Verifying the boundary](#verifying-the-boundary)). The
 deployment must establish and maintain these exclusions. An executable name,
 argv value, or self-reported PID is not a substitute for that isolation.
 
-**The engine's runtime files sit inside the run directory.** The model engine's
-private socket, `<base>/run/engine.sock`, and its transient API key and pid file,
-`<base>/run/engine/`, live in the same `run` directory the agent must traverse
-to reach `pam.sock` and to probe `daemon.lock` (and, on Windows, to read
-`public.json`). A sandbox rule that allows `<base>/run` by subpath therefore
-also exposes the key for the moments it exists and, as a unix-socket allowance,
-the engine's OpenAI-compatible endpoint. This was found while designing the
-boundary check (ptrack issue 44). The operational closure is in force now: every
-reference profile allows the literal `pam.sock` and the read of `daemon.lock`
-only, and denies `<base>/run/engine.sock` and `<base>/run/engine/` by name, and
-`pam doctor` probes both (`engine.socket`, `engine.runtime_read`). The structural
-fix is to move the engine's runtime under `<base>/engine/run`, a directory the
-agent is never granted; that relocation is under way (plan 53, task T10), and a
-profile written to the invariant above keeps working after it lands.
+**The engine's runtime files live under the engine directory.** The model
+engine's private socket, `<base>/engine/run/engine.sock`, and its transient API
+key and pid file beside it, sit inside `<base>/engine`, a directory the agent is
+never granted; `<base>/run` holds `pam.sock`, `daemon.lock` and (Windows)
+`public.json` only. They used to live inside `run`, the directory the agent must
+traverse to reach `pam.sock`, where a rule allowing `<base>/run` by subpath
+exposed the key for the moments it exists and, as a unix-socket allowance, the
+engine's OpenAI-compatible endpoint (found while designing the boundary check,
+ptrack issue 44; relocated by plan 53, task T10). Every reference profile allows
+the literal `pam.sock` and the read of `daemon.lock` only and denies the rest of
+the base, and `pam doctor` probes the engine runtime at its place
+(`engine.socket`, `engine.runtime_read`). A daemon that finds an older daemon's
+engine runtime inside `run` removes it at start.
 
 A daemon that a client starts lazily is started with an environment allowlist
 (home, user, locale, temp directory, absolute `PATH` entries, `PAM_LOG`, an
@@ -176,18 +175,20 @@ not be classified).
   (`admin.endpoint`, and through the `run/../admin` alias); listing `admin/`;
   opening `state.sqlite3`, `-wal` and `-shm` for read and for write; opening
   `daemon.lock` for write; listing `backup/`, `model-trust/`, `engine/`,
-  `flows/`, `log/` and `<base>/run/engine`; connecting to
-  `<base>/run/engine.sock`. No probe writes, creates, truncates, unlinks,
-  renames, sends a frame or reads a private byte. The admin connect holds the
-  socket for 150 ms, sending and reading nothing, so the daemon can read the
-  peer's pid before it drops, and then drops it. The only bytes read from the
-  base are the lock file's pid (and, on Windows, `public.json`, which the
-  ordinary client reads too).
+  `flows/`, `log/` and `<base>/engine/run`; connecting to
+  `<base>/engine/run/engine.sock`. No probe writes, creates, truncates,
+  unlinks, renames, sends a frame or reads a private byte. The admin connect
+  holds the socket for 150 ms, sending and reading nothing, so the daemon can
+  read the peer's pid before it drops, and then drops it. Nothing is read from
+  under the base but, on Windows, `public.json`, which the ordinary client
+  reads too; the daemon's pid, for the signal probe, comes from the hello
+  acknowledgement.
 - **Must be denied, by helper.** Each runs by absolute path with a cleared
   environment, no stdin and a five-second bound: a keychain search for the
   `dev.pam.connector` service with an account that does not exist (nothing is
-  created, read or prompted for); `kill -0` of the daemon's pid, which delivers
-  no signal; a read-only LaunchServices query and a property read through the
+  created, read or prompted for); `kill -0` of the daemon's pid as the hello
+  acknowledgement names it, which delivers no signal (and works through the
+  relay, where nothing under the base is readable); a read-only LaunchServices query and a property read through the
   AppleEvents broker, which launch and send nothing; and the writability of the
   `pam` executable and of the `.app` bundle's `Info.plist`, asked with
   `/bin/test -w`, which is `access(2)`. **Neither the executable nor anything
@@ -251,8 +252,10 @@ a pid within 60 seconds of an unexplained admin contact from that pid sets the
 contact's `attributed` to the report's request and removes it from the
 unattributed count. The client's document plays no part in it. The reply to the
 report also says whether the harness the client claimed (`claimed_harness`)
-agrees with the one the daemon resolved (`harness_agrees`; `null` where it
-has none, as on Windows or through the relay).
+agrees with the one the daemon resolved (`harness_agrees`: `false` only when
+both sides know and differ; `null`, printed `undetermined`, where either does
+not — the daemon on Windows or through the relay, the client under a profile
+that denies `/bin/ps` and so claims `unknown`).
 
 An admin contact nobody explains stays unattributed and is the headline of the
 block. A fabricated `established` beside an unattributed admin contact is

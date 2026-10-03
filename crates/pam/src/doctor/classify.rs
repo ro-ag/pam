@@ -97,7 +97,7 @@ pub const APPLEEVENTS_ANSWER_MARKER: &str = "com.apple.finder";
 /// a Finder that is not running (no login session) and stays `unknown`.
 pub const APPLEEVENTS_DENIED_MARKER: &str = "connection invalid";
 
-/// `PowerShell`'s answer when the lock pid names no process.
+/// `PowerShell`'s answer when the daemon's pid names no process.
 pub const PROCESS_GONE_MARKER: &str = "Cannot find a process";
 
 /// The prefix of the process-query helper's one output line.
@@ -209,10 +209,13 @@ pub fn classify_reach(
     answer: HelloAnswer,
 ) -> (ProbeResult, Option<DaemonFacts>) {
     match answer {
+        // The pid travels to the signal probe through the inventory's
+        // `DaemonPid`, not through the report's facts.
         HelloAnswer::Ready {
             version,
             proto,
             epoch,
+            pid: _,
         } => (
             ProbeResult::allowed(),
             Some(DaemonFacts {
@@ -309,7 +312,7 @@ pub fn classify_kill(outcome: &HelperOutcome) -> ProbeResult {
         });
     }
     if run.stderr.contains(KILL_GONE_MARKER) {
-        return ProbeResult::unknown("the lock pid names no process: nothing to signal");
+        return ProbeResult::unknown("the daemon's pid names no process: nothing to signal");
     }
     unrecognised("kill", run)
 }
@@ -426,7 +429,7 @@ pub fn classify_process_query(outcome: &HelperOutcome) -> ProbeResult {
         return if path.is_empty() {
             ProbeResult::denied(
                 OsError::of_kind("ProcessQueryDenied")
-                    .with_detail("the executable path of the lock pid is not visible"),
+                    .with_detail("the executable path of the daemon's pid is not visible"),
             )
             .with_note("query only")
         } else {
@@ -434,7 +437,7 @@ pub fn classify_process_query(outcome: &HelperOutcome) -> ProbeResult {
         };
     }
     if run.stderr.contains(PROCESS_GONE_MARKER) {
-        return ProbeResult::unknown("the lock pid names no process: nothing to query");
+        return ProbeResult::unknown("the daemon's pid names no process: nothing to query");
     }
     unrecognised("process query", run)
 }
@@ -467,12 +470,6 @@ fn unrecognised(helper: &str, run: &HelperRun) -> ProbeResult {
         .or_else(|| first_line(&run.stdout))
         .unwrap_or("no output");
     ProbeResult::unknown(format!("unrecognised {helper} output ({exit}): {line}"))
-}
-
-/// The lock file's pid: a positive decimal, nothing else.
-#[must_use]
-pub fn parse_lock_pid(text: &str) -> Option<u32> {
-    text.trim().parse().ok().filter(|pid| *pid != 0)
 }
 
 /// One `ps -o ppid=,comm= -p <pid>` line: the parent pid and the

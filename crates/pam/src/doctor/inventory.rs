@@ -16,8 +16,8 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ use pam_proto::doctor::{DaemonFacts, Platform, Probe, ProbeId, ProbeResult};
 use pam_proto::wire::Via;
 
 use super::classify::{classify_io_result, classify_lock, classify_reach, fit_result};
-use super::os::Os;
+use super::os::{HelloAnswer, Os};
 use super::{Options, RunError};
 
 /// `$PAM_BASE_DIR`, reported as the base override.
@@ -95,6 +95,10 @@ pub struct Context {
     pub pid: u32,
     /// A random suffix for the absent names: alphanumeric only.
     pub nonce: String,
+    /// The daemon's pid as the hello acknowledgement names it: filled by
+    /// the reach probe, awaited by the probes that signal or query the
+    /// daemon process. Nothing under the base is read for it.
+    pub daemon_pid: Arc<DaemonPid>,
 }
 
 impl Context {
@@ -123,6 +127,7 @@ impl Context {
             options: options.clone(),
             pid: std::process::id(),
             nonce: nonce(),
+            daemon_pid: Arc::new(DaemonPid::default()),
         })
     }
 
@@ -148,6 +153,57 @@ impl Context {
     #[must_use]
     pub fn absent_account(&self) -> String {
         format!("pam.doctor.absent.{}.{}", self.pid, self.nonce)
+    }
+}
+
+/// The daemon's pid, handed from the reach probe to the probes that need
+/// it. It is set exactly once per run, to the pid the acknowledged hello
+/// carried or to `None` when nothing acknowledged; a waiter that sees
+/// nothing within its bound reads `None` too (the reach probe overran, or
+/// its thread never answered).
+#[derive(Debug, Default)]
+pub struct DaemonPid {
+    slot: Mutex<PidSlot>,
+    ready: Condvar,
+}
+
+/// What the reach probe has said so far.
+#[derive(Debug, Default, Clone, Copy)]
+enum PidSlot {
+    /// The hello has not been answered yet.
+    #[default]
+    Pending,
+    /// The hello was answered: the pid it carried, or none.
+    Answered(Option<u32>),
+}
+
+impl DaemonPid {
+    /// Records what the hello answered and wakes every waiter.
+    pub fn set(&self, pid: Option<u32>) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = PidSlot::Answered(pid);
+        self.ready.notify_all();
+    }
+
+    /// The pid, once the reach probe has answered; `None` when it answered
+    /// without one or did not answer within `timeout`.
+    #[must_use]
+    pub fn wait(&self, timeout: Duration) -> Option<u32> {
+        let slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (slot, _) = self
+            .ready
+            .wait_timeout_while(slot, timeout, |slot| matches!(slot, PidSlot::Pending))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *slot {
+            PidSlot::Answered(pid) => pid,
+            PidSlot::Pending => None,
+        }
     }
 }
 
@@ -309,22 +365,48 @@ fn plan_common(id: ProbeId, context: &Context) -> Option<Planned> {
 }
 
 /// The public hello, bounded by the client's connect bound plus a margin
-/// for the thread.
+/// for the thread. The acknowledgement's pid is handed to the probes that
+/// wait for it before the answer is classified.
 fn reach(context: &Context) -> Planned {
     let os = Arc::clone(&context.os);
     let dirs = context.dirs.clone();
     let via = context.via();
     let bound = context.options.hello_bound;
     let platform = context.platform;
+    let daemon_pid = Arc::clone(&context.daemon_pid);
     Planned {
         id: ProbeId::PublicReach,
-        bound: bound + Duration::from_secs(1),
+        bound: reach_bound(bound),
         op: Box::new(move || {
-            let (result, daemon) =
-                classify_reach(platform, via, bound, os.hello(&dirs, via, bound));
+            let answer = os.hello(&dirs, via, bound);
+            daemon_pid.set(match &answer {
+                HelloAnswer::Ready { pid, .. } => Some(*pid),
+                _ => None,
+            });
+            let (result, daemon) = classify_reach(platform, via, bound, answer);
             Outcome { result, daemon }
         }),
     }
+}
+
+/// The reach probe's bound: the hello bound plus the thread margin. A
+/// probe that waits for the daemon's pid waits at most this long for it.
+#[must_use]
+pub fn reach_bound(hello_bound: Duration) -> Duration {
+    hello_bound + Duration::from_secs(1)
+}
+
+/// The daemon's pid for a probe that signals or queries the daemon
+/// process, or the `not_probed` row to report when no daemon was reached:
+/// without an acknowledged hello there is no process to ask about, and the
+/// run is `cannot_probe` regardless.
+///
+/// # Errors
+///
+/// The result to report when no daemon answered the hello.
+pub fn daemon_pid(cell: &DaemonPid, hello_bound: Duration) -> Result<u32, ProbeResult> {
+    cell.wait(reach_bound(hello_bound))
+        .ok_or_else(|| ProbeResult::not_probed("no daemon reached: no pid to probe"))
 }
 
 /// A file or socket operation under the probe bound.
@@ -367,20 +449,6 @@ pub fn list_dir(context: &Context, id: ProbeId, path: PathBuf) -> Planned {
     file_op(context, id, move |os| {
         classify_io_result(platform, os.list_dir(&path))
     })
-}
-
-/// The lock file's pid, or the `unknown` its absence classifies to.
-///
-/// # Errors
-///
-/// The result to report when the pid could not be read.
-pub fn lock_pid(os: &dyn Os, lock: &Path) -> Result<u32, ProbeResult> {
-    let text = os.read_pid_file(lock).map_err(|error| {
-        ProbeResult::unknown("lock file unreadable: no pid to probe")
-            .with_os_error(pam_proto::doctor::OsError::from_io(&error))
-    })?;
-    super::classify::parse_lock_pid(&text)
-        .ok_or_else(|| ProbeResult::unknown("lock file holds no pid: nothing to probe"))
 }
 
 /// This process's executable, or the `unknown` its absence classifies to.

@@ -17,10 +17,10 @@
 //!
 //! Every template keeps one invariant: allow the literal public socket
 //! `<base>/run/pam.sock` (and read of `<base>/run/daemon.lock`), deny the rest
-//! of the base, including the engine runtime inside `run`
-//! (`<base>/run/engine.sock`, `<base>/run/engine/`), the keychain, process
-//! control of the daemon, the launch brokers, and writes to the trusted
-//! executable and bundle, wherever the harness has a setting for it.
+//! of the base (the engine runtime, `<base>/engine/run`, sits inside the
+//! denied `engine` tree), the keychain, process control of the daemon, the
+//! launch brokers, and writes to the trusted executable and bundle, wherever
+//! the harness has a setting for it.
 
 use std::fmt;
 use std::path::Path;

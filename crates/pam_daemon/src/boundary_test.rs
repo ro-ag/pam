@@ -19,7 +19,7 @@ use tokio::sync::watch;
 
 use crate::boundary::{
     AdminContact, Boundary, Observed, PeerFacts, PeerResolver, ResolvedPeer, admin_sink_for,
-    never_checked_block, register_admin_sink, summary,
+    harness_agreement, never_checked_block, register_admin_sink, summary,
 };
 use crate::framed::Accept;
 use crate::ingress::PeerIdentity;
@@ -135,6 +135,29 @@ fn classification_follows_the_shared_table_and_the_relay_marker() {
     let empty = PeerFacts::classify(&ResolvedPeer::default(), false);
     assert!(empty.is_empty());
     assert!(empty.harness.is_none());
+}
+
+/// `harness_agrees` is three-valued: `false` only when both sides know
+/// and differ. A sandboxed client whose `/bin/ps` cannot exec claims
+/// `unknown`, a relayed peer is seen as `relay`, and a daemon with no
+/// resolution sees nothing — each is undetermined, never a disagreement.
+#[test]
+fn harness_agreement_is_undetermined_unless_both_sides_know() {
+    assert_eq!(harness_agreement(Some("claude"), "claude"), Some(true));
+    assert_eq!(harness_agreement(Some("claude"), "codex"), Some(false));
+    assert_eq!(harness_agreement(Some("zsh"), "zsh"), Some(true));
+    // The client's walk produced nothing: `classify_chain(&[])`.
+    assert_eq!(
+        harness_agreement(Some("claude"), &pam_proto::caller::classify_chain(&[])),
+        None
+    );
+    assert_eq!(harness_agreement(Some("claude"), "unknown"), None);
+    // The daemon sees the relay process, not the client.
+    assert_eq!(harness_agreement(Some("relay"), "claude"), None);
+    assert_eq!(harness_agreement(Some("relay"), "relay"), None);
+    // The daemon resolved nothing (Windows, a missed budget).
+    assert_eq!(harness_agreement(None, "claude"), None);
+    assert_eq!(harness_agreement(None, "unknown"), None);
 }
 
 #[tokio::test]

@@ -119,6 +119,12 @@ pub struct HelloAck {
     /// A ULID minted at daemon boot. A follower that sees a different epoch
     /// knows its sequence numbers belong to a daemon that is gone.
     pub epoch: String,
+    /// The daemon's process id. Public information (the lock file holds
+    /// it too, and `pam daemon stop` prints it); through the session relay
+    /// it is the one place a client that may read nothing under the base
+    /// learns which process answered, so `pam doctor` can ask the kernel
+    /// whether it may signal that process without reading the lock.
+    pub pid: u32,
 }
 
 /// Public follow request: a waiting `query` for one ticket, plus where a

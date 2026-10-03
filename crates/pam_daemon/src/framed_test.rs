@@ -69,6 +69,7 @@ pub(crate) fn ack() -> HelloAck {
         proto: WIRE_PROTOCOL,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         epoch: "01JB2M5T8Q0V7K3W9X4Y6Z1ABC".to_owned(),
+        pid: std::process::id(),
     }
 }
 

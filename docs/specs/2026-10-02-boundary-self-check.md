@@ -93,8 +93,8 @@ the probe inventory.
 | `<base>/run/pam.sock` (unix) | daemon, `0600` in `0700` `run` | **connect** | `runtime_dir.rs:55`, `framed_unix.rs:3-7` |
 | `<base>/run/public.json` (Windows: port + nonce) | daemon | **read** | `runtime_dir.rs:58`, spec `2026-10-02-framed-public-transport.md:609-631` |
 | `<base>/run/daemon.lock` | daemon | read + shared-lock probe (the client's readiness test, `crates/pam_client/src/client.rs:545-575`, `:1545-1555`); **not write** | `lifecycle.rs:36`, `:141-166` |
-| `<base>/run/engine.sock` | engine supervisor | **not connect** | `crates/pam_model/src/engine_server.rs:341` |
-| `<base>/run/engine/api.key`, `engine.pid` | engine supervisor (`0600`, transient) | **not read** | `engine_server.rs:351`, `:380`, `:386` |
+| `<base>/engine/run/engine.sock` (relocated by T10; was `<base>/run/engine.sock`) | engine supervisor | **not connect** | `crates/pam_model/src/engine_server.rs`, `EngineLayout::runtime_dir` |
+| `<base>/engine/run/api.key`, `engine.pid` (relocated by T10; was `<base>/run/engine/`) | engine supervisor (`0600` in `0700`, transient) | **not read** | `engine_server.rs`, `pam_model/src/engine.rs` |
 | `<base>/admin/` and `control.sock` (macOS, `0700`/`0600`) | daemon | **not connect, not list** | `admin_transport_unix.rs:142-157` |
 | `<base>/admin/control.json` (Windows) | daemon | **not open for read** | `admin_transport_windows.rs:6-13`, `:116-127` |
 | `<base>/state.sqlite3`, `-wal`, `-shm` | store | **not read, not write** | `broker-macos.sb:14-16` |
@@ -108,16 +108,19 @@ the probe inventory.
 | the `pam` executable, the `.app` bundle, embedded frontend | installer | **not write** | `admin-boundary.md:88`, `:98-108` |
 | LaunchServices / AppleEvents brokers (macOS), ShellExecute (Windows) | OS | **not reach** | `admin-boundary.md:98-108`, `broker_windows.rs:9-13` |
 
-Finding (not previously recorded). The engine's private socket and its
-transient API key live **inside the run directory** the agent must traverse:
-`<base>/run/engine.sock` and `<base>/run/engine/api.key`
-(`engine_server.rs:338-352`, `:376-381`). A profile that allows reads under
-`<base>/run` so that the client can probe the lock (or read `public.json` on
-Windows) therefore also exposes the engine key for the moments it exists, and a
-profile that allows unix-socket connects under `<base>/run` by subpath exposes
-the engine's OpenAI-compatible endpoint. Every reference profile below allows
-the literal `pam.sock` only and denies `<base>/run/engine` and
-`<base>/run/engine.sock` explicitly; `doctor` probes both. Relocating the engine
+Finding (not previously recorded; **resolved by T10 on this branch**). The
+engine's private socket and its transient API key lived **inside the run
+directory** the agent must traverse: `<base>/run/engine.sock` and
+`<base>/run/engine/api.key`. A profile that allows reads under `<base>/run` so
+that the client can probe the lock (or read `public.json` on Windows) therefore
+also exposed the engine key for the moments it exists, and a profile that
+allows unix-socket connects under `<base>/run` by subpath exposed the engine's
+OpenAI-compatible endpoint. T10 moved the runtime to `<base>/engine/run`
+(`0700`, inside the `engine` tree every profile denies as a whole); `run/` now
+holds `pam.sock`, `daemon.lock` and (Windows) `public.json` only, and the
+reference profiles name no path under `run` but those. `doctor` still probes the
+engine runtime at its new place (`engine.runtime_read`, `engine.socket`). An
+older daemon's leftovers inside `run` are removed at daemon start. Relocating the engine
 runtime under `<base>/engine/run` is the structural fix and is filed as an
 issue in the implementation plan rather than done here.
 
@@ -284,12 +287,12 @@ public endpoint, which is `<dir>/pam.sock` under `PAM_SOCKET_DIR`):
 | `backup.read` | must_deny | `read_dir("<base>/backup")` | usually `absent` |
 | `model_trust.read` | must_deny | `read_dir("<base>/model-trust")` | |
 | `engine.read` | must_deny | `read_dir("<base>/engine")` | |
-| `engine.runtime_read` | must_deny | `read_dir("<base>/run/engine")` | the key-file directory (finding above) |
-| `engine.socket` | must_deny | connect `<base>/run/engine.sock`; drop | `absent` when no engine runs |
+| `engine.runtime_read` | must_deny | `read_dir("<base>/engine/run")` | the key-file directory (finding above; relocated by T10) |
+| `engine.socket` | must_deny | connect `<base>/engine/run/engine.sock`; drop | `absent` when no engine runs |
 | `flows.read` | must_deny | `read_dir("<base>/flows")` | |
 | `log.read` | must_deny | `read_dir("<base>/log")` | |
 | `keychain.search` | must_deny | spawn `/usr/bin/security find-generic-password -s dev.pam.connector -a pam.doctor.absent.<pid>.<random>` with a cleared environment, null stdin, 5 s | `denied` on `SecKeychainSearchCreateFromAttributes:` in stderr; `allowed` on exit 44 / "could not be found" (the keychain answered); `unknown` otherwise. No item is created, read or changed; a search for an absent item never prompts. Same method and same evidence rule as the fixture (`sandbox_macos.rs:66-83`). |
-| `daemon.signal` | must_deny | spawn `/bin/kill -0 <pid>` where `<pid>` is the lock file's content (readable under every profile that keeps the lock probe) | `denied` on "Operation not permitted"; `allowed` on exit 0; `unknown` when the lock is unreadable or the pid is gone. Signal 0 delivers nothing (`sandbox_macos.rs:60-65`). Through the relay the lock is usually unreadable → `unknown`; the report says so. |
+| `daemon.signal` | must_deny | spawn `/bin/kill -0 <pid>` where `<pid>` is the daemon's pid **as the hello acknowledgement names it** (As built, 22; designed as the lock file's content) | `denied` on "Operation not permitted"; `allowed` on exit 0; `unknown` when the pid is gone; `not_probed` when no daemon acknowledged the hello (the run is `cannot_probe` then). Signal 0 delivers nothing (`sandbox_macos.rs:60-65`). The lock file is never read for it, so the probe is judged through the relay too, where nothing under the base is readable. |
 | `broker.launchservices` | must_deny | **superseded (As built, 1):** `/usr/bin/lsappinfo find bundleid=com.apple.loginwindow`. Designed as: spawn `/usr/bin/open -b dev.pam.doctor.absent.<random>` | the bundle id does not exist, so nothing can launch; `allowed` when LaunchServices answered "Unable to find application"; `denied` when the lookup itself failed (the Mach bootstrap was refused). The exact strings are pinned by the acceptance test on the real OS, never guessed: until pinned, an unrecognised message is `unknown`, which is fail-closed. |
 | `broker.appleevents` | must_deny | **superseded (As built, 1):** `/usr/bin/osascript -e 'id of application "Finder"'`. Designed as: spawn `/usr/bin/osascript -e 'tell application id "dev.pam.doctor.absent.<random>" to activate'` | same shape: an absent application id cannot be launched and does not trigger an automation consent prompt (prompts arise when targeting a running application). `allowed` when the AppleEvent runtime resolved the id and reported it absent; `denied` when the runtime could not start. Strings pinned by the acceptance test. |
 | `exe.write` | must_deny | `/bin/test -w <std::env::current_exe()>` through the helper runner (absolute path, cleared environment, bounded) — `access(2)` with `W_OK`; the executable is **never opened** | exit 0 → `allowed`; exit 1 → `denied` with the note `access(W_OK) refused` (no errno to carry; `test -e` then tells a refused path from a missing one, which is `absent`); spawn failure, timeout or any other status → `unknown`. Never an open-for-write: on macOS, opening a Mach-O that another process is mapped from (the daemon, always, in production) for write invalidates the kernel's cached code signature for that inode, and every later exec of the file is `SIGKILL`ed until the file is replaced — one unsandboxed run would have left `pam` and `PAM.app` unrunnable until reinstalled. |
@@ -307,7 +310,7 @@ Windows differs where the mechanism differs:
 | `store.*`, `backup.read`, `model_trust.read`, `engine.read`, `engine.runtime_read`, `flows.read`, `log.read`, `run.lock_write` | as macOS | | `engine.socket` is `not_probed` on Windows (the engine binds loopback there). |
 | `exe.write` | must_deny | open `std::env::current_exe()` for write through the seam (`create(false)`, `truncate(false)`, no byte written); close | **Decision**: the open stays on Windows. The image section of a running executable makes `CreateFile` refuse write access at the share check — after the ACL's access check, so `ERROR_SHARING_VIOLATION` is `allowed` and `ERROR_ACCESS_DENIED` is `denied` — before any handle exists, and Windows keeps no code-signature cache the attempt could invalidate (the macOS hazard above). The non-opening alternatives answer a different question: the read-only attribute is not the ACL, and a directory opened for write is always `ERROR_ACCESS_DENIED`, which would read `denied` unsandboxed — a false pass. |
 | `keychain.search` | must_deny | `keyring_core` read of service `dev.pam.connector`, account `pam.doctor.absent.<pid>.<random>` | `NoEntry` → `allowed` (Credential Manager answered); an access error → `denied`; else `unknown`. No entry is created. |
-| `daemon.process_query` | must_deny | (as built, a PowerShell `Get-Process`, As built 4) `sysinfo` refresh of the lock file's pid and read of its exe path | `allowed` when the process is visible with its executable (query rights were granted); `denied` when the refresh yields nothing for a pid the lock names and the lock is fresh. Query rights are attribution, not control: a termination-rights probe needs `OpenProcess` through FFI, which the workspace forbids, and is **not** done. The report says "query only". |
+| `daemon.process_query` | must_deny | (as built, a PowerShell `Get-Process` of the pid the hello acknowledged, As built 4 and 22) `sysinfo` refresh of the lock file's pid and read of its exe path | `allowed` when the process is visible with its executable (query rights were granted); `denied` when the query yields nothing for the pid the daemon named. Query rights are attribution, not control: a termination-rights probe needs `OpenProcess` through FFI, which the workspace forbids, and is **not** done. The report says "query only". |
 | `broker.shellexecute` | must_deny | spawn `%SystemRoot%\System32\where.exe` with a cleared environment | process creation is the broker (`broker_windows.rs:9-13`): if `doctor` itself was created, this is `allowed`. It exists so the Windows verdict lists the right reason. |
 | `bundle.write`, `broker.launchservices`, `broker.appleevents` | — | `not_probed` on Windows | |
 
@@ -315,8 +318,9 @@ Safety invariants, enforced by code and by test:
 
 - No probe writes, creates, truncates, unlinks, renames, sends a frame, reads
   private bytes, or changes a lock. The only bytes `doctor` reads from the base
-  are the lock file's pid and (Windows) `public.json`, both of which the
-  ordinary client already reads.
+  are (Windows) `public.json`, which the ordinary client already reads; the
+  daemon's pid comes from the hello acknowledgement, not from the lock file
+  (As built, 22).
 - Spawned helpers are named by absolute path, run with a cleared environment,
   null stdin, captured output capped at 64 KiB, and a 5 s bound; a helper that
   cannot start is `unknown(spawn: <error>)`.
@@ -388,11 +392,12 @@ then `report: recorded as <request id>` or `report: not sent (<reason>)`.
       "os_error": { "kind": "PermissionDenied", "code": 1 }, "elapsed_ms": 0 },
     { "id": "backup.read", "class": "must_deny", "result": "absent",
       "os_error": { "kind": "NotFound", "code": 2 }, "elapsed_ms": 0 },
-    { "id": "daemon.signal", "class": "must_deny", "result": "unknown",
-      "note": "lock file unreadable: no pid to probe", "elapsed_ms": 0 }
+    { "id": "daemon.signal", "class": "must_deny", "result": "denied",
+      "os_error": { "kind": "PermissionDenied", "code": 1,
+                    "detail": "kill: 4711: Operation not permitted" }, "elapsed_ms": 12 }
   ],
   "failed": ["admin.endpoint"],
-  "unverified": ["daemon.signal"],
+  "unverified": [],
   "skipped": [{ "id": "backup.read", "why": "absent" },
               { "id": "public.unlink", "why": "not_probed: side effect" }],
   "env": {
@@ -885,7 +890,7 @@ where the sets are disjoint. Clippy on the touched crate before the full gate
 | T7 | macOS acceptance: `doctor_macos.rs` (items 1–4), helper string capture recorded in the test and in `docs/macos-sandbox-acceptance.md` | `crates/pam/tests/doctor_macos.rs`, `crates/pam/tests/support/pam-agent.sb` (generated from `docs/sandbox`), `docs/macos-sandbox-acceptance.md` | both verdict paths pass under `cargo test -p pam --test doctor_macos` |
 | T8 | Docs: `docs/admin-boundary.md` (new "Verifying the boundary" section; per-user authority statement replacing "Per-agent repository authentication is not implemented"; the engine-runtime finding), `docs/session-socket-relay.md` (doctor through the relay), `CHANGELOG.md`, `docs/reviews/design-review-2026-10-02.md` decision 4 pointer to this spec | those files | docs-only PR rule applies only if split out; otherwise part of the branch |
 | T9 | Windows: `crates/pam/tests/doctor_windows.rs` (unsandboxed list; classification), the Parallels VM runs recorded in `docs/sandbox/windows/README.md` with dates; `bash tools/check.sh` green; CI green | `crates/pam/tests/doctor_windows.rs`, `docs/sandbox/windows/README.md` | the three VM runs recorded; `tools/check.sh` passes locally |
-| T10 | Issue: relocate the engine runtime (`engine.sock`, `engine/api.key`, `engine/engine.pid`) out of `<base>/run` into `<base>/engine/run` with the 0700 mode the base has — filed with `ptrack issue add --severity high`, not done in this plan | — | issue exists and is linked from `admin-boundary.md` |
+| T10 | Relocate the engine runtime (`engine.sock`, `engine/api.key`, `engine/engine.pid`) out of `<base>/run` into `<base>/engine/run` with the 0700 mode the base has (ptrack issue 44) — **done on this branch**: `EngineLayout::runtime_dir`, migration of an older daemon's leftovers at start, probes and profiles follow | `crates/pam_model/src/{engine.rs,engine_server.rs}`, `crates/pam_daemon/src/model_service.rs`, `crates/pam/src/doctor/{inventory.rs,probe_unix.rs}`, `docs/sandbox/**` | `pam_model` and `pam_daemon` tests; `doctor_macos` re-run |
 | T11 | Integrate and verify (ptrack 217): rerun T7 and T9, `ptrack summary set`, `plan done` | — | checkpoint block acted on |
 
 Parallelism: T1 first; then T2 ‖ T4 ‖ T6; then T3 (needs T1, T2) ‖ T5 (needs T4); then T7, T8, T9; then T10, T11.
@@ -908,8 +913,10 @@ Parallelism: T1 first; then T2 ‖ T4 ‖ T6; then T3 (needs T1, T2) ‖ T5 (nee
 7. The beacon does not change colour on the boundary; Settings › Daemon and
    Home carry it. Liveness and the boundary are different questions.
 8. No per-agent grant model (section above); the docs state per-user authority.
-9. The engine runtime's placement under `<base>/run` is a filed issue; the
-   profiles and `doctor` close it operationally now.
+9. The engine runtime's placement under `<base>/run` was filed as issue 44 and
+   closed operationally by the profiles and `doctor`; T10 then moved it to
+   `<base>/engine/run` on this branch (As built, T10 row), and the profiles no
+   longer name any engine path under `run`.
 10. `KNOWN_AGENTS`/`classify_chain` live in `pam_proto`; the daemon walks the
     peer's ancestry itself on macOS.
 
@@ -929,14 +936,13 @@ Parallelism: T1 first; then T2 ‖ T4 ‖ T6; then T3 (needs T1, T2) ‖ T5 (nee
 
 ## As built (2026-10-02)
 
-What shipped on `feat/boundary-doctor` for T1 to T6 and T8, and where it departs
-from the design above. Where this section and an earlier one disagree, this one
-is the behavior; the sections above stay as the reasoning. T7 (macOS acceptance
-under `sandbox-exec`) and T9 (Windows runs in the Parallels VM) are in progress
-and record their measurements in `docs/macos-sandbox-acceptance.md` and
-`docs/sandbox/windows/README.md`; T10 (relocating the engine runtime) is under
-way. Line references in the design sections are to the tree it was written
-against and have moved.
+What shipped on `feat/boundary-doctor` for T1 to T8 and T10, and where it
+departs from the design above. Where this section and an earlier one disagree,
+this one is the behavior; the sections above stay as the reasoning. T7 (macOS
+acceptance under `sandbox-exec`) records its measurements in
+`docs/macos-sandbox-acceptance.md`; T9 (Windows runs in the Parallels VM)
+records them in `docs/sandbox/windows/README.md`. Line references in the design
+sections are to the tree it was written against and have moved.
 
 ### Probes
 
@@ -1114,15 +1120,29 @@ against and have moved.
     compiled and ran only through the code that builds on macOS; T9 runs them in
     the VM. The `established` exit-0 path through the binary is T7's, under
     `sandbox-exec`.
+22. **`daemon.signal` and `daemon.process_query` take the daemon's pid from
+    the hello acknowledgement**, not from `<base>/run/daemon.lock`. The
+    `hello_ack` frame carries `pid` (`pam_proto::wire::HelloAck`; the admin
+    plane's acknowledgement carries it too), the reach probe hands it to the
+    probes that wait for it, and the lock file is never read: the seam reads no
+    byte from under the base at all (a source test pins it). With no daemon
+    acknowledged the two rows are `not_probed` ("no daemon reached: no pid to
+    probe"), counted under `skipped`; the run is `cannot_probe` regardless.
+    Consequence: through the session relay, under the documented relay
+    variant of a profile (nothing under `<base>` readable), the verdict is
+    `established` — T7 asserts it for both relay variants. The pid is public
+    information (the lock holds it, `pam daemon stop` prints it) and the
+    public socket is reachable by the same user only.
+23. **`harness_agrees` is three-valued.** `false` only when both sides know
+    and differ; `null` (printed `undetermined`) when the daemon has no
+    resolution (Windows, a missed budget), when it sees the relay process in
+    place of the client, or when the client's own chain is empty — under both
+    shipped Seatbelt profiles `/bin/ps` cannot exec, so a correct sandboxed run
+    claims `unknown` and must not read as a disagreement
+    (`pam_daemon::boundary::harness_agreement`). The profiles do not allow
+    `/bin/ps`: a process listing is information the sandbox should deny.
 
 ### Open at this status
 
-- **Through the relay, `daemon.signal` reads `unknown`.** Its pid comes from
-  `<base>/run/daemon.lock`, which a relay profile (nothing under the base) does
-  not leave readable, and an unknown on a must-deny probe fails the verdict. A
-  relayed run is `not_established` with `daemon.signal` unverified until the probe
-  is judged another way; the design's remark that "the report says so" does not
-  make the verdict reachable. Decision needed: treat a missing pid under
-  `PAM_SOCKET_DIR` as `not_probed`, or keep the lock readable in the relay profile.
-- The engine runtime is still under `<base>/run` (issue 44, T10); the profiles
-  and both `engine.*` probes close it operationally.
+Nothing: the two items recorded here earlier (the relayed `daemon.signal`
+and the engine runtime inside `run`) closed with As built 22 and T10.

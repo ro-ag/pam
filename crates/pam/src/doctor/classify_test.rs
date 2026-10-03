@@ -15,8 +15,7 @@ use super::classify::{
     classify_access_write, classify_appleevents, classify_connect, classify_exists, classify_io,
     classify_io_result, classify_keyring, classify_kill, classify_kind_code,
     classify_launchservices, classify_lock, classify_process_query, classify_reach,
-    classify_security, classify_shell_execute, first_line, fit_result, parse_lock_pid,
-    parse_ps_line,
+    classify_security, classify_shell_execute, first_line, fit_result, parse_ps_line,
 };
 use super::helpers::{HelperOutcome, HelperRun};
 use super::os::{HelloAnswer, KeyringAnswer, LockState};
@@ -184,6 +183,7 @@ fn the_reach_table() {
             version: "0.4.3".to_owned(),
             proto: 2,
             epoch: "01J".to_owned(),
+            pid: 4242,
         },
     );
     assert_eq!(ready, ProbeResult::allowed());
@@ -500,13 +500,6 @@ fn keyring_table() {
 
 #[test]
 fn parsers() {
-    assert_eq!(parse_lock_pid("4242\n"), Some(4242));
-    assert_eq!(parse_lock_pid(" 7 "), Some(7));
-    assert_eq!(parse_lock_pid("0"), None);
-    assert_eq!(parse_lock_pid(""), None);
-    assert_eq!(parse_lock_pid("-1"), None);
-    assert_eq!(parse_lock_pid("pid 12"), None);
-
     assert_eq!(
         parse_ps_line(" 1669 /bin/zsh\n"),
         Some((1669, "zsh".to_owned()))

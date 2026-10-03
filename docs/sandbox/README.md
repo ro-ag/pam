@@ -19,11 +19,11 @@ With `<base>` the PAM base directory (default `~/.pam`, or `$PAM_BASE_DIR`):
    `<dir>/pam.sock` (the directory `pam listen <dir>` serves) and nothing under
    `<base>` at all.
 2. **Deny** the rest of `<base>`: `admin/` and its socket, `state.sqlite3` with
-   `-wal` and `-shm`, `backup/`, `model-trust/`, `engine/`, `flows/`, `log/`,
-   **and inside `run/`: `engine.sock` and `engine/`**. The engine's private
-   socket and its transient API key live in the run directory the agent must
-   traverse; allowing `run/` by subpath exposes them, so each profile allows the
-   literal `pam.sock` and names the engine paths as denied.
+   `-wal` and `-shm`, `backup/`, `model-trust/`, `engine/`, `flows/`, `log/`.
+   The engine's private socket and its transient API key live under
+   `<base>/engine/run`, inside the denied `engine/` tree; nothing but
+   `pam.sock` and `daemon.lock` is under `run/`, and each profile allows the
+   literal `pam.sock` rather than `run/` by subpath.
 3. **Deny** the keychain, process control of the daemon (signals), and the GUI
    launch brokers (LaunchServices, AppleEvents on macOS).
 4. **Deny** writes to the trusted `pam` executable and to the `.app` bundle.
@@ -39,7 +39,7 @@ Where a harness has no setting for one of these, the profile says so and
 | Codex | [`macos/codex.config.toml`](macos/codex.config.toml) | `config.toml` permission profile | documented keys, cited; Beta page; format verified by syntax only — `pam doctor` from inside is the evidence |
 | Gemini CLI | [`macos/gemini-cli.sandbox-macos-pam.sb`](macos/gemini-cli.sandbox-macos-pam.sb) | custom Seatbelt profile file | documented mechanism, source read; `pam doctor` under `sandbox-exec` with the launcher's `-D` names: **`established`** (`doctor_macos.rs`, macOS 26) |
 | Copilot CLI | [`macos/copilot-cli.md`](macos/copilot-cli.md) | `/sandbox config` dialog choices | no file format; dialog choices verified by reading only; the `pam-agent.sb` wrapper it falls back to is `established` (below) |
-| anything else (Cursor, Aider, a shell, a wrapper) | [`macos/pam-agent.sb`](macos/pam-agent.sb) | `sandbox-exec` profile | fallback; the strongest; `pam doctor` under it: **`established`**, exit 0, report recorded (`doctor_macos.rs`, macOS 26). Relay variant as commented (no read under `<base>`): `not_established`, `unverified = [daemon.signal]` — the pid in `run/daemon.lock` is unreadable; keep the `daemon.lock` read line to get `established` through the relay |
+| anything else (Cursor, Aider, a shell, a wrapper) | [`macos/pam-agent.sb`](macos/pam-agent.sb) | `sandbox-exec` profile | fallback; the strongest; `pam doctor` under it: **`established`**, exit 0, report recorded (`doctor_macos.rs`, macOS 26). Relay variant as commented (no read under `<base>`): **`established`** too — the daemon's pid comes from the hello acknowledgement, so `daemon.signal` is judged without the lock file; keeping the `daemon.lock` read line changes only the informational lock probe |
 | Windows | [`windows/README.md`](windows/README.md) | none | no supported configuration |
 
 `pam doctor --profile <name> [--base DIR]` prints the profile with `<base>`

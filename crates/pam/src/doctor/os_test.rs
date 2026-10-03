@@ -62,7 +62,6 @@ pub(crate) struct FakeOs {
     pub(crate) default: Answer,
     pub(crate) overrides: HashMap<(Op, PathBuf), Answer>,
     pub(crate) lock: Result<LockState, Answer>,
-    pub(crate) pid_file: Result<String, Answer>,
     pub(crate) hello: Mutex<Option<HelloAnswer>>,
     pub(crate) helper_mood: HelperMood,
     pub(crate) chain: Vec<String>,
@@ -80,11 +79,11 @@ impl FakeOs {
             default: Answer::Ok,
             overrides: HashMap::new(),
             lock: Ok(LockState::Held),
-            pid_file: Ok("4242\n".to_owned()),
             hello: Mutex::new(Some(HelloAnswer::Ready {
                 version: "0.4.3".to_owned(),
                 proto: 2,
                 epoch: "01JBEPOCH".to_owned(),
+                pid: 4242,
             })),
             helper_mood: HelperMood::Allowed,
             chain: vec!["zsh".to_owned(), "claude".to_owned()],
@@ -254,17 +253,6 @@ impl Os for FakeOs {
         }
     }
 
-    fn read_pid_file(&self, path: &Path) -> io::Result<String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("ReadPid {}", path.display()));
-        match &self.pid_file {
-            Ok(text) => Ok(text.clone()),
-            Err(answer) => answer.to_io().map(|()| String::new()),
-        }
-    }
-
     fn connect_unix(&self, path: &Path, _hold: Duration) -> io::Result<()> {
         self.answer(Op::Connect, path)
     }
@@ -411,14 +399,25 @@ fn the_executable_and_the_bundle_are_never_opened_for_write_on_unix() {
 }
 
 #[test]
-fn the_seam_reads_bytes_in_exactly_one_place_the_pid_file() {
+fn the_seam_reads_no_bytes_from_under_the_base() {
+    // The daemon's pid comes from the hello acknowledgement; nothing in
+    // the seam reads file contents.
     let source = include_str!("os.rs");
-    assert_eq!(source.matches("read_to_string").count(), 1);
-    assert!(!source.contains("read_to_end"));
-    assert!(!source.contains("read_exact"));
-    assert!(!source.contains("fs::read("));
-    // The read is bounded.
-    assert!(source.contains(".take(MAX_PID_FILE_BYTES as u64)"));
+    for forbidden in [
+        "read_to_string",
+        "read_to_end",
+        "read_exact",
+        "fs::read(",
+        "read_pid_file",
+        "BufReader",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "os.rs must not contain `{forbidden}`"
+        );
+    }
+    // The pid is carried by the acknowledged hello.
+    assert!(source.contains("pid: ack.pid"));
 }
 
 #[test]
@@ -538,16 +537,5 @@ fn the_lock_probe_reports_a_holder_and_releases_what_it_took() {
             .unwrap_err()
             .kind(),
         io::ErrorKind::NotFound
-    );
-}
-
-#[test]
-fn the_pid_file_read_is_bounded() {
-    let tmp = tempfile::tempdir().unwrap();
-    let lock = tmp.path().join("daemon.lock");
-    std::fs::write(&lock, "9".repeat(1000)).unwrap();
-    assert_eq!(
-        RealOs.read_pid_file(&lock).unwrap().len(),
-        super::os::MAX_PID_FILE_BYTES
     );
 }

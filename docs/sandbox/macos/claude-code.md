@@ -17,9 +17,9 @@
   file inside the denied base, `<base>/run/daemon.lock` (the client's readiness
   probe).
 - **Deny:** `sandbox.filesystem.denyRead` names the base and every private path
-  under it, including the engine runtime that lives inside the run directory,
-  `<base>/run/engine.sock` and `<base>/run/engine/`; `denyWrite` names the base
-  and `/Applications/PAM.app`; `permissions.deny` stops Claude's own file tools.
+  under it (the engine's socket and API key live under `<base>/engine/run`,
+  covered by the `<base>/engine` rule); `denyWrite` names the base and
+  `/Applications/PAM.app`; `permissions.deny` stops Claude's own file tools.
 - **Prove:** from a Bash tool call inside a Claude Code session run
   `pam doctor`; it must print `boundary: established` and exit `0`.
 

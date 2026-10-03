@@ -107,19 +107,22 @@ What the daemon records is the relay's peer, not the agent's. The
 shows `relay` for it. The harness chain of the client (`env.harness_chain`, and
 the `claimed_harness` the reply derives from it) is carried in the report as a
 self-report, never as the daemon's own finding; `harness_agrees` is `null`
-because the daemon has no harness of its own to compare it with.
+(printed `undetermined`) because the daemon sees the relay process, not the
+client's harness, and cannot say the two disagree.
 
 Two consequences for reading a relayed report:
 
-- **Nothing under `<base>` is expected to be reachable.** The relay profile
-  allows `<dir>/pam.sock` and no path under the base, so the lock-file probe is
-  `denied` ("unreadable under the relay"), which is informational, and every
-  private path should read `denied` or `absent`. `daemon.signal` takes its pid
-  from the lock file, which the relay profile does not leave readable, so it has
-  no pid to probe and reads `unknown` ("lock file unreadable: no pid to probe").
-  An unknown on a must-deny probe fails the verdict, so a run through the relay
-  is `not_established` with `daemon.signal` under `unverified` until that probe
-  can be judged another way; the `failed` list is what to act on.
+- **Nothing under `<base>` is expected to be reachable, and the verdict is
+  still computed.** The relay profile allows `<dir>/pam.sock` and no path under
+  the base, so the lock-file probe is `denied` ("unreadable under the relay;
+  lazy start is not needed here"), which is informational, and every private
+  path should read `denied` or `absent`. `daemon.signal` takes the daemon's pid
+  from the hello acknowledgement (the daemon answers the hello through the
+  relay, so the pid is the daemon's, not the relay's) and never reads the lock
+  file, so it is probed and refused like every other must-deny row. A run
+  through the relay under the documented relay variant of `pam-agent.sb` is
+  `established` (`doctor_macos.rs`, macOS 26); keeping the `daemon.lock` read
+  line changes only the informational lock probe.
 - **A relayed run cannot attribute its own admin contact.** The daemon matches
   an unexplained admin contact to a report by kernel pid. The contact, if the
   sandbox lets the client reach the private endpoint at all, comes from the

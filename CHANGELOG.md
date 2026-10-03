@@ -297,12 +297,22 @@ All notable changes to pam are documented in this file. The format follows
   same pid. The Windows probe opens `control.json` for read and closes it
   without reading a byte, and never dials the admin port; the keychain probe
   searches for an account that does not exist.
-- The engine's private socket and transient API key live inside the run
-  directory that a sandboxed agent must traverse to reach `pam.sock` (ptrack
-  issue 44). Every reference profile allows the literal `pam.sock` and the lock
-  read only and denies `<base>/run/engine.sock` and `<base>/run/engine/`, and
-  `pam doctor` probes both. Moving the engine runtime out of `run` is filed as a
-  follow-up.
+- The engine's private socket and transient API key no longer live inside the
+  run directory that a sandboxed agent must traverse to reach `pam.sock`
+  (ptrack issue 44): the engine runtime moved to `<base>/engine/run` (`0700`,
+  inside the `engine` tree every profile denies), `run/` holds the public plane
+  only, and a daemon removes an older daemon's leftovers inside `run` at
+  start. The reference profiles name no engine path under `run` any more, and
+  `pam doctor` probes the runtime where it is.
+- `pam doctor` reads no byte from under the base. The daemon's pid, which the
+  `daemon.signal` and `daemon.process_query` probes need, comes from the hello
+  acknowledgement (`hello_ack` now carries `pid`) instead of the lock file, so
+  the probe is judged through the session relay too: a run through
+  `pam listen` under a profile that allows nothing under the base is
+  `established`. `harness_agrees` in the `doctor.report` reply is three-valued:
+  `false` only when both the daemon's resolution and the client's own chain are
+  known and differ; `null` (undetermined) when either is unknown, as under a
+  profile that denies `/bin/ps`.
 
 ### Removed
 

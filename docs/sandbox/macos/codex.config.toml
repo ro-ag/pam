@@ -18,10 +18,10 @@
 #           filesystem "read" re-opens exactly <base>/run/daemon.lock inside the
 #           denied base ("a more specific path can also reopen a narrower
 #           subtree inside a broader deny")
-# Deny:     filesystem "deny" for the base and every private path under it,
-#           including <base>/run/engine.sock and <base>/run/engine/ (the
-#           engine's socket and API key live inside the run directory the agent
-#           must traverse); unix_sockets "deny" for the admin and engine sockets
+# Deny:     filesystem "deny" for the base and every private path under it
+#           (the engine's socket and API key live under <base>/engine/run,
+#           covered by the engine deny); unix_sockets "deny" for the admin and
+#           engine sockets
 # Prove:    with default_permissions = "pam" selected, from a command Codex
 #           runs, `pam doctor` must print "boundary: established" and exit 0
 #
@@ -72,8 +72,6 @@ extends = ":workspace"
 "<base>/engine" = "deny"
 "<base>/flows" = "deny"
 "<base>/log" = "deny"
-"<base>/run/engine" = "deny"
-"<base>/run/engine.sock" = "deny"
 
 [permissions.pam.network]
 enabled = true
@@ -81,4 +79,4 @@ enabled = true
 [permissions.pam.network.unix_sockets]
 "<base>/run/pam.sock" = "allow"
 "<base>/admin/control.sock" = "deny"
-"<base>/run/engine.sock" = "deny"
+"<base>/engine/run/engine.sock" = "deny"

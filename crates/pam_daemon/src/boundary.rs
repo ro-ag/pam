@@ -36,7 +36,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pam_proto::Outcome;
-use pam_proto::caller::{MAX_CHAIN_DEPTH, RELAY_HARNESS, canonical_agent, classify_chain};
+use pam_proto::caller::{
+    MAX_CHAIN_DEPTH, RELAY_HARNESS, UNKNOWN_AGENT, canonical_agent, classify_chain,
+};
 use pam_proto::doctor::DoctorReport;
 use pam_store::{
     Actor, AuditEntry, BoundaryCensus, BoundaryObservationInsert, BoundaryObservationRow,
@@ -751,7 +753,7 @@ impl Boundary {
         let attributed = self.attribute_after_report(ctx, pid).await;
         self.load().await;
         let claimed = classify_chain(&report.env.harness_chain);
-        let harness_agrees = peer.harness.as_deref().map(|harness| harness == claimed);
+        let harness_agrees = harness_agreement(peer.harness.as_deref(), &claimed);
         Ok(CapabilityOutput {
             outcome: Outcome::Verified,
             body: json!({
@@ -895,6 +897,23 @@ pub async fn report(ctx: &ExecContext) -> Result<CapabilityOutput, CapabilityFai
         });
     };
     boundary.record_report(ctx).await
+}
+
+/// Whether the harness the daemon resolved for the peer (`seen`) and the
+/// one the client's own walk claimed (`claimed`) name the same harness.
+/// Three-valued: `Some(false)` only when both sides know and differ.
+/// `None` (undetermined) when either side does not know — the daemon has
+/// no resolution (Windows, a missed budget), it sees the relay process in
+/// place of the client, or the client's walk produced nothing (a profile
+/// that denies `/bin/ps` leaves its chain empty, which classifies as
+/// `unknown`). A correct sandboxed run must not read as a disagreement.
+#[must_use]
+pub fn harness_agreement(seen: Option<&str>, claimed: &str) -> Option<bool> {
+    match seen {
+        None | Some(RELAY_HARNESS) => None,
+        Some(_) if claimed == UNKNOWN_AGENT => None,
+        Some(seen) => Some(seen == claimed),
+    }
 }
 
 /// The block before any report and with no observations: what a daemon

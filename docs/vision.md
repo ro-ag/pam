@@ -7,6 +7,7 @@ CLI-only agent access (no MCP), sandbox/admin trust, and model authority. Old
 llama.cpp, size-floor, chatbot and model-controlled retry proposals below are
 retained as history, not instructions to implement.
 The platform list below is superseded (2026-10-02): supported platforms are macOS arm64 and Windows amd64/arm64; Linux and Intel macOS are dropped.
+The ZeroMQ transport below is superseded (2026-10-02): agents and the daemon speak PAM's own length-prefixed frame protocol on `run/pam.sock`, with no socket library and no broadcast; see [the framed public transport](specs/2026-10-02-framed-public-transport.md).
 
 Original status: draft. Repo: `ro-ag/pam` (fresh). The old codebase lives archived at
 `ro-ag/pam-old`.

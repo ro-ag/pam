@@ -156,6 +156,30 @@ describe("ReadinessCard", () => {
     ).toBeInTheDocument();
   });
 
+  it("discloses the summary prompt fingerprint and that it was not measured", () => {
+    render(
+      <ReadinessCard
+        status={status({
+          readiness: {
+            light: tier({
+              tier: "light",
+              summary_contract: {
+                task: "summary",
+                fingerprint: "0123456789abcdef0123",
+                measured: false,
+                note: "Summaries are advisory and labelled untrusted.",
+              },
+            }),
+            heavy: tier({ summary_contract: undefined }),
+          },
+        })}
+        failure={null}
+        onRepair={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByText("summary prompt 0123456789ab · not measured")).toHaveLength(1);
+  });
+
   it("shows no note for a tier without a record, or from a daemon that sends none", () => {
     render(
       <ReadinessCard

@@ -233,7 +233,19 @@ fn create_private_dir(run: &Path) -> io::Result<()> {
     std::fs::set_permissions(run, std::fs::Permissions::from_mode(0o700))
 }
 
+/// No owner-only DACL without FFI: like the admin directory
+/// (`admin_transport_windows::control_path`), the run directory takes its ACL
+/// by inheritance from the base, so it must be a real directory there and not
+/// a symlink or junction whose ACL comes from somewhere else.
 #[cfg(not(unix))]
 fn create_private_dir(run: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(run)
+    std::fs::create_dir_all(run)?;
+    let metadata = run.symlink_metadata()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime directory must be a real, non-symlink directory",
+        ));
+    }
+    Ok(())
 }

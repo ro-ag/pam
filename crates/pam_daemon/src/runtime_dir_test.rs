@@ -40,6 +40,32 @@ fn ok_path_passes_and_creates_run_dir() {
     assert_eq!(dirs.public_control(), dirs.run_dir().join("public.json"));
 }
 
+#[cfg(windows)]
+#[test]
+fn a_junctioned_run_dir_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("target");
+    let base = tmp.path().join("pam");
+    std::fs::create_dir(&base).expect("base");
+    // A junction needs no privilege, unlike a directory symlink.
+    let status = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(base.join("run"))
+        .arg(&elsewhere)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("mklink");
+    assert!(status.success(), "mklink /J failed");
+    let err = RuntimeDir::at_base(&base).expect_err("a junction must be refused");
+    let RuntimeDirError::Create { ref source, .. } = err else {
+        panic!("expected Create, got {err:?}");
+    };
+    assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+}
+
 #[cfg(unix)]
 #[test]
 fn run_dir_is_created_with_0700() {

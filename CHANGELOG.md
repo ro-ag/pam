@@ -488,6 +488,9 @@ All notable changes to pam are documented in this file. The format follows
   the Windows certificate store through MDM. A bundle file would replace the
   store's trust and break public hosts, so the network stays on store trust
   and `pam policy check --platform windows` reports the leaf.
+- On Windows the daemon refuses to start when `<base>\run` is a symlink or
+  junction, as it already did for `<base>\admin`. The run directory takes its
+  ACL by inheritance from the base, so a link would let it come from elsewhere.
 
 ### Removed
 

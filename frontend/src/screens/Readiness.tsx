@@ -171,6 +171,14 @@ export function TierRow({
           {record && readiness.note && (
             <p className="font-sans text-xs text-ink-muted">{readiness.note}</p>
           )}
+          {/* The summary prompt this model is sent, by fingerprint, and whether any record
+              was measured under it: a disclosure, never a gate. */}
+          {readiness.model_id && readiness.summary_contract?.fingerprint && (
+            <p className="select-text font-data text-xs text-ink-faint">
+              summary prompt {readiness.summary_contract.fingerprint.slice(0, 12)} ·{" "}
+              {readiness.summary_contract.measured ? "measured" : "not measured"}
+            </p>
+          )}
         </div>
         {repair && onRepair && (
           <Button size="sm" variant="secondary" onClick={() => onRepair(repair.target)}>

@@ -51,6 +51,25 @@ chmod 755 "$stage"
 readonly writable="$stage.dmg"
 readonly mountpoint="$stage.mount"
 attached=''
+
+# Detaches a volume, retrying, because a just-written volume is often still
+# busy for a few seconds (Spotlight and fseventsd hold it on CI runners).
+# Polite first, forced only on the last attempts, with a pause between tries.
+detach_volume() {
+    local target="$1"
+    local attempt
+    sync
+    for attempt in 1 2 3 4 5; do
+        if ((attempt <= 3)); then
+            run_bounded 60 hdiutil detach "$target" -quiet >/dev/null 2>&1 && return 0
+        else
+            run_bounded 30 hdiutil detach "$target" -force -quiet >/dev/null 2>&1 && return 0
+        fi
+        ((attempt < 5)) && sleep $((attempt * 2))
+    done
+    return 1
+}
+
 cleanup() {
     if [[ -n "$attached" ]]; then
         run_bounded 30 hdiutil detach "$attached" -force -quiet >/dev/null 2>&1 || true
@@ -107,9 +126,7 @@ brand_volume() {
             "$mountpoint" 2>/dev/null; then
         flagged=1
     fi
-    run_bounded 60 hdiutil detach "$mountpoint" -quiet >/dev/null 2>&1 ||
-        run_bounded 30 hdiutil detach "$mountpoint" -force -quiet >/dev/null 2>&1 ||
-        fail 'the staging volume could not be detached'
+    detach_volume "$mountpoint" || fail 'the staging volume could not be detached'
     attached=''
     ((flagged))
 }

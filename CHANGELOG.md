@@ -6,6 +6,34 @@ All notable changes to pam are documented in this file. The format follows
 
 ## [Unreleased]
 
+- Nothing yet.
+
+## [0.5.0] - 2026-10-03
+
+### Upgrading from 0.4.x
+
+Read [Compatibility](#compatibility) below before upgrading. In short:
+
+- The store moves to SQLite on the first start, after a full copy into
+  `<base>/backup/state-<UTC time>-pre-sqlite/`. There is no downgrade: older
+  binaries refuse the upgraded database, and going back means restoring that
+  copy and losing what was written since.
+- Supported platforms are macOS on Apple Silicon and Windows amd64/arm64.
+  Linux and Intel Mac builds are gone.
+- The agent protocol on `run/pam.sock` changed. The first `pam` command run
+  outside a sandbox, the GUI, or `pam listen` stops a running 0.4.x daemon and
+  starts the new one, silently and for up to ten seconds if it has work in
+  flight. On Windows end the old daemon's process yourself; a sandboxed client
+  prints what to run instead.
+- Quit and reopen a GUI left open across the upgrade. An old `pam` binary
+  cannot talk to the new daemon.
+- A login unit still pinned to the old binary cannot start the daemon:
+  `pam service status` says whether it pins this binary, and
+  `pam service install` registers the new one.
+- Sandbox profiles need only `pam.sock`; `events.sock` is gone.
+- Flows naming `connector: aws` fail validation; that adapter is removed.
+- Building from source needs a C compiler, for the bundled SQLite.
+
 ### Added
 
 - `status` carries a `containment` block saying whether this machine can

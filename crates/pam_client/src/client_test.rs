@@ -795,15 +795,26 @@ fn a_spawned_daemon_is_ready_only_once_it_acknowledges_a_hello() {
 fn an_outdated_daemon_is_waited_out_and_replaced() {
     let tmp = short_tempdir();
     let base = tmp.path().to_path_buf();
-    let old = FakeDaemon::start(tmp.path(), |mut peer| async move {
-        peer.hello().await;
-        peer.send(&Frame::error(cause::DAEMON_OUTDATED, "replaced", "retry"))
-            .await;
-        peer.until_closed().await;
+    let (refused, observed) = std::sync::mpsc::channel();
+    let old = FakeDaemon::start(tmp.path(), move |mut peer| {
+        let refused = refused.clone();
+        async move {
+            peer.hello().await;
+            peer.send(&Frame::error(cause::DAEMON_OUTDATED, "replaced", "retry"))
+                .await;
+            let _ = refused.send(());
+            peer.until_closed().await;
+        }
     });
-    // Longer than the boot wait (two attempts of 100 ms), shorter than the handover.
+    // Start draining only once the client has reached the old daemon: a
+    // loaded runner must not spend the handover before the first probe.
+    // The drain outlasts both boot attempts, whose bounds also have to allow
+    // the replacement's Windows nonce handshake to run under suite load.
     let drain = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(600));
+        observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the client reaches the outdated daemon");
+        std::thread::sleep(Duration::from_millis(1_500));
         old.stop();
     });
     let mut fakes = Vec::new();
@@ -818,7 +829,7 @@ fn an_outdated_daemon_is_waited_out_and_replaced() {
         spawn: &mut spawn,
         signal: &mut signal,
         client_version: env!("CARGO_PKG_VERSION"),
-        wait: Duration::from_millis(100),
+        wait: WAIT,
         poll: POLL,
         handover: Duration::from_secs(10),
         probe: Duration::from_millis(500),

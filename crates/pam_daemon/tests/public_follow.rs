@@ -578,7 +578,11 @@ async fn a_slow_follower_loses_progress_but_not_the_ending() {
         let fixture = Fixture::start().await;
         let hub = fixture.handle().event_hub();
 
-        let ticket = fixture.ticket("req_slow", 2_500).await;
+        // Outlive the enclosing harness deadline: completion is triggered
+        // below, after the slow reader has observed the published tail.
+        let ticket = fixture
+            .ticket_within("req_slow", 60_000, Some(120_000))
+            .await;
         fixture.wait_for_state(&ticket, RequestState::Running).await;
         let mut slow = fixture.follow("req_slow_follow", &ticket, 0, None).await;
         slow.following().await;
@@ -605,9 +609,18 @@ async fn a_slow_follower_loses_progress_but_not_the_ending() {
             started.elapsed()
         );
 
-        // Now it reads: far fewer events than were published, in order, with
-        // a gap — and then the ending, which cannot be dropped.
-        let (events, end) = slow.until_end().await;
+        // Now it reads: far fewer events than were published, in order,
+        // with a gap. Observe the tail before ending the request, so an
+        // echo timer cannot remove the hub entry during the burst.
+        let mut events = Vec::new();
+        loop {
+            let event = slow.event().await;
+            let seq = event.0;
+            events.push(event);
+            if seq == published + 2 {
+                break;
+            }
+        }
         let delivered = u64::try_from(events.len()).unwrap();
         assert!(
             delivered < published,
@@ -622,14 +635,31 @@ async fn a_slow_follower_loses_progress_but_not_the_ending() {
         // held the most recent events, not the oldest.
         let tail = events.last().expect("some events").0;
         assert!(tail > published - u64::try_from(FOLLOWER_QUEUE).unwrap());
-        assert_eq!(end.event, Some(Event::Done));
+
+        let cancel = fixture.envelope(
+            "req_slow_cancel",
+            "cancel",
+            serde_json::json!({ "ticket": ticket }),
+            true,
+        );
+        assert!(matches!(
+            fixture.call(&cancel).await,
+            Response::Result { .. }
+        ));
+        let (remaining, end) = slow.until_end().await;
+        assert!(remaining.is_empty());
+        assert_eq!(end.event, Some(Event::Refused));
         assert_eq!(end.seq, Some(published + 3));
-        assert_eq!(state_of(&end.response), "done");
+        assert_eq!(state_of(&end.response), "failed");
+        assert!(matches!(
+            &end.response,
+            Response::Result { body, .. } if body["outcome"] == "cancelled"
+        ));
 
         // The follower that kept reading was not held back by the slow one.
         let (_, end) = reader.await.unwrap();
         assert_eq!(end.seq, Some(published + 3));
-        assert_eq!(state_of(&end.response), "done");
+        assert_eq!(state_of(&end.response), "failed");
 
         fixture.daemon.stop().await;
     })

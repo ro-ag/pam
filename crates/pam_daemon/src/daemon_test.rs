@@ -328,6 +328,7 @@ mod live {
         STATUS_SLOTS, WORK_SLOTS, run_daemon_with,
     };
     use crate::ingress::{Origin, PeerIdentity, PublicPeer};
+    use crate::lifecycle::LifecyclePhase;
     use crate::secrets::FakeSecretBackend;
     use crate::transport::IncomingRequest;
 
@@ -1246,6 +1247,97 @@ mod live {
             detail.contains("the daemon stopped while this job was running"),
             "{detail}"
         );
+        store.close().await.unwrap();
+    }
+
+    /// A stop that begins while the executor loop is granting a lease: the
+    /// row is on its way to `running` but no lease exists yet. The drain
+    /// used to wait on the leases alone, see nothing in flight, end at once
+    /// and let the store close under the execution, whose terminal write
+    /// then met `StoreError::Closed`: the row stayed in flight for the next
+    /// boot's crash recovery although the work finished (`store_lifecycle`,
+    /// once on windows-2025). The drain now waits for the grant and the
+    /// execution, and the file a stopped daemon leaves has the result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_that_begins_while_a_lease_is_granted_still_records_the_result() {
+        let live = Live::start("relaxed", |_| {}).await;
+        let store = live.store();
+        let queue = live.handle.queue();
+        let mut phase = live.handle.lifecycle();
+
+        // The lane is busy with a long echo, so the request behind it is
+        // admitted and placed (store calls of its own) and then waits.
+        let holder = live
+            .ask(request(
+                "holder",
+                "echo",
+                serde_json::json!({ "delay_ms": 8_000 }),
+                false,
+            ))
+            .await;
+        assert!(matches!(holder, Response::Ticket { .. }), "{holder:?}");
+        eventually("the holder is leased", || async {
+            queue.leased_ids().await == ["holder"]
+        })
+        .await;
+        let ticket = live
+            .ask(request("granting", "echo", serde_json::json!({}), false))
+            .await;
+        assert!(matches!(ticket, Response::Ticket { .. }), "{ticket:?}");
+        eventually("the request is queued behind the holder", || async {
+            state_of(&store, "granting").await == Some(RequestState::Queued)
+        })
+        .await;
+
+        // Freeing the lane makes the executor loop grant the next lease;
+        // its take_next for this request waits in the store with the lane
+        // reserved: in flight, not leased.
+        let mut hold = queue.hold_store("granting");
+        let _ = queue.cancel("holder", pam_store::Actor::System).await;
+        hold.reached().await;
+        assert!(queue.leased_ids().await.is_empty());
+        assert_eq!(queue.in_flight_ids().await, ["granting"]);
+
+        // The stop begins in that window, joined as the daemon's host joins
+        // it: the store closes when the drain lets it.
+        let Live {
+            handle,
+            shutdown,
+            tmp,
+        } = live;
+        let _ = shutdown.send(true);
+        let stopping = tokio::spawn(async move {
+            handle.shutdown().await;
+            tmp
+        });
+        tokio::time::timeout(
+            PATIENCE,
+            phase.wait_for(|phase| *phase == LifecyclePhase::Draining),
+        )
+        .await
+        .expect("the drain begins")
+        .unwrap();
+        // Long past the drain's first look at what is in flight.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !stopping.is_finished(),
+            "the drain waits for the lease being granted"
+        );
+        assert_eq!(queue.in_flight_ids().await, ["granting"]);
+
+        hold.release();
+        let tmp = tokio::time::timeout(Duration::from_secs(30), stopping)
+            .await
+            .expect("the daemon drains")
+            .unwrap();
+
+        // What the stopped daemon left on disk.
+        let store = pam_testkit::open_store(&tmp).await;
+        let row = store.get_request("granting").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Done, "{row:?}");
+        let audit = store.audit_for_request("granting").await.unwrap();
+        assert_eq!(audit.len(), 1, "{audit:?}");
+        assert_eq!(audit[0].action, ACTION_EXECUTE);
         store.close().await.unwrap();
     }
 

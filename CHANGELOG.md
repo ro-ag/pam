@@ -8,7 +8,7 @@ All notable changes to pam are documented in this file. The format follows
 
 - Nothing yet.
 
-## [0.5.0] - 2026-10-03
+## [0.5.0] - 2026-10-04
 
 ### Upgrading from 0.4.x
 
@@ -540,6 +540,10 @@ Read [Compatibility](#compatibility) below before upgrading. In short:
 
 ### Fixed
 
+- A graceful stop that began just as a request was being started no longer
+  closes the store under it. The request's result was lost, and the next start
+  failed it through crash recovery even though the work had finished. The
+  drain now waits for that request and hands out no new work once it begins.
 - Evidence pages are served from the 64 KiB chunks they cover instead of
   the whole stored view, and every byte served is checked against its
   chunk's recorded SHA-256 first: a page of a 32 MiB view went from 3.8 ms

@@ -1853,3 +1853,110 @@ async fn a_cancelled_store_call_gives_back_its_claim_and_lane() {
     .await
     .expect("test within deadline");
 }
+
+/// The drain's set of in-flight work is the lanes' busy holders, so a lease
+/// being granted counts from the moment its lane is reserved — before its
+/// row is `running`, before the lease exists — and stops counting when the
+/// request completes. The leases alone appear one store call later, and a
+/// stop that began in that window used to see nothing in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_being_granted_is_in_flight_before_it_is_a_lease() {
+    timeout(DEADLINE, async {
+        let (_store, queue) = manager().await;
+        enqueue(
+            &queue,
+            &envelope("granting", REPO_A, serde_json::json!({}), None),
+        )
+        .await;
+        assert!(
+            queue.in_flight_ids().await.is_empty(),
+            "queued is not in flight"
+        );
+
+        let mut hold = queue.hold_store("granting");
+        let take = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move { queue.take_next(REPO_A).await }
+        });
+        hold.reached().await;
+        assert!(queue.leased_ids().await.is_empty(), "no lease yet");
+        assert_eq!(queue.in_flight_ids().await, ["granting"]);
+
+        hold.release();
+        let work = take.await.unwrap().unwrap().unwrap();
+        assert_eq!(work.request_id, "granting");
+        assert_eq!(queue.leased_ids().await, ["granting"]);
+        assert_eq!(queue.in_flight_ids().await, ["granting"]);
+
+        assert!(
+            queue
+                .complete("granting", RequestState::Done, Some("ok"), execute_entry())
+                .await
+                .unwrap()
+        );
+        assert!(queue.leased_ids().await.is_empty());
+        assert!(queue.in_flight_ids().await.is_empty());
+    })
+    .await
+    .expect("test within deadline");
+}
+
+/// Once leasing stops, `take_next` hands out nothing and a queued row stays
+/// `queued` — the checkpoint the next boot reloads — while the work already
+/// in flight completes and is cancelled exactly as before.
+#[tokio::test]
+async fn stop_leasing_grants_nothing_more_and_leaves_queued_rows_for_the_next_boot() {
+    timeout(DEADLINE, async {
+        let (store, queue) = manager().await;
+        // Distinct args: same-shape requests on one lane attach instead.
+        enqueue(
+            &queue,
+            &envelope("out", REPO_A, serde_json::json!({ "n": 1 }), None),
+        )
+        .await;
+        enqueue(
+            &queue,
+            &envelope("behind", REPO_A, serde_json::json!({ "n": 2 }), None),
+        )
+        .await;
+        enqueue(
+            &queue,
+            &envelope("waiting", REPO_B, serde_json::json!({}), None),
+        )
+        .await;
+        let work = queue.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "out");
+
+        queue.stop_leasing().await;
+        assert!(queue.take_next(REPO_B).await.unwrap().is_none());
+        let row = store.get_request("waiting").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+        assert_eq!(queue.in_flight_ids().await, ["out"]);
+
+        // The lease out completes as before; its freed lane leases nothing.
+        assert!(
+            queue
+                .complete("out", RequestState::Done, Some("ok"), execute_entry())
+                .await
+                .unwrap()
+        );
+        assert!(queue.in_flight_ids().await.is_empty());
+        assert!(queue.take_next(REPO_A).await.unwrap().is_none());
+        let row = store.get_request("behind").await.unwrap().unwrap();
+        assert_eq!(row.state, RequestState::Queued);
+
+        // A queued row is still the drain's to cancel.
+        assert_eq!(
+            queue.cancel("waiting", Actor::System).await.unwrap(),
+            CancelOutcome::CancelledQueued
+        );
+
+        // What the next boot finds: the row left queued, in its lane.
+        let restarted = QueueManager::new(Arc::clone(&store));
+        assert_eq!(restarted.rebuild_from_store().await.unwrap(), 1);
+        let work = restarted.take_next(REPO_A).await.unwrap().unwrap();
+        assert_eq!(work.request_id, "behind");
+    })
+    .await
+    .expect("test within deadline");
+}

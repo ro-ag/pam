@@ -27,6 +27,13 @@
 //!   (`QueueManager::reap_expired_notifying`, driven by [`QueueManager::run_reaper`]): terminal
 //!   `failed`/[`CAUSE_LEASE_EXPIRED`], audited ([`ACTION_LEASE_REAPED`], decision `timeout`, actor
 //!   `system`), the holder's cancel signal fires, and the lane is freed.
+//! - **Drain**: the daemon's graceful stop calls [`QueueManager::stop_leasing`], after which
+//!   `take_next` hands out nothing and the lanes keep their `queued` rows for the next boot, and
+//!   then waits on [`QueueManager::in_flight_ids`]. That set is the lanes' `busy` holders: the
+//!   outstanding leases **and** the lease a `take_next` is granting, whose row is already
+//!   `running` before the lease exists. Waiting on the leases alone let a stop that began in that
+//!   window close the store under the execution, which then met [`StoreError::Closed`] at its
+//!   terminal write and left the row for crash recovery.
 //! - **Cancellation**: [`QueueManager::cancel`] serves `pam cancel <ticket>` and the GUI, acting as
 //!   the caller-supplied [`Actor`]. The actor is decided by where the request entered the daemon,
 //!   never by a label: the `cancel` capability passes [`Actor::Human`] only for a request the
@@ -288,6 +295,9 @@ struct Inner {
     withdrawn: HashSet<String>,
     /// Terminal-notice slots promised to operations that are in the store.
     reserved_terminals: usize,
+    /// Set by [`QueueManager::stop_leasing`]: no further lease is handed
+    /// out, the lanes keep their `queued` rows for the next boot.
+    draining: bool,
 }
 
 impl Inner {
@@ -863,7 +873,7 @@ impl QueueManager {
     /// Under the lock: claims `repo`'s head and reserves the lane for it.
     fn claim_lane_head(&self, repo: &str) -> Step<(Claim<'_>, String, Instant), ()> {
         let mut inner = self.lock();
-        if inner.busy.contains_key(repo) {
+        if inner.draining || inner.busy.contains_key(repo) {
             return Step::Done(());
         }
         let Some(head) = inner.lanes.get(repo).and_then(VecDeque::front) else {
@@ -911,12 +921,39 @@ impl QueueManager {
         })
     }
 
-    /// Ids of every outstanding lease — the in-flight work a graceful
-    /// drain waits for (and, past the drain bound, cancels).
+    /// Ids of every outstanding lease. A lease being granted — its row
+    /// already `running`, [`Self::take_next`] still in the store — is not
+    /// one yet; the drain waits on [`Self::in_flight_ids`], which counts it.
     pub async fn leased_ids(&self) -> Vec<String> {
         let _entered = self.enter().await;
         let inner = self.lock();
         inner.leases.keys().cloned().collect()
+    }
+
+    /// Ids of the work in flight: every outstanding lease and every lease
+    /// being granted (the request a [`Self::take_next`] has moved, or is
+    /// moving, to `running` and will hand out when it returns). This is
+    /// what a graceful drain waits for and, past its bound, cancels: a
+    /// request that is `running` on disk must reach its terminal row while
+    /// the store is still open, whether or not its lease is out yet.
+    /// Sorted.
+    pub async fn in_flight_ids(&self) -> Vec<String> {
+        let _entered = self.enter().await;
+        let inner = self.lock();
+        let mut ids: Vec<String> = inner.busy.values().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Stops handing out leases: from now on [`Self::take_next`] answers
+    /// `None` and every lane keeps its `queued` rows, which are the
+    /// restart-safe checkpoint the next boot reloads. Decided under the lane
+    /// lock, like a lease grant, so once this returns no new grant can
+    /// start and [`Self::in_flight_ids`] can only shrink. Cancellation,
+    /// completion and expiry of the work already in flight go on as before.
+    pub async fn stop_leasing(&self) {
+        let _entered = self.enter().await;
+        self.lock().draining = true;
     }
 
     /// Wait for a parked request becoming ready or releasing its repository lane.

@@ -299,3 +299,12 @@ Managed by memento.py — log with `memento hit`, do not hand-edit entry fields.
 - cost: 0
 - status: watching
 
+
+## pam-drain-misses-lease-grant
+- kind: habit
+- scope: project
+- rule: A graceful drain must wait on the queue's in-flight set (the busy lane holders: leases out and the lease a take_next is granting), never on the leases alone. take_next writes the row running one store call before the lease exists; a stop that begins in that window sees nothing in flight, closes the store under the execution, and the terminal write meets StoreError::Closed, leaving the row running for crash recovery although the work finished.
+- fix: QueueManager::stop_leasing (decided under the lane lock, so no grant slips past the drain's first look) then poll QueueManager::in_flight_ids in lifecycle_task. Reproduce by sleeping 300 ms between start_queued_request and lease_out in take_next: store_lifecycle fails Running != Done every run (once in CI on windows-2025 without the sleep). Regression tests in queue_test (in-flight before leased, stop_leasing) and daemon_test (a stop in the grant window).
+- hits: 2026-10-04
+- cost: 0
+- status: watching

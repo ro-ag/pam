@@ -54,8 +54,10 @@
 //!   policy in force applies from the first request; its poll task runs with the other background
 //!   tasks and stops when the drain starts.
 //! - **Shutdown** is a graceful drain: phase leaves [`LifecyclePhase::Serving`] (new requests
-//!   refused, [`CAUSE_DAEMON_SHUTTING_DOWN`]), executor/reaper stop taking leases (`queued` rows
-//!   are the restart-safe checkpoint), in-flight leases get [`DaemonConfig::drain_timeout`] then
+//!   refused, [`CAUSE_DAEMON_SHUTTING_DOWN`]), executor/reaper stop taking leases and the queue
+//!   refuses to grant any ([`QueueManager::stop_leasing`]; `queued` rows are the restart-safe
+//!   checkpoint), the work in flight — leases out and the lease a grant in progress is about to
+//!   hand out, [`QueueManager::in_flight_ids`] — gets [`DaemonConfig::drain_timeout`] then
 //!   cooperative cancellation, then the dispatcher stops. Every write, audit included, is durable
 //!   when its call returns, so nothing is flushed here; the store is closed last
 //!   ([`DaemonHandle::shutdown`]) so that its write-ahead log is folded into the main file and a
@@ -1017,9 +1019,10 @@ fn open_http_transport(
 
 /// Drives the graceful drain (see the module docs): waits for the
 /// caller's shutdown flip or a self-restart request, refuses new work
-/// via the phase, stops the lease-granting tasks, waits (bounded) for
-/// in-flight leases, cancels leftovers cooperatively, then stops the
-/// dispatcher.
+/// via the phase, stops the lease-granting tasks and the queue's leasing,
+/// waits (bounded) for the work in flight — leases out and leases being
+/// granted ([`QueueManager::in_flight_ids`]) — cancels leftovers
+/// cooperatively, then stops the dispatcher.
 async fn lifecycle_task(
     mut shutdown: watch::Receiver<bool>,
     phase: watch::Sender<LifecyclePhase>,
@@ -1046,11 +1049,20 @@ async fn lifecycle_task(
     let _ = drain.send(true);
     tracing::info!(phase = ?*phase.borrow(), "daemon draining");
 
+    // The executor loop stops on the drain flag, but it may be in the
+    // middle of a grant, and it could grant once more before it sees the
+    // flag. The queue refuses leases from here on, under the lock a grant
+    // takes, so the in-flight set below can only shrink.
+    queue.stop_leasing().await;
+    // In flight is every lease out and every lease being granted: a
+    // request whose row is already `running` must reach its terminal row
+    // before the store closes, or crash recovery fails it at the next boot
+    // although the work finished. The leases alone missed the grant window.
     let drain_deadline = Instant::now() + drain_timeout;
-    while !queue.leased_ids().await.is_empty() && Instant::now() < drain_deadline {
+    while !queue.in_flight_ids().await.is_empty() && Instant::now() < drain_deadline {
         tokio::time::sleep(DRAIN_POLL).await;
     }
-    let leftovers = queue.leased_ids().await;
+    let leftovers = queue.in_flight_ids().await;
     if !leftovers.is_empty() {
         tracing::warn!(
             count = leftovers.len(),
@@ -1060,7 +1072,7 @@ async fn lifecycle_task(
             let _ = queue.cancel(&id, Actor::System).await;
         }
         let grace_deadline = Instant::now() + CANCEL_GRACE;
-        while !queue.leased_ids().await.is_empty() && Instant::now() < grace_deadline {
+        while !queue.in_flight_ids().await.is_empty() && Instant::now() < grace_deadline {
             tokio::time::sleep(DRAIN_POLL).await;
         }
     }

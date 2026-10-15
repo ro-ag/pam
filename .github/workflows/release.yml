@@ -128,7 +128,7 @@ jobs:
           Compress-Archive -Path "downloaded/*" -DestinationPath "pam_$($env:VERSION)_windows_$($env:ARCH).zip"
 
       - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pam-${{ matrix.family }}-${{ matrix.arch }}
           path: pam_*
@@ -253,7 +253,7 @@ jobs:
           echo "path=$release_dmg" >> "$GITHUB_OUTPUT"
 
       - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pam-darwin-arm64
           path: ${{ steps.package.outputs.path }}
